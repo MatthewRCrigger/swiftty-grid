@@ -71,6 +71,8 @@ let package = Package(
     // SwiftMux (spec.multiplexer.md): shared messages, engine bridge,
     // service, PTY launcher, client connection and frontends.
     .target(name: "SwiftMuxProtocol"),
+    // OSC 7501 attention reducer (unified spec §8): pure, no I/O.
+    .target(name: "MuxAttention", dependencies: ["SwiftMuxProtocol"]),
     // Frame export needs only the engine; import needs the renderer.
     .target(
       name: "SwiftMuxExport",
@@ -83,7 +85,9 @@ let package = Package(
     // Headless: links the engine, never the Metal renderer or fonts.
     .target(
       name: "SwiftMuxService",
-      dependencies: ["SwifttyEngine", "SwiftMuxProtocol", "SwiftMuxExport"]
+      dependencies: [
+        "SwifttyEngine", "SwiftMuxProtocol", "SwiftMuxExport", "MuxAttention",
+      ]
     ),
     .executableTarget(name: "SwiftMuxAgent", dependencies: ["SwiftMuxService"]),
     // Fresh-process terminal setup: login_tty, then exec the shell in place.
@@ -212,8 +216,12 @@ let package = Package(
       name: "SwiftMuxTests",
       dependencies: [
         "SwiftMuxProtocol", "SwiftMuxBridge", "SwiftMuxService",
-        "SwiftMuxClient", "SwiftMuxTerminal", "SwifttyCore",
+        "SwiftMuxClient", "SwiftMuxTerminal", "SwifttyCore", "MuxAttention",
       ]
+    ),
+    .testTarget(
+      name: "MuxAttentionTests",
+      dependencies: ["MuxAttention", "SwiftMuxProtocol"]
     ),
     .testTarget(
       name: "SwifttyAppTests",

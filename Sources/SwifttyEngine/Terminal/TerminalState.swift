@@ -1193,7 +1193,7 @@ public struct TerminalState: ~Copyable {
     discardControlString()
     invalidateSelection()
     resetShellState()
-    if programStatus.removeAll() { programStatusChanged = true }
+    if programStatus.reset() { programStatusChanged = true }
     hyperlinks = []
     hyperlinkHashes = []
     hyperlinkIndex.removeAll(keepingCapacity: true)

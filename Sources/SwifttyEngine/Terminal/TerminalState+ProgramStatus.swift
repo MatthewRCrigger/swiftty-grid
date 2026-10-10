@@ -64,10 +64,39 @@ extension TerminalState {
     programStatusChanged = true
   }
 
-  /// The current records if they changed since the last call.
+  /// The current records if they changed since the last call. Also
+  /// discards the journal.
   public mutating func takeProgramStatusChange() -> ProgramStatusSnapshot? {
     guard programStatusChanged else { return nil }
     programStatusChanged = false
+    _ = programStatus.takeJournal()
     return programStatus.snapshot
+  }
+
+  /// Every change since the last take, in stream order, with the records
+  /// they produced; nil when nothing changed. Journals only while
+  /// `programStatusJournalLimit` is positive.
+  public mutating func takeProgramStatusJournal() -> ProgramStatusJournal? {
+    guard programStatusChanged else { return nil }
+    programStatusChanged = false
+    let (changes, truncated) = programStatus.takeJournal()
+    return ProgramStatusJournal(
+      changes: changes,
+      truncated: truncated,
+      snapshot: programStatus.snapshot
+    )
+  }
+
+  /// Changes journaled between takes; past it the journal is truncated.
+  /// 0 (the default) journals nothing.
+  public var programStatusJournalLimit: Int {
+    get { programStatus.journalLimit }
+    set { programStatus.journalLimit = max(0, newValue) }
+  }
+
+  /// Records kept per terminal: the protocol's 64 through 256 (default).
+  public var programStatusCapacity: Int {
+    get { programStatus.limit }
+    set { if programStatus.setLimit(newValue) { programStatusChanged = true } }
   }
 }
