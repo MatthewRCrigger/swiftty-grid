@@ -20,8 +20,18 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private var config: Configuration
   private(set) var workspace: WorkspaceSnapshot?
   private(set) var views: [PaneID: MuxPaneView] = [:]
-  private let tabBar = NSSegmentedControl()
-  private let layoutView = MuxLayoutView()
+  private(set) var containers: [PaneID: MuxPaneContainer] = [:]
+  let tabStrip = MuxTabStrip()
+  /// Sanitized program titles, from snapshots and title events.
+  private var titles: [PaneID: String] = [:]
+  /// Panes with output the user has not seen (hidden tabs, bells).
+  private(set) var activity: Set<PaneID> = []
+  /// A divider drag shown locally before the service commits it.
+  private var ratioProposal: RatioProposal?
+  private var ratioSending = false
+  /// Test hook: answers destructive confirmations without a sheet.
+  var confirmDestructive: ((String) async -> Bool)?
+  let layoutView = MuxLayoutView()
   private var inputs: AsyncStream<InputJob>.Continuation?
   private var commands: AsyncStream<@Sendable () async -> Void>.Continuation?
   private var tasks: [Task<Void, Never>] = []
@@ -55,22 +65,21 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     super.init(window: window)
     window.delegate = self
     let content = NSView()
-    tabBar.segmentStyle = .automatic
-    tabBar.trackingMode = .selectOne
-    tabBar.target = self
-    tabBar.action = #selector(tabClicked(_:))
-    tabBar.translatesAutoresizingMaskIntoConstraints = false
+    tabStrip.translatesAutoresizingMaskIntoConstraints = false
+    tabStrip.onSelect = { [weak self] tab in self?.selectTab(tab) }
+    tabStrip.onClose = { [weak self] tab in self?.closeTab(tab) }
+    tabStrip.onRename = { [weak self] tab, name in self?.renameTab(tab, name) }
+    tabStrip.onNew = { [weak self] in self?.newTab() }
     layoutView.translatesAutoresizingMaskIntoConstraints = false
     layoutView.controller = self
-    content.addSubview(tabBar)
+    content.addSubview(tabStrip)
     content.addSubview(layoutView)
     NSLayoutConstraint.activate([
-      tabBar.topAnchor.constraint(equalTo: content.topAnchor, constant: 4),
-      tabBar.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-      layoutView.topAnchor.constraint(
-        equalTo: tabBar.bottomAnchor,
-        constant: 4
-      ), layoutView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+      tabStrip.topAnchor.constraint(equalTo: content.topAnchor),
+      tabStrip.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+      tabStrip.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+      layoutView.topAnchor.constraint(equalTo: tabStrip.bottomAnchor),
+      layoutView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
       layoutView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
       layoutView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
     ])
@@ -277,16 +286,22 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     switch event {
     case let .layout(ws): apply(ws)
     case let .title(pane, title):
-      if pane == activePane {
-        window?.title = title.isEmpty ? workspaceTitle : title
-      }
-    case .bell: NSSound.beep()
+      titles[pane] = DisplayText.sanitize(title)
+      refreshChrome()
+    case let .bell(pane):
+      NSSound.beep()
+      if pane != activePane { markActivity(pane) }
+    case let .activity(pane): markActivity(pane)
     case let .detached(reason): connectionEnded(reason)
-    case let .paneExited(_, _, truncated):
+    case let .paneExited(pane, status, truncated):
       if truncated {
         window?.subtitle =
           "A pane was force-killed; its final output may be incomplete"
       }
+      if let i = workspace?.panes.firstIndex(where: { $0.id == pane }) {
+        workspace?.panes[i].exitStatus = status
+      }
+      refreshChrome()
     case .paste, .frameUnavailable, .frame: break
     }
   }
@@ -309,20 +324,22 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     guard workspace == nil || ws.layoutRevision >= workspace!.layoutRevision
     else { return }
     workspace = ws
-    tabBar.segmentCount = ws.tabs.count
-    for (i, tab) in ws.tabs.enumerated() {
-      tabBar.setLabel(tab.name, forSegment: i)
-      tabBar.setWidth(0, forSegment: i)
+    for pane in ws.panes where titles[pane.id] == nil || !pane.title.isEmpty {
+      titles[pane.id] = DisplayText.sanitize(pane.title)
     }
-    if let i = ws.tabs.firstIndex(where: { $0.id == ws.activeTab }) {
-      tabBar.selectedSegment = i
+    let known = Set(ws.panes.map(\.id))
+    titles = titles.filter { known.contains($0.key) }
+    activity.formIntersection(known)
+    guard let tab = ws.activeTabSnapshot else {
+      refreshChrome()
+      return
     }
-    guard let tab = ws.activeTabSnapshot else { return }
     // Rebind: keep views for surviving panes, drop the rest.
     let visible = tab.zoomedPane.map { [$0] } ?? tab.layout.panes
     for (id, view) in views where !visible.contains(id) {
       view.cancelComposition()
-      view.removeFromSuperview()
+      containers[id]?.removeFromSuperview()
+      containers.removeValue(forKey: id)
       views.removeValue(forKey: id)
     }
     for id in visible where views[id] == nil {
@@ -330,14 +347,26 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
         continue
       }
       view.controller = self
+      let container = MuxPaneContainer(paneView: view)
+      container.header.onAction = { [weak self] action in
+        self?.headerAction(action, pane: id)
+      }
       views[id] = view
-      layoutView.addSubview(view)
+      containers[id] = container
+      layoutView.addSubview(container)
     }
     for (id, view) in views { view.isActivePane = id == tab.activePane }
-    window?.title = ws.pane(tab.activePane)?.title.nonEmpty ?? workspaceTitle
+    // Shown panes are seen.
+    activity.subtract(visible)
+    if let proposal = ratioProposal, proposal.tab != tab.id {
+      ratioProposal = nil
+    }
+    refreshChrome()
     layoutView.needsLayout = true
     layoutView.layoutSubtreeIfNeeded()
-    if let active = views[tab.activePane], window?.firstResponder !== active {
+    if let active = views[tab.activePane], window?.firstResponder !== active,
+      !(window?.firstResponder is NSText)
+    {
       window?.makeFirstResponder(active)
     }
     if visible != subscribed {
@@ -347,27 +376,104 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     geometryChanged()
   }
 
+  // MARK: Chrome
+
+  func title(of pane: PaneID) -> String {
+    titles[pane].flatMap(\.nonEmpty) ?? "shell"
+  }
+
+  /// Tab strip, pane headers and window title from the current snapshot.
+  private func refreshChrome() {
+    guard let ws = workspace else { return }
+    tabStrip.update(
+      ws.tabs.map { tab in
+        let name = DisplayText.sanitize(tab.name)
+        // Service default names are numbers; show the program instead.
+        let automatic = name.isEmpty || name.allSatisfy(\.isNumber)
+        let label = automatic ? title(of: tab.activePane) : name
+        return MuxTabItem(
+          id: tab.id,
+          title: label,
+          symbol: MuxIcons.symbol(for: title(of: tab.activePane)),
+          isActive: tab.id == ws.activeTab,
+          hasActivity: tab.id != ws.activeTab
+            && tab.layout.panes.contains(where: activity.contains)
+        )
+      }
+    )
+    guard let tab = ws.activeTabSnapshot else { return }
+    let split = tab.layout.panes.count > 1
+    for (id, container) in containers {
+      container.showsHeader = split
+      container.update(
+        MuxPaneHeaderState(
+          title: title(of: id),
+          isActive: id == tab.activePane,
+          hasActivity: activity.contains(id),
+          isZoomed: tab.zoomedPane == id,
+          hasExited: ws.pane(id)?.exitStatus != nil
+        )
+      )
+    }
+    let active = titles[tab.activePane].flatMap(\.nonEmpty)
+    window?.title = active ?? workspaceTitle
+  }
+
+  private func markActivity(_ pane: PaneID) {
+    guard pane != activePane || !subscribed.contains(pane) else { return }
+    guard activity.insert(pane).inserted else { return }
+    refreshChrome()
+  }
+
+  // MARK: Geometry
+
+  /// The active tab's tree with any local divider drag applied.
+  private var displayedLayout: LayoutNode? {
+    guard let tab = activeTab else { return nil }
+    if let p = ratioProposal, p.tab == tab.id,
+      let moved = tab.layout.settingRatio(p.ratio, at: p.path)
+    {
+      return moved
+    }
+    return tab.layout
+  }
+
+  /// Smallest pane in points: 10 columns by 2 rows plus its header.
+  var minimumPaneSize: (columns: Int, rows: Int) {
+    guard let view = views.values.first else { return (80, 40) }
+    let scale = view.window?.backingScaleFactor ?? 2
+    let cell = view.renderer.cellSize
+    let o = view.renderer.options
+    return (
+      Int(((cell.width * 10 + o.paddingX * 2) / scale).rounded(.up)),
+      Int(((cell.height * 2 + o.paddingY * 2) / scale).rounded(.up))
+        + Int(MuxPaneContainer.headerHeight)
+    )
+  }
+
   /// Frames for visible panes in points, plus dividers for dragging.
   func layout(
     in bounds: NSRect
-  ) -> (panes: [(MuxPaneView, NSRect)], dividers: [LayoutDivider]) {
-    guard let tab = activeTab else { return ([], []) }
+  ) -> (panes: [(MuxPaneContainer, NSRect)], dividers: [LayoutDivider]) {
+    guard let tab = activeTab, let tree = displayedLayout else {
+      return ([], [])
+    }
     let area = LayoutRect(
       x: 0,
       y: 0,
       width: Int(bounds.width),
       height: Int(bounds.height)
     )
-    if let zoomed = tab.zoomedPane, let view = views[zoomed] {
+    if let zoomed = tab.zoomedPane, let view = containers[zoomed] {
       return ([(view, bounds)], [])
     }
     let frames = LayoutGeometry.frames(
-      tab.layout,
+      tree,
       in: area,
       divider: MuxLayoutView.divider
     )
-    let panes = frames.compactMap { id, r -> (MuxPaneView, NSRect)? in
-      views[id]
+    let panes = frames.compactMap { id, r -> (MuxPaneContainer, NSRect)? in
+      containers[id]
         .map {
           // LayoutRect y grows downward; AppKit's grows upward.
           (
@@ -383,23 +489,62 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     }
     return (
       panes,
-      LayoutGeometry.dividers(
-        tab.layout,
-        in: area,
-        divider: MuxLayoutView.divider
-      )
+      LayoutGeometry.dividers(tree, in: area, divider: MuxLayoutView.divider)
     )
   }
 
+  /// A divider drag: shown at once, sent coalesced (one request in
+  /// flight, newest ratio pending), clamped to the minimum pane size.
   func setRatio(_ ratio: Double, path: [Bool]) {
-    guard let tab = activeTab else { return }
-    command(
-      .setSplitRatio(
-        tab: tab.id,
-        path: path,
-        ratio: min(0.95, max(0.05, ratio))
-      )
+    guard let tab = activeTab, let tree = displayedLayout else { return }
+    let bounds = layoutView.bounds
+    let clamped = LayoutGeometry.clampedRatio(
+      ratio,
+      at: path,
+      of: tree,
+      in: LayoutRect(
+        x: 0,
+        y: 0,
+        width: Int(bounds.width),
+        height: Int(bounds.height)
+      ),
+      minimum: minimumPaneSize,
+      divider: MuxLayoutView.divider
     )
+    ratioProposal = RatioProposal(tab: tab.id, path: path, ratio: clamped)
+    layoutView.needsLayout = true
+    flushRatio()
+  }
+
+  /// The current ratio of the split at `path` as displayed.
+  func ratio(at path: [Bool]) -> Double? {
+    guard case let .split(_, r, _, _)? = displayedLayout?.node(at: path) else {
+      return nil
+    }
+    return r
+  }
+
+  private func flushRatio() {
+    guard !ratioSending, !detached, let proposal = ratioProposal else { return }
+    ratioSending = true
+    let connection = connection
+    commands?
+      .yield {
+        let reply = try? await connection.execute(
+          .setSplitRatio(
+            tab: proposal.tab,
+            path: proposal.path,
+            ratio: proposal.ratio
+          )
+        )
+        await MainActor.run { [weak self] in
+          guard let self else { return }
+          ratioSending = false
+          if ratioProposal == proposal { ratioProposal = nil }
+          if case let .layout(ws)? = reply { apply(ws) }
+          flushRatio()
+        }
+      }
   }
 
   /// Coalesces superseded geometry into one batch per run loop turn.
@@ -500,28 +645,135 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     if view.pane != activePane { focus(view.pane) }
   }
 
-  @objc
-  private func tabClicked(_ sender: NSSegmentedControl) {
-    guard let ws = workspace, ws.tabs.indices.contains(sender.selectedSegment)
+  /// Moves focus to the visible pane beside the active one.
+  func focus(_ direction: Direction) {
+    guard let tab = activeTab, tab.zoomedPane == nil, let tree = displayedLayout
     else { return }
-    command(.selectTab(ws.tabs[sender.selectedSegment].id))
+    let frames = LayoutGeometry.frames(
+      tree,
+      in: LayoutRect(x: 0, y: 0, width: 10_000, height: 10_000),
+      divider: MuxLayoutView.divider
+    )
+    if let next = LayoutGeometry.neighbor(
+      of: tab.activePane,
+      direction: direction,
+      frames: frames,
+      order: tree.panes
+    ) {
+      focus(next)
+      if let view = views[next] { window?.makeFirstResponder(view) }
+    }
+  }
+
+  /// Moves the nearest divider beside the active pane (keyboard resize).
+  func resizeActivePane(_ direction: Direction, step: Double = 0.05) {
+    guard let tab = activeTab, let tree = displayedLayout else { return }
+    let axis: SplitAxis =
+      direction == .left || direction == .right ? .leftRight : .topBottom
+    guard let split = tree.enclosingSplit(of: tab.activePane, axis: axis),
+      let current = ratio(at: split.path)
+    else { return }
+    let grow = direction == .right || direction == .down
+    setRatio(current + (grow ? step : -step), path: split.path)
+  }
+
+  func selectTab(_ tab: TabID) {
+    guard tab != workspace?.activeTab else { return }
+    command(.selectTab(tab))
+  }
+
+  func renameTab(_ tab: TabID, _ name: String) {
+    let clean = DisplayText.sanitize(name)
+    guard !clean.isEmpty else { return }
+    command(.renameTab(tab, name: clean))
+  }
+
+  func beginRenamingActiveTab() {
+    tabStrip.buttons.first { $0.item?.isActive == true }?.beginRename()
   }
 
   func newTab() { command(.newTab(name: nil, launch: nil)) }
 
-  func split(_ axis: SplitAxis) {
-    guard let pane = activePane else { return }
+  func split(_ axis: SplitAxis, pane: PaneID? = nil) {
+    guard let pane = pane ?? activePane else { return }
     command(.split(pane: pane, axis: axis, launch: nil))
   }
 
-  func toggleZoom() {
+  func toggleZoom(pane: PaneID? = nil) {
     guard let tab = activeTab else { return }
+    if let pane, pane != tab.activePane { command(.focusPane(pane)) }
     command(.toggleZoom(tab.id))
   }
 
-  func endPane() {
-    guard let pane = activePane else { return }
-    command(.endPane(pane))
+  private func headerAction(_ action: MuxPaneHeader.Action, pane: PaneID) {
+    switch action {
+    case .splitRight: split(.leftRight, pane: pane)
+    case .splitDown: split(.topBottom, pane: pane)
+    case .zoom: toggleZoom(pane: pane)
+    case .close: endPane(pane)
+    }
+  }
+
+  /// Whether ending `panes` would terminate a running process.
+  private func running(_ panes: [PaneID]) -> Bool {
+    panes.contains { workspace?.pane($0)?.exitStatus == nil }
+  }
+
+  /// Destructive actions terminate only their target, and ask first
+  /// while a process is still running. Hiding and closing views never
+  /// end anything.
+  func endPane(_ pane: PaneID? = nil) {
+    guard let pane = pane ?? activePane else { return }
+    let name = title(of: pane)
+    confirmThen(
+      running([pane]),
+      "End the pane “\(name)”?",
+      "Its process is still running and will be terminated."
+    ) { [weak self] in self?.command(.endPane(pane)) }
+  }
+
+  func closeTab(_ tab: TabID? = nil) {
+    guard let ws = workspace,
+      let snapshot = ws.tabs.first(where: { $0.id == (tab ?? ws.activeTab) })
+    else { return }
+    let panes = snapshot.layout.panes
+    confirmThen(
+      running(panes),
+      "End the tab “\(title(of: snapshot.activePane))”?",
+      panes.count == 1
+        ? "Its process is still running and will be terminated."
+        : "Its \(panes.count) panes and their processes will be terminated."
+    ) { [weak self] in self?.command(.endTab(snapshot.id)) }
+  }
+
+  private func confirmThen(
+    _ ask: Bool,
+    _ message: String,
+    _ detail: String,
+    _ action: @escaping @MainActor () -> Void
+  ) {
+    guard ask else { return action() }
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      let ok: Bool
+      if let hook = confirmDestructive {
+        ok = await hook(message)
+      } else {
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.informativeText = detail
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "End")
+        alert.addButton(withTitle: "Cancel")
+        if let window {
+          ok =
+            await alert.beginSheetModal(for: window) == .alertFirstButtonReturn
+        } else {
+          ok = alert.runModal() == .alertFirstButtonReturn
+        }
+      }
+      if ok { action() }
+    }
   }
 
   func cycleTab(_ delta: Int) {
@@ -649,8 +901,9 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
 final class MuxLayoutView: NSView {
   static let divider = 4
   weak var controller: MuxWorkspaceController?
-  private var dividers: [LayoutDivider] = []
+  private(set) var dividers: [LayoutDivider] = []
   private var dragging: LayoutDivider?
+  private var dividerElements: [MuxDividerElement] = []
 
   override var isFlipped: Bool { false }
 
@@ -668,20 +921,32 @@ final class MuxLayoutView: NSView {
       view.frame = frame
     }
     window?.invalidateCursorRects(for: self)
+    dividerElements = dividers.map { d in
+      let element = MuxDividerElement(divider: d, in: self)
+      element.setAccessibilityFrameInParentSpace(appKitRect(d.rect))
+      return element
+    }
+  }
+
+  func appKitRect(_ r: LayoutRect) -> NSRect {
+    NSRect(
+      x: r.x,
+      y: Int(bounds.height) - r.maxY,
+      width: r.width,
+      height: r.height
+    )
+  }
+
+  override func accessibilityChildren() -> [Any]? {
+    (super.accessibilityChildren() ?? []) + dividerElements
   }
 
   private func flippedY(_ p: NSPoint) -> Int { Int(bounds.height - p.y) }
 
   override func resetCursorRects() {
     for d in dividers {
-      let r = NSRect(
-        x: d.rect.x,
-        y: Int(bounds.height) - d.rect.maxY,
-        width: d.rect.width,
-        height: d.rect.height
-      )
       addCursorRect(
-        r,
+        appKitRect(d.rect),
         cursor: d.axis == .leftRight ? .resizeLeftRight : .resizeUpDown
       )
     }
@@ -719,6 +984,55 @@ final class MuxLayoutView: NSView {
     NSColor.separatorColor.setFill()
     bounds.fill()
   }
+}
+
+/// A split handle for assistive technologies: its value is the first
+/// child's share; increment and decrement move it in 5% steps.
+/// AppKit calls accessibility on the main thread.
+final class MuxDividerElement: NSAccessibilityElement {
+  let divider: LayoutDivider
+  private weak var layoutView: MuxLayoutView?
+
+  @MainActor
+  init(divider: LayoutDivider, in view: MuxLayoutView) {
+    self.divider = divider
+    layoutView = view
+    super.init()
+    setAccessibilityParent(view)
+    setAccessibilityRole(.splitter)
+    setAccessibilityOrientation(
+      divider.axis == .leftRight ? .vertical : .horizontal
+    )
+    setAccessibilityLabel(
+      divider.axis == .leftRight ? "Left/right divider" : "Top/bottom divider"
+    )
+  }
+
+  override func accessibilityValue() -> Any? {
+    let (view, path) = (layoutView, divider.path)
+    return MainActor.assumeIsolated { view?.controller?.ratio(at: path) }
+      .map { $0 as NSNumber }
+  }
+
+  override func accessibilityPerformIncrement() -> Bool { move(0.05) }
+  override func accessibilityPerformDecrement() -> Bool { move(-0.05) }
+
+  private func move(_ delta: Double) -> Bool {
+    let (view, path) = (layoutView, divider.path)
+    return MainActor.assumeIsolated {
+      guard let controller = view?.controller,
+        let ratio = controller.ratio(at: path)
+      else { return false }
+      controller.setRatio(ratio + delta, path: path)
+      return true
+    }
+  }
+}
+
+struct RatioProposal: Equatable {
+  var tab: TabID
+  var path: [Bool]
+  var ratio: Double
 }
 
 struct MuxUnavailable: LocalizedError {

@@ -199,6 +199,7 @@ public final class TerminalClient {
       }
       redraw()
     case .bell: tty.write("\u{07}")
+    case .activity: break
     case let .detached(reason): finish(.detached(reason), detach: false)
     case let .paste(_, state):
       if state != .completed { show("paste \(state.rawValue)") }

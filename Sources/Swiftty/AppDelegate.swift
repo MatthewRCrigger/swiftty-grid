@@ -135,6 +135,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   func muxEndPane(_ sender: Any?) { mux?.endPane() }
 
   @objc
+  func muxCloseTab(_ sender: Any?) { mux?.closeTab() }
+
+  @objc
+  func muxRenameTab(_ sender: Any?) { mux?.beginRenamingActiveTab() }
+
+  /// Focus and resize items carry their direction in the tag.
+  @objc
+  func muxFocusPane(_ sender: NSMenuItem) {
+    Self.direction(sender.tag).map { mux?.focus($0) }
+  }
+
+  @objc
+  func muxResizePane(_ sender: NSMenuItem) {
+    Self.direction(sender.tag).map { mux?.resizeActivePane($0) }
+  }
+
+  private static let directions: [Direction] = [.left, .right, .up, .down]
+
+  private static func direction(_ tag: Int) -> Direction? {
+    directions.indices.contains(tag) ? directions[tag] : nil
+  }
+
+  @objc
   func muxNextTab(_ sender: Any?) { mux?.cycleTab(1) }
 
   @objc
@@ -146,7 +169,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     case #selector(muxDetach(_:)), #selector(muxNewTab(_:)),
       #selector(muxSplitLeftRight(_:)), #selector(muxSplitTopBottom(_:)),
       #selector(muxZoom(_:)), #selector(muxEndPane(_:)),
-      #selector(muxNextTab(_:)), #selector(muxPreviousTab(_:)):
+      #selector(muxNextTab(_:)), #selector(muxPreviousTab(_:)),
+      #selector(muxCloseTab(_:)), #selector(muxRenameTab(_:)),
+      #selector(muxFocusPane(_:)), #selector(muxResizePane(_:)):
       mux != nil
     default: true
     }
@@ -333,21 +358,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   /// A menu item whose shortcut is whatever `action` is bound to (the
   /// view's key bindings handle the key itself; this only shows it).
   private func muxMenuItems() -> [NSMenuItem] {
-    [
-      item("New Workspace", #selector(muxNewWorkspace(_:))),
-      item("Attach to Workspace…", #selector(muxAttach(_:))),
-      item("Detach", #selector(muxDetach(_:))), .separator(),
-      item("New Tab", #selector(muxNewTab(_:))),
-      item("Split Left/Right", #selector(muxSplitLeftRight(_:))),
-      item("Split Top/Bottom", #selector(muxSplitTopBottom(_:))),
-      item("Zoom Pane", #selector(muxZoom(_:))),
-      item("End Pane", #selector(muxEndPane(_:))), .separator(),
-      item("Next Tab", #selector(muxNextTab(_:))),
-      item("Previous Tab", #selector(muxPreviousTab(_:))), .separator(),
-      item("Stage Update…", #selector(muxStageUpdate(_:))),
-      item("Install Staged Update…", #selector(muxInstallUpdate(_:))),
-      item("Cancel Update", #selector(muxCancelUpdate(_:))),
+    func arrow(_ key: Int) -> String {
+      String(UnicodeScalar(UInt16(key)).map(Character.init) ?? " ")
+    }
+    let arrows = [
+      ("Left", NSLeftArrowFunctionKey), ("Right", NSRightArrowFunctionKey),
+      ("Up", NSUpArrowFunctionKey), ("Down", NSDownArrowFunctionKey),
     ]
+    func directional(
+      _ verb: String,
+      _ selector: Selector,
+      _ modifiers: NSEvent.ModifierFlags
+    ) -> [NSMenuItem] {
+      arrows.enumerated()
+        .map { i, a in
+          let menuItem = item(
+            "\(verb) \(a.0)",
+            selector,
+            key: arrow(a.1),
+            modifiers: modifiers
+          )
+          menuItem.tag = i
+          return menuItem
+        }
+    }
+    return [
+      item(
+        "New Workspace",
+        #selector(muxNewWorkspace(_:)),
+        key: "n",
+        modifiers: [.command, .control]
+      ), item("Attach to Workspace…", #selector(muxAttach(_:))),
+      item(
+        "Detach",
+        #selector(muxDetach(_:)),
+        key: "d",
+        modifiers: [.command, .control]
+      ), .separator(), item("New Tab", #selector(muxNewTab(_:)), key: "t"),
+      item("Rename Tab…", #selector(muxRenameTab(_:))),
+      item(
+        "Close Tab",
+        #selector(muxCloseTab(_:)),
+        key: "w",
+        modifiers: [.command, .control]
+      ),
+      item(
+        "Next Tab",
+        #selector(muxNextTab(_:)),
+        key: "]",
+        modifiers: [.command, .shift]
+      ),
+      item(
+        "Previous Tab",
+        #selector(muxPreviousTab(_:)),
+        key: "[",
+        modifiers: [.command, .shift]
+      ), .separator(),
+      item("Split Left/Right", #selector(muxSplitLeftRight(_:)), key: "d"),
+      item(
+        "Split Top/Bottom",
+        #selector(muxSplitTopBottom(_:)),
+        key: "d",
+        modifiers: [.command, .shift]
+      ),
+      item(
+        "Zoom Pane",
+        #selector(muxZoom(_:)),
+        key: "\r",
+        modifiers: [.command, .shift]
+      ),
+      item(
+        "End Pane",
+        #selector(muxEndPane(_:)),
+        key: "w",
+        modifiers: [.command, .option]
+      ), .separator(),
+    ]
+      + directional(
+        "Focus Pane",
+        #selector(muxFocusPane(_:)),
+        [.command, .option]
+      ) + [.separator()]
+      + directional(
+        "Resize Pane",
+        #selector(muxResizePane(_:)),
+        [.command, .control]
+      ) + [
+        .separator(), item("Stage Update…", #selector(muxStageUpdate(_:))),
+        item("Install Staged Update…", #selector(muxInstallUpdate(_:))),
+        item("Cancel Update", #selector(muxCancelUpdate(_:))),
+      ]
   }
 
   private func item(

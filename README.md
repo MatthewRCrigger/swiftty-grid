@@ -81,7 +81,11 @@ validated pane frames.
   input encoding and PTY code, with no Metal, fonts or AppKit. `SwifttyCore`
   re-exports the engine and adds the renderer, fonts and sessions.
 - The Swiftty app's SwiftMux menu attaches a native window. Its panes render
-  service frames directly through Metal. Find (⌘F, ⌘G, ⇧⌘G) searches the
+  service frames directly through Metal. AppKit draws the tab strip (icons,
+  titles, activity dots, double-click to rename), pane headers and draggable,
+  VoiceOver-adjustable dividers. Shortcuts: ⌘T new tab, ⌘D / ⇧⌘D split,
+  ⌥⌘arrows focus, ⌃⌘arrows resize, ⇧⌘↩ zoom, ⌥⌘W end pane, ⌃⌘W close tab.
+  Ending a running pane or tab asks first. Find (⌘F, ⌘G, ⇧⌘G) searches the
   service-side history, and app theme changes update the colours panes
   report to programs. Quitting the app detaches; the shells
   keep running.
@@ -97,7 +101,7 @@ Scripts/package-swiftmux.sh [identity]   # Swiftty.app with the bundled agent (S
 ```
 
 Acceptance evidence and measurements (`mise run bench-swiftmux`) are recorded
-in [spec.multiplexer.results.md](spec.multiplexer.results.md).
+in section 11 of [spec.multiplexer.md](spec.multiplexer.md).
 
 The service enforces the limits in `MuxLimits`: 32 panes, a 256 KiB input
 buffer per pane, 16 MiB frames, 1 MiB pastes and a bounded history per pane.

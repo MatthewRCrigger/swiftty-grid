@@ -649,6 +649,9 @@ public actor MuxService {
               workingDirectory: launch.workingDirectory
             )
             completion(service, .success(id))
+            // Output read before the record existed posted a change that
+            // found no pane; take it now, which also re-arms `onChange`.
+            service.paneChanged(id, reportActivity: false)
             // Creation generation: the target may have ended meanwhile.
             if service.locate(pane: id) == nil {
               service.panes[id]?.detachedFromLayout = true
@@ -858,10 +861,24 @@ public actor MuxService {
 
   // MARK: Pane events
 
-  private func paneChanged(_ id: PaneID) {
+  /// `reportActivity` is off for a pane's launch, which is not unseen
+  /// output in a hidden tab.
+  private func paneChanged(_ id: PaneID, reportActivity: Bool = true) {
     guard let record = panes[id] else { return }
     record.runtime.changePosted.store(false, ordering: .releasing)
-    guard lease?.frames[id] != nil else { return }
+    guard lease?.frames[id] != nil else {
+      // Only panes in other tabs are hidden; the active tab's panes are
+      // shown or about to be subscribed.
+      if reportActivity, let current = lease,
+        let ws = workspaces.first(where: { $0.id == current.workspace }),
+        record.workspace == ws.id, let tab = ws.tabIndex(containing: id),
+        ws.tabs[tab].id != ws.activeTab, !current.reportedActivity.contains(id)
+      {
+        lease?.reportedActivity.insert(id)
+        send(.event(.activity(id)), to: current.client)
+      }
+      return
+    }
     lease?.frames[id]?.dirty = true
     pump()
   }
@@ -968,6 +985,7 @@ public actor MuxService {
     }
     lease?.subscriptions = list
     lease?.frames = frames
+    lease?.reportedActivity.subtract(list)
     pump()
     return nil
   }

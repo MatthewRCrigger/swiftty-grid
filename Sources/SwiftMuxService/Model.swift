@@ -89,4 +89,6 @@ struct Lease {
   var frames: [PaneID: FrameSlot] = [:]
   var geometryGeneration: UInt64 = 0
   var pastes: [UInt64: ActivePaste] = [:]
+  /// Unsubscribed panes already reported through `activity`.
+  var reportedActivity: Set<PaneID> = []
 }

@@ -519,6 +519,9 @@ public enum MuxEvent: Codable, Sendable {
   case paneExited(PaneID, status: Int32, truncated: Bool)
   case title(PaneID, String)
   case bell(PaneID)
+  /// An unsubscribed pane in another tab of the attached workspace
+  /// changed. Sent once until it is subscribed again.
+  case activity(PaneID)
   /// The lease ended without this client asking (e.g. another client
   /// released it, or the workspace ended).
   case detached(reason: String)
