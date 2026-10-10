@@ -3,6 +3,7 @@ import MetalKit
 import SwiftMuxBridge
 import SwiftMuxProtocol
 import SwifttyCore
+import SwifttyMac
 
 /// A decoded, validated frame with its app-owned renderer snapshot.
 struct MuxPresentation: @unchecked Sendable {

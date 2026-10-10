@@ -57,7 +57,7 @@ extension TerminalView {
     !tracking || event.modifierFlags.contains(.shift)
   }
 
-  override func mouseDown(with event: NSEvent) {
+  public override func mouseDown(with event: NSEvent) {
     reportsLeftMouseGesture = false
     selectionOrigin = nil
     if event.modifierFlags.contains(.command), let link = link(for: event) {
@@ -72,7 +72,7 @@ extension TerminalView {
     beginSelection(event)
   }
 
-  override func mouseUp(with event: NSEvent) {
+  public override func mouseUp(with event: NSEvent) {
     defer { reportsLeftMouseGesture = false }
     guard selectionOrigin == nil else {
       if selectionDragged { extendSelection(event, scrollEdges: false) }
@@ -82,7 +82,7 @@ extension TerminalView {
     if reportsLeftMouseGesture { sendMouse(.release, .left, event) }
   }
 
-  override func mouseDragged(with event: NSEvent) {
+  public override func mouseDragged(with event: NSEvent) {
     guard selectionOrigin == nil else {
       extendSelection(event);
       return
@@ -196,6 +196,7 @@ extension TerminalView {
   // MARK: Links and the pointer
 
   func link(for event: NSEvent) -> TerminalLink? {
+    guard capabilities.openURLs else { return nil }
     let p = point(for: event)
     let detect = config.linkURL
     return session.withState { $0.link(at: p, detectURLs: detect) }
@@ -204,7 +205,7 @@ extension TerminalView {
   /// Opens web, mail, FTP and SSH links only: the application chooses
   /// the target, so a `file:` link could launch a local program.
   func open(_ string: String) {
-    guard let url = LinkPolicy.openableURL(string) else {
+    guard capabilities.openURLs, let url = LinkPolicy.openableURL(string) else {
       NSSound.beep()
       return
     }
@@ -268,35 +269,35 @@ extension TerminalView {
     needsDisplay = true
   }
 
-  override func mouseEntered(with event: NSEvent) { updateHover(event) }
+  public override func mouseEntered(with event: NSEvent) { updateHover(event) }
 
-  override func mouseExited(with event: NSEvent) { clearHover() }
+  public override func mouseExited(with event: NSEvent) { clearHover() }
 
-  override func resetCursorRects() {
+  public override func resetCursorRects() {
     addCursorRect(bounds, cursor: applicationCursor)
   }
 
-  override func flagsChanged(with event: NSEvent) {
+  public override func flagsChanged(with event: NSEvent) {
     super.flagsChanged(with: event)
     // Keyboard events do not carry the last pointer location.
     hoverModifiers = event.modifierFlags
     refreshHover()
   }
 
-  override func rightMouseDown(with event: NSEvent) {
+  public override func rightMouseDown(with event: NSEvent) {
     guard tracking else { return super.rightMouseDown(with: event) }
     sendMouse(.press, .right, event)
   }
 
-  override func rightMouseUp(with event: NSEvent) {
+  public override func rightMouseUp(with event: NSEvent) {
     sendMouse(.release, .right, event)
   }
 
-  override func rightMouseDragged(with event: NSEvent) {
+  public override func rightMouseDragged(with event: NSEvent) {
     sendMouse(.motion, .right, event)
   }
 
-  override func menu(for event: NSEvent) -> NSMenu? {
+  public override func menu(for event: NSEvent) -> NSMenu? {
     guard !tracking else { return nil }
     let c = unclampedCell(for: event)
     lastClick = session.withState { state in
@@ -306,16 +307,21 @@ extension TerminalView {
       )
     }
     let menu = NSMenu()
-    menu.addItem(
-      withTitle: "Copy",
-      action: #selector(copy(_:)),
-      keyEquivalent: ""
-    )
-    menu.addItem(
-      withTitle: "Paste",
-      action: #selector(paste(_:)),
-      keyEquivalent: ""
-    )
+    // Unavailable actions are left out rather than disabled.
+    if capabilities.allows(.copyToClipboard) {
+      menu.addItem(
+        withTitle: "Copy",
+        action: #selector(copy(_:)),
+        keyEquivalent: ""
+      )
+    }
+    if capabilities.allows(.pasteFromClipboard) {
+      menu.addItem(
+        withTitle: "Paste",
+        action: #selector(paste(_:)),
+        keyEquivalent: ""
+      )
+    }
     menu.addItem(
       withTitle: "Select Command Output",
       action: #selector(selectCommandOutput(_:)),
@@ -340,29 +346,29 @@ extension TerminalView {
     open(url)
   }
 
-  override func otherMouseDown(with event: NSEvent) {
+  public override func otherMouseDown(with event: NSEvent) {
     guard event.buttonNumber == 2 else { return }
     sendMouse(.press, .middle, event)
   }
 
-  override func otherMouseUp(with event: NSEvent) {
+  public override func otherMouseUp(with event: NSEvent) {
     guard event.buttonNumber == 2 else { return }
     sendMouse(.release, .middle, event)
   }
 
-  override func otherMouseDragged(with event: NSEvent) {
+  public override func otherMouseDragged(with event: NSEvent) {
     guard event.buttonNumber == 2 else { return }
     sendMouse(.motion, .middle, event)
   }
 
-  override func mouseMoved(with event: NSEvent) {
+  public override func mouseMoved(with event: NSEvent) {
     updateHover(event)
     guard containsTerminalPoint(convert(event.locationInWindow, from: nil))
     else { return }
     if lastModes.contains(.mouseAny) { sendMouse(.motion, .none, event) }
   }
 
-  override func updateTrackingAreas() {
+  public override func updateTrackingAreas() {
     super.updateTrackingAreas()
     for area in trackingAreas { removeTrackingArea(area) }
     addTrackingArea(
@@ -377,7 +383,7 @@ extension TerminalView {
     )
   }
 
-  override func scrollWheel(with event: NSEvent) {
+  public override func scrollWheel(with event: NSEvent) {
     let lineHeight =
       renderer.cellSize.height / (window?.backingScaleFactor ?? 2)
     let lines = scrollAccumulator.add(
@@ -406,7 +412,7 @@ extension TerminalView {
         for _ in 0 ..< abs(lines) {
           session.send(.key(KeyEvent(lines > 0 ? .up : .down)))
         }
-      } else {
+      } else if capabilities.scrollback {
         session.scrollViewport(by: lines)
       }
     }

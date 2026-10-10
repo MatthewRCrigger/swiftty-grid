@@ -15,9 +15,7 @@ final class TerminalSearchBar: UIView, UITextFieldDelegate {
 
   override init(frame: CGRect) {
     super.init(frame: frame)
-    let blur = UIVisualEffectView(
-      effect: UIBlurEffect(style: .systemThickMaterial)
-    )
+    let blur = UIVisualEffectView(effect: UIBlurEffect(style: Self.material))
     blur.frame = bounds
     blur.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     blur.layer.cornerRadius = 12
@@ -75,6 +73,13 @@ final class TerminalSearchBar: UIView, UITextFieldDelegate {
 
   @available(*, unavailable)
   required init?(coder: NSCoder) { fatalError() }
+
+  // tvOS has no system materials.
+  #if os(tvOS)
+  private static let material = UIBlurEffect.Style.regular
+  #else
+  private static let material = UIBlurEffect.Style.systemThickMaterial
+  #endif
 
   private func isCompact(width: CGFloat) -> Bool {
     // 120-point query, three 44-point buttons, four gaps and margins.

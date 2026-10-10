@@ -4,36 +4,36 @@ import SwifttyCore
 /// VoiceOver: the view is a read-only text area holding the visible
 /// screen, with the insertion point at the terminal cursor.
 extension TerminalView {
-  override func isAccessibilityElement() -> Bool { true }
+  public override func isAccessibilityElement() -> Bool { true }
 
-  override func accessibilityRole() -> NSAccessibility.Role? { .textArea }
+  public override func accessibilityRole() -> NSAccessibility.Role? { .textArea }
 
-  override func accessibilityRoleDescription() -> String? { "terminal" }
+  public override func accessibilityRoleDescription() -> String? { "terminal" }
 
-  override func accessibilityLabel() -> String? { window?.title ?? "Terminal" }
+  public override func accessibilityLabel() -> String? { window?.title ?? "Terminal" }
 
-  override func accessibilityValue() -> Any? { accessibilityText?.string ?? "" }
+  public override func accessibilityValue() -> Any? { accessibilityText?.string ?? "" }
 
-  override func accessibilityNumberOfCharacters() -> Int {
+  public override func accessibilityNumberOfCharacters() -> Int {
     accessibilityText?.string.utf16.count ?? 0
   }
 
-  override func accessibilityVisibleCharacterRange() -> NSRange {
+  public override func accessibilityVisibleCharacterRange() -> NSRange {
     NSRange(location: 0, length: accessibilityNumberOfCharacters())
   }
 
-  override func accessibilitySelectedTextRange() -> NSRange {
+  public override func accessibilitySelectedTextRange() -> NSRange {
     selectedAccessibilityRanges.first
       ?? NSRange(location: accessibilityText?.cursorOffset ?? 0, length: 0)
   }
 
-  override func accessibilitySelectedTextRanges() -> [NSValue]? {
+  public override func accessibilitySelectedTextRanges() -> [NSValue]? {
     let ranges = selectedAccessibilityRanges
     return (ranges.isEmpty ? [accessibilitySelectedTextRange()] : ranges)
       .map { NSValue(range: $0) }
   }
 
-  override func accessibilitySelectedText() -> String? {
+  public override func accessibilitySelectedText() -> String? {
     guard let text = accessibilityText else { return "" }
     let string = text.string as NSString
     return selectedAccessibilityRanges.map { string.substring(with: $0) }
@@ -87,21 +87,21 @@ extension TerminalView {
     return [NSRange(location: start, length: end - start)]
   }
 
-  override func accessibilityInsertionPointLineNumber() -> Int {
+  public override func accessibilityInsertionPointLineNumber() -> Int {
     accessibilityText?.cursorLine ?? 0
   }
 
-  override func accessibilityLine(for index: Int) -> Int {
+  public override func accessibilityLine(for index: Int) -> Int {
     accessibilityText?.line(forOffset: index) ?? 0
   }
 
-  override func accessibilityRange(forLine line: Int) -> NSRange {
+  public override func accessibilityRange(forLine line: Int) -> NSRange {
     guard let text = accessibilityText, line >= 0, line < text.lineRanges.count
     else { return NSRange(location: 0, length: 0) }
     return text.lineRanges[line]
   }
 
-  override func accessibilityRange(for index: Int) -> NSRange {
+  public override func accessibilityRange(for index: Int) -> NSRange {
     guard let text = accessibilityText, let snapshot = lastSnapshot, index >= 0,
       index < text.string.utf16.count
     else { return NSRange(location: NSNotFound, length: 0) }
@@ -123,7 +123,7 @@ extension TerminalView {
     )
   }
 
-  override func accessibilityRange(for point: NSPoint) -> NSRange {
+  public override func accessibilityRange(for point: NSPoint) -> NSRange {
     guard point.x.isFinite, point.y.isFinite, let window,
       let text = accessibilityText, let snapshot = lastSnapshot
     else { return NSRange(location: NSNotFound, length: 0) }
@@ -167,7 +167,7 @@ extension TerminalView {
     return NSRange(location: NSNotFound, length: 0)
   }
 
-  override func accessibilityString(for range: NSRange) -> String? {
+  public override func accessibilityString(for range: NSRange) -> String? {
     guard let string = accessibilityText?.string else { return nil }
     let ns = string as NSString
     guard range.location >= 0, range.length >= 0, range.location <= ns.length,
@@ -177,7 +177,7 @@ extension TerminalView {
   }
 
   /// Screen rectangle enclosing the cells `range` touches.
-  override func accessibilityFrame(for range: NSRange) -> NSRect {
+  public override func accessibilityFrame(for range: NSRange) -> NSRect {
     guard let text = accessibilityText, let snapshot = lastSnapshot, let window
     else { return .zero }
     let length = text.string.utf16.count

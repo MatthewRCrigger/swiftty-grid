@@ -1,8 +1,8 @@
 # swiftty
 
 Swift 6.4 terminal core and frontends for macOS (AppKit) and iOS/iPadOS
-(UIKit). `SwifttyCore` and `SwifttyMobile` also build for Mac Catalyst and
-visionOS. [spec.md](spec.md) defines scope, protocols and acceptance requirements.
+(UIKit). `SwifttyCore` and `SwifttyMobile` also build for Mac Catalyst,
+visionOS and tvOS. [spec.md](spec.md) defines scope, protocols and acceptance requirements.
 [Shell](https://github.com/chr33s/shell) embeds the core through its libghostty API.
 
 ## Build and test
@@ -29,6 +29,7 @@ with Xcode; the package's AppKit executable scheme is macOS-only:
 xcodebuild -scheme SwifttyMobile -destination 'generic/platform=iOS Simulator' build
 xcodebuild -scheme SwifttyMobile -configuration Release -destination 'generic/platform=macOS,variant=Mac Catalyst' CODE_SIGNING_ALLOWED=NO build
 xcodebuild -scheme SwifttyMobile -configuration Release -destination 'generic/platform=visionOS' CODE_SIGNING_ALLOWED=NO build
+xcodebuild -scheme SwifttyMobile -configuration Release -destination 'generic/platform=tvOS' CODE_SIGNING_ALLOWED=NO build
 ```
 
 Hosted mobile tests need XcodeGen and Python 3:
@@ -55,7 +56,33 @@ authentication and reconnection belong to the embedding app.
 target can use `SwifttyMobileAppDelegate` and `SwifttyMobileSceneDelegate` for
 the reference demo. No Xcode app project or network client is included.
 visionOS omits accessory views, input clicks, haptics and screen-coordinate
-keyboard avoidance.
+keyboard avoidance. tvOS additionally omits the clipboard, edit menus,
+pointer, hover, pinch, long-press and pan gestures: the focus engine can focus
+the view, the select button makes it first responder, and hardware or system
+keyboards provide input.
+
+### Remote presentation and surface capabilities
+
+`TerminalSession(presentationColumns:rows:configuration:)` creates a session
+that displays frames produced by another, authoritative terminal (for example
+a roaming host). It never parses program output or encodes input:
+`installPresentation(_:)` validates a `PresentationFrame` and replaces the whole
+screen atomically, keeping the frame's cell widths, graphemes and wraps without
+reflow, and marks it fully damaged. `send` forwards committed text, key presses
+and pastes to `semanticInputHandler` (never `onWrite`), `resize` proposes the
+view's grid to `gridProposalHandler`, and history is disabled. Local selection
+and copy work on the displayed frame.
+
+Both frontends take a `capabilities: SurfaceCapabilities` (default `.full`;
+`.roaming` for remote presentation). Program-initiated clipboard writes (OSC
+52) reach the pasteboard only with `remoteClipboardWrites`. Without the
+matching capability, link opening, search, scrollback, mouse reporting, paste,
+copy and text input are hidden or disabled rather than shown as nonfunctional
+controls; presentation sessions also disable local resets and raw-byte
+bindings. On UIKit, `hidesContentWhenInactive` covers the terminal while its
+scene is inactive or in the background, so app-switcher snapshots omit it.
+Shell input disables autocorrection, capitalization, spell checking, smart
+quotes, dashes and insert/delete, and inline prediction.
 
 OSC 7501 is opt-in through `SessionConfiguration.programStatusEnabled` or
 `setProgramStatusEnabled(_:)`. Read `programStatusSnapshot`, subscribe through
@@ -105,6 +132,83 @@ in section 11 of [spec.multiplexer.md](spec.multiplexer.md).
 
 The service enforces the limits in `MuxLimits`: 32 panes, a 256 KiB input
 buffer per pane, 16 MiB frames, 1 MiB pastes and a bounded history per pane.
+
+## Roaming SSH (RST/1)
+
+[spec.roaming.md](spec.roaming.md) (with its Swiftty integration in Appendix A) defines SSH clients for Apple
+platforms whose shells survive network changes: a per-user `swifttyd` agent on
+the Mac owns the PTY and the authoritative Swiftty terminal, and clients
+receive complete current screens over QUIC instead of a byte log. There is no
+speculative echo; typing latency is ordinary remote echo.
+Appendix B of the spec records the design sources.
+
+| Target | Role |
+|---|---|
+| `SessionCore` | IDs, limits, input ledger (client queue, host admission), lifecycle, backoff, transfer manifests |
+| `ScreenProtocol` | RST/1 messages, framing, RFC 1950 snapshots, validation, snapshot scheduler, bootstrap envelope, `RSTConnection` |
+| `SSHClient` | SwiftNIO SSH: host trust, password/Ed25519, exec, shell, SFTP v3 subset, resumable verified transfers |
+| `AppleTransport` | Network framework QUIC (ALPN `rst/1`, TLS 1.3, no 0-RTT), exact-certificate pinning, host identity |
+| `TerminalHost` | macOS host: exporter, tracked PTY writer, session registry, attachment protocol, control socket |
+| `TerminalSurface` | Client: `RoamingClient`, frontend backends (roaming, ordinary SSH, local PTY), SSH and QUIC bridges |
+| `CompanionModel` | Bounded watch/iPhone status DTOs; no Swiftty, SSH or QUIC |
+| `RoamingApp` (`Apps/Shared`) | Shared app model and SwiftUI for the direct clients |
+| `swifttyd` (`Apps/swifttyd`) | `serve`, `bootstrap --stdio`, `install`/`uninstall`/`status` |
+
+Host setup: enable Remote Login, install the signed helper at
+`/usr/local/libexec/swifttyd`, write a configuration with an explicit
+`bindAddress`, `advertisedHost` and UDP `port` (51222 by default), then run
+`swifttyd install` as the SSH user (never root). Firewall changes are not made
+automatically.
+
+Clients bootstrap with `ssh <mac> /usr/local/libexec/swifttyd bootstrap --stdio`
+(a no-PTY exec with a length-prefixed JSON request), receive a session grant
+with the agent's certificate and a bearer token, and attach over QUIC pinned to
+that exact certificate. The apps are generated with XcodeGen:
+
+```sh
+Scripts/build-platforms.sh   # iOS, macOS, Catalyst, visionOS, tvOS, watchOS, swifttyd
+mise exec -- swift test --filter "ProtocolTests|IntegrationTests"
+```
+
+`IntegrationTests/EndToEnd` runs the real registry, PTY, QUIC listener, pinned
+client and a presentation-mode display, with and without an in-process SSH
+server. Simulator runtimes:
+
+```sh
+Scripts/test-roaming-simulator.sh <ios-or-ipad-udid> [iOS|tvOS|visionOS]  # client in the simulator vs a real `swifttyd serve`
+Scripts/test-companion-watch.sh <watch-udid>                             # companion tests hosted by the watch app
+Scripts/test-real-ssh.sh                                                 # real OpenSSH (apple/container Linux VM) + real swifttyd
+```
+
+`test-real-ssh.sh` needs `container`. `swifttyd` is macOS-only, so the Linux
+VM's `/usr/local/libexec/swifttyd` relays `bootstrap --stdio` to an agent on
+this Mac. macOS Local Network privacy can deny test runners a route to the VM
+subnet, so the script reaches sshd through `container exec`.
+
+Roaming verification record (2026-10-10, Xcode 27.0, OS 27 SDKs):
+
+| Destination | Evidence |
+|---|---|
+| iPhone 16, iOS 27.0.1 (physical) | App UI flow over LAN to real `swifttyd` + OpenSSH; signed Keychain; A2: 50 Wi-Fi↔5G switches over Tailscale, one retained shell, no duplicated input (`Tests/DeviceHandover/Evidence`) |
+| iPad Pro 12.9" (5th gen), iPadOS 27.0.1 (physical) | App UI flow over LAN; signed Keychain |
+| macOS 27 native, Mac Catalyst | App UI flow; signed Keychain (Apple Development) |
+| iOS, iPadOS, tvOS, visionOS simulators | Roaming runtime test vs real `swifttyd`; Keychain |
+| watchOS simulator | Companion tests hosted by the watch app |
+| macOS host | Unit, integration, end-to-end QUIC and real OpenSSH suites |
+
+QUIC connection migration: clients enable it (`multipathServiceType =
+.handover`), but Network framework's QUIC listener on the OS 27 SDK keeps
+replying to a client's old address, so a path change ends in reattachment to
+the retained session instead (spec §9 fallback). `MigrationTests` documents
+the listener behaviour and `RoamingEndToEndTests` checks recovery to the same
+shell with each command applied once.
+
+Still open (spec §2.4, §13): physical Apple TV, Vision Pro and paired Apple
+Watch runs.
+
+`Scripts/test-handover.sh <iphone-udid> [switches]` runs A2: a standalone app
+on the phone keeps one roaming session open while you toggle Wi-Fi, and the
+retained shell on the Mac logs one line per switch.
 
 ## API and storage contracts
 

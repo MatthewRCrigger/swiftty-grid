@@ -1,0 +1,81 @@
+import ScreenProtocol
+import SessionCore
+
+/// Accumulates one inbound snapshot stream with strict, header-driven
+/// bounds (spec §7.2, §12). Nothing beyond the 9-byte header plus the
+/// header's `encodedLength` is ever buffered, and that length is itself
+/// capped by `RSTLimits.maxSnapshotEncodedBytes`. Only an exactly complete
+/// payload is returned at FIN; partial, oversized, or trailing-data streams
+/// are errors and their bytes are discarded by the caller.
+public struct SnapshotStreamAccumulator: Sendable {
+  /// Largest stream the client will ever buffer.
+  public static let hardLimit =
+    SnapshotFrame.headerLength + RSTLimits.maxSnapshotEncodedBytes
+
+  public private(set) var bytes: [UInt8] = []
+  /// Header length plus the header's encoded length, once known.
+  public private(set) var expectedLength: Int?
+
+  public init() {}
+
+  /// Most bytes the next read should request: enough to complete the
+  /// stream plus one, so an overrun is detected without buffering it all.
+  public var nextReadLimit: Int {
+    let target = expectedLength ?? Self.hardLimit
+    return max(1, min(64 * 1024, target - bytes.count + 1))
+  }
+
+  public mutating func append(
+    _ data: some Collection<UInt8>
+  ) throws(FramingError) {
+    let limit = expectedLength ?? Self.hardLimit
+    guard data.count <= limit - bytes.count else {
+      throw bytes.count + data.count > Self.hardLimit
+        ? .snapshotTooLarge : .trailingData
+    }
+    bytes.append(contentsOf: data)
+    if expectedLength == nil,
+      let header = try SnapshotFrame.header(bytes)
+    {
+      let expected = SnapshotFrame.headerLength + header.encodedLength
+      guard bytes.count <= expected else { throw .trailingData }
+      expectedLength = expected
+    }
+  }
+
+  /// Call at FIN. Returns the payload only when exactly complete.
+  public func finish() throws(FramingError) -> [UInt8] {
+    guard let expectedLength, bytes.count == expectedLength else {
+      throw .truncated
+    }
+    return bytes
+  }
+}
+
+/// A token bucket for rate-limiting new handshakes (spec §12).
+public struct TokenBucket: Sendable {
+  public let capacity: Double
+  public let refillPerSecond: Double
+  private var tokens: Double
+  private var last: ContinuousClock.Instant?
+
+  public init(capacity: Int, refillPerSecond: Double) {
+    self.capacity = Double(max(1, capacity))
+    self.refillPerSecond = max(0, refillPerSecond)
+    self.tokens = self.capacity
+  }
+
+  /// Takes one token if available.
+  public mutating func take(now: ContinuousClock.Instant = .now) -> Bool {
+    if let last {
+      let elapsed = last.duration(to: now)
+      let seconds = Double(elapsed.components.seconds)
+        + Double(elapsed.components.attoseconds) / 1e18
+      tokens = min(capacity, tokens + max(0, seconds) * refillPerSecond)
+    }
+    last = now
+    guard tokens >= 1 else { return false }
+    tokens -= 1
+    return true
+  }
+}

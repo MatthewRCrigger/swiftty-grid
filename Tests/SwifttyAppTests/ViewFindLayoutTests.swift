@@ -1,5 +1,6 @@
 import AppKit
 @testable import Swiftty
+@testable import SwifttyMac
 import Testing
 
 extension ViewBehaviorTests {

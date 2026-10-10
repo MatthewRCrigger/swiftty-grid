@@ -6,6 +6,7 @@ import SwiftMuxProtocol
 import SwiftMuxService
 @testable import Swiftty
 import SwifttyCore
+import SwifttyMac
 import Testing
 
 /// Drives the native SwiftMux window against an in-process service with

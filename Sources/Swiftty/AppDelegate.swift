@@ -1,5 +1,6 @@
 import AppKit
 import SwiftMuxProtocol
+import SwifttyMac
 import SwifttyCore
 
 @MainActor

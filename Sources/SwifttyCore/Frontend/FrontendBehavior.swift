@@ -301,3 +301,42 @@ public enum SelectionMath {
     row < 0 ? 1 : row >= rows ? -1 : 0
   }
 }
+
+/// How frontends apply `SurfaceCapabilities` (spec.roaming.md §A.4.1,
+/// §7): unavailable actions are hidden or disabled, never bypassed.
+extension SurfaceCapabilities {
+  /// Without clipboard access (tvOS): no copy, paste or program writes.
+  public var withoutClipboard: SurfaceCapabilities {
+    var capabilities = self
+    capabilities.localCopy = false
+    capabilities.paste = false
+    capabilities.remoteClipboardWrites = false
+    return capabilities
+  }
+
+  /// The modes a frontend routes pointer and scroll input by: without
+  /// mouse reporting, tracking and focus reports are ignored.
+  public func effectiveModes(_ modes: Modes) -> Modes {
+    guard !mouseReporting else { return modes }
+    return modes.subtracting(Modes.mouseTracking.union(.focusEvents))
+  }
+
+  /// Whether a key-binding or menu action is available. `presentation`
+  /// sessions display another terminal's frames, so local screen resets
+  /// would only blank the copy until the next frame.
+  public func allows(_ action: KeyAction, presentation: Bool = false) -> Bool {
+    switch action {
+    case .copyToClipboard: localCopy
+    case .pasteFromClipboard: paste && textInput
+    case .scrollToTop, .scrollToBottom, .scrollPageUp, .scrollPageDown,
+      .scrollPageLines, .jumpToPrompt:
+      scrollback
+    case .startSearch, .searchSelection, .navigateSearch, .endSearch: search
+    case .clearScreen, .reset: !presentation
+    case .text, .textBytes, .csi, .esc: textInput && !presentation
+    case .increaseFontSize, .decreaseFontSize, .resetFontSize, .selectAll,
+      .ignore:
+      true
+    }
+  }
+}

@@ -16,6 +16,13 @@ import Dispatch
 /// Callback properties can be replaced from any thread. Each invocation
 /// retains its current handler and runs outside the callback-storage lock.
 /// Read-only properties and `withState` may be used within callbacks.
+///
+/// A presentation session (`init(presentationColumns:rows:configuration:)`)
+/// has no transport and no parser: it displays frames another terminal
+/// produced (`installPresentation`), forwards semantic input to
+/// `semanticInputHandler` and proposes grid sizes to
+/// `gridProposalHandler`, so remote modes and side effects stay with the
+/// terminal that owns them (spec.roaming.md §A.4.3–4.4).
 public final class TerminalSession: @unchecked Sendable {
   package let queue = DispatchQueue(
     label: "swiftty.terminal",
@@ -88,6 +95,28 @@ public final class TerminalSession: @unchecked Sendable {
     set { callbacks.onControlModeData = newValue }
   }
 
+  /// Receives semantic `.text`, `.key` (press and repeat) and `.paste`
+  /// input instead of encoding it (presentation mode), on `queue`, in
+  /// order. Mouse, focus and raw bytes are dropped.
+  public var semanticInputHandler: (@Sendable (TerminalInput) -> Void)? {
+    get { callbacks.semanticInput }
+    set { callbacks.semanticInput = newValue }
+  }
+
+  /// Receives the grid a frontend proposes (view geometry) instead of
+  /// resizing or reflowing the displayed frame (presentation mode). Called
+  /// on `queue`, in order with input; dimensions are at least one.
+  public var gridProposalHandler:
+    (@Sendable (_ columns: Int, _ rows: Int) -> Void)?
+  {
+    get { callbacks.gridProposal }
+    set { callbacks.gridProposal = newValue }
+  }
+
+  /// Presentation mode: shows frames produced by a remote authoritative
+  /// terminal. Never parses program output or encodes input.
+  public let isPresentation: Bool
+
   // Owned by `queue`.
   private var state: TerminalState
   private var parser = Parser()
@@ -116,11 +145,48 @@ public final class TerminalSession: @unchecked Sendable {
   /// Longest a synchronized update (mode 2026) holds back redraws.
   static let synchronizedTimeout: UInt64 = 1_000_000_000
 
-  public init(
+  public convenience init(
     columns: Int = 80,
     rows: Int = 24,
     configuration: SessionConfiguration = SessionConfiguration()
   ) {
+    self.init(
+      columns: columns,
+      rows: rows,
+      configuration: configuration,
+      presentation: false
+    )
+  }
+
+  /// Presentation mode: shows frames produced by a remote authoritative
+  /// terminal. Never parses program output or encodes input.
+  ///
+  /// History is disabled; `configuration` supplies the palette. The
+  /// screen starts blank until the first `installPresentation`.
+  public convenience init(
+    presentationColumns columns: Int,
+    rows: Int,
+    configuration: SessionConfiguration = SessionConfiguration()
+  ) {
+    var configuration = configuration
+    configuration.scrollbackLimitBytes = 0
+    configuration.scrollbackLimitRows = 0
+    configuration.programStatusEnabled = false
+    self.init(
+      columns: columns,
+      rows: rows,
+      configuration: configuration,
+      presentation: true
+    )
+  }
+
+  private init(
+    columns: Int,
+    rows: Int,
+    configuration: SessionConfiguration,
+    presentation: Bool
+  ) {
+    isPresentation = presentation
     queue.setSpecific(key: queueKey, value: true)
     state = TerminalState(
       columns: columns,
@@ -151,6 +217,7 @@ public final class TerminalSession: @unchecked Sendable {
 
   #if os(macOS)
   public func start(_ configuration: SessionConfiguration) throws {
+    precondition(!isPresentation, "a presentation session has no process")
     try queue.sync {
       precondition(process == nil, "session already started")
       let process = try PTYProcess.spawn(
@@ -239,8 +306,10 @@ public final class TerminalSession: @unchecked Sendable {
   #endif
 
   /// Parses program output from an external transport. Ordered with
-  /// `send`, `resize` and other calls; returns immediately.
+  /// `send`, `resize` and other calls; returns immediately. Ignored in
+  /// presentation mode.
   public func receive(_ bytes: [UInt8]) {
+    guard !isPresentation else { return }
     queue.async { [self] in
       bytes.withUnsafeBufferPointer { parse($0) }
       publish()
@@ -251,10 +320,11 @@ public final class TerminalSession: @unchecked Sendable {
   /// runs on `queue`, ordered with input, resizing and other output. This
   /// lets an in-process transport format output for the current dimensions
   /// without a resize interleaving between formatting and parsing.
-  /// Empty output does not publish an update.
+  /// Empty output does not publish an update. Ignored in presentation mode.
   public func receive(
     _ makeOutput: @escaping @Sendable (borrowing TerminalState) -> [UInt8]
   ) {
+    guard !isPresentation else { return }
     queue.async { [self] in
       let bytes = makeOutput(state)
       guard !bytes.isEmpty else { return }
@@ -265,7 +335,16 @@ public final class TerminalSession: @unchecked Sendable {
 
   // MARK: Input / resize / output
 
+  /// Resizes (reflowing) the terminal and its PTY. In presentation mode
+  /// only proposes the grid to `gridProposalHandler`; the displayed frame
+  /// keeps its size until the remote terminal sends one at the new size.
   public func resize(columns: Int, rows: Int) {
+    if isPresentation {
+      let columns = max(1, columns)
+      let rows = max(1, rows)
+      queue.async { [self] in callbacks.gridProposal?(columns, rows) }
+      return
+    }
     queue.async { [self] in
       state.resize(columns: columns, rows: rows)
       #if os(macOS)
@@ -302,7 +381,19 @@ public final class TerminalSession: @unchecked Sendable {
     }
   }
 
+  /// Encodes input with the current modes and writes it to the program.
+  /// In presentation mode routes `.text`, `.key` and `.paste` to
+  /// `semanticInputHandler` instead and never reaches `onWrite`.
   public func send(_ input: TerminalInput) {
+    if isPresentation {
+      switch input {
+      case let .key(event) where event.action == .release: return
+      case .text, .key, .paste:
+        queue.async { [self] in callbacks.semanticInput?(input) }
+      case .mouse, .focus, .bytes: return
+      }
+      return
+    }
     queue.async { [self] in
       encodeBuffer.removeAll(keepingCapacity: true)
       guard
@@ -344,6 +435,7 @@ public final class TerminalSession: @unchecked Sendable {
   /// all output already queued there. Applied here in order with `receive`.
   /// Stop feeding `source` before calling; call from outside both queues.
   public func continueStream(from source: TerminalSession) {
+    guard !isPresentation else { return }
     let (continuation, controlString, status, phase) = source.queue.sync {
       (
         source.parser.continuation, source.state.controlStringContinuation,
@@ -438,7 +530,9 @@ public final class TerminalSession: @unchecked Sendable {
   }
 
   /// Feeds bytes as if the child had written them (tests, replays, benchmarks).
+  /// Ignored in presentation mode.
   public func feed(_ bytes: borrowing Span<UInt8>) {
+    guard !isPresentation else { return }
     bytes.withUnsafeBufferPointer { buffer in
       queue.sync {
         parse(buffer)
@@ -480,6 +574,31 @@ public final class TerminalSession: @unchecked Sendable {
       return try body(state)
     }
     return try queue.sync { try body(state) }
+  }
+
+  // MARK: Presentation
+
+  /// Atomically replaces the visible state with `frame` after validating
+  /// it (`PresentationFrame.isValid`); returns false, changing nothing,
+  /// if it is invalid or this is not a presentation session.
+  ///
+  /// The frame's layout wins: no reflow and no width recalculation. Clears
+  /// the selection and search, damages the whole screen and publishes an
+  /// update, ordered with other calls. May be called from any thread,
+  /// including `queue`.
+  @discardableResult
+  public func installPresentation(_ frame: PresentationFrame) -> Bool {
+    guard isPresentation, frame.isValid else { return false }
+    let install = { [self] in
+      state.installPresentation(frame)
+      publish()
+    }
+    if DispatchQueue.getSpecific(key: queueKey) == true {
+      install()
+    } else {
+      queue.sync(execute: install)
+    }
+    return true
   }
 
   // MARK: Queue-owned internals

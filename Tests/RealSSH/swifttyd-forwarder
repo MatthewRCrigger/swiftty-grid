@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stand-in for /usr/local/libexec/swifttyd inside the Linux container:
+# only `bootstrap --stdio` exists, and it is relayed byte-for-byte to the
+# Mac's real swifttyd control socket through the test bridge.
+[ "$*" = "bootstrap --stdio" ] || { echo "unsupported" >&2; exit 64; }
+exec socat -t 30 STDIO "TCP:${RST_BRIDGE:-192.168.64.1:51400}"

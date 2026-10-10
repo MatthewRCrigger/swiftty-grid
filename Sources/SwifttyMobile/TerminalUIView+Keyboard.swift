@@ -7,7 +7,13 @@ import UIKit
 extension TerminalUIView {
   public override var canBecomeFirstResponder: Bool { true }
 
-  #if !os(visionOS)
+  #if os(tvOS)
+  /// The focus engine can move to the terminal; the select button then
+  /// makes it first responder so keyboards reach the session.
+  public override var canBecomeFocused: Bool { true }
+  #endif
+
+  #if !os(visionOS) && !os(tvOS)
   public override var inputAccessoryView: UIView? {
     isSearchVisible ? nil : accessoryBar
   }
@@ -98,6 +104,11 @@ extension TerminalUIView {
         handledPresses.insert(usage)
         return true
       }
+    }
+    // A read-only surface swallows keys rather than passing them on.
+    guard effectiveCapabilities.textInput else {
+      handledPresses.insert(usage)
+      return true
     }
     guard
       let event = KeyTranslator.keyEvent(
@@ -210,7 +221,12 @@ extension TerminalUIView {
       // Key commands consume the press. Unconsumed bindings need
       // pressesBegan so the terminal receives the original key too.
       guard let binding = configuration.keybindings.binding(for: trigger),
-        binding.consumesInput, !binding.requiresPerformable
+        binding.consumesInput, !binding.requiresPerformable,
+        // Unavailable actions are left out of the discoverability HUD.
+        effectiveCapabilities.allows(
+          action,
+          presentation: session.isPresentation
+        )
       else { continue }
       // Plain keys stay with the terminal; they are matched in pressesBegan.
       guard
@@ -293,6 +309,9 @@ extension TerminalUIView {
   /// Runs a key-binding action.
   @discardableResult
   public func perform(_ action: KeyAction) -> Bool {
+    guard
+      effectiveCapabilities.allows(action, presentation: session.isPresentation)
+    else { return false }
     if ActionDispatch.viewportDelta(for: action, rows: 0, history: 0) != nil {
       stopMomentum()
       return session.mutate { state in
@@ -365,7 +384,7 @@ extension TerminalUIView {
   }
 
   internal func send(_ inputs: [TerminalInput]) {
-    guard !inputs.isEmpty else { return }
+    guard !inputs.isEmpty, effectiveCapabilities.textInput else { return }
     stopKeyRepeat()
     noteInput()
     for input in inputs { session.send(input) }
@@ -377,10 +396,19 @@ extension TerminalUIView {
     _ action: Selector,
     withSender sender: Any?
   ) -> Bool {
-    switch action {
+    let available = effectiveCapabilities
+    func canPaste() -> Bool {
+      #if os(tvOS)
+      false
+      #else
+      available.allows(.pasteFromClipboard) && pasteboard.hasStrings
+      #endif
+    }
+    return switch action {
     case #selector(copy(_:)):
-      hasSelection && session.withState { $0.selection != nil }
-    case #selector(paste(_:)): pasteboard.hasStrings
+      available.localCopy && hasSelection
+        && session.withState { $0.selection != nil }
+    case #selector(paste(_:)): canPaste()
     case #selector(selectAll(_:)), #selector(performKeyCommand(_:)): true
     default: false
     }
@@ -389,19 +417,30 @@ extension TerminalUIView {
   public override func copy(_ sender: Any?) { _ = copySelection() }
 
   private func copySelection() -> Bool {
-    guard let text = session.withState({ $0.selectionText }), !text.isEmpty
+    #if os(tvOS)
+    return false
+    #else
+    guard effectiveCapabilities.localCopy,
+      let text = session.withState({ $0.selectionText }), !text.isEmpty
     else { return false }
     pasteboard.string = text
     return true
+    #endif
   }
 
   public override func paste(_ sender: Any?) { _ = pasteClipboard() }
 
   private func pasteClipboard() -> Bool {
-    guard let text = pasteboard.string else { return false }
+    #if os(tvOS)
+    return false
+    #else
+    guard effectiveCapabilities.allows(.pasteFromClipboard),
+      let text = pasteboard.string
+    else { return false }
     clearSelection()
     send([.paste(text)])
     return true
+    #endif
   }
 
   public override func selectAll(_ sender: Any?) {
@@ -463,6 +502,10 @@ extension TerminalUIView: UITextInput {
   }
 
   public func insertText(_ text: String) {
+    guard effectiveCapabilities.textInput else {
+      setPreedit("", selection: NSRange(location: 0, length: 0))
+      return
+    }
     let committed = hardwareTextInput.commit(
       text,
       keyboardFlags: session.keyboardFlags

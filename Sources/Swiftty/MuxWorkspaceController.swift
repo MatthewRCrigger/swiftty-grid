@@ -3,6 +3,7 @@ import ServiceManagement
 import SwiftMuxClient
 import SwiftMuxProtocol
 import SwifttyCore
+import SwifttyMac
 
 /// The native SwiftMux workspace window. Owns the single connection and
 /// the interactive lease; pane views only present and forward input.

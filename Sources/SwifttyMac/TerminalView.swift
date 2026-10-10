@@ -5,9 +5,9 @@ import SwifttyCore
 
 /// An MTKView that renders a session on demand at the display refresh rate.
 @MainActor
-final class TerminalView: MTKView, MTKViewDelegate {
+public final class TerminalView: MTKView, MTKViewDelegate {
   private static let surfaces = NSHashTable<TerminalView>.weakObjects()
-  let session: TerminalSession
+  public let session: TerminalSession
   let renderer: MetalRenderer
   private(set) var config: Configuration
   /// Manual zoom, or nil to follow the configured point size.
@@ -16,6 +16,8 @@ final class TerminalView: MTKView, MTKViewDelegate {
     explicitFontSize ?? CGFloat(Configuration.boundedFontSize(config.fontSize))
   }
 
+  /// Modes of the last drawn frame, as `capabilities` lets the view act
+  /// on them (mouse tracking is masked without mouse reporting).
   var lastModes: Modes = .initial
   var scrollAccumulator = ScrollAccumulator()
   var horizontalScrollAccumulator = ScrollAccumulator()
@@ -36,6 +38,13 @@ final class TerminalView: MTKView, MTKViewDelegate {
   var reportsLeftMouseGesture = false
   var hasSelection = false
   var pasteboard = NSPasteboard.general
+  /// What this surface offers for its session (`.full` by default; a
+  /// remote presentation uses `.roaming`). Unavailable actions are hidden
+  /// or disabled: program clipboard writes (OSC 52), link opening, search,
+  /// scrollback, mouse reporting, paste and local terminal resets.
+  public var capabilities = SurfaceCapabilities.full {
+    didSet { capabilitiesChanged() }
+  }
   /// Where the last click landed, for "Select Command Output".
   var lastClick: (point: TerminalPoint, generation: UInt64)?
 
@@ -61,7 +70,7 @@ final class TerminalView: MTKView, MTKViewDelegate {
   private var retryScheduled = false
   private var visibilityObservers: [NSKeyValueObservation] = []
 
-  var searchBar: SearchBar?
+  package var searchBar: SearchBar?
   var accessibilityThrottle = NotificationThrottle(interval: 0.5)
   private var lastAccessibilityValue: String?
   private var lastAccessibilityRanges: [NSRange]?
@@ -70,15 +79,25 @@ final class TerminalView: MTKView, MTKViewDelegate {
   /// Screen text for VoiceOver, rebuilt once per snapshot.
   var accessibilityCache = AccessibilityTextCache()
 
-  var onTitle: ((String) -> Void)?
-  var onExit: (() -> Void)?
+  public var onTitle: ((String) -> Void)?
+  public var onExit: (() -> Void)?
 
-  init(configuration: Configuration) throws {
+  public convenience init(configuration: Configuration) throws {
+    let scheme = Self.scheme(of: NSApp.effectiveAppearance)
+    try self.init(
+      configuration: configuration,
+      session: TerminalSession(
+        configuration: configuration.sessionConfiguration(scheme: scheme)
+      )
+    )
+  }
+
+  /// Hosts `session`: a local PTY session to `start()`, an external
+  /// transport's, or a presentation session showing remote frames.
+  public init(configuration: Configuration, session: TerminalSession) throws {
     config = configuration
     colorScheme = Self.scheme(of: NSApp.effectiveAppearance)
-    session = TerminalSession(
-      configuration: configuration.sessionConfiguration(scheme: colorScheme)
-    )
+    self.session = session
     guard let device = MTLCreateSystemDefaultDevice() else {
       throw RendererError.setup("no Metal device")
     }
@@ -114,7 +133,7 @@ final class TerminalView: MTKView, MTKViewDelegate {
   @available(*, unavailable)
   required init(coder: NSCoder) { fatalError() }
 
-  func start() throws {
+  public func start() throws {
     updateGrid()
     try session.start(config.sessionConfiguration(scheme: colorScheme))
     isStopped = false
@@ -123,7 +142,7 @@ final class TerminalView: MTKView, MTKViewDelegate {
     updateFrameDriving()
   }
 
-  func stop() {
+  public func stop() {
     Self.surfaces.remove(self)
     isStopped = true
     resetBlink()
@@ -132,7 +151,7 @@ final class TerminalView: MTKView, MTKViewDelegate {
     session.stop()
   }
 
-  func preferredSize(columns: Int, rows: Int) -> NSSize {
+  public func preferredSize(columns: Int, rows: Int) -> NSSize {
     let scale = renderer.font.descriptor.scale
     let maximum =
       (window?.screen ?? NSScreen.main)?.visibleFrame.size
@@ -156,8 +175,10 @@ final class TerminalView: MTKView, MTKViewDelegate {
     case let .title(title): onTitle?(title)
     case .bell: NSSound.beep()
     case let .clipboard(text):
-      NSPasteboard.general.clearContents()
-      NSPasteboard.general.setString(text, forType: .string)
+      // Program-initiated writes pass the policy gate (spec §A.7).
+      guard capabilities.remoteClipboardWrites else { break }
+      pasteboard.clearContents()
+      pasteboard.setString(text, forType: .string)
     case let .pointerShape(name):
       applicationCursor = Self.cursor(named: name)
       window?.invalidateCursorRects(for: self)
@@ -170,7 +191,7 @@ final class TerminalView: MTKView, MTKViewDelegate {
 
   /// Applies a reloaded configuration. The scrollback limit and command
   /// only take effect in new windows.
-  func apply(_ configuration: Configuration) {
+  public func apply(_ configuration: Configuration) {
     let fontChanged =
       configuration.fontDescriptor(scale: 1) != config.fontDescriptor(scale: 1)
     let paletteChanged =
@@ -228,11 +249,11 @@ final class TerminalView: MTKView, MTKViewDelegate {
     }
   }
 
-  static func scheme(of appearance: NSAppearance) -> ColorScheme {
+  package static func scheme(of appearance: NSAppearance) -> ColorScheme {
     appearance.bestMatch(from: [.darkAqua, .aqua]) == .aqua ? .light : .dark
   }
 
-  override func viewDidChangeEffectiveAppearance() {
+  public override func viewDidChangeEffectiveAppearance() {
     super.viewDidChangeEffectiveAppearance()
     let scheme = Self.scheme(of: effectiveAppearance)
     guard scheme != colorScheme else { return }
@@ -248,7 +269,7 @@ final class TerminalView: MTKView, MTKViewDelegate {
 
   // MARK: Layout
 
-  override func viewWillMove(toWindow newWindow: NSWindow?) {
+  public override func viewWillMove(toWindow newWindow: NSWindow?) {
     if window !== newWindow { clearHover() }
     if let window, window !== newWindow, window.firstResponder === self {
       _ = resignFirstResponder()
@@ -256,7 +277,7 @@ final class TerminalView: MTKView, MTKViewDelegate {
     super.viewWillMove(toWindow: newWindow)
   }
 
-  override func viewDidMoveToWindow() {
+  public override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
     observeVisibility()
     let center = NotificationCenter.default
@@ -305,7 +326,7 @@ final class TerminalView: MTKView, MTKViewDelegate {
     }
   }
 
-  override func viewDidMoveToSuperview() {
+  public override func viewDidMoveToSuperview() {
     super.viewDidMoveToSuperview()
     observeVisibility()
     windowVisibilityChanged()
@@ -317,12 +338,12 @@ final class TerminalView: MTKView, MTKViewDelegate {
     if isSurfaceVisible { needsDisplay = true }
   }
 
-  override func viewDidHide() {
+  public override func viewDidHide() {
     super.viewDidHide()
     updateFrameDriving()
   }
 
-  override func viewDidUnhide() {
+  public override func viewDidUnhide() {
     super.viewDidUnhide()
     updateFrameDriving()
     needsDisplay = true
@@ -342,13 +363,13 @@ final class TerminalView: MTKView, MTKViewDelegate {
     needsDisplay = true
   }
 
-  override func viewDidChangeBackingProperties() {
+  public override func viewDidChangeBackingProperties() {
     super.viewDidChangeBackingProperties()
     applyRenderOptions(scale: window?.backingScaleFactor ?? 2)
     applyFont()
   }
 
-  override func setFrameSize(_ newSize: NSSize) {
+  public override func setFrameSize(_ newSize: NSSize) {
     super.setFrameSize(newSize)
     updateGrid()
     searchBar?.position(in: bounds)
@@ -388,17 +409,17 @@ final class TerminalView: MTKView, MTKViewDelegate {
   }
 
   @objc
-  func increaseFontSize(_ sender: Any?) { perform(.increaseFontSize(1)) }
+  public func increaseFontSize(_ sender: Any?) { perform(.increaseFontSize(1)) }
 
   @objc
-  func decreaseFontSize(_ sender: Any?) { perform(.decreaseFontSize(1)) }
+  public func decreaseFontSize(_ sender: Any?) { perform(.decreaseFontSize(1)) }
 
   @objc
-  func resetFontSize(_ sender: Any?) { perform(.resetFontSize) }
+  public func resetFontSize(_ sender: Any?) { perform(.resetFontSize) }
 
   // MARK: Drawing
 
-  override var needsDisplay: Bool {
+  public override var needsDisplay: Bool {
     get { super.needsDisplay }
     set {
       if !newValue {
@@ -413,9 +434,9 @@ final class TerminalView: MTKView, MTKViewDelegate {
     }
   }
 
-  func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+  public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
-  func draw(in view: MTKView) {
+  public func draw(in view: MTKView) {
     let snapshot = session.snapshot()
     if let event = hoverEvent,
       !snapshot.damage.isEmpty
@@ -424,7 +445,7 @@ final class TerminalView: MTKView, MTKViewDelegate {
     {
       refreshHover()
     }
-    lastModes = snapshot.modes
+    lastModes = capabilities.effectiveModes(snapshot.modes)
     lastSnapshot = snapshot
     if hasSelection, snapshot.selection == nil {
       hasSelection = false
@@ -695,9 +716,9 @@ final class TerminalView: MTKView, MTKViewDelegate {
 
   // MARK: Keyboard
 
-  override var acceptsFirstResponder: Bool { true }
+  public override var acceptsFirstResponder: Bool { true }
 
-  override func becomeFirstResponder() -> Bool {
+  public override func becomeFirstResponder() -> Bool {
     clearHover()
     if window == nil || window?.isKeyWindow == true {
       session.send(.focus(true))
@@ -706,7 +727,7 @@ final class TerminalView: MTKView, MTKViewDelegate {
     return true
   }
 
-  override func resignFirstResponder() -> Bool {
+  public override func resignFirstResponder() -> Bool {
     clearHover()
     // Key-up may go to the next responder after focus moves away.
     for var key in heldKeys.values {
@@ -720,7 +741,7 @@ final class TerminalView: MTKView, MTKViewDelegate {
   }
 
   /// Key bindings run before the menu's key equivalents.
-  override func performKeyEquivalent(with event: NSEvent) -> Bool {
+  public override func performKeyEquivalent(with event: NSEvent) -> Bool {
     guard window?.firstResponder === self, !hasMarkedText(),
       let binding = binding(for: event)
     else { return super.performKeyEquivalent(with: event) }
@@ -730,7 +751,7 @@ final class TerminalView: MTKView, MTKViewDelegate {
     return true
   }
 
-  override func keyDown(with event: NSEvent) {
+  public override func keyDown(with event: NSEvent) {
     resetBlink()
     if config.mouseHideWhileTyping { NSCursor.setHiddenUntilMouseMoves(true) }
     if !hasMarkedText(), let binding = binding(for: event) {
@@ -751,7 +772,7 @@ final class TerminalView: MTKView, MTKViewDelegate {
     interpretingEvent = nil
   }
 
-  override func keyUp(with event: NSEvent) {
+  public override func keyUp(with event: NSEvent) {
     if var key = heldKeys.removeValue(forKey: event.keyCode) {
       key.action = .release
       session.send(.key(key))
@@ -842,7 +863,7 @@ final class TerminalView: MTKView, MTKViewDelegate {
     return mods
   }
 
-  static let specialKeys: [UInt16: Key] = [
+  package static let specialKeys: [UInt16: Key] = [
     36: .enter, 76: .enter, 48: .tab, 51: .backspace, 53: .escape, 123: .left,
     124: .right, 125: .down, 126: .up, 115: .home, 119: .end, 116: .pageUp,
     121: .pageDown, 117: .delete, 114: .insert, 122: .function(1),

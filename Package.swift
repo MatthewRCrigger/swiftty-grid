@@ -5,19 +5,47 @@ let core: [SwiftSetting] = [.enableExperimentalFeature("Lifetimes")]
 
 let package = Package(
   name: "swiftty",
+  // Deployment minimums for every included Apple product profile
+  // (spec.roaming.md §2.1). Declarations are not proof of compatibility:
+  // the watch companion links only CompanionModel, and SwifttyCore is not
+  // built for watchOS.
   platforms: [
     .macOS("27.0"), .iOS("27.0"), .macCatalyst("27.0"), .visionOS("27.0"),
+    .tvOS("27.0"), .watchOS("27.0"),
   ],
   products: [
     .library(name: "SwifttyEngine", targets: ["SwifttyEngine"]),
     .library(name: "SwifttyCore", targets: ["SwifttyCore"]),
     .library(name: "SwifttyMobile", targets: ["SwifttyMobile"]),
+    .library(name: "SwifttyMac", targets: ["SwifttyMac"]),
+    .library(name: "SessionCore", targets: ["SessionCore"]),
+    .library(name: "ScreenProtocol", targets: ["ScreenProtocol"]),
+    .library(name: "SSHClient", targets: ["SSHClient"]),
+    .library(name: "AppleTransport", targets: ["AppleTransport"]),
+    .library(name: "TerminalHost", targets: ["TerminalHost"]),
+    .library(name: "TerminalSurface", targets: ["TerminalSurface"]),
+    .library(name: "CompanionModel", targets: ["CompanionModel"]),
+    .library(name: "RoamingApp", targets: ["RoamingApp"]),
     .executable(name: "swiftty", targets: ["Swiftty"]),
     .executable(name: "swiftty-bench", targets: ["SwifttyBench"]),
     .executable(name: "swmux", targets: ["SwiftMuxCLI"]),
     .executable(name: "swiftmux-agent", targets: ["SwiftMuxAgent"]),
     .executable(name: "swmux-launcher", targets: ["SwiftMuxLauncher"]),
     .executable(name: "swiftmux-bench", targets: ["SwiftMuxBench"]),
+    .executable(name: "swifttyd", targets: ["Swifttyd"]),
+  ],
+  dependencies: [
+    .package(url: "https://github.com/apple/swift-nio.git", from: "2.86.0"),
+    .package(url: "https://github.com/apple/swift-nio-ssh.git", from: "0.11.0"),
+    .package(
+      url: "https://github.com/apple/swift-nio-transport-services.git",
+      from: "1.25.0"
+    ),
+    .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0" ..< "5.0.0"),
+    .package(
+      url: "https://github.com/apple/swift-certificates.git",
+      from: "1.10.0"
+    ),
   ],
   targets: [
     // Headless terminal engine: parser, state, history, input encoding
@@ -32,9 +60,13 @@ let package = Package(
     ),
     // Test/bench-only allocation counter built on libmalloc's logger hook.
     .target(name: "CAllocCounter"),
+    // AppKit terminal view, embeddable by the native Mac client.
+    .target(name: "SwifttyMac", dependencies: ["SwifttyCore"]),
     .executableTarget(
       name: "Swiftty",
-      dependencies: ["SwifttyCore", "SwiftMuxClient", "SwiftMuxBridge"]
+      dependencies: [
+        "SwifttyCore", "SwifttyMac", "SwiftMuxClient", "SwiftMuxBridge",
+      ]
     ),
     // SwiftMux (spec.multiplexer.md): shared messages, engine bridge,
     // service, PTY launcher, client connection and frontends.
@@ -86,6 +118,83 @@ let package = Package(
       path: "Tests/StorageBoundsProbe",
       swiftSettings: core
     ),
+
+    // MARK: Roaming SSH product (spec.roaming.md §11)
+
+    // IDs, policies, lifecycle, input ledger, transfer manifests.
+    // Foundation only; no terminal, network or UI code.
+    .target(
+      name: "SessionCore",
+      dependencies: [.product(name: "Crypto", package: "swift-crypto")]
+    ),
+    // RST/1 messages, framing, snapshots, validation, bounded scheduler.
+    .target(name: "ScreenProtocol", dependencies: ["SessionCore"]),
+    // SSH authentication, host trust, exec, shell and the SFTP v3 client.
+    .target(
+      name: "SSHClient",
+      dependencies: [
+        "SessionCore", "ScreenProtocol",
+        .product(name: "NIOCore", package: "swift-nio"),
+        .product(name: "NIOPosix", package: "swift-nio"),
+        .product(name: "NIOSSH", package: "swift-nio-ssh"),
+        .product(
+          name: "NIOTransportServices",
+          package: "swift-nio-transport-services"
+        ),
+        .product(name: "Crypto", package: "swift-crypto"),
+      ]
+    ),
+    // Network framework QUIC, TLS identity and pinning policy.
+    .target(
+      name: "AppleTransport",
+      dependencies: [
+        "SessionCore", "ScreenProtocol",
+        .product(name: "X509", package: "swift-certificates"),
+        .product(name: "Crypto", package: "swift-crypto"),
+      ]
+    ),
+    // Swiftty adapter, macOS PTY ownership, session registry, bootstrap.
+    .target(
+      name: "TerminalHost",
+      dependencies: [
+        "SessionCore", "ScreenProtocol", "AppleTransport", "SwifttyCore",
+      ],
+      swiftSettings: core
+    ),
+    // Shared direct-client frame/input abstraction and backends.
+    .target(
+      name: "TerminalSurface",
+      dependencies: [
+        "SessionCore", "ScreenProtocol", "AppleTransport", "SSHClient",
+        "SwifttyCore", .product(name: "NIOCore", package: "swift-nio"),
+      ],
+      swiftSettings: core
+    ),
+    // Bounded watch/iPhone status DTOs; no SSH/RST secrets, no Swiftty.
+    .target(name: "CompanionModel"),
+    // Shared app model and per-platform UI for the direct clients
+    // (Apps/* app targets are thin XcodeGen wrappers around this).
+    .target(
+      name: "RoamingApp",
+      dependencies: [
+        "SessionCore", "ScreenProtocol", "SSHClient", "TerminalSurface",
+        "CompanionModel", "SwifttyCore", "SwifttyMobile",
+        // AppKit surface for the native Mac client only; never Catalyst.
+        .target(name: "SwifttyMac", condition: .when(platforms: [.macOS])),
+        .product(name: "Crypto", package: "swift-crypto"),
+      ],
+      path: "Apps/Shared",
+      swiftSettings: core
+    ),
+    .executableTarget(
+      name: "Swifttyd",
+      dependencies: [
+        "TerminalHost", "SessionCore", "ScreenProtocol", "AppleTransport",
+      ],
+      path: "Apps/swifttyd",
+      swiftSettings: core
+    ),
+
     .testTarget(
       name: "SwifttyCoreTests",
       dependencies: [
@@ -109,9 +218,28 @@ let package = Package(
     .testTarget(
       name: "SwifttyAppTests",
       dependencies: [
-        "Swiftty", "SwifttyCore", "TestSupport", "SwiftMuxService",
+        "Swiftty", "SwifttyMac", "SwifttyCore", "TestSupport", "SwiftMuxService",
         "SwiftMuxClient", "SwiftMuxProtocol",
       ]
+    ),
+    .testTarget(
+      name: "ProtocolTests",
+      dependencies: [
+        "SessionCore", "ScreenProtocol", "CompanionModel", "TestSupport",
+      ]
+    ),
+    .testTarget(
+      name: "IntegrationTests",
+      dependencies: [
+        "SessionCore", "ScreenProtocol", "SSHClient", "AppleTransport",
+        "TerminalHost", "TerminalSurface", "SwifttyCore", "TestSupport",
+        "RoamingApp",
+        .product(name: "NIOCore", package: "swift-nio"),
+        .product(name: "NIOPosix", package: "swift-nio"),
+        .product(name: "NIOSSH", package: "swift-nio-ssh"),
+        .product(name: "Crypto", package: "swift-crypto"),
+      ],
+      swiftSettings: core
     ),
   ],
 )
