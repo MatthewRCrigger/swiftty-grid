@@ -37,7 +37,10 @@ struct RoamingEndToEndTests {
     let service: BootstrapService
     let serverConnections: ConnectionLog
 
-    init(loginShell: Bool = false) async throws {
+    /// Set when clients reach the listener through an address-changing relay.
+    let relay: RebindingUDPRelay?
+
+    init(loginShell: Bool = false, throughRelay: Bool = false) async throws {
       let identity = try AppleTransport.HostIdentity.generate(
         ipAddresses: ["127.0.0.1"]
       )
@@ -52,10 +55,13 @@ struct RoamingEndToEndTests {
         connections.list.withLock { $0.append(connection) }
         pending.withLock { $0 }?.accept(connection)
       }
+      let relay = throughRelay ? try RebindingUDPRelay(serverPort: listener.port) : nil
+      self.relay = relay
+      let relayPort = relay?.port
       let home = NSTemporaryDirectory()
       let registry = SessionRegistry(
         identity: TerminalHost.HostIdentity(
-          endpoint: BootstrapEndpoint(host: "127.0.0.1", port: listener.port),
+          endpoint: BootstrapEndpoint(host: "127.0.0.1", port: relayPort ?? listener.port),
           certificate: HostCertificate(der: identity.certificateDER)
         ),
         launch: {
@@ -85,6 +91,7 @@ struct RoamingEndToEndTests {
     }
 
     func shutdown() async {
+      relay?.stop()
       for summary in registry.list() {
         _ = await registry.terminate(summary.sessionID)
       }
@@ -145,6 +152,42 @@ struct RoamingEndToEndTests {
     } catch {
       Issue.record("status \(await client.status)\n\(screen(display))")
     }
+    await client.close(.terminate)
+    await harness.shutdown()
+  }
+
+  @Test
+  func `client address change mid-session recovers the same shell exactly once`() async throws {
+    // The phone's address changes (Wi-Fi to cellular): the server's replies
+    // go to the old address, so the client detects the stall after its
+    // path-change probe and reattaches to the retained session (spec §9).
+    let harness = try await Harness(throughRelay: true)
+    let relay = try #require(harness.relay)
+    let display = TerminalSession(presentationColumns: 80, rows: 24)
+    let client = harness.makeClient(display: display)
+    try await client.start(.create(GridSize(columns: 80, rows: 24)))
+    try await waitFor("active") { await client.state == .active }
+    let session = try #require(await client.status.sessionID)
+    let pid = try #require(harness.registry.session(session)?.status.pid)
+
+    for hop in 1 ... 3 {
+      relay.rebind()
+      await client.pathChanged()
+      try await waitFor("recovery \(hop)", timeout: .seconds(30)) {
+        await client.state == .active
+      }
+      _ = await client.submit(.text("echo hop-$((\(hop)*11))"))
+      _ = await client.submit(.key(SemanticKey(.enter)))
+      try await waitFor("hop \(hop) output", timeout: .seconds(30)) {
+        screen(display).contains("hop-\(hop * 11)")
+      }
+    }
+    let text = screen(display)
+    for hop in 1 ... 3 {
+      #expect(text.components(separatedBy: "hop-\(hop * 11)").count - 1 == 1)
+    }
+    #expect(await client.status.sessionID == session)
+    #expect(harness.registry.session(session)?.status.pid == pid)
     await client.close(.terminate)
     await harness.shutdown()
   }

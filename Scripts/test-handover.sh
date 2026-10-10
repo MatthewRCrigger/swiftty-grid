@@ -14,6 +14,8 @@ udid=$1
 switches=${2:-50}
 team=${3:-72KB9YQR7B}
 repository_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
+# RST_PUBLIC_HOST=<router's public IP> with RST_QUIC_PORT/RST_SSH_PORT
+# forwarded tests direct QUIC migration without a VPN.
 if [ -z "${RST_PUBLIC_HOST:-}" ]; then
   RST_PUBLIC_HOST=$(/Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4 2>/dev/null | head -1 || true)
 fi
@@ -93,4 +95,5 @@ while :; do
 done
 echo "HANDOVER summary: $(grep -c '^hop-' "$progress") hop lines," \
   "$(cut -d- -f3 "$progress" | grep -v '^$' | sort -u | wc -l | tr -d ' ') distinct shell pid(s)," \
-  "$(grep '^hop-' "$progress" | cut -d- -f2 | sort | uniq -d | wc -l | tr -d ' ') duplicated hop(s)"
+  "$(grep '^hop-' "$progress" | cut -d- -f2 | sort | uniq -d | wc -l | tr -d ' ') duplicated hop(s)," \
+  "$(grep -c -- '-migrated$' "$progress") migrated, $(grep -c -- '-reattached$' "$progress") reattached"

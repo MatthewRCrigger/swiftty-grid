@@ -154,9 +154,15 @@ Roaming verification record (2026-10-10, Xcode 27.0, OS 27 SDKs):
 | watchOS simulator | Companion tests hosted by the watch app |
 | macOS host | Unit, integration, end-to-end QUIC and real OpenSSH suites |
 
-Still open (spec §2.4, §13): physical Apple TV, Vision Pro and paired
-Apple Watch runs, and QUIC connection migration on a real path change (the A2
-run went through Tailscale, which hides the path change from QUIC).
+QUIC connection migration: clients enable it (`multipathServiceType =
+.handover`), but Network framework's QUIC listener on the OS 27 SDK keeps
+replying to a client's old address, so a path change ends in reattachment to
+the retained session instead (spec §9 fallback). `MigrationTests` documents
+the listener behaviour and `RoamingEndToEndTests` checks recovery to the same
+shell with each command applied once.
+
+Still open (spec §2.4, §13): physical Apple TV, Vision Pro and paired Apple
+Watch runs.
 
 `Scripts/test-handover.sh <iphone-udid> [switches]` runs A2: a standalone app
 on the phone keeps one roaming session open while you toggle Wi-Fi, and the

@@ -61,7 +61,7 @@ public struct QUICRSTConnector: Sendable {
     let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: nwPort)
     let group = NWConnectionGroup(
       with: NWMultiplexGroup(to: endpoint),
-      using: QUICOptions.parameters(quic)
+      using: QUICOptions.parameters(quic, migration: true)
     )
     let connection = QUICRSTConnection(role: .client, group: group, queue: queue)
     connection.attachGroupHandlers()

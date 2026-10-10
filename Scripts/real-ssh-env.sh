@@ -70,7 +70,8 @@ container build --progress plain -t swiftty-rst-ssh:test \
 (cd "$repository_root" && mise exec -- swift build --product swifttyd >"$workspace/swift-build.log" 2>&1) \
   || fail "swifttyd build failed; see $workspace/swift-build.log"
 host_bin="$(cd "$repository_root" && mise exec -- swift build --show-bin-path)/swifttyd"
-quic_port=$((51500 + $$ % 400))
+# RST_QUIC_PORT / RST_SSH_PORT pin ports, e.g. for router port forwarding.
+quic_port=${RST_QUIC_PORT:-$((51500 + $$ % 400))}
 # RST_PUBLIC_HOST=<this Mac's LAN address> serves physical devices: swifttyd
 # and the SSH relay listen on all interfaces and grants advertise that
 # address. Default: loopback only (simulators and local tests).
@@ -157,7 +158,7 @@ hostkey=$(container exec "$name" cut -d' ' -f1,2 /tmp/hostkey.pub)
 echo "$hostkey" >"$workspace/hostkey.pub"
 fingerprint=$(ssh-keygen -lf "$workspace/hostkey.pub" | awk '{print $2}')
 
-ssh_port=$((52000 + $$ % 400))
+ssh_port=${RST_SSH_PORT:-$((52000 + $$ % 400))}
 python3 -I - "$ssh_port" "$name" "$relay_bind" >"$workspace/relay.log" 2>&1 <<'PY' &
 import socket, subprocess, sys, threading
 port, name, bind = int(sys.argv[1]), sys.argv[2], sys.argv[3]

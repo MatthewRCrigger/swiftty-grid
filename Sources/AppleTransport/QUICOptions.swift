@@ -26,10 +26,17 @@ enum QUICOptions {
     sec_protocol_options_set_tls_renegotiation_enabled(options, false)
   }
 
-  static func parameters(_ quic: NWProtocolQUIC.Options) -> NWParameters {
+  static func parameters(
+    _ quic: NWProtocolQUIC.Options,
+    migration: Bool = false
+  ) -> NWParameters {
     let parameters = NWParameters(quic: quic)
     parameters.allowFastOpen = false
     parameters.includePeerToPeer = false
+    // QUIC connection migration (RFC 9000 §9) is opt-in in Network
+    // framework: `.handover` lets a client move to a new path (Wi-Fi to
+    // cellular) without a new handshake (spec §9). Only clients migrate.
+    if migration { parameters.multipathServiceType = .handover }
     return parameters
   }
 

@@ -79,6 +79,10 @@ final class HandoverRunner {
       sink: display
     )
     let paths = PathWatcher()
+    // States seen since the last switch: a reattach passes through
+    // reconnecting/attaching; a migrated QUIC connection stays attached.
+    let seen = StateLog()
+    await client.setStatusHandler { status in seen.record(status.state) }
     func screen() -> String { display.snapshot().text.joined(separator: "\n") }
     func run(_ command: String) async {
       _ = await client.submit(.text(command))
@@ -114,6 +118,7 @@ final class HandoverRunner {
         return
       }
       let started = Date()
+      seen.reset()
       last = paths.current
       await client.pathChanged()
       guard await wait(seconds: 180, { await client.state == .active }) else {
@@ -121,7 +126,10 @@ final class HandoverRunner {
         await run("echo FAILED-recovery-\(hop) | tee -a \(logPath)")
         return
       }
-      await run("echo hop-$((\(hop)*1))-$$-\(last) | tee -a \(logPath)")
+      // Let a reattach, if any, show up before classifying the switch.
+      try? await Task.sleep(for: .seconds(1))
+      let mode = seen.reattached ? "reattached" : "migrated"
+      await run("echo hop-$((\(hop)*1))-$$-\(last)-\(mode) | tee -a \(logPath)")
       guard await wait(seconds: 180, { screen().contains("hop-\(hop)-") }) else {
         headline = "no output after switch \(hop)"
         return
@@ -144,6 +152,22 @@ final class HandoverRunner {
       try? await Task.sleep(for: .milliseconds(100))
     }
     return true
+  }
+}
+
+final class StateLog: @unchecked Sendable {
+  private let lock = NSLock()
+  private var states: [ClientConnectionState] = []
+
+  func record(_ state: ClientConnectionState) {
+    lock.lock(); states.append(state); lock.unlock()
+  }
+
+  func reset() { lock.lock(); states = []; lock.unlock() }
+
+  var reattached: Bool {
+    lock.lock(); defer { lock.unlock() }
+    return states.contains { [.reconnecting, .attaching, .sshBootstrap].contains($0) }
   }
 }
 
