@@ -275,6 +275,12 @@ public final class RoamingAppModel {
       guard companionSettings != oldValue else { return }
       Self.saveCompanionSettings(companionSettings)
       onCompanionSettingsChange?(companionSettings)
+      // Observations are dropped while sharing is off: re-send the
+      // current one so the watch does not show "no session" until the
+      // next state change.
+      if companionSettings.sharingEnabled, !oldValue.sharingEnabled {
+        onSessionObservation?(currentCompanionObservation)
+      }
     }
   }
 
@@ -411,14 +417,18 @@ public final class RoamingAppModel {
     session.previewLines = nil
     activeSession = nil
     transferPolicy.setPendingInput(false)
-    onSessionObservation?(
-      PhoneCompanionBridge.Observation(
+    onSessionObservation?(currentCompanionObservation)
+  }
+
+  /// The active session's observation, or "no session" observed now.
+  var currentCompanionObservation: PhoneCompanionBridge.Observation {
+    activeSession?.companionObservation
+      ?? PhoneCompanionBridge.Observation(
         sessionToken: nil,
         nickname: nil,
         state: .noSession,
         observedAt: .now
       )
-    )
   }
 
   /// Bounded detach of the active session before the app quits; the

@@ -15,7 +15,9 @@ import Foundation
 ///   the foreground, and is only ever returned as an immediate reply. It
 ///   is not representable in `CompanionApplicationContext`.
 /// - Turning sharing off clears every cached observation and produces a
-///   `.cleared` context so the watch drops its cache too.
+///   `.cleared` context so the watch drops its cache too. Observations
+///   are not retained while off, so the owner re-sends the current one
+///   when sharing is turned back on.
 public struct PhoneCompanionBridge: Sendable {
   /// One iPhone observation of the explicitly selected session.
   public struct Observation: Hashable, Sendable {
@@ -126,11 +128,14 @@ public struct PhoneCompanionBridge: Sendable {
     settings = newSettings
     if !newSettings.allowsPreview { cachedPreview = nil }
     if old.sharingEnabled, !newSettings.sharingEnabled {
+      // A synthetic state, not an observation: it keeps the last real
+      // observation time so that, once re-enabled, the active session's
+      // (re-sent) observation is not rejected as out of order.
       observation = Observation(
         sessionToken: nil,
         nickname: nil,
         state: .noSession,
-        observedAt: max(now, observation.observedAt)
+        observedAt: observation.observedAt
       )
       cachedPreview = nil
       clearedAt = now
