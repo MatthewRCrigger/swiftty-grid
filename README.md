@@ -168,15 +168,45 @@ https://<configured domain>/a/<locator>
   occurrence seen.
 - On macOS, Swiftty handles the `swiftty` scheme (`CFBundleURLTypes`, written
   by `Scripts/package-swiftmux.sh`). It opens or activates the SwiftMux window
-  and focuses the pane. Prompts appear as alerts. Universal Links stay off
-  until `SWIFTTY_LINK_DOMAINS` is set when packaging.
+  and focuses the pane. Prompts appear as alerts.
 - The roaming clients (iOS/iPadOS, Catalyst, visionOS, tvOS and the Mac
   client) register the scheme through `Apps/Config/AttentionLinks.plist`. They
   route `onOpenURL`, web-browsing activities and attention Handoff into a
   destination sheet. RST/1 does not carry attention data yet, so roaming hosts
-  report "attention not yet available over roaming". Universal Links need
-  `SWIFTTY_LINK_DOMAIN` and `Apps/Config/AssociatedDomains.entitlements.template`,
-  which is not enabled. `links.example.invalid` is a placeholder only.
+  report "attention not yet available over roaming".
+- Universal Links are off unless `SWIFTTY_LINK_DOMAINS` is set. It is a
+  comma-separated list of hostnames, validated by `Scripts/link-domains.sh`
+  (an invalid name fails the build). When it is unset, no target gets the
+  associated-domains entitlement and only `swiftty://` links work.
+  `links.example.invalid` is a placeholder only.
+
+  ```sh
+  # 1. The association file each domain serves, with no redirects, as
+  #    application/json at /.well-known/apple-app-site-association.
+  #    It claims only /a/<locator> (one component, no query or fragment).
+  Scripts/make-aasa.sh -o apple-app-site-association TEAMID12345 \
+    com.chr33s.swiftty dev.swiftty.roaming.mobile dev.swiftty.roaming.mac \
+    dev.swiftty.roaming.catalyst dev.swiftty.roaming.vision
+  Scripts/make-aasa.sh --check apple-app-site-association   # re-validate
+
+  # 2. Native macOS app: Info.plist SwifttyAssociatedDomains plus the
+  #    signed com.apple.developer.associated-domains entitlement.
+  SWIFTTY_LINK_DOMAINS=links.example.com \
+    SWIFTTY_PROVISIONING_PROFILE=Swiftty.provisionprofile \
+    Scripts/package-swiftmux.sh "Developer ID Application: …"
+
+  # 3. Roaming clients: XcodeGen's preGenCommand (Scripts/configure-links.sh)
+  #    writes Apps/Config/Generated/ with the domain list and per-target
+  #    entitlements for MobileClient, MacClient, CatalystClient and
+  #    VisionClient. tvOS stays swiftty:// only.
+  SWIFTTY_LINK_DOMAINS=links.example.com Scripts/build-platforms.sh
+  ```
+
+  `SWIFTTY_LINK_MODE=developer` signs `applinks:<domain>?mode=developer` so
+  development builds fetch the association file directly instead of through
+  Apple's CDN. The macOS entitlement is honoured only with a provisioning
+  profile that has the Associated Domains capability; without
+  `SWIFTTY_PROVISIONING_PROFILE` the script warns.
 - The watch shows redacted `AttentionSummary` values: category, app name,
   counts and time. Message text is hidden by default. The watch can offer a
   Handoff (`AttentionHandoffRequest`) to a paired device, but it never takes a
@@ -211,8 +241,13 @@ in stream order, then sends coalesced updates
 - The native window's toolbar shows the Needs-you count. Its popover lists
   requests, failures and results as sanitized plain text. **Open in Pane**
   reveals the pane, and opening a workspace controlled elsewhere asks before
-  taking over. **Mark Reviewed** dismisses failures and results. OSC 7501
-  reports status only: Swiftty never answers a request for the program.
+  taking over. **Snooze** (15 minutes, 1 hour or tomorrow at 9:00) hides a
+  waiting request from the count until then, and **Unsnooze** brings it back.
+  **Mark Reviewed** dismisses failures and results. **Load More** reads past
+  the first 100 rows. A failed command is reported in the popover, or in an
+  alert once the popover has closed. Stale or missing items are dropped and
+  the list is reread. OSC 7501 reports status only: Swiftty never answers a
+  request for the program.
 
 ## Roaming SSH (RST/1)
 

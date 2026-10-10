@@ -3,16 +3,16 @@
 <plist version="1.0">
 <dict>
 	<!--
-	Attention deep links (swiftty-unified-spec.md §9), merged into each
-	direct client's generated Info.plist.
+	Attention deep links (spec.inbox.md §4.4), merged into each direct
+	client's generated Info.plist.
 
 	- swiftty://attention/open?ref=<locator> is always registered.
 	- SwifttyAssociatedDomains lists the hosts whose
-	  https://<domain>/a/<locator> Universal Links the app accepts. It
-	  comes from the SWIFTTY_LINK_DOMAIN build setting, empty by default,
-	  which disables the Universal Link form. Accepting such links also
-	  needs AssociatedDomains.entitlements.template enabled under real
-	  signing and an apple-app-site-association file on the domain.
+	  https://<domain>/a/<locator> Universal Links the app accepts. It is
+	  empty here. Scripts/configure-links.sh (the XcodeGen preGenCommand)
+	  copies this file to Config/Generated/AttentionLinks.plist with the
+	  domains from SWIFTTY_LINK_DOMAINS for the targets that support
+	  Universal Links; TVClient uses this file unchanged.
 	-->
 	<key>CFBundleURLTypes</key>
 	<array>
@@ -28,8 +28,6 @@
 		</dict>
 	</array>
 	<key>SwifttyAssociatedDomains</key>
-	<array>
-		<string>$(SWIFTTY_LINK_DOMAIN)</string>
-	</array>
+	<array/>
 </dict>
 </plist>
