@@ -216,4 +216,54 @@ struct TerminalClientTests {
     #expect(list.first?.paneCount == 2)
     #expect(list.first?.isAttached == false)
   }
+
+  /// Layout events and the switch reply arrive on different paths: a
+  /// newer layout of the target that overtakes the reply is kept, late
+  /// layouts of the old workspace are ignored, and revisions never go
+  /// backwards.
+  @Test
+  func switchKeepsTheNewestLayoutAcrossReorderedReplies() async throws {
+    let h = try Harness()
+    let connection = try await h.connect(.terminal)
+    guard
+      case let .created(one) = try await connection.execute(
+        .newWorkspace(NewWorkspaceRequest(name: "one", launch: shellLaunch()))
+      ),
+      case let .created(two) = try await connection.execute(
+        .newWorkspace(NewWorkspaceRequest(name: "two", launch: shellLaunch()))
+      ),
+      case let .attached(attachment, workspace) = try await connection.execute(
+        .attach(.id(one.id))
+      ),
+      case let .layout(reply) = try await connection.execute(
+        .switchWorkspace(.id(two.id))
+      )
+    else {
+      Issue.record("setup")
+      return
+    }
+    let outer = Outer()
+    let client = TerminalClient(
+      connection: connection,
+      attachment: attachment,
+      workspace: workspace,
+      limits: .standard,
+      tty: RawTTY(input: outer.slave, output: outer.slave)
+    )
+    // The target's newer layout event overtakes the switch reply.
+    var newer = reply
+    newer.name = "two-renamed"
+    newer.layoutRevision += 1
+    client.handle(.layout(newer))
+    #expect(client.workspace.id == one.id)
+    client.apply(reply, attached: true)
+    #expect(client.workspace == newer)
+    // A late layout of the old workspace and an older one are ignored.
+    var late = workspace
+    late.layoutRevision += 5
+    client.handle(.layout(late))
+    client.handle(.layout(reply))
+    #expect(client.workspace == newer)
+    await connection.close()
+  }
 }

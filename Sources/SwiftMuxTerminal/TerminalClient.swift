@@ -43,7 +43,16 @@ public final class TerminalClient {
   let tty: RawTTY
   let settings: Settings
   private var decoder: InputDecoder
-  private(set) var workspace: WorkspaceSnapshot
+  package private(set) var workspace: WorkspaceSnapshot
+  /// The workspace this connection holds the lease for, from the attach
+  /// or the last switch reply. Snapshots of any other workspace (a late
+  /// layout event after a switch) are not shown.
+  private var attachedWorkspace: WorkspaceID
+  /// Highest layout revision shown per workspace.
+  private var layoutRevisions: [WorkspaceID: UInt64] = [:]
+  /// The newest snapshot that arrived for a workspace not (yet) attached:
+  /// its layout event can overtake the switch reply.
+  private var earlySnapshot: WorkspaceSnapshot?
   private var frames: [PaneID: PaneFrame] = [:]
   private var size: (columns: Int, rows: Int)
   private var renderer = DiffRenderer()
@@ -73,6 +82,8 @@ public final class TerminalClient {
     self.connection = connection
     self.attachment = attachment
     self.workspace = workspace
+    attachedWorkspace = workspace.id
+    layoutRevisions[workspace.id] = workspace.layoutRevision
     self.tty = tty
     self.settings = settings
     self.limits = limits
@@ -159,7 +170,7 @@ public final class TerminalClient {
 
   // MARK: Service events
 
-  func handle(_ event: MuxEvent) {
+  package func handle(_ event: MuxEvent) {
     switch event {
     case let .frame(frame):
       guard frame.identity.attachment == attachment else { return }
@@ -176,15 +187,7 @@ public final class TerminalClient {
         mode = .copy(state)
       }
       redraw()
-    case let .layout(snapshot):
-      guard snapshot.id == workspace.id else { return }
-      workspace = snapshot
-      let live = Set(snapshot.panes.map(\.id))
-      frames = frames.filter { live.contains($0.key) }
-      if case let .copy(state) = mode, !live.contains(state.pane) {
-        mode = .normal
-      }
-      syncLayout()
+    case let .layout(snapshot): apply(snapshot)
     case let .paneExited(pane, status, truncated):
       if truncated {
         show("pane was force-killed; its final output may be incomplete")
@@ -209,6 +212,48 @@ public final class TerminalClient {
   }
 
   // MARK: Layout and geometry
+
+  /// Shows `ws`. With `attached`, it is the switch reply and names the
+  /// workspace this connection now holds; otherwise it is shown only for
+  /// that workspace and when no older than the layout already shown.
+  package func apply(_ ws: WorkspaceSnapshot, attached: Bool = false) {
+    if attached, attachedWorkspace != ws.id {
+      attachedWorkspace = ws.id
+      if let early = earlySnapshot, early.id == ws.id,
+        early.layoutRevision > ws.layoutRevision
+      {
+        earlySnapshot = nil
+        apply(early)
+        return
+      }
+      earlySnapshot = nil
+    }
+    guard ws.id == attachedWorkspace else {
+      if earlySnapshot?.id != ws.id
+        || ws.layoutRevision >= earlySnapshot?.layoutRevision ?? 0
+      {
+        earlySnapshot = ws
+      }
+      return
+    }
+    guard ws.layoutRevision >= layoutRevisions[ws.id, default: 0] else {
+      return
+    }
+    layoutRevisions[ws.id] = ws.layoutRevision
+    if ws.id != workspace.id {
+      // The service dropped the old subscriptions and geometry.
+      frames = [:]
+      subscriptions = []
+      lastGeometry = nil
+    }
+    workspace = ws
+    let live = Set(ws.panes.map(\.id))
+    frames = frames.filter { live.contains($0.key) }
+    if case let .copy(state) = mode, !live.contains(state.pane) {
+      mode = .normal
+    }
+    syncLayout()
+  }
 
   private var compositor: Compositor {
     Compositor(columns: size.columns, rows: size.rows)
@@ -263,12 +308,9 @@ public final class TerminalClient {
           guard let self else { return }
           switch result {
           case let .success(reply):
-            if case let .layout(snapshot) = reply,
-              snapshot.id == self.workspace.id,
-              snapshot.layoutRevision >= self.workspace.layoutRevision
-            {
-              self.handle(.layout(snapshot))
-            }
+            // A switch reply also names the attached workspace; its
+            // callback applies it as such.
+            if case let .layout(snapshot) = reply { self.apply(snapshot) }
             then?(reply)
           case let .failure(error):
             if !quiet.contains(error.code) { self.show(error.description) }
@@ -644,11 +686,7 @@ public final class TerminalClient {
           guard let self, !name.isEmpty else { return }
           self.command(.switchWorkspace(.name(name))) { reply in
             guard case let .layout(snapshot) = reply else { return }
-            self.workspace = snapshot
-            self.frames = [:]
-            self.subscriptions = []
-            self.lastGeometry = nil
-            self.syncLayout()
+            self.apply(snapshot, attached: true)
           }
         }
       )
