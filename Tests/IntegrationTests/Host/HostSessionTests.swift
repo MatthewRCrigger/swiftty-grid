@@ -294,6 +294,12 @@ struct HostSessionTests {
         return false
       }
 
+      // Never swept while a client is attached to it.
+      #expect(await registry.sweep(now: .now + .seconds(301)).isEmpty)
+      again.connection.sever()
+      try await hostEventually("detached") {
+        session.status.isAttached ? nil : true
+      }
       #expect(await registry.sweep(now: .now + .seconds(240)).isEmpty)
       #expect(
         await registry.sweep(now: .now + .seconds(301)) == [grant.sessionID]
