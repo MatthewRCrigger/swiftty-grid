@@ -20,6 +20,15 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private let limits: MuxLimits
   private var config: Configuration
   private(set) var workspace: WorkspaceSnapshot?
+  /// The workspace this connection holds the lease for, from the last
+  /// attach, switch or takeover reply. Snapshots of any other workspace
+  /// (a late layout event after a switch) are not shown.
+  private(set) var attachedWorkspace: WorkspaceID?
+  /// Highest layout revision shown per workspace.
+  private var layoutRevisions: [WorkspaceID: UInt64] = [:]
+  /// The newest snapshot that arrived for a workspace not (yet) attached:
+  /// its layout event can overtake the switch reply.
+  private var earlySnapshot: WorkspaceSnapshot?
   private(set) var views: [PaneID: MuxPaneView] = [:]
   private(set) var containers: [PaneID: MuxPaneContainer] = [:]
   let tabStrip = MuxTabStrip()
@@ -220,11 +229,41 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       welcome: welcome,
       configuration: configuration
     )
-    controller.apply(ws)
+    controller.apply(ws, attached: true)
     controller.startEvents()
     controller.startInbox()
     controller.sendTheme()
     controller.observeAppearance()
+    return controller
+  }
+
+  /// Opens `selector` on the new `connection` and only then leaves
+  /// `current` (one SwiftMux window and lease at a time). A failed attach
+  /// (`leaseHeld` before a confirmed takeover, `staleRevision`, …)
+  /// closes `connection` and leaves `current` with its window and lease.
+  static func replace(
+    _ current: MuxWorkspaceController?,
+    with selector: WorkspaceSelector,
+    configuration: Configuration,
+    connection: MuxConnection,
+    takeover expectedLease: UInt64? = nil
+  ) async throws -> MuxWorkspaceController {
+    let controller: MuxWorkspaceController
+    do {
+      controller = try await open(
+        selector,
+        configuration: configuration,
+        connection: connection,
+        takeover: expectedLease
+      )
+    } catch {
+      await connection.close()
+      throw error
+    }
+    if let current {
+      await current.detach()
+      current.close()
+    }
     return controller
   }
 
@@ -297,7 +336,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       .receive(presentation, server: server)
   }
 
-  private func handle(_ event: MuxEvent) {
+  /// Applies one non-frame event (internal for tests).
+  func handle(_ event: MuxEvent) {
     switch event {
     case let .layout(ws): apply(ws)
     case let .title(pane, title):
@@ -340,10 +380,34 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   var activeTab: TabSnapshot? { workspace?.activeTabSnapshot }
   var activePane: PaneID? { activeTab?.activePane }
 
-  private func apply(_ ws: WorkspaceSnapshot) {
-    guard workspace == nil || ws.id != workspace!.id
-      || ws.layoutRevision >= workspace!.layoutRevision
-    else { return }
+  /// Shows `ws`. With `attached`, it is the reply to an attach, switch
+  /// or takeover and names the workspace this connection now holds;
+  /// otherwise it is shown only for that workspace and when no older
+  /// than the layout already shown.
+  private func apply(_ ws: WorkspaceSnapshot, attached: Bool = false) {
+    if attached, attachedWorkspace != ws.id {
+      attachedWorkspace = ws.id
+      if let early = earlySnapshot, early.id == ws.id,
+        early.layoutRevision > ws.layoutRevision
+      {
+        earlySnapshot = nil
+        apply(early)
+        return
+      }
+      earlySnapshot = nil
+    }
+    guard ws.id == attachedWorkspace else {
+      if ws.layoutRevision >= earlySnapshot?.layoutRevision ?? 0
+        || earlySnapshot?.id != ws.id
+      {
+        earlySnapshot = ws
+      }
+      return
+    }
+    guard ws.layoutRevision >= layoutRevisions[ws.id, default: 0] else {
+      return
+    }
+    layoutRevisions[ws.id] = ws.layoutRevision
     if let current = workspace, current.id != ws.id {
       // Switched workspaces (inbox navigation): the service dropped the
       // old subscriptions and geometry.
@@ -644,8 +708,17 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
         do {
           let reply = try await connection.execute(command)
           switch reply {
-          case let .layout(ws), let .attached(_, ws):
-            await MainActor.run { [weak self] in self?.apply(ws) }
+          case let .attached(_, ws):
+            await MainActor.run { [weak self] in
+              self?.apply(ws, attached: true)
+            }
+          case let .layout(ws):
+            // A switch reply names the workspace now held.
+            var switched = false
+            if case .switchWorkspace = command { switched = true }
+            await MainActor.run { [weak self] in
+              self?.apply(ws, attached: switched)
+            }
           default: break
           }
           if let then { await then() }

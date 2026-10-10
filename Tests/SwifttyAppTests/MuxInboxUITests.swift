@@ -2,6 +2,7 @@ import AppKit
 import SwiftMuxClient
 import SwiftMuxProtocol
 @testable import Swiftty
+import SwifttyCore
 import Testing
 
 /// The native attention inbox: toolbar badge, popover rows, seen versus
@@ -413,5 +414,197 @@ extension MuxNativeTests {
     )
     model.forget(waiting.occurrence)
     #expect(model.items.count == 1)
+  }
+
+  @Test
+  func `a page read before a removal never resurrects the item`() {
+    let source = AttentionSource(
+      serviceEpoch: ServerInstanceID(),
+      pane: PaneID(),
+      terminalEpoch: TerminalEpochID(),
+      recordPath: "",
+      recordIncarnation: 1
+    )
+    func item(
+      _ occurrence: OccurrenceID,
+      _ revision: UInt64,
+      _ resolution: AttentionResolution = .open
+    ) -> AttentionItem {
+      AttentionItem(
+        occurrence: occurrence,
+        source: source,
+        workspace: WorkspaceID(),
+        tab: nil,
+        category: .needsYou,
+        resolution: resolution,
+        status: AttentionStatus(
+          source: source,
+          state: .blocked,
+          updatedAt: Date()
+        ),
+        createdAt: Date(),
+        updatedAt: Date(),
+        revision: revision
+      )
+    }
+    func page(_ items: [AttentionItem], at revision: UInt64) -> InboxPage {
+      InboxPage(
+        items: items,
+        counts: InboxCounts(needsYou: items.count),
+        revision: revision,
+        nextCursor: nil
+      )
+    }
+    let removed = OccurrenceID()
+    let resolved = OccurrenceID()
+    let kept = OccurrenceID()
+    var model = MuxInboxModel()
+    _ = model.apply(
+      InboxUpdate(
+        revision: 2,
+        counts: InboxCounts(needsYou: 3),
+        changed: [item(removed, 2), item(resolved, 2), item(kept, 2)],
+        removed: []
+      )
+    )
+    #expect(model.items.count == 3)
+    // Revision 3 removes one item and resolves another…
+    _ = model.apply(
+      InboxUpdate(
+        revision: 3,
+        counts: InboxCounts(needsYou: 1),
+        changed: [item(resolved, 3, .resolved)],
+        removed: [removed]
+      )
+    )
+    #expect(Set(model.items.keys) == [kept])
+    // …then pages read at revision 2 arrive: neither comes back.
+    let stale = page(
+      [item(removed, 2), item(resolved, 2), item(kept, 2)],
+      at: 2
+    )
+    model.reset([.needsYou: stale, .results: page([], at: 2)])
+    #expect(Set(model.items.keys) == [kept])
+    #expect(model.counts.needsYou == 1)
+    model.append(stale, section: .needsYou)
+    #expect(Set(model.items.keys) == [kept])
+    // An item older than the one held never replaces it.
+    _ = model.apply(
+      InboxUpdate(
+        revision: 4,
+        counts: InboxCounts(needsYou: 1),
+        changed: [item(kept, 5)],
+        removed: []
+      )
+    )
+    model.append(page([item(kept, 4, .resolved)], at: 4), section: .needsYou)
+    #expect(model.items[kept]?.revision == 5)
+    // A page read after the removal is authoritative again.
+    model.reset([.needsYou: page([item(removed, 6)], at: 6)])
+    #expect(model.items[removed] != nil)
+  }
+
+  @Test(.enabled(if: hasMetal))
+  func `a late layout event for the previous workspace is ignored`()
+    async throws
+  {
+    let f = try await open()
+    defer { f.controller.close() }
+    let c = f.controller
+    let previous = try #require(c.workspace)
+    let other = try await MuxConnection.connect(
+      endpoint: f.endpoint,
+      frontend: .native
+    )
+    defer { Task { await other.close() } }
+    let launch = LaunchSpec(
+      command: ["/bin/sh"],
+      workingDirectory: "/tmp",
+      environment: [
+        "PATH": "/usr/bin:/bin", "PS1": "$ ", "HOME": NSTemporaryDirectory(),
+      ]
+    )
+    guard
+      case let .created(created) = try await other.execute(
+        .newWorkspace(NewWorkspaceRequest(launch: launch))
+      ),
+      case let .attached(_, ws) = try await other.execute(
+        .attach(.id(created.id))
+      ), let pane = ws.activeTabSnapshot?.activePane
+    else {
+      Issue.record("no second workspace")
+      return
+    }
+    await other.post(
+      .text(Self.osc("state=blocked:kind=question:app=far")),
+      to: pane
+    )
+    #expect(await until { c.inbox.sorted.contains { $0.workspace == ws.id } })
+    let item = try #require(c.inbox.sorted.first { $0.workspace == ws.id })
+    _ = try await other.execute(.detach)
+    c.openAttention(item)
+    #expect(await until { c.workspace?.id == ws.id })
+    #expect(c.attachedWorkspace == ws.id)
+
+    // The previous workspace's layout event lands after the switch.
+    var late = previous
+    late.layoutRevision += 100
+    c.handle(.layout(late))
+    #expect(c.workspace?.id == ws.id)
+    #expect(c.attachedWorkspace == ws.id)
+    // An older layout of the current workspace is not shown either.
+    var older = try #require(c.workspace)
+    older.layoutRevision -= 1
+    older.name = "stale"
+    c.handle(.layout(older))
+    #expect(c.workspace?.name != "stale")
+  }
+
+  @Test(.enabled(if: hasMetal))
+  func `a refused attach keeps the current window and closes its connection`()
+    async throws
+  {
+    let f = try await open()
+    defer { f.controller.close() }
+    let c = f.controller
+    let other = try await MuxConnection.connect(
+      endpoint: f.endpoint,
+      frontend: .native
+    )
+    defer { Task { await other.close() } }
+    guard
+      case let .created(created) = try await other.execute(
+        .newWorkspace(
+          NewWorkspaceRequest(
+            launch: LaunchSpec(command: ["/bin/sh"], workingDirectory: "/tmp")
+          )
+        )
+      ), case .attached = try await other.execute(.attach(.id(created.id)))
+    else {
+      Issue.record("no second workspace")
+      return
+    }
+    let connection = try await MuxConnection.connect(
+      endpoint: f.endpoint,
+      frontend: .native
+    )
+    // Held elsewhere and no takeover confirmed: refused, nothing left.
+    await #expect {
+      _ = try await MuxWorkspaceController.replace(
+        c,
+        with: .id(created.id),
+        configuration: Configuration(),
+        connection: connection
+      )
+    } throws: { ($0 as? MuxError)?.code == .leaseHeld }
+    #expect(c.workspace?.id == f.workspace)
+    #expect(c.window?.isVisible == true)
+    // The new connection was closed: its event stream ends at once.
+    #expect(await (try? connection.nextEvent()) == nil)
+    // The current window still holds its lease and works.
+    let pane = try #require(c.activePane)
+    c.split(.leftRight)
+    #expect(await until { c.workspace?.panes.count == 2 })
+    #expect(c.workspace?.pane(pane) != nil)
   }
 }
