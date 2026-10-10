@@ -31,19 +31,25 @@ public struct BootstrapRequest: Hashable, Sendable, Codable {
   /// so retained operations can be retried. Omitted after a cold start.
   public var writerID: WriterID?
   public var initialGrid: GridSize?
+  /// For `resume`: the user confirmed taking control of a workspace
+  /// another frontend (for example the Mac app) is attached to. Without
+  /// it, attaching to a held workspace fails with `writerBusy`.
+  public var takeover: Bool?
 
   public init(
     operation: Operation,
     protocols: [String] = [RSTLimits.protocolName],
     sessionID: SessionID? = nil,
     writerID: WriterID? = nil,
-    initialGrid: GridSize? = nil
+    initialGrid: GridSize? = nil,
+    takeover: Bool? = nil
   ) {
     self.operation = operation
     self.protocols = protocols
     self.sessionID = sessionID
     self.writerID = writerID
     self.initialGrid = initialGrid
+    self.takeover = takeover
   }
 
   public enum ValidationError: Error, Equatable {

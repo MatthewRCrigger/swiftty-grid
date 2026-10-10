@@ -140,6 +140,18 @@ struct PaneLauncher: Sendable {
     }
     _ = fcntl(pipeFDs[0], F_SETFD, FD_CLOEXEC)
     _ = fcntl(pipeFDs[1], F_SETFD, FD_CLOEXEC)
+    // The child receives the slave as fd 3 and the pipe as fd 4. Sources
+    // already at 3 or 4 would collide: `dup2(3, 3)` keeps close-on-exec,
+    // and crossed duplicates overwrite each other. Move both above.
+    slave = Self.aboveChildDescriptors(slave)
+    pipeFDs[1] = Self.aboveChildDescriptors(pipeFDs[1])
+    guard slave >= 0, pipeFDs[1] >= 0 else {
+      close(master)
+      if slave >= 0 { close(slave) }
+      close(pipeFDs[0])
+      if pipeFDs[1] >= 0 { close(pipeFDs[1]) }
+      throw MuxError(.launchFailed, "fcntl: \(String(cString: strerror(errno)))")
+    }
 
     func cleanup() {
       close(master)
@@ -223,6 +235,15 @@ struct PaneLauncher: Sendable {
       pid: pid,
       warnings: warnings
     )
+  }
+
+  /// A close-on-exec duplicate of `fd` numbered 5 or higher (closing
+  /// `fd`); `fd` itself when it already is. -1 on failure.
+  static func aboveChildDescriptors(_ fd: Int32) -> Int32 {
+    guard fd < 5 else { return fd }
+    let moved = fcntl(fd, F_DUPFD_CLOEXEC, 5)
+    close(fd)
+    return moved
   }
 
   /// Cooked interactive settings, matching the BSD `ttydefaults`.

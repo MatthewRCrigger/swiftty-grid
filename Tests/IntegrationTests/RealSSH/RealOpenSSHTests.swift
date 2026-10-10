@@ -11,7 +11,7 @@ import TerminalSurface
 import Synchronization
 import Testing
 
-/// Runs against a real OpenSSH server and a real `swifttyd serve`, set up
+/// Runs against a real OpenSSH server and a real SwiftMux service with roaming (`swiftmux-agent --roaming-config`), set up
 /// by Scripts/test-real-ssh.sh (an apple/container Linux VM whose fixed
 /// helper path relays `bootstrap --stdio` to the Mac's agent). Skipped
 /// unless that script provides the environment.

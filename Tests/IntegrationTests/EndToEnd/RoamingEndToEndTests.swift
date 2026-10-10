@@ -4,6 +4,7 @@ import Foundation
 import ScreenProtocol
 import SessionCore
 import Synchronization
+import SwiftMuxProtocol
 import SwifttyCore
 import TerminalHost
 import TerminalSurface
@@ -60,20 +61,20 @@ struct RoamingEndToEndTests {
       let relayPort = relay?.port
       let home = NSTemporaryDirectory()
       let registry = SessionRegistry(
+        service: try makeService(),
         identity: TerminalHost.HostIdentity(
           endpoint: BootstrapEndpoint(host: "127.0.0.1", port: relayPort ?? listener.port),
           certificate: HostCertificate(der: identity.certificateDER)
         ),
         launch: {
-          if loginShell { return ShellLaunch.loginShell() }
-          return ShellLaunch(
-            executable: "/bin/sh",
-            arguments: ["sh"],
+          if loginShell { return RoamingHost.defaultLaunch() }
+          return LaunchSpec(
+            command: ["/bin/sh"],
+            workingDirectory: home,
             environment: [
-              "PATH": "/usr/bin:/bin", "TERM": "xterm-256color",
-              "HOME": home, "PS1": "$ ", "LANG": "en_US.UTF-8",
-            ],
-            workingDirectory: home
+              "PATH": "/usr/bin:/bin", "HOME": home, "PS1": "$ ",
+              "LANG": "en_US.UTF-8",
+            ]
           )
         }
       )
@@ -90,9 +91,15 @@ struct RoamingEndToEndTests {
       )
     }
 
+    /// The shell PID of a session's pane in the SwiftMux service.
+    func pid(_ id: SessionID) async -> pid_t? {
+      guard let session = registry.session(id) else { return nil }
+      return await shellPID(registry, session)
+    }
+
     func shutdown() async {
       relay?.stop()
-      for summary in registry.list() {
+      for summary in await registry.list() {
         _ = await registry.terminate(summary.sessionID)
       }
       listener.stop()
@@ -168,7 +175,7 @@ struct RoamingEndToEndTests {
     try await client.start(.create(GridSize(columns: 80, rows: 24)))
     try await waitFor("active") { await client.state == .active }
     let session = try #require(await client.status.sessionID)
-    let pid = try #require(harness.registry.session(session)?.status.pid)
+    let pid = try #require((await harness.pid(session)))
 
     for hop in 1 ... 3 {
       relay.rebind()
@@ -187,7 +194,7 @@ struct RoamingEndToEndTests {
       #expect(text.components(separatedBy: "hop-\(hop * 11)").count - 1 == 1)
     }
     #expect(await client.status.sessionID == session)
-    #expect(harness.registry.session(session)?.status.pid == pid)
+    #expect((await harness.pid(session)) == pid)
     await client.close(.terminate)
     await harness.shutdown()
   }
@@ -200,7 +207,7 @@ struct RoamingEndToEndTests {
     try await client.start(.create(GridSize(columns: 80, rows: 24)))
     try await waitFor("active") { await client.state == .active }
     let sessionID = try #require(await client.status.sessionID)
-    let pid = try #require(harness.registry.session(sessionID)?.status.pid)
+    let pid = try #require((await harness.pid(sessionID)))
 
     _ = await client.submit(.text("echo first-$((1+1))"))
     _ = await client.submit(.key(SemanticKey(.enter)))
@@ -215,7 +222,7 @@ struct RoamingEndToEndTests {
       await client.state == .active
         && harness.serverConnections.list.withLock { $0.count } >= 2
     }
-    #expect(harness.registry.session(sessionID)?.status.pid == pid)
+    #expect((await harness.pid(sessionID)) == pid)
 
     _ = await client.submit(.text("echo second-$((2+2))"))
     _ = await client.submit(.key(SemanticKey(.enter)))

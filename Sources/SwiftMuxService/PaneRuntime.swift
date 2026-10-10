@@ -232,6 +232,7 @@ final class PaneRuntime: @unchecked Sendable {
         case let .key(key, mods):
           .key(KeyEvent(Self.key(key), modifiers: Self.modifiers(mods)))
         case let .focus(f): .focus(f)
+        case let .paste(s): .paste(s)
         }
       // Enhanced keyboard reporting is disabled in this profile.
       InputEncoder.encode(
@@ -500,6 +501,15 @@ final class PaneRuntime: @unchecked Sendable {
 
   /// Plain text of the visible screen (tests, diagnostics).
   func screenLines() -> [String] { queue.sync { state.screenLines } }
+
+  /// Runs `body` in this pane's order with the authoritative state, for
+  /// exports other than `PaneFrame` (the roaming bridge's screens).
+  func inspect<T: Sendable>(
+    _ body: @escaping @Sendable (borrowing TerminalState) -> T,
+    completion: @escaping @Sendable (T) -> Void
+  ) {
+    queue.async { [self] in completion(body(state)) }
+  }
 
   var size: (columns: Int, rows: Int) {
     queue.sync { (state.columns, state.rows) }

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Runs Tests/SimulatorRuntime in a simulator runtime against a real
-# `swifttyd serve` on this Mac (loopback QUIC, real PTY).
+# a SwiftMux service with roaming (`swiftmux-agent --roaming-config`) on this Mac (loopback QUIC, real PTY).
 #   Scripts/test-roaming-simulator.sh <simulator-udid> [platform]
 # platform: iOS (default), tvOS or visionOS.
 set -eu
@@ -11,12 +11,13 @@ repository_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
 workspace=$(mktemp -d /tmp/rsts.XXXXXX)
 echo "Workspace (results and host log): $workspace"
 
-(cd "$repository_root" && mise exec -- swift build --product swifttyd >/dev/null)
-host_bin="$(cd "$repository_root" && mise exec -- swift build --show-bin-path)/swifttyd"
+(cd "$repository_root" && mise exec -- swift build --product swiftmux-agent && mise exec -- swift build --product swmux-launcher && mise exec -- swift build --product swifttyd >/dev/null)
+bin_dir="$(cd "$repository_root" && mise exec -- swift build --show-bin-path)"
+host_bin="$bin_dir/swiftmux-agent"
 port=$((51300 + $$ % 500))
 printf '{"bindAddress":"127.0.0.1","advertisedHost":"127.0.0.1","port":%s,"stateDirectory":"%s/state"}' \
   "$port" "$workspace" >"$workspace/config.json"
-"$host_bin" serve --config "$workspace/config.json" 2>"$workspace/host.log" &
+"$host_bin" --mach-service "com.chr33s.swiftty.swiftmux.test.$$" --launcher "$bin_dir/swmux-launcher" --roaming-config "$workspace/config.json" 2>"$workspace/host.log" &
 host_pid=$!
 trap 'kill $host_pid 2>/dev/null || true' EXIT INT TERM
 i=0

@@ -61,9 +61,16 @@ struct PaneRecord {
   }
 }
 
+/// How the service reaches a client.
+enum ClientTransport {
+  case xpc(SMXChannel)
+  /// In-process (the roaming bridge): values, never encoded.
+  case local(LocalClientSink)
+}
+
 final class Client {
-  let id = UUID()
-  let channel: SMXChannel
+  let id: UUID
+  let transport: ClientTransport
   var hello: Hello?
   /// Receives `workspaces` events (metadata only, no lease).
   var observesWorkspaces = false
@@ -72,7 +79,27 @@ final class Client {
   /// Bridged from the roaming transport rather than local XPC.
   var remote = false
 
-  init(channel: SMXChannel) { self.channel = channel }
+  init(channel: SMXChannel) {
+    id = UUID()
+    transport = .xpc(channel)
+  }
+
+  init(id: UUID, local sink: LocalClientSink, remote: Bool) {
+    self.id = id
+    transport = .local(sink)
+    self.remote = remote
+  }
+
+  var local: LocalClientSink? {
+    if case let .local(sink) = transport { sink } else { nil }
+  }
+
+  func cancel() {
+    switch transport {
+    case let .xpc(channel): channel.cancel()
+    case let .local(sink): sink.onClosed("closed by service")
+    }
+  }
 }
 
 struct FrameSlot {

@@ -22,7 +22,7 @@ struct ControlSocketTests {
     let directory = try makeTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
     try ControlDirectory.prepare(directory)
-    let registry = SessionRegistry(identity: testIdentity())
+    let registry = SessionRegistry(service: try makeService(), identity: testIdentity())
     let service = BootstrapService(registry: registry)
     let server = try ControlSocketServer(directory: directory) {
       await service.respond(toEnvelope: $0)
@@ -54,7 +54,7 @@ struct ControlSocketTests {
     #expect(grant.endpoint == testIdentity().endpoint)
     #expect(grant.serverCertificateSHA256 == testIdentity().certificate.sha256Hex)
     #expect(grant.initialGrid == GridSize(columns: 100, rows: 30))
-    #expect(registry.list().count == 1)
+    #expect((await registry.list()).count == 1)
 
     let listed = try response(
       BootstrapService.forward(
@@ -62,7 +62,7 @@ struct ControlSocketTests {
         socketPath: server.path
       )
     )
-    #expect(listed == .sessions(registry.list()))
+    #expect(listed == .sessions((await registry.list())))
     await registry.terminate(grant.sessionID)
   }
 
@@ -70,7 +70,7 @@ struct ControlSocketTests {
   func `malformed and unsupported requests create nothing`() async throws {
     let directory = try makeTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let registry = SessionRegistry(identity: testIdentity())
+    let registry = SessionRegistry(service: try makeService(), identity: testIdentity())
     let service = BootstrapService(registry: registry)
     let server = try ControlSocketServer(directory: directory) {
       await service.respond(toEnvelope: $0)
@@ -104,14 +104,14 @@ struct ControlSocketTests {
       try response(await service.respond(toEnvelope: unsupported))
         == .failure(.unsupportedVersion)
     )
-    #expect(registry.list().isEmpty)
+    #expect((await registry.list()).isEmpty)
   }
 
   @Test
   func `peers with another UID are refused`() async throws {
     let directory = try makeTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let registry = SessionRegistry(identity: testIdentity())
+    let registry = SessionRegistry(service: try makeService(), identity: testIdentity())
     let service = BootstrapService(registry: registry)
     let server = try ControlSocketServer(
       directory: directory,
@@ -126,7 +126,7 @@ struct ControlSocketTests {
       try response(BootstrapService.forward(envelope: request, socketPath: server.path))
         == .failure(.agentUnavailable)
     )
-    #expect(registry.list().isEmpty)
+    #expect((await registry.list()).isEmpty)
   }
 
   @Test
@@ -165,23 +165,16 @@ struct ControlSocketTests {
   }
 
   @Test
-  func `launch agent runs serve for the current user`() throws {
-    let agent = LaunchAgent(
-      executable: "/usr/local/bin/swifttyd",
-      configurationPath: "/Users/me/rst.json"
-    )
-    #expect(agent.serviceTarget(uid: 501) == "gui/501/\(LaunchAgent.defaultLabel)")
-    let plist = try PropertyListSerialization.propertyList(
-      from: agent.propertyList(),
-      format: nil
-    ) as? [String: Any]
-    #expect(plist?["Label"] as? String == LaunchAgent.defaultLabel)
+  func `service and bootstrap helper resolve the same configuration`() {
     #expect(
-      plist?["ProgramArguments"] as? [String]
-        == ["/usr/local/bin/swifttyd", "serve", "--config", "/Users/me/rst.json"]
+      HostConfiguration.resolvedConfigurationURL(environment: [:])
+        == HostConfiguration.defaultConfigurationURL
     )
-    #expect(plist?["UserName"] == nil)
-    #expect(agent.plistURL.path.contains("Library/LaunchAgents"))
+    #expect(
+      HostConfiguration.resolvedConfigurationURL(
+        environment: [HostConfiguration.environmentKey: "/tmp/rst.json"]
+      ).path == "/tmp/rst.json"
+    )
   }
 
   @Test

@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 import ScreenProtocol
 
-/// `swifttyd serve` configuration (spec §4). The bind address and the
+/// Roaming configuration of the SwiftMux service (spec §4). The bind address and the
 /// endpoint advertised to clients are explicit; nothing changes firewall
 /// policy.
 public struct HostConfiguration: Sendable, Hashable, Codable {
@@ -73,91 +73,20 @@ public struct HostConfiguration: Sendable, Hashable, Codable {
   }
 }
 
-/// The per-user launchd agent definition (never a root daemon).
-public struct LaunchAgent: Sendable, Hashable {
-  public static let defaultLabel = "dev.swiftty.swifttyd"
+extension HostConfiguration {
+  /// Overrides the configuration location for both the service and the
+  /// bootstrap helper (tests, side-by-side development installs).
+  public static let environmentKey = "SWIFTMUX_ROAMING_CONFIG"
 
-  public var label: String
-  public var executable: String
-  public var configurationPath: String?
-
-  public init(
-    label: String = Self.defaultLabel,
-    executable: String,
-    configurationPath: String? = nil
-  ) {
-    self.label = label
-    self.executable = executable
-    self.configurationPath = configurationPath
-  }
-
-  public static var agentsDirectory: URL {
-    URL(fileURLWithPath: NSHomeDirectory())
-      .appendingPathComponent("Library/LaunchAgents")
-  }
-
-  public var plistURL: URL {
-    Self.agentsDirectory.appendingPathComponent("\(label).plist")
-  }
-
-  /// `gui/<uid>/<label>` for `launchctl print`/`bootout`.
-  public func serviceTarget(uid: uid_t = getuid()) -> String {
-    "gui/\(uid)/\(label)"
-  }
-
-  public var programArguments: [String] {
-    var arguments = [executable, "serve"]
-    if let configurationPath {
-      arguments += ["--config", configurationPath]
-    }
-    return arguments
-  }
-
-  /// The `--config` path recorded in an installed agent property list.
-  public static func configurationPath(inPropertyList data: Data) -> String? {
-    guard
-      let plist = try? PropertyListSerialization.propertyList(
-        from: data,
-        format: nil
-      ) as? [String: Any],
-      let arguments = plist["ProgramArguments"] as? [String],
-      let flag = arguments.firstIndex(of: "--config"),
-      flag + 1 < arguments.count
-    else { return nil }
-    return arguments[flag + 1]
-  }
-
-  /// The configuration `bootstrap --stdio` must use: the one the installed
-  /// agent serves with, so both agree on the control socket. Falls back to
-  /// the default configuration location.
+  /// The configuration both `swiftmux-agent` and `swifttyd bootstrap`
+  /// use, so they agree on the control socket.
   public static func resolvedConfigurationURL(
-    label: String = Self.defaultLabel
+    environment: [String: String] = ProcessInfo.processInfo.environment
   ) -> URL {
-    let agent = LaunchAgent(label: label, executable: "")
-    if let data = try? Data(contentsOf: agent.plistURL),
-      let path = configurationPath(inPropertyList: data)
-    {
+    if let path = environment[environmentKey], !path.isEmpty {
       return URL(fileURLWithPath: path)
     }
-    return HostConfiguration.defaultConfigurationURL
-  }
-
-  /// XML property list contents.
-  public func propertyList() throws -> Data {
-    let plist: [String: Any] = [
-      "Label": label,
-      "ProgramArguments": programArguments,
-      "RunAtLoad": true,
-      "KeepAlive": ["SuccessfulExit": false],
-      "ProcessType": "Interactive",
-      "StandardErrorPath": "/dev/null",
-      "StandardOutPath": "/dev/null",
-    ]
-    return try PropertyListSerialization.data(
-      fromPropertyList: plist,
-      format: .xml,
-      options: 0
-    )
+    return defaultConfigurationURL
   }
 }
 #endif

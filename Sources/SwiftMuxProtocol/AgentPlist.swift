@@ -12,8 +12,10 @@ public enum AgentPlist {
       } else {
         "<key>BundleProgram</key>\n  <string>\(escape(bundleProgram ?? "Contents/MacOS/swiftmux-agent"))</string>"
       }
-    // On demand: started by its Mach service, no KeepAlive or
-    // memory-pressure exit while terminal sessions exist.
+    // Started by its Mach service, and once at login so a configured
+    // roaming listener is up before any local client connects. No
+    // KeepAlive: without roaming it exits at the empty-state barrier.
+    // No memory-pressure exit while terminal sessions exist.
     return """
       <?xml version="1.0" encoding="UTF-8"?>
       <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -27,6 +29,8 @@ public enum AgentPlist {
           <key>\(escape(label))</key>
           <true/>
         </dict>
+        <key>RunAtLoad</key>
+        <true/>
         <key>ProcessType</key>
         <string>Interactive</string>
         <key>EnablePressuredExit</key>

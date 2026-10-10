@@ -85,7 +85,11 @@ let package = Package(
       name: "SwiftMuxService",
       dependencies: ["SwifttyEngine", "SwiftMuxProtocol", "SwiftMuxExport"]
     ),
-    .executableTarget(name: "SwiftMuxAgent", dependencies: ["SwiftMuxService"]),
+    // The one PTY owner: local XPC and, when configured, roaming RST/1.
+    .executableTarget(
+      name: "SwiftMuxAgent",
+      dependencies: ["SwiftMuxService", "TerminalHost"]
+    ),
     // Fresh-process terminal setup: login_tty, then exec the shell in place.
     .executableTarget(name: "SwiftMuxLauncher"),
     .target(name: "SwiftMuxClient", dependencies: ["SwiftMuxProtocol"]),
@@ -153,11 +157,13 @@ let package = Package(
         .product(name: "Crypto", package: "swift-crypto"),
       ]
     ),
-    // Swiftty adapter, macOS PTY ownership, session registry, bootstrap.
+    // RST/1 host over SwiftMux: grants, attachments, screen export and
+    // bootstrap. Owns no PTYs; panes belong to the SwiftMux service.
     .target(
       name: "TerminalHost",
       dependencies: [
-        "SessionCore", "ScreenProtocol", "AppleTransport", "SwifttyCore",
+        "SessionCore", "ScreenProtocol", "AppleTransport", "SwifttyEngine",
+        "SwiftMuxProtocol", "SwiftMuxService",
       ],
       swiftSettings: core
     ),
@@ -186,11 +192,10 @@ let package = Package(
       path: "Apps/Shared",
       swiftSettings: core
     ),
+    // The fixed no-PTY SSH bootstrap helper; relays to the service.
     .executableTarget(
       name: "Swifttyd",
-      dependencies: [
-        "TerminalHost", "SessionCore", "ScreenProtocol", "AppleTransport",
-      ],
+      dependencies: ["TerminalHost", "SessionCore", "ScreenProtocol"],
       path: "Apps/swifttyd",
       swiftSettings: core
     ),
@@ -233,7 +238,7 @@ let package = Package(
       dependencies: [
         "SessionCore", "ScreenProtocol", "SSHClient", "AppleTransport",
         "TerminalHost", "TerminalSurface", "SwifttyCore", "TestSupport",
-        "RoamingApp",
+        "RoamingApp", "SwiftMuxProtocol", "SwiftMuxService", "SwiftMuxClient",
         .product(name: "NIOCore", package: "swift-nio"),
         .product(name: "NIOPosix", package: "swift-nio"),
         .product(name: "NIOSSH", package: "swift-nio-ssh"),

@@ -154,11 +154,20 @@ Appendix B of the spec records the design sources.
 | `RoamingApp` (`Apps/Shared`) | Shared app model and SwiftUI for the direct clients |
 | `swifttyd` (`Apps/swifttyd`) | `serve`, `bootstrap --stdio`, `install`/`uninstall`/`status` |
 
-Host setup: enable Remote Login, install the signed helper at
-`/usr/local/libexec/swifttyd`, write a configuration with an explicit
-`bindAddress`, `advertisedHost` and UDP `port` (51222 by default), then run
-`swifttyd install` as the SSH user (never root). Firewall changes are not made
-automatically.
+Host setup (unified spec §1): there is one PTY owner, the SwiftMux service.
+`swiftmux-agent` serves remote clients from the same process as the native
+app when a roaming configuration exists at
+`~/Library/Application Support/SwiftMux/roaming/config.json` (or
+`--roaming-config PATH`, or `$SWIFTMUX_ROAMING_CONFIG`) with an explicit
+`bindAddress`, `advertisedHost` and UDP `port` (51222 by default). Enable
+Remote Login and install the signed bootstrap helper at
+`/usr/local/libexec/swifttyd`; it only relays `bootstrap --stdio` to the
+service's control socket (`swifttyd status` checks it). RST/1 session IDs
+are SwiftMux workspace IDs, the grant's server instance is the service
+epoch, and each attachment takes the workspace's interactive lease: a
+workspace the Mac app controls is refused (`writerBusy`) unless the client
+resumes with `takeover`. Grant expiry never ends a shell the remote client
+did not create. Firewall changes are not made automatically.
 
 Clients bootstrap with `ssh <mac> /usr/local/libexec/swifttyd bootstrap --stdio`
 (a no-PTY exec with a length-prefixed JSON request), receive a session grant

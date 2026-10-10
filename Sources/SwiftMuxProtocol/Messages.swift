@@ -522,6 +522,10 @@ public enum MuxInput: Codable, Sendable, Hashable {
   case text(String)
   case key(MuxKey, MuxKeyModifiers)
   case focus(Bool)
+  /// One bounded paste (at most `maxPasteChunkBytes`), admitted or
+  /// refused whole and bracketed per the pane's modes. Larger pastes use
+  /// the `pasteBegin`/`pasteChunk`/`pasteEnd` records.
+  case paste(String)
 }
 
 public enum InputPayload: Codable, Sendable, Equatable {

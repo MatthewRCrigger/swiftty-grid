@@ -18,10 +18,10 @@ public enum ControlSocketError: Error, Equatable, Sendable {
 
 /// The owner-only directory holding the agent's control socket (spec §4).
 public enum ControlDirectory {
-  /// `~/Library/Application Support/swifttyd`.
+  /// `~/Library/Application Support/SwiftMux/roaming`.
   public static var defaultURL: URL {
     URL(fileURLWithPath: NSHomeDirectory())
-      .appendingPathComponent("Library/Application Support/swifttyd")
+      .appendingPathComponent("Library/Application Support/SwiftMux/roaming")
   }
 
   /// Creates the directory with mode 0700 when missing, then verifies it

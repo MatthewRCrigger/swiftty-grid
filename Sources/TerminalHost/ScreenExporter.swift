@@ -1,7 +1,7 @@
 #if os(macOS)
 import ScreenProtocol
 import SessionCore
-import SwifttyCore
+import SwifttyEngine
 
 /// Converts the authoritative `TerminalState` into an owned RST/1
 /// `ScreenSnapshot` (spec §6, §A.4.2).

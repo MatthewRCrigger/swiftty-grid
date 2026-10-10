@@ -13,7 +13,7 @@ import Synchronization
 final class HostAttachment: @unchecked Sendable {
   private enum Phase {
     case awaitingAttach
-    case attached(HostTerminalSession)
+    case attached(RoamingSession)
     case closed
   }
 

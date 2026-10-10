@@ -2,54 +2,72 @@
 import Foundation
 import ScreenProtocol
 import SessionCore
+import SwiftMuxProtocol
 @testable import TerminalHost
 import TestSupport
 import Testing
 
 @Suite(.timeLimit(.minutes(1)))
 struct SessionRegistryTests {
+  private static let grid = GridSize(columns: 80, rows: 24)
+
   @Test
-  func `grants carry the injected identity and bounded token lifetime`() throws {
-    let registry = SessionRegistry(identity: testIdentity())
-    let grant = try registry.create(grid: GridSize(columns: 80, rows: 24))
-    #expect(grant.protocol == "RST/1")
-    #expect(grant.serverInstanceID == registry.serverInstanceID)
-    #expect(grant.endpoint == testIdentity().endpoint)
-    #expect(grant.serverCertificateDER == testIdentity().certificate.der)
-    #expect(grant.serverCertificateSHA256.count == 64)
-    #expect(
-      HostCertificate(
-        der: grant.serverCertificateDER,
-        sha256Hex: grant.serverCertificateSHA256
-      ) != nil
-    )
-    let lifetime = grant.tokenExpiresAt - Date().timeIntervalSince1970
-    #expect(lifetime > 8 * 3600 - 60 && lifetime <= 8 * 3600)
-    #expect(grant.initialGrid == GridSize(columns: 80, rows: 24))
-    #expect(!grant.description.contains(grant.applicationToken.bytes.description))
+  func `grants carry the injected identity, service epoch and bounded token lifetime`()
+    async throws
+  {
+    try await withRegistry { registry in
+      let grant = try await registry.create(grid: Self.grid)
+      #expect(grant.protocol == "RST/1")
+      #expect(grant.serverInstanceID == registry.serverInstanceID)
+      // One service epoch for both transports.
+      #expect(
+        grant.serverInstanceID
+          == SessionCore.ServerInstanceID(registry.service.instance)
+      )
+      // The session is a SwiftMux workspace.
+      #expect(
+        await registry.workspaces().map(\.id) == [grant.sessionID.workspace]
+      )
+      #expect(grant.endpoint == testIdentity().endpoint)
+      #expect(grant.serverCertificateDER == testIdentity().certificate.der)
+      #expect(
+        HostCertificate(
+          der: grant.serverCertificateDER,
+          sha256Hex: grant.serverCertificateSHA256
+        ) != nil
+      )
+      let lifetime = grant.tokenExpiresAt - Date().timeIntervalSince1970
+      #expect(lifetime > 8 * 3600 - 60 && lifetime <= 8 * 3600)
+      #expect(grant.initialGrid == Self.grid)
+      #expect(!grant.description.contains(grant.applicationToken.bytes.description))
+    }
   }
 
   @Test
-  func `at most eight sessions`() throws {
-    let registry = SessionRegistry(identity: testIdentity())
-    for _ in 0 ..< 8 {
-      _ = try registry.create(grid: GridSize(columns: 80, rows: 24))
+  func `at most eight sessions`() async throws {
+    try await withRegistry { registry in
+      for _ in 0 ..< 8 { _ = try await registry.create(grid: Self.grid) }
+      await #expect(throws: BootstrapErrorCode.sessionLimit) {
+        try await registry.create(grid: Self.grid)
+      }
+      #expect(await registry.list().count == 8)
+      #expect(await registry.list().allSatisfy { $0.state == .reserved })
     }
-    #expect(throws: BootstrapErrorCode.sessionLimit) {
-      try registry.create(grid: GridSize(columns: 80, rows: 24))
-    }
-    #expect(registry.list().count == 8)
-    #expect(registry.list().allSatisfy { $0.state == .reserved })
   }
 
   @Test
-  func `unattached reservations expire`() async throws {
+  func `unattached reservations expire and end the workspace created for them`()
+    async throws
+  {
     var policy = RegistryPolicy()
     policy.reservationLifetime = .milliseconds(100)
     try await withRegistry(policy: policy) { registry in
-      let grant = try registry.create(grid: GridSize(columns: 80, rows: 24))
+      let grant = try await registry.create(grid: Self.grid)
       #expect(await registry.sweep().isEmpty)
       #expect(await registry.sweep(now: .now + .seconds(1)) == [grant.sessionID])
+      try await hostEventuallyAsync("workspace ended") {
+        await registry.workspaces().isEmpty ? true : nil
+      }
       let client = TestClient(registry)
       try await client.attach(grant)
       #expect(try await client.errorCode() == .unknownSession)
@@ -57,15 +75,16 @@ struct SessionRegistryTests {
   }
 
   @Test
-  func `detached sessions are retained until idle past the retention`()
+  func `detached retention revokes the grant but keeps the shell`()
     async throws
   {
     try await withRegistry { registry in
-      let grant = try registry.create(grid: GridSize(columns: 80, rows: 24))
+      let grant = try await registry.create(grid: Self.grid)
       let client = TestClient(registry)
       _ = try await client.attached(grant)
-      client.connection.sever()
       let session = try #require(registry.session(grant.sessionID))
+      let pid = try #require(await shellPID(registry, session))
+      client.connection.sever()
       try await hostEventually("detached") {
         session.status.state == .detached ? true : nil
       }
@@ -74,17 +93,27 @@ struct SessionRegistryTests {
         await registry.sweep(now: .now + .seconds(24 * 3600 + 1))
           == [grant.sessionID]
       )
-      #expect(session.status.state == .terminated)
+      // Remote authorization ended; the local shell lifetime is separate.
+      #expect(isAlive(pid))
+      #expect(await registry.workspaces().count == 1)
+      let late = TestClient(registry)
+      try await late.attach(grant)
+      #expect(try await late.errorCode() == .unknownSession)
+      // A fresh resume authorizes the same workspace again.
+      let again = try await registry.resume(grant.sessionID)
+      let next = TestClient(registry)
+      _ = try await next.attached(again)
+      let resumed = try #require(registry.session(grant.sessionID))
+      #expect(await shellPID(registry, resumed) == pid)
     }
   }
 
   @Test
-  func `attachment failures fail closed without starting a shell`() async throws
-  {
+  func `attachment failures fail closed`() async throws {
     var policy = RegistryPolicy()
     policy.tokenLifetime = .milliseconds(150)
     try await withRegistry(policy: policy) { registry in
-      let grant = try registry.create(grid: GridSize(columns: 80, rows: 24))
+      let grant = try await registry.create(grid: Self.grid)
       let session = try #require(registry.session(grant.sessionID))
 
       let early = TestClient(registry)
@@ -120,8 +149,9 @@ struct SessionRegistryTests {
       try await expired.attach(grant)
       #expect(try await expired.errorCode() == .expired)
 
-      #expect(session.status.pid == nil)
       #expect(session.status.state == .reserved)
+      // Nothing attached: no lease was taken.
+      #expect(await registry.workspaces().first?.isAttached == false)
     }
   }
 
@@ -130,7 +160,7 @@ struct SessionRegistryTests {
     var policy = RegistryPolicy()
     policy.attachFailureLimit = 3
     try await withRegistry(policy: policy) { registry in
-      let grant = try registry.create(grid: GridSize(columns: 80, rows: 24))
+      let grant = try await registry.create(grid: Self.grid)
       for _ in 0 ..< 3 {
         let bad = TestClient(registry)
         try await bad.attach(grant, token: .random())
@@ -147,11 +177,11 @@ struct SessionRegistryTests {
     async throws
   {
     try await withRegistry { registry in
-      let first = try registry.create(grid: GridSize(columns: 80, rows: 24))
-      let kept = try registry.resume(first.sessionID, writerID: first.writerID)
+      let first = try await registry.create(grid: Self.grid)
+      let kept = try await registry.resume(first.sessionID, writerID: first.writerID)
       #expect(kept.writerID == first.writerID)
       #expect(kept.applicationToken != first.applicationToken)
-      let fresh = try registry.resume(first.sessionID)
+      let fresh = try await registry.resume(first.sessionID)
       #expect(fresh.writerID != first.writerID)
 
       let revoked = TestClient(registry)
@@ -163,48 +193,57 @@ struct SessionRegistryTests {
       #expect(attached.writerID == fresh.writerID)
       #expect(attached.lastFullyAppliedInputSequence == 0)
 
-      #expect(throws: BootstrapErrorCode.unknownSession) {
-        try registry.resume(.random())
+      await #expect(throws: BootstrapErrorCode.unknownSession) {
+        try await registry.resume(.random())
       }
     }
   }
 
   @Test
-  func `bootstrap requests are validated before anything is created`() async {
-    let registry = SessionRegistry(identity: testIdentity())
-    let unsupported = await registry.handle(
-      BootstrapRequest(
-        operation: .create,
-        protocols: ["RST/2"],
-        initialGrid: GridSize(columns: 80, rows: 24)
+  func `bootstrap requests are validated before anything is created`()
+    async throws
+  {
+    try await withRegistry { registry in
+      let unsupported = await registry.handle(
+        BootstrapRequest(
+          operation: .create,
+          protocols: ["RST/2"],
+          initialGrid: Self.grid
+        )
       )
-    )
-    #expect(unsupported == .failure(.unsupportedVersion))
-    let badGrid = await registry.handle(
-      BootstrapRequest(operation: .create, initialGrid: GridSize(columns: 0, rows: 24))
-    )
-    #expect(badGrid == .failure(.malformed))
-    #expect(registry.list().isEmpty)
+      #expect(unsupported == .failure(.unsupportedVersion))
+      let badGrid = await registry.handle(
+        BootstrapRequest(
+          operation: .create,
+          initialGrid: GridSize(columns: 0, rows: 24)
+        )
+      )
+      #expect(badGrid == .failure(.malformed))
+      #expect(await registry.list().isEmpty)
 
-    let created = await registry.handle(
-      BootstrapRequest(operation: .create, initialGrid: GridSize(columns: 80, rows: 24))
-    )
-    guard case let .granted(grant) = created else {
-      Issue.record("create failed")
-      return
+      let created = await registry.handle(
+        BootstrapRequest(operation: .create, initialGrid: Self.grid)
+      )
+      guard case let .granted(grant) = created else {
+        Issue.record("create failed")
+        return
+      }
+      #expect(
+        await registry.handle(BootstrapRequest(operation: .list))
+          == .sessions(await registry.list())
+      )
+      #expect(
+        await registry.handle(
+          BootstrapRequest(operation: .terminate, sessionID: grant.sessionID)
+        ) == .terminated(grant.sessionID)
+      )
+      #expect(
+        await registry.handle(
+          BootstrapRequest(operation: .terminate, sessionID: grant.sessionID)
+        ) == .failure(.unknownSession)
+      )
+      #expect(await registry.list().isEmpty)
     }
-    #expect(await registry.handle(BootstrapRequest(operation: .list)) == .sessions(registry.list()))
-    #expect(
-      await registry.handle(
-        BootstrapRequest(operation: .terminate, sessionID: grant.sessionID)
-      ) == .terminated(grant.sessionID)
-    )
-    #expect(
-      await registry.handle(
-        BootstrapRequest(operation: .terminate, sessionID: grant.sessionID)
-      ) == .failure(.unknownSession)
-    )
-    #expect(registry.list().isEmpty)
   }
 }
 #endif

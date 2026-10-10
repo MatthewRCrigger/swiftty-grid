@@ -4,6 +4,8 @@ import Dispatch
 import Foundation
 import ScreenProtocol
 import SessionCore
+import SwiftMuxProtocol
+import SwiftMuxService
 import Synchronization
 
 /// The QUIC server certificate delivered through SSH (spec §5.2).
@@ -37,7 +39,10 @@ public struct HostIdentity: Sendable, Hashable {
   }
 }
 
-/// Session limits and lifetimes (spec §4, §5.2, §12).
+/// Session limits and lifetimes (spec §4, §5.2, §12). Lifetimes govern
+/// remote authorization only: a SwiftMux workspace outlives them unless
+/// this host created it and it was never attached or its shell exited
+/// (unified spec §7: "local shell lifetime is separate").
 public struct RegistryPolicy: Sendable {
   public var maxSessions = RSTLimits.maxSessionsPerAccount
   public var reservationLifetime = RSTLimits.reservationLifetime
@@ -49,26 +54,30 @@ public struct RegistryPolicy: Sendable {
   /// is refused until the window passes.
   public var attachFailureLimit = 16
   public var attachFailureWindow: Duration = .seconds(10)
-  /// Each escalation phase (SIGHUP, SIGTERM, SIGKILL) waits this long.
-  public var terminationGrace: Duration = .seconds(2)
   public var sweepInterval: Duration = .seconds(1)
 
   public init() {}
 }
 
-/// Owns every host session of this agent lifetime: reservation, grants,
-/// capabilities, attachment authorization, retention and termination.
+/// Remote authorization for SwiftMux workspaces: bootstrap grants,
+/// capabilities, attachment authorization and retention. It owns no
+/// shells; RST/1 session identifiers are workspace identities and the
+/// grant's server instance is the SwiftMux service epoch.
 public final class SessionRegistry: @unchecked Sendable {
   private struct Credential {
     var token: ApplicationToken
     var writer: WriterID
     var expiresAt: ContinuousClock.Instant
+    var takeover: Bool
   }
 
   private struct Entry {
-    var session: HostTerminalSession
+    var session: RoamingSession
     var credential: Credential?
     var createdAt: ContinuousClock.Instant
+    /// Created by a bootstrap `create`, so an abandoned reservation or
+    /// exited shell may be ended here. Workspaces from elsewhere are not.
+    var createdHere: Bool
   }
 
   private struct State {
@@ -76,79 +85,126 @@ public final class SessionRegistry: @unchecked Sendable {
     var failures: [ContinuousClock.Instant] = []
   }
 
-  /// Random identifier for this agent lifetime.
-  public let serverInstanceID: ServerInstanceID
+  /// The SwiftMux service epoch.
+  public let serverInstanceID: SessionCore.ServerInstanceID
   public let identity: HostIdentity
   public let policy: RegistryPolicy
-  private let makeLaunch: @Sendable () -> ShellLaunch
-  private let writer: any PTYWriting
+  public let service: MuxService
+  private let makeLaunch: @Sendable () -> LaunchSpec
+  private let control: MuxLocalSession
   private let state = Mutex(State())
   private let timer = Mutex<DispatchSourceTimer?>(nil)
 
   public init(
+    service: MuxService,
     identity: HostIdentity,
     policy: RegistryPolicy = RegistryPolicy(),
-    launch: @escaping @Sendable () -> ShellLaunch = { .loginShell() },
-    writer: any PTYWriting = DarwinPTYWriter()
+    launch: @escaping @Sendable () -> LaunchSpec = { LaunchSpec() }
   ) {
-    serverInstanceID = .random()
+    self.service = service
+    serverInstanceID = SessionCore.ServerInstanceID(service.instance)
     self.identity = identity
     var policy = policy
     policy.tokenLifetime = min(policy.tokenLifetime, RSTLimits.maxTokenLifetime)
     self.policy = policy
     makeLaunch = launch
-    self.writer = writer
+    let queue = DispatchQueue(label: "swiftmux.roaming.registry")
+    control = MuxLocalSession(queue: queue)
+    queue.sync {
+      control.connect(to: service, frontend: .control, remote: true)
+    }
   }
 
-  deinit { timer.withLock { $0?.cancel() } }
+  deinit {
+    timer.withLock { $0?.cancel() }
+    let control = control
+    control.queue.async { control.close() }
+  }
 
   // MARK: Bootstrap operations
 
-  /// Reserves a session and grants its first capability. The shell does
-  /// not start until the first successful attachment.
-  public func create(grid: GridSize) throws(BootstrapErrorCode) -> BootstrapGrant {
+  /// Starts a new workspace (one pane, kept after exit so the final
+  /// screen survives) and grants its first capability.
+  public func create(
+    grid: GridSize
+  ) async throws(BootstrapErrorCode) -> BootstrapGrant {
     guard grid.isValid else { throw .malformed }
-    let session = HostTerminalSession(
-      grid: grid,
-      launch: makeLaunch(),
-      writer: writer
+    let full = state.withLock { $0.entries.count >= policy.maxSessions }
+    guard !full else { throw .sessionLimit }
+    let result = await control.request(
+      .newWorkspace(
+        NewWorkspaceRequest(
+          columns: grid.columns,
+          rows: grid.rows,
+          launch: makeLaunch(),
+          remainOnExit: true
+        )
+      )
     )
+    guard case let .success(.created(ws)) = result else {
+      if case let .failure(error) = result, error.code == .resourceLimit {
+        throw .sessionLimit
+      }
+      throw .internalError
+    }
+    let id = SessionID(ws.id)
+    let session = makeSession(id, grid: grid)
     let writerID = WriterID.random()
     do {
       try session.authorize(writer: writerID)
     } catch {
       throw .internalError
     }
-    session.onTerminateRequested = { [weak self] id in
-      guard let self else { return }
-      Task { _ = await self.terminate(id) }
-    }
     let now = ContinuousClock.now
-    let credential = issue(writer: writerID, now: now)
+    let credential = issue(writer: writerID, takeover: false, now: now)
     let admitted = state.withLock { s -> Bool in
       guard s.entries.count < policy.maxSessions else { return false }
-      s.entries[session.id] = Entry(
+      s.entries[id] = Entry(
         session: session,
         credential: credential,
-        createdAt: now
+        createdAt: now,
+        createdHere: true
       )
       return true
     }
-    guard admitted else { throw .sessionLimit }
-    return grant(session.id, credential: credential, grid: grid)
+    guard admitted else {
+      _ = await control.request(.endWorkspace(.id(ws.id)))
+      throw .sessionLimit
+    }
+    return grant(id, credential: credential, grid: grid)
   }
 
-  /// Issues fresh credentials for a retained session and revokes the
-  /// previous capability. The writer is kept only when `writerID` names
-  /// the current writer; a different writer cannot take over while
+  /// Issues fresh credentials for a workspace and revokes the previous
+  /// capability. Any workspace of the service can be resumed, including
+  /// one created by the Mac app. The writer is kept only when `writerID`
+  /// names the current writer; a different writer cannot take over while
   /// admitted input is incomplete.
   public func resume(
     _ id: SessionID,
-    writerID: WriterID? = nil
-  ) throws(BootstrapErrorCode) -> BootstrapGrant {
-    guard let session = state.withLock({ $0.entries[id]?.session }) else {
-      throw .unknownSession
+    writerID: WriterID? = nil,
+    takeover: Bool = false,
+    grid: GridSize? = nil
+  ) async throws(BootstrapErrorCode) -> BootstrapGrant {
+    var session = state.withLock { $0.entries[id]?.session }
+    if session == nil {
+      guard await workspaces().contains(where: { $0.id == id.workspace }) else {
+        throw .unknownSession
+      }
+      let candidate = makeSession(id, grid: grid ?? GridSize(columns: 80, rows: 24))
+      session = state.withLock { s -> RoamingSession? in
+        if let existing = s.entries[id] { return existing.session }
+        guard s.entries.count < policy.maxSessions else { return nil }
+        s.entries[id] = Entry(
+          session: candidate,
+          credential: nil,
+          createdAt: .now,
+          createdHere: false
+        )
+        return candidate
+      }
+      guard session != nil else { throw .sessionLimit }
     }
+    guard let session else { throw .unknownSession }
     let writer: WriterID
     if let requested = writerID, requested == session.writerID {
       writer = requested
@@ -160,7 +216,7 @@ public final class SessionRegistry: @unchecked Sendable {
         throw .writerBusy
       }
     }
-    let credential = issue(writer: writer, now: .now)
+    let credential = issue(writer: writer, takeover: takeover, now: .now)
     let found = state.withLock { s -> Bool in
       guard s.entries[id] != nil else { return false }
       s.entries[id]?.credential = credential
@@ -171,43 +227,60 @@ public final class SessionRegistry: @unchecked Sendable {
     return grant(
       id,
       credential: credential,
-      grid: GridSize(columns: status.columns, rows: status.rows)
+      grid: GridSize(
+        columns: min(max(status.columns, 1), RSTLimits.maxColumns),
+        rows: min(max(status.rows, 1), RSTLimits.maxRows)
+      )
     )
   }
 
-  public func list() -> [SessionSummary] {
-    let sessions = state.withLock { s in s.entries.values.map(\.session) }
-    return sessions.map { session in
-      let status = session.status
+  /// The service's workspaces, most recently active first (bounded by
+  /// the wire limit).
+  public func list() async -> [SessionSummary] {
+    let summaries = await workspaces()
+    let entries = state.withLock { $0.entries }
+    let list = summaries.map { ws -> SessionSummary in
+      let id = SessionID(ws.id)
+      guard let status = entries[id]?.session.status else {
+        return SessionSummary(
+          sessionID: id,
+          state: ws.isAttached ? .attached : .detached,
+          columns: 80,
+          rows: 24,
+          lastActivity: ws.createdAt.timeIntervalSince1970
+        )
+      }
       let state: SessionSummary.State =
         switch status.state {
         case .reserved: .reserved
         case .attached: .attached
-        case .detached: .detached
+        case .detached: ws.isAttached ? .attached : .detached
         case .exited, .terminated: .exited
         }
       return SessionSummary(
-        sessionID: session.id,
+        sessionID: id,
         state: state,
-        columns: status.columns,
-        rows: status.rows,
+        columns: min(max(status.columns, 1), RSTLimits.maxColumns),
+        rows: min(max(status.rows, 1), RSTLimits.maxRows),
         lastActivity: status.lastActivityWall,
         exitStatus: status.exitStatus
       )
     }
-    .sorted { $0.lastActivity > $1.lastActivity }
+    return Array(
+      list.sorted { $0.lastActivity > $1.lastActivity }
+        .prefix(RSTLimits.maxSessionsPerAccount)
+    )
   }
 
-  /// Revokes credentials and destroys the session. Returns false when it
-  /// does not exist.
+  /// Revokes credentials and ends the workspace (an explicit user
+  /// request). Returns false when it does not exist.
   @discardableResult
   public func terminate(_ id: SessionID) async -> Bool {
-    guard
-      let session = state.withLock({ $0.entries.removeValue(forKey: id) })?
-        .session
-    else { return false }
-    await session.terminate(grace: policy.terminationGrace)
-    return true
+    let entry = state.withLock { $0.entries.removeValue(forKey: id) }
+    entry?.session.markTerminated()
+    let result = await control.request(.endWorkspace(.id(id.workspace)))
+    if case .success = result { return true }
+    return entry != nil
   }
 
   /// Answers one validated bootstrap request (spec §5.1).
@@ -226,12 +299,19 @@ public final class SessionRegistry: @unchecked Sendable {
       switch request.operation {
       case .create:
         guard let grid = request.initialGrid else { throw .malformed }
-        return .granted(try create(grid: grid))
+        return .granted(try await create(grid: grid))
       case .resume:
         guard let id = request.sessionID else { throw .malformed }
-        return .granted(try resume(id, writerID: request.writerID))
+        return .granted(
+          try await resume(
+            id,
+            writerID: request.writerID,
+            takeover: request.takeover ?? false,
+            grid: request.initialGrid
+          )
+        )
       case .list:
-        return .sessions(list())
+        return .sessions(await list())
       case .terminate:
         guard let id = request.sessionID else { throw .malformed }
         guard await terminate(id) else { throw .unknownSession }
@@ -242,9 +322,26 @@ public final class SessionRegistry: @unchecked Sendable {
     }
   }
 
-  /// The session for `id`, if retained (diagnostics and tests).
-  public func session(_ id: SessionID) -> HostTerminalSession? {
+  /// The roaming session for `id`, if retained (diagnostics and tests).
+  public func session(_ id: SessionID) -> RoamingSession? {
     state.withLock { $0.entries[id]?.session }
+  }
+
+  private func makeSession(_ id: SessionID, grid: GridSize) -> RoamingSession {
+    let session = RoamingSession(id: id, service: service, grid: grid)
+    session.onTerminateRequested = { [weak self] id in
+      guard let self else { return }
+      Task { _ = await self.terminate(id) }
+    }
+    return session
+  }
+
+  /// The service's workspaces, as the control client sees them.
+  package func workspaces() async -> [WorkspaceSummary] {
+    guard case let .success(.workspaces(list)) = await control.request(
+      .listWorkspaces
+    ) else { return [] }
+    return list
   }
 
   // MARK: Attachments
@@ -260,18 +357,27 @@ public final class SessionRegistry: @unchecked Sendable {
   func attach(
     _ request: ControlMessage.Attach,
     attachment: HostAttachment
-  ) async -> AttachOutcome<HostTerminalSession> {
+  ) async -> AttachOutcome<RoamingSession> {
     let now = ContinuousClock.now
-    let checked = state.withLock { s -> AttachOutcome<HostTerminalSession> in
+    let checked = state.withLock { s -> AttachOutcome<(RoamingSession, Bool)> in
       s.failures.removeAll { $0 + policy.attachFailureWindow <= now }
       guard s.failures.count < policy.attachFailureLimit else {
         return .failure(.limitExceeded)
       }
-      let result = Self.authorize(request, entries: s.entries, instance: serverInstanceID, now: now)
+      let result = Self.authorize(
+        request,
+        entries: s.entries,
+        instance: serverInstanceID,
+        now: now
+      )
       if case .failure = result { s.failures.append(now) }
       return result
     }
-    guard case let .success(session) = checked else { return checked }
+    guard case let .success((session, takeover)) = checked else {
+      if case let .failure(code) = checked { return .failure(code) }
+      return .failure(.internalError)
+    }
+    session.allowTakeover = takeover
     switch await session.attach(attachment, writer: request.writerID) {
     case .success: return .success(session)
     case let .failure(code):
@@ -283,9 +389,9 @@ public final class SessionRegistry: @unchecked Sendable {
   private static func authorize(
     _ request: ControlMessage.Attach,
     entries: [SessionID: Entry],
-    instance: ServerInstanceID,
+    instance: SessionCore.ServerInstanceID,
     now: ContinuousClock.Instant
-  ) -> AttachOutcome<HostTerminalSession> {
+  ) -> AttachOutcome<(RoamingSession, Bool)> {
     guard request.serverInstanceID == instance else {
       return .failure(.wrongInstance)
     }
@@ -299,17 +405,19 @@ public final class SessionRegistry: @unchecked Sendable {
     guard credential.writer == request.writerID else {
       return .failure(.unauthorized)
     }
-    return .success(entry.session)
+    return .success((entry.session, credential.takeover))
   }
 
   // MARK: Retention
 
-  /// Expires unattached reservations, idle detached sessions and exited
-  /// sessions past their retention. Returns the removed identifiers.
+  /// Expires remote authorization. Ends only workspaces this host
+  /// created that were never attached, or whose shell exited; every
+  /// other workspace keeps running and only loses its remote grant.
   @discardableResult
   public func sweep(now: ContinuousClock.Instant = .now) async -> [SessionID] {
-    let expired = state.withLock { s -> [HostTerminalSession] in
-      var out: [HostTerminalSession] = []
+    let (removed, end) = state.withLock { s -> ([SessionID], [SessionID]) in
+      var removed: [SessionID] = []
+      var end: [SessionID] = []
       for (id, entry) in s.entries {
         let status = entry.session.status
         let expire: Bool =
@@ -324,17 +432,21 @@ public final class SessionRegistry: @unchecked Sendable {
           case .terminated: true
           case .attached: false
           }
-        if expire {
-          out.append(entry.session)
-          s.entries.removeValue(forKey: id)
+        guard expire else { continue }
+        s.entries.removeValue(forKey: id)
+        removed.append(id)
+        if entry.createdHere,
+          status.state == .reserved || status.state == .exited
+        {
+          end.append(id)
         }
       }
-      return out
+      return (removed, end)
     }
-    for session in expired {
-      await session.terminate(grace: policy.terminationGrace)
+    for id in end {
+      _ = await control.request(.endWorkspace(.id(id.workspace)))
     }
-    return expired.map(\.id)
+    return removed
   }
 
   /// Sweeps periodically until the registry is released.
@@ -359,12 +471,14 @@ public final class SessionRegistry: @unchecked Sendable {
 
   private func issue(
     writer: WriterID,
+    takeover: Bool,
     now: ContinuousClock.Instant
   ) -> Credential {
     Credential(
       token: .random(),
       writer: writer,
-      expiresAt: now + policy.tokenLifetime
+      expiresAt: now + policy.tokenLifetime,
+      takeover: takeover
     )
   }
 

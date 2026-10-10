@@ -7,7 +7,7 @@ import TerminalSurface
 import XCTest
 
 /// Runs the direct-client roaming stack inside a simulator runtime against
-/// a real `swifttyd serve` on the Mac (Scripts/test-roaming-simulator.sh).
+/// a real SwiftMux service with roaming (`swiftmux-agent --roaming-config`) on the Mac (Scripts/test-roaming-simulator.sh).
 /// The control socket stands in for the SSH exec hop, which needs the
 /// user's SSH credentials.
 final class RoamingRuntimeTests: XCTestCase {

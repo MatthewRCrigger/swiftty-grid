@@ -6,7 +6,7 @@
 #   Scripts/real-ssh-env.sh stop  <state-dir>
 #
 # `start` brings up, and leaves running in the background:
-#  - a real `swifttyd serve` on this Mac (QUIC on 127.0.0.1:<quic port>);
+#  - a real SwiftMux service with roaming (`swiftmux-agent --roaming-config`) on this Mac (QUIC on 127.0.0.1:<quic port>);
 #  - an apple/container Linux VM running OpenSSH (sshd, sftp-server) as user
 #    `rst` with a random password and authorized Ed25519 key. Its fixed
 #    helper path /usr/local/libexec/swifttyd relays `bootstrap --stdio` over
@@ -67,9 +67,10 @@ container build --progress plain -t swiftty-rst-ssh:test \
   "$repository_root/Tests/RealSSH" >"$workspace/build.log" 2>&1 \
   || fail "container build failed; see $workspace/build.log"
 
-(cd "$repository_root" && mise exec -- swift build --product swifttyd >"$workspace/swift-build.log" 2>&1) \
+(cd "$repository_root" && mise exec -- swift build --product swiftmux-agent && mise exec -- swift build --product swmux-launcher && mise exec -- swift build --product swifttyd >"$workspace/swift-build.log" 2>&1) \
   || fail "swifttyd build failed; see $workspace/swift-build.log"
-host_bin="$(cd "$repository_root" && mise exec -- swift build --show-bin-path)/swifttyd"
+bin_dir="$(cd "$repository_root" && mise exec -- swift build --show-bin-path)"
+host_bin="$bin_dir/swiftmux-agent"
 # RST_QUIC_PORT / RST_SSH_PORT pin ports, e.g. for router port forwarding.
 quic_port=${RST_QUIC_PORT:-$((51500 + $$ % 400))}
 # RST_PUBLIC_HOST=<this Mac's LAN address> serves physical devices: swifttyd
@@ -83,7 +84,7 @@ else
 fi
 printf '{"bindAddress":"%s","advertisedHost":"%s","port":%s,"stateDirectory":"%s/state"}' \
   "$bind_address" "$advertised" "$quic_port" "$workspace" >"$workspace/config.json"
-"$host_bin" serve --config "$workspace/config.json" </dev/null >/dev/null 2>"$workspace/host.log" &
+"$host_bin" --mach-service "com.chr33s.swiftty.swiftmux.test.$$" --launcher "$bin_dir/swmux-launcher" --roaming-config "$workspace/config.json" </dev/null >/dev/null 2>"$workspace/host.log" &
 echo $! >"$workspace/host.pid"
 
 password=$(openssl rand -hex 12)

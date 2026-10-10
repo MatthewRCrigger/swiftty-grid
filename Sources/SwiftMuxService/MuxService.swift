@@ -126,8 +126,7 @@ public actor MuxService {
       return
     }
     let client = Client(channel: channel)
-    clients[client.id] = client
-    idleWork?.cancel()
+    register(client)
     let id = client.id
     channel.activate { [weak self] event in
       guard let self else { return }
@@ -140,7 +139,12 @@ public actor MuxService {
     }
   }
 
-  private func disconnected(_ id: UUID, reason: String) {
+  func register(_ client: Client) {
+    clients[client.id] = client
+    idleWork?.cancel()
+  }
+
+  func disconnected(_ id: UUID, reason: String) {
     guard clients.removeValue(forKey: id) != nil else { return }
     if let ws = clientLeases[id] {
       // Connection loss: cancel remaining input, release the lease.
@@ -151,15 +155,22 @@ public actor MuxService {
 
   private func send(_ message: ServerMessage, to id: UUID) {
     guard let client = clients[id] else { return }
-    do {
-      client.channel.send(
-        try SMXCodec.encode(message, limit: SMXCodec.serverRecordLimit(limits))
-      )
-    } catch { log.error("encode failed: \(error.description)") }
+    switch client.transport {
+    case let .xpc(channel):
+      do {
+        channel.send(
+          try SMXCodec.encode(
+            message,
+            limit: SMXCodec.serverRecordLimit(limits)
+          )
+        )
+      } catch { log.error("encode failed: \(error.description)") }
+    case let .local(sink): sink.onMessage(message)
+    }
   }
 
   private func receive(_ data: Data, from id: UUID) {
-    guard let client = clients[id] else { return }
+    guard clients[id] != nil else { return }
     let message: ClientMessage
     do {
       message = try SMXCodec.decode(
@@ -171,10 +182,15 @@ public actor MuxService {
       send(.rejected(error), to: id)
       return
     }
+    receive(message, from: id)
+  }
+
+  func receive(_ message: ClientMessage, from id: UUID) {
+    guard let client = clients[id] else { return }
     guard let hello = client.hello else {
       guard case let .hello(hello) = message else {
         send(.rejected(MuxError(.invalidRequest, "expected hello")), to: id)
-        client.channel.cancel()
+        client.cancel()
         return
       }
       handshake(hello, client: client)
@@ -203,7 +219,7 @@ public actor MuxService {
         ),
         to: client.id
       )
-      client.channel.cancel()
+      client.cancel()
       return
     }
     if hello.frontend == .terminal, hello.terminalProfile != SMX.terminalProfile
@@ -217,7 +233,7 @@ public actor MuxService {
         ),
         to: client.id
       )
-      client.channel.cancel()
+      client.cancel()
       return
     }
     client.hello = hello
@@ -1000,6 +1016,11 @@ public actor MuxService {
     guard let record = panes[id] else { return }
     record.runtime.changePosted.store(false, ordering: .releasing)
     let wsID = record.workspace
+    if let holder = leases[wsID], let sink = clients[holder.client]?.local {
+      // The roaming bridge exports its own screens on demand.
+      sink.onPaneChanged(id)
+      return
+    }
     guard leases[wsID]?.frames[id] != nil else {
       // Only panes in other tabs are hidden; the active tab's panes are
       // shown or about to be subscribed.
@@ -1110,6 +1131,9 @@ public actor MuxService {
       let ws = workspaces.first(where: { $0.id == wsID })
     else { return MuxError(.notAttached) }
     let members = Set(ws.allPanes)
+    guard clients[client]?.local == nil || list.isEmpty else {
+      return MuxError(.invalidRequest, "in-process clients export screens")
+    }
     guard list.count <= limits.maxPanes, Set(list).count == list.count,
       list.allSatisfy(members.contains)
     else { return MuxError(.invalidRequest, "subscription list") }
@@ -1206,8 +1230,10 @@ public actor MuxService {
     leases[wsID]?.frames[pane]?.capturing = false
     switch result {
     case let .success((data, revision)):
-      guard let client = clients[current.client] else { return }
-      client.channel.send(data)
+      guard let client = clients[current.client],
+        case let .xpc(channel) = client.transport
+      else { return }
+      channel.send(data)
       leases[wsID]?.frames[pane]?.inflight = (revision, data.count)
       leases[wsID]?.frames[pane]?.lastSent = DispatchTime.now().uptimeNanoseconds
       inflightFrameBytes += data.count
@@ -1259,6 +1285,9 @@ public actor MuxService {
       if case let .text(s) = input, s.utf8.count > limits.maxPasteChunkBytes {
         return ack(MuxError(.resourceLimit, "text input record too large"))
       }
+      if case let .paste(s) = input, s.utf8.count > limits.maxPasteChunkBytes {
+        return ack(MuxError(.resourceLimit, "text input record too large"))
+      }
       let estimate = Self.estimate(input)
       guard runtime.reserve(estimate) else {
         return ack(MuxError(.resourceLimit, "pane input buffer is full"))
@@ -1308,6 +1337,9 @@ public actor MuxService {
   static func estimate(_ input: MuxInput) -> Int {
     switch input {
     case let .text(s): s.utf8.count
+    // Brackets plus a carriage return for every newline.
+    case let .paste(s):
+      s.utf8.count + 12 + s.utf8.reduce(0) { $0 + ($1 == 0x0A ? 1 : 0) }
     case .key: 32
     case .focus: 3
     }
@@ -1397,6 +1429,8 @@ public actor MuxService {
   public func historyBudget(_ pane: PaneID) -> (pane: Int, total: Int)? {
     panes[pane].map { ($0.runtime.historyBytes, allocatedHistoryBytes) }
   }
+
+  func runtime(_ pane: PaneID) -> PaneRuntime? { panes[pane]?.runtime }
 
   public func panePID(_ pane: PaneID) -> Int32? {
     panes[pane].map { $0.runtime.pid }
