@@ -80,7 +80,7 @@ struct AttentionLinkRouting: ViewModifier {
       // iPadOS/visionOS/Catalyst: an attention link goes to an existing
       // window (this one, when it is frontmost) instead of a new scene;
       // every scene shares the one app model and its single terminal.
-      .handlesExternalEvents(preferring: ["attention", "/a/"], allowing: ["*"])
+      .preferringAttentionEvents()
       .sheet(item: $session) { session in
         AttentionDestinationView(navigator: session.navigator) { self.session = nil }
           .macSheetFrame(width: 440, height: 320)
@@ -227,5 +227,17 @@ struct AttentionDestinationView: View {
     case .failure: "Failed"
     case .result: "Result"
     }
+  }
+}
+
+extension View {
+  /// Scene preference for attention links where scenes exist (not tvOS).
+  @ViewBuilder
+  fileprivate func preferringAttentionEvents() -> some View {
+    #if os(tvOS)
+      self
+    #else
+      handlesExternalEvents(preferring: ["attention", "/a/"], allowing: ["*"])
+    #endif
   }
 }
