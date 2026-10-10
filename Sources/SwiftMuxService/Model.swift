@@ -114,7 +114,7 @@ struct ActivePaste {
   var bytes = 0
 }
 
-/// One interactive lease on one workspace (unified spec §6). A client
+/// One interactive lease on one workspace (spec.inbox.md §2). A client
 /// holds at most one; a workspace has at most one holder.
 struct Lease {
   let client: UUID

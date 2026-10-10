@@ -8,7 +8,7 @@ import SwiftMuxProtocol
 import SwiftMuxService
 import Synchronization
 
-/// The roaming transport of the SwiftMux service (unified spec §3, §7):
+/// The roaming transport of the SwiftMux service (spec.inbox.md §1, §7):
 /// the pinned QUIC listener, the bootstrap control socket and the grant
 /// registry, all inside the one service process that owns the panes.
 /// `swifttyd bootstrap --stdio` (run by sshd) reaches it through the

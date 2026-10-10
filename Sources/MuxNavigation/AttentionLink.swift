@@ -35,7 +35,7 @@ public struct AttentionLinkConfiguration: Sendable, Equatable {
   }
 }
 
-/// Parses and builds attention links (swiftty-unified-spec.md §9 step 1):
+/// Parses and builds attention links (spec.inbox.md §4 step 1):
 ///
 /// ```text
 /// swiftty://attention/open?ref=<locator>

@@ -5,7 +5,7 @@ import SwiftMuxProtocol
 import Testing
 
 /// The native attention inbox: toolbar badge, popover rows, seen versus
-/// resolved, and review of results (unified spec §8; acceptance 15).
+/// resolved, and review of results (spec.inbox.md §3; acceptance 15).
 extension MuxNativeTests {
   static func osc(_ body: String) -> String {
     "printf '\\033]7501;\(body)\\007'\r"

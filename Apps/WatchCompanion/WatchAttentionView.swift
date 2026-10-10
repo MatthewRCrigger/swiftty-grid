@@ -1,7 +1,7 @@
 import MuxNavigation
 import SwiftUI
 
-/// Redacted attention summaries (swiftty-unified-spec.md §9, scenario
+/// Redacted attention summaries (spec.inbox.md §4, scenario
 /// 20): category, optional app name, counts and a relative time only.
 /// The single action advertises a Handoff to a paired, authorized device;
 /// the watch never opens panes, takes a writer lease or sends input.

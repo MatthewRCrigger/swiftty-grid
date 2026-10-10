@@ -136,7 +136,7 @@ buffer per pane, 16 MiB frames, 1 MiB pastes and a bounded history per pane.
 ### Deep links
 
 Attention items (OSC 7501) can be opened from a link, as described in section 9
-of `swiftty-unified-spec.md`:
+of `spec.inbox.md`:
 
 ```text
 swiftty://attention/open?ref=<locator>
@@ -217,7 +217,7 @@ https://<configured domain>/a/<locator>
 Every SwiftMux pane parses OSC 7501 program status (protocol revision 0.3),
 whether or not it is shown, attached or leased. The service reduces each change
 in stream order, then sends coalesced updates
-([swiftty-unified-spec.md](swiftty-unified-spec.md) §8):
+([spec.inbox.md](spec.inbox.md) §8):
 
 - `MuxAttention` is a pure reducer with three separate models: the current
   status of each record, **Needs you** occurrences (one per stretch of
@@ -270,7 +270,7 @@ Appendix B of the spec records the design sources.
 | `RoamingApp` (`Apps/Shared`) | Shared app model and SwiftUI for the direct clients |
 | `swifttyd` (`Apps/swifttyd`) | `serve`, `bootstrap --stdio`, `install`/`uninstall`/`status` |
 
-Host setup (unified spec §1): there is one PTY owner, the SwiftMux service.
+Host setup (spec.inbox.md §1): there is one PTY owner, the SwiftMux service.
 `swiftmux-agent` serves remote clients from the same process as the native
 app when a roaming configuration exists at
 `~/Library/Application Support/SwiftMux/roaming/config.json` (or
@@ -290,7 +290,7 @@ Clients bootstrap with `ssh <mac> /usr/local/libexec/swifttyd bootstrap --stdio`
 with the agent's certificate, its SPKI pin (SHA-256 of the certificate's
 SubjectPublicKeyInfo) and a bearer token, and attach over QUIC. The TLS
 handshake must present that key and that exact certificate before the token is
-sent; a changed pin fails closed (unified spec §1.8). The apps are generated
+sent; a changed pin fails closed (spec.inbox.md §1.8). The apps are generated
 with XcodeGen:
 
 ```sh

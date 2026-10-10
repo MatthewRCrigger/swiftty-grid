@@ -3,7 +3,7 @@ import MuxAttention
 import SwiftMuxProtocol
 import Testing
 
-/// The OSC 7501 reducer: every row of the unified spec §8 transition
+/// The OSC 7501 reducer: every row of the spec.inbox.md §3 transition
 /// table, acceptance 12, 13 and 15, exact-occurrence rules and bounds.
 struct AttentionInboxTests {
   let server = ServerInstanceID()

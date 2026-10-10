@@ -4,7 +4,7 @@
 // serves one Mach/XPC endpoint. With a roaming configuration it also
 // serves remote clients (SSH bootstrap + QUIC RST/1) from the same
 // process, so local and remote attachments share one set of panes
-// (unified spec §1). It exits only at the ordered empty-state barrier,
+// (spec.inbox.md §1). It exits only at the ordered empty-state barrier,
 // after an idle delay that respects launchd's launch throttling, and
 // never while serving roaming clients.
 import Darwin

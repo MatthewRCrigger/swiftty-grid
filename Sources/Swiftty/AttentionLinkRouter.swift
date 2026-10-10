@@ -6,7 +6,7 @@ import SwifttyCore
 
 /// Routes `swiftty://attention/open?ref=…` (and configured Universal
 /// Links) into the attention navigator and renders its states as alerts
-/// (swiftty-unified-spec.md §9). The native app has one host: this Mac's
+/// (spec.inbox.md §4). The native app has one host: this Mac's
 /// SwiftMux service over local XPC.
 @MainActor
 final class AttentionLinkRouter {

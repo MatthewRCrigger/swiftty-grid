@@ -2,7 +2,7 @@ import Foundation
 import SwiftMuxProtocol
 
 /// Opaque, non-secret, compact encoding of an `AttentionDestination` for
-/// links (swiftty-unified-spec.md §9).
+/// links (spec.inbox.md §4).
 ///
 /// The locator is **not** an authentication credential and must never
 /// become one: it carries only identifiers, never endpoints, hostnames,

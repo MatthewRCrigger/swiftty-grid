@@ -3,8 +3,8 @@ import ScreenProtocol
 import SwiftMuxProtocol
 import SwiftUI
 
-/// The attention inbox across this device's configured Macs (unified
-/// spec §8, §9). Program text is untrusted: shown verbatim as plain text,
+/// The attention inbox across this device's configured Macs (spec.inbox.md
+/// §3, §4). Program text is untrusted: shown verbatim as plain text,
 /// never as markup or a link. Opening an item goes through the link
 /// navigator, so the exact occurrence is checked and a held workspace
 /// asks for explicit takeover.

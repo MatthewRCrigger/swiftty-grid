@@ -4,7 +4,7 @@ import SwiftMuxProtocol
 import SwiftMuxService
 import Testing
 
-/// The OSC 7501 attention inbox through the service (unified spec §8;
+/// The OSC 7501 attention inbox through the service (spec.inbox.md §3;
 /// acceptance 12, 14, 15, 18, 21).
 @Suite(.serialized, .timeLimit(.minutes(1)))
 struct InboxTests {

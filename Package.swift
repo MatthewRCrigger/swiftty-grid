@@ -73,7 +73,7 @@ let package = Package(
     // SwiftMux (spec.multiplexer.md): shared messages, engine bridge,
     // service, PTY launcher, client connection and frontends.
     .target(name: "SwiftMuxProtocol"),
-    // OSC 7501 attention reducer (unified spec §8): pure, no I/O.
+    // OSC 7501 attention reducer (spec.inbox.md §3): pure, no I/O.
     .target(name: "MuxAttention", dependencies: ["SwiftMuxProtocol"]),
     // Frame export needs only the engine; import needs the renderer.
     .target(
@@ -99,7 +99,7 @@ let package = Package(
     // Fresh-process terminal setup: login_tty, then exec the shell in place.
     .executableTarget(name: "SwiftMuxLauncher"),
     .target(name: "SwiftMuxClient", dependencies: ["SwiftMuxProtocol"]),
-    // Deep links (swiftty-unified-spec.md §9): typed destinations, the
+    // Deep links (spec.inbox.md §4): typed destinations, the
     // opaque locator, URL validation and the navigation state machine.
     // Foundation only, so the watch companion can link it.
     .target(name: "MuxNavigation", dependencies: ["SwiftMuxProtocol"]),

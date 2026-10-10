@@ -5,7 +5,7 @@ import SwiftMuxService
 import Testing
 
 /// Per-workspace leases, explicit takeover, metadata observation and the
-/// input ledger (unified spec §6, §7; acceptance 2, 7, 18).
+/// input ledger (spec.inbox.md §2, §7; acceptance 2, 7, 18).
 @Suite(.serialized, .timeLimit(.minutes(1)))
 struct LeaseTests {
   private func create(

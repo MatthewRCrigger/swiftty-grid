@@ -7,8 +7,8 @@ import SwiftMuxProtocol
 import SwiftMuxService
 import Synchronization
 
-/// One roaming session: an RST/1 view of a SwiftMux workspace (unified
-/// spec §1, §7). The SwiftMux service owns the shell, PTY and terminal;
+/// One roaming session: an RST/1 view of a SwiftMux workspace (spec.inbox.md
+/// §1). The SwiftMux service owns the shell, PTY and terminal;
 /// this owns only the RST side: the writer and its input ledger, the
 /// attachment epoch, and snapshot scheduling for the workspace's active
 /// pane.

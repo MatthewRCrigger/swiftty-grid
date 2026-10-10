@@ -5,7 +5,7 @@ import ScreenProtocol
 import SessionCore
 import TerminalHost
 
-/// `swifttyd`: the fixed, no-PTY SSH bootstrap helper (unified spec §7).
+/// `swifttyd`: the fixed, no-PTY SSH bootstrap helper (spec.inbox.md §1–2).
 /// sshd runs it as the authenticated user; it relays one bounded request
 /// envelope to the SwiftMux service's control socket and prints the
 /// response. It owns no sessions: the SwiftMux service (`swiftmux-agent`,

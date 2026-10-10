@@ -9,7 +9,7 @@ import SwiftMuxService
 import TestSupport
 import Testing
 
-/// One service, two transports (unified spec §1, §12 risk 7): the native
+/// One service, two transports (spec.inbox.md §1, §12 risk 7): the native
 /// XPC frontend and RST/1 roaming clients reach the same panes under one
 /// single-writer rule.
 @Suite(.timeLimit(.minutes(1)))

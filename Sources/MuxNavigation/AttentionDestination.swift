@@ -2,7 +2,7 @@ import Foundation
 import SwiftMuxProtocol
 
 /// The typed internal destination of an attention link
-/// (swiftty-unified-spec.md §9). Kept separate from URL handling: links
+/// (spec.inbox.md §4). Kept separate from URL handling: links
 /// decode into this value, and navigation only ever works from it.
 ///
 /// Every field is an opaque identifier. There is no endpoint, hostname,

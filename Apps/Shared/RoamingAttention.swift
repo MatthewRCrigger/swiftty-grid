@@ -8,7 +8,7 @@ import SwiftMuxProtocol
 import TerminalSurface
 
 /// Attention metadata for roaming hosts over the SSH bootstrap channel
-/// (unified spec §8, §9): host-key check and authentication first, then
+/// (spec.inbox.md §3, §9): host-key check and authentication first, then
 /// lease-free `attention` requests to the SwiftMux service. Opening a pane
 /// goes through the ordinary roaming attachment, with explicit takeover.
 struct RoamingAttentionConnector: AttentionServiceConnector {
@@ -161,7 +161,7 @@ extension SessionID {
 // MARK: Inbox across configured hosts
 
 /// The attention inbox of every configured Mac, keyed by
-/// `(host, service epoch, occurrence)` (unified spec §9 multi-host
+/// `(host, service epoch, occurrence)` (spec.inbox.md §4 multi-host
 /// aggregation). Fetched on demand over SSH; there is no push delivery.
 @MainActor
 @Observable

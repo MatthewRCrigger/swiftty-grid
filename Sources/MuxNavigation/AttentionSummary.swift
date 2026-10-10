@@ -20,7 +20,7 @@ public struct AttentionSummaryPolicy: Sendable, Equatable, Codable {
   )
 }
 
-/// Redacted attention metadata for watchOS (swiftty-unified-spec.md §9,
+/// Redacted attention metadata for watchOS (spec.inbox.md §4,
 /// scenario 20): a category, optional app name, inbox counts and a time.
 /// No title, no message unless the policy allows it, no IDs beyond the
 /// opaque handoff locator, never terminal output.

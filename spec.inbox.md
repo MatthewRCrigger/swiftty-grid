@@ -358,6 +358,47 @@ never keyed by program name or message.
 - **Never an approval channel.** Opening an item never types into the pane;
   OSC 7501 is status only.
 
+### 3.6 Remote inbox (SSH bootstrap)
+
+Remote clients read the inbox over the SSH bootstrap channel, not RST/1,
+so reading never needs an attachment or a writer lease.
+
+- **Operation.** `BootstrapRequest(operation: .attention, attention:)`
+  carries one `AttentionRequest`: `workspaces`, `inbox(InboxQuery)`,
+  `locate(ref)`, `markSeen(ref)`, `snooze(ref, until:)` or
+  `markReviewed(ref)`. A missing payload is refused as `malformed` before
+  anything runs.
+- **Answer.** `BootstrapResponse.metadata(HostMetadata)` always carries
+  `serviceEpoch`, plus the workspaces (with lease generation and holder),
+  an inbox page or a location. The registry answers through its control
+  client, which never holds a lease, so `leaseHeldElsewhere` reports any
+  holder; the client clears it when the holder is its own attachment.
+- **Envelope bound.** An inbox page is re-queried with half the row limit
+  until the encoded response fits the 64 KiB bootstrap envelope, so the
+  cursor stays exact.
+- **Opening.** `resume` accepts `target: ResumeTarget{pane, expectedLease}`.
+  Once the attachment holds the lease it focuses `pane`. With
+  `expectedLease` it takes over only a lease of exactly that generation;
+  a newer holder makes the attachment fail `writerBusy`.
+- **Client (`RoamingAttentionService`).** One SSH connection (host-key
+  check, then authentication) runs each request as a no-PTY exec of the
+  fixed helper. It implements the navigator's `AttentionService`; `open`
+  checks the lease first, then starts the roaming terminal with
+  `RoamingTarget.reveal(session, target)`. Replacing this device's own
+  attachment is not treated as a takeover.
+- **Multi-host inbox (`RoamingInboxModel`).** It fetches the needs-you and
+  results sections from every configured Mac and keys entries by
+  `(host, service epoch, occurrence)`. A host that fails shows its own
+  error; the others still load. It refreshes when a scene becomes active
+  and on pull-to-refresh. The background refresh skips password hosts so
+  it never prompts. There is no push delivery.
+- **Roaming UI (`AttentionInboxView`).** A toolbar entry with the
+  needs-you count. Rows show untrusted text as plain text. Open goes
+  through the link navigator in the current scene, so the exact
+  occurrence is checked and a held workspace asks for takeover. The
+  context menu offers Snooze 1 Hour, Unsnooze, and Mark Reviewed (failures
+  and results only).
+
 ## 4. Deep links and navigation
 
 ### 4.1 Typed destination (`MuxNavigation`)
@@ -476,7 +517,14 @@ every piece is generated from configuration and can be checked locally.
   - The `swiftty` scheme comes from `Apps/Config/AttentionLinks.plist`.
   - `.onOpenURL`, web-activity and Handoff-activity routing live in
     `Apps/Shared/AttentionLinkViews.swift`.
-  - A sheet shows the destination states.
+  - A sheet shows the destination states. Links resolve through
+    `RoamingAttentionConnector` (§3.6).
+  - **Scenes:** each app's `WindowGroup` handles external events, and the
+    root view prefers attention links (`"attention"`, `"/a/"`), so a link
+    reuses an open window instead of creating one. All scenes share the
+    one app model and its single roaming terminal. An inbox entry opens
+    in the scene where it was tapped (an environment action, not shared
+    state). tvOS has no scenes, so the preference is skipped there.
   - **Associated domains:** `Apps/project.yml` runs
     `Scripts/configure-links.sh` as its XcodeGen `preGenCommand`. The script
     writes `Apps/Config/Generated/` (gitignored):
@@ -499,6 +547,12 @@ every piece is generated from configuration and can be checked locally.
   - `AttentionHandoffRequest`, sent as activity `dev.swiftty.attention.open`,
     carries only a locator so a paired device can open the item. It never
     grants a lease or sends input.
+  - **Delivery:** after each inbox refresh the iPhone sends an
+    `AttentionSummaryBatch` (at most 20 redacted summaries, at most 32 KiB)
+    as an extra key in its WatchConnectivity application context, beside
+    the companion status. The watch decodes the two separately and
+    re-applies the redaction limits, dropping any locator that does not
+    decode.
 
 ## 5. Verification
 
@@ -524,8 +578,16 @@ These suites all pass with `mise exec -- swift test`:
   - a takeover refused with `staleRevision` asks again, then focuses the
     pane;
   - snooze choices, error wording and paging cursors.
-- **`MuxNavigationTests` (34):**
+- **`RemoteAttentionTests`:**
+  - the inbox is read, marked seen and snoozed over bootstrap with no
+    lease taken; a request cannot be reviewed away;
+  - bootstrap envelopes carry attention requests end to end, and a
+    missing payload is refused;
+  - a reveal focuses the linked pane, and takes over only the confirmed
+    lease generation (a stale one leaves the Mac in control).
+- **`MuxNavigationTests` (35):**
   - locator round trips, corruption and canonical encoding;
+  - watch summary batches are bounded and re-redacted on decode;
   - malformed links, plus 3,000 random mutations;
   - no secrets in locators or URLs;
   - every navigator branch;

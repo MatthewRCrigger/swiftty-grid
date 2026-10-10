@@ -53,7 +53,7 @@ public struct HostIdentity: Sendable, Hashable {
 /// Session limits and lifetimes (spec §4, §5.2, §12). Lifetimes govern
 /// remote authorization only: a SwiftMux workspace outlives them unless
 /// this host created it and it was never attached or its shell exited
-/// (unified spec §7: "local shell lifetime is separate").
+/// (spec.inbox.md §1–2: "local shell lifetime is separate").
 public struct RegistryPolicy: Sendable {
   public var maxSessions = RSTLimits.maxSessionsPerAccount
   public var reservationLifetime = RSTLimits.reservationLifetime

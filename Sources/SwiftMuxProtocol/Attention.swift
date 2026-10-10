@@ -1,6 +1,6 @@
 import Foundation
 
-// OSC 7501 attention inbox (swiftty-unified-spec.md §8). These are the
+// OSC 7501 attention inbox (spec.inbox.md §3). These are the
 // wire values; the reducer that produces them lives in MuxAttention.
 
 public enum TerminalEpochTag: Sendable {}

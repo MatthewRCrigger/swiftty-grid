@@ -38,7 +38,7 @@ public struct TakeoverOffer: Sendable, Equatable {
   }
 }
 
-/// UI states of one link navigation (swiftty-unified-spec.md §9).
+/// UI states of one link navigation (spec.inbox.md §4).
 public enum AttentionNavigationState: Sendable, Equatable {
   public enum MissingReason: Sendable, Equatable {
     /// Different service epoch: the service restarted since the link
@@ -71,7 +71,7 @@ public enum AttentionNavigationState: Sendable, Equatable {
 }
 
 /// Platform-independent state machine for following an attention link
-/// (swiftty-unified-spec.md §9, steps 1–7). Platform code feeds it URLs
+/// (spec.inbox.md §4, steps 1–7). Platform code feeds it URLs
 /// and user choices, renders `state`, and supplies the host directory and
 /// service connector.
 ///

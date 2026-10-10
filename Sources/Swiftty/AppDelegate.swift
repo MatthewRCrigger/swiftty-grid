@@ -19,7 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   )
 
   /// `swiftty://attention/open?ref=…` and configured Universal Links
-  /// (swiftty-unified-spec.md §9). Other URLs are rejected without
+  /// (spec.inbox.md §4). Other URLs are rejected without
   /// contacting anything.
   func application(_ application: NSApplication, open urls: [URL]) {
     // A burst of links: only the newest navigates.

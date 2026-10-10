@@ -1,7 +1,7 @@
 import Foundation
 import SwiftMuxProtocol
 
-/// The OSC 7501 attention reducer (unified spec §8). Pure and
+/// The OSC 7501 attention reducer (spec.inbox.md §3). Pure and
 /// synchronous: the owner feeds it status changes in stream order, with
 /// a clock, and flushes `takeUpdate()` to subscribers afterwards, so
 /// every transition is reduced before any coalescing.

@@ -23,7 +23,7 @@ public enum CertificatePinError: Error, Equatable, Sendable {
 }
 
 /// The server certificate delivered through the SSH-authenticated
-/// bootstrap (spec §5.2; unified spec: spec.inbox.md §1.8). It is
+/// bootstrap (spec §5.2; spec.inbox.md §1.8). It is
 /// a connection-scoped trust anchor: no system trust, no other self-signed
 /// certificate, no chain building.
 ///

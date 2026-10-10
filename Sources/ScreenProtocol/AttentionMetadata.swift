@@ -1,8 +1,8 @@
 import Foundation
 import SwiftMuxProtocol
 
-/// Lease-free host metadata over the SSH bootstrap channel (unified spec
-/// §8, §9): the attention inbox and workspace lease state, read and
+/// Lease-free host metadata over the SSH bootstrap channel (spec.inbox.md
+/// §3, §4): the attention inbox and workspace lease state, read and
 /// acknowledged without attaching. Every request is authenticated by SSH;
 /// nothing here grants a writer lease or carries input.
 public enum AttentionRequest: Hashable, Sendable, Codable {

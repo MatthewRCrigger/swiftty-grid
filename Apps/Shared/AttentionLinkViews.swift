@@ -5,7 +5,7 @@ import SwiftUI
 
 /// The recipient's saved hosts as navigation hosts: IDs and nicknames
 /// only. A link can name a host profile ID but never adds a host,
-/// endpoint or credential (swiftty-unified-spec.md §9).
+/// endpoint or credential (spec.inbox.md §4).
 struct RoamingHostDirectory: AttentionHostDirectory {
   let model: RoamingAppModel
 

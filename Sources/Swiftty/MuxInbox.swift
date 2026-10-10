@@ -1,7 +1,7 @@
 import AppKit
 import SwiftMuxProtocol
 
-/// The window's mirror of the service attention inbox (unified spec §8):
+/// The window's mirror of the service attention inbox (spec.inbox.md §3):
 /// current requests, unreviewed failures and results. The service owns
 /// the reduction; this only applies its pages and coalesced updates.
 struct MuxInboxModel: Equatable {

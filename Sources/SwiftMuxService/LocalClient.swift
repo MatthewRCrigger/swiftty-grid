@@ -24,7 +24,7 @@ package final class LocalClientSink: Sendable {
 /// An SMX client inside the service process: the roaming (RST/1) bridge
 /// attaches through this, so remote attachments obey the same leases,
 /// takeover fencing, input ledger and pane ownership as local XPC ones
-/// (unified spec §1, §12 risk 7). Values are passed without encoding;
+/// (spec.inbox.md §1, §12 risk 7). Values are passed without encoding;
 /// frames are not delivered (`setSubscriptions` must stay empty): the
 /// client exports screens itself with `inspect`.
 package final class MuxLocalConnection: Sendable {

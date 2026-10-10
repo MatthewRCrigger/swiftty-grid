@@ -60,7 +60,7 @@ public actor MuxService {
   private var listeners: [SMXListener] = []
   /// Called once the empty-state barrier holds for `idleExitDelay`.
   private var onIdle: (@Sendable () -> Void)?
-  /// OSC 7501 attention inbox (unified spec §8).
+  /// OSC 7501 attention inbox (spec.inbox.md §3).
   private var attention: InboxHub
 
   var limits: MuxLimits { configuration.limits }
@@ -1376,7 +1376,7 @@ public actor MuxService {
     guard record.attachment == current.attachment else {
       return ack(MuxError(.staleAttachment, "attachment is no longer current"))
     }
-    // Ledger (unified spec §7): each sequence is answered once and in
+    // Ledger (spec.inbox.md §1–2): each sequence is answered once and in
     // order. A duplicate was already answered and is never written
     // again; a gap is refused without consuming anything.
     guard record.sequence >= current.nextInput else { return ack(nil) }
