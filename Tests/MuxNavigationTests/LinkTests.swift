@@ -83,6 +83,8 @@ struct LinkTests {
       ("swiftty://attention/open?ref=\(locator)\n", .malformedURL),
       ("swiftty://attention/open?ref=x\(String(repeating: "A", count: 2100))", .tooLong),
       ("", .malformedURL),
+      // An empty port parses as no port.
+      ("swiftty://attention:/open?ref=\(locator)", .unexpectedComponent),
     ]
     for (text, expected) in cases {
       let result = reject(text)
@@ -109,7 +111,10 @@ struct LinkTests {
       if let d = try? AttentionLink.parse(text, configuration: config) {
         // Anything accepted is the canonical spelling of a valid locator.
         #expect(d.isValid)
-        #expect(AttentionLink.customURL(for: d).absoluteString.lowercased() == text.lowercased())
+        #expect(
+          AttentionLink.customURL(for: d).absoluteString.lowercased() == text.lowercased(),
+          "accepted non-canonical \(TestFixtureText(text))"
+        )
       }
     }
   }
@@ -150,4 +155,9 @@ struct LinkTests {
     }
     #expect(texts[1].utf8.count <= AttentionLinkConfiguration.maxURLBytes)
   }
+}
+
+/// Escapes controls so a failing fixture cannot affect the terminal.
+private func TestFixtureText(_ s: String) -> String {
+  s.unicodeScalars.map { $0.value < 0x20 || $0.value == 0x7F ? "\\u{\(String($0.value, radix: 16))}" : String($0) }.joined()
 }
