@@ -1,7 +1,9 @@
 import CompanionModel
 import Foundation
+import MuxNavigation
 import Observation
 import SSHClient
+import ScreenProtocol
 import SessionCore
 import SwifttyCore
 import TerminalSurface
@@ -279,6 +281,10 @@ public final class RoamingAppModel {
   /// Receives every observation of the active session (iPhone bridge).
   @ObservationIgnored
   public var onSessionObservation: (@MainActor (PhoneCompanionBridge.Observation) -> Void)?
+  /// Redacted inbox summaries after each refresh, for the watch bridge.
+  @ObservationIgnored
+  public var onAttentionSummaries: (@MainActor ([AttentionSummary]) -> Void)?
+
   @ObservationIgnored
   public var onCompanionSettingsChange: (@MainActor (CompanionSettings) -> Void)?
   /// Observes the user's answer to each `pendingTrust` (diagnostics).
@@ -291,6 +297,8 @@ public final class RoamingAppModel {
 
   @ObservationIgnored private let store: HostProfileStore
   @ObservationIgnored private let resumeStore: SessionResumeStore
+  /// Attention links waiting for their host's next roaming start.
+  @ObservationIgnored private var pendingReveals: [UUID: ResumeTarget] = [:]
   @ObservationIgnored private var trustQueue:
     [(prompt: TrustPrompt, continuation: CheckedContinuation<TrustDecision, Never>)] = []
   @ObservationIgnored private var passwordQueue:
@@ -419,6 +427,21 @@ public final class RoamingAppModel {
     guard let session = activeSession, let controller = session.controller else { return }
     session.controller = nil
     await controller.close(.detach)
+  }
+
+  /// Opens `workspace` on `host` from an attention link: the next start
+  /// resumes it, focuses `target.pane` and takes over only the lease the
+  /// user confirmed (`target.expectedLease`). Replaces the active session.
+  public func reveal(_ host: HostProfile, workspace: SessionID, target: ResumeTarget) {
+    if activeSession != nil { close() }
+    rememberSession(workspace, for: host)
+    pendingReveals[host.id] = target
+    open(host)
+  }
+
+  /// The reveal for `host`'s next start, consumed once.
+  func takeReveal(for host: HostProfile) -> ResumeTarget? {
+    pendingReveals.removeValue(forKey: host.id)
   }
 
   // MARK: Resume (non-secret session identifiers only)

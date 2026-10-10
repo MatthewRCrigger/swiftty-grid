@@ -69,6 +69,7 @@ public final class SessionRegistry: @unchecked Sendable {
     var writer: WriterID
     var expiresAt: ContinuousClock.Instant
     var takeover: Bool
+    var target: ResumeTarget?
   }
 
   private struct Entry {
@@ -183,6 +184,7 @@ public final class SessionRegistry: @unchecked Sendable {
     _ id: SessionID,
     writerID: WriterID? = nil,
     takeover: Bool = false,
+    target: ResumeTarget? = nil,
     grid: GridSize? = nil
   ) async throws(BootstrapErrorCode) -> BootstrapGrant {
     var session = state.withLock { $0.entries[id]?.session }
@@ -216,7 +218,8 @@ public final class SessionRegistry: @unchecked Sendable {
         throw .writerBusy
       }
     }
-    let credential = issue(writer: writer, takeover: takeover, now: .now)
+    var credential = issue(writer: writer, takeover: takeover, now: .now)
+    credential.target = target
     let found = state.withLock { s -> Bool in
       guard s.entries[id] != nil else { return false }
       s.entries[id]?.credential = credential
@@ -291,7 +294,7 @@ public final class SessionRegistry: @unchecked Sendable {
       switch error {
       case .unsupportedProtocol, .tooManyProtocols:
         return .failure(.unsupportedVersion)
-      case .missingSession, .invalidGrid:
+      case .missingSession, .invalidGrid, .missingAttention:
         return .failure(.malformed)
       }
     }
@@ -307,6 +310,7 @@ public final class SessionRegistry: @unchecked Sendable {
             id,
             writerID: request.writerID,
             takeover: request.takeover ?? false,
+            target: request.target,
             grid: request.initialGrid
           )
         )
@@ -316,9 +320,69 @@ public final class SessionRegistry: @unchecked Sendable {
         guard let id = request.sessionID else { throw .malformed }
         guard await terminate(id) else { throw .unknownSession }
         return .terminated(id)
+      case .attention:
+        guard let attention = request.attention else { throw .malformed }
+        return .metadata(try await metadata(attention))
       }
     } catch {
       return .failure(error)
+    }
+  }
+
+  /// Answers lease-free metadata through the control client, which never
+  /// holds a lease, so `leaseHeldElsewhere` reports any holder.
+  public func metadata(
+    _ request: AttentionRequest
+  ) async throws(BootstrapErrorCode) -> HostMetadata {
+    var metadata = HostMetadata(serviceEpoch: service.instance)
+    switch request {
+    case .workspaces:
+      metadata.workspaces = await workspaces()
+    case let .inbox(query):
+      metadata.inbox = try await inboxPage(query)
+    case let .locate(reference):
+      guard case let .success(.attention(location)) = await control.request(
+        .locateAttention(reference)
+      ) else { throw .internalError }
+      metadata.location = location
+    case let .markSeen(reference):
+      try await acknowledge(.markSeen(reference))
+    case let .snooze(reference, until):
+      try await acknowledge(.snooze(reference, until: until))
+    case let .markReviewed(reference):
+      try await acknowledge(.markReviewed(reference))
+    }
+    return metadata
+  }
+
+  private func acknowledge(_ command: MuxCommand) async throws(BootstrapErrorCode) {
+    switch await control.request(command) {
+    case .success: return
+    case let .failure(error) where error.code == .notFound:
+      throw .unknownSession
+    case let .failure(error) where error.code == .invalidRequest:
+      throw .malformed
+    case .failure: throw .internalError
+    }
+  }
+
+  /// One inbox page that fits the bootstrap envelope: the row limit is
+  /// halved until the encoded response fits, so the cursor stays exact.
+  private func inboxPage(
+    _ query: InboxQuery
+  ) async throws(BootstrapErrorCode) -> InboxPage {
+    var query = query
+    query.limit = min(max(query.limit, 1), 100)
+    while true {
+      guard case let .success(.inbox(page)) = await control.request(
+        .inbox(query)
+      ) else { throw .internalError }
+      let response = BootstrapResponse.metadata(
+        HostMetadata(serviceEpoch: service.instance, inbox: page)
+      )
+      if (try? BootstrapEnvelope.encode(response)) != nil { return page }
+      guard query.limit > 1 else { throw .internalError }
+      query.limit /= 2
     }
   }
 
@@ -359,7 +423,7 @@ public final class SessionRegistry: @unchecked Sendable {
     attachment: HostAttachment
   ) async -> AttachOutcome<RoamingSession> {
     let now = ContinuousClock.now
-    let checked = state.withLock { s -> AttachOutcome<(RoamingSession, Bool)> in
+    let checked = state.withLock { s -> AttachOutcome<(RoamingSession, Credential)> in
       s.failures.removeAll { $0 + policy.attachFailureWindow <= now }
       guard s.failures.count < policy.attachFailureLimit else {
         return .failure(.limitExceeded)
@@ -373,11 +437,13 @@ public final class SessionRegistry: @unchecked Sendable {
       if case .failure = result { s.failures.append(now) }
       return result
     }
-    guard case let .success((session, takeover)) = checked else {
+    guard case let .success((session, credential)) = checked else {
       if case let .failure(code) = checked { return .failure(code) }
       return .failure(.internalError)
     }
-    session.allowTakeover = takeover
+    session.allowTakeover =
+      credential.takeover || credential.target?.expectedLease != nil
+    session.target = credential.target
     switch await session.attach(attachment, writer: request.writerID) {
     case .success: return .success(session)
     case let .failure(code):
@@ -391,7 +457,7 @@ public final class SessionRegistry: @unchecked Sendable {
     entries: [SessionID: Entry],
     instance: SessionCore.ServerInstanceID,
     now: ContinuousClock.Instant
-  ) -> AttachOutcome<(RoamingSession, Bool)> {
+  ) -> AttachOutcome<(RoamingSession, Credential)> {
     guard request.serverInstanceID == instance else {
       return .failure(.wrongInstance)
     }
@@ -405,7 +471,7 @@ public final class SessionRegistry: @unchecked Sendable {
     guard credential.writer == request.writerID else {
       return .failure(.unauthorized)
     }
-    return .success((entry.session, credential.takeover))
+    return .success((entry.session, credential))
   }
 
   // MARK: Retention

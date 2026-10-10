@@ -76,6 +76,10 @@ public enum RoamingTarget: Hashable, Sendable {
   case create(GridSize)
   /// A retained session after a cold launch (fresh writer identity).
   case resume(SessionID)
+  /// A workspace opened from an attention link: focus `target.pane`
+  /// and, when `target.expectedLease` is set, take over exactly that
+  /// lease (the one the user confirmed).
+  case reveal(SessionID, ResumeTarget)
 }
 
 /// Nonsecret reason for the latest failure, for display.

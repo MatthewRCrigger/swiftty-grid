@@ -39,7 +39,7 @@ public struct BootstrapService: Sendable {
       switch error {
       case .unsupportedProtocol, .tooManyProtocols:
         return .failure(.unsupportedVersion)
-      case .missingSession, .invalidGrid:
+      case .missingSession, .invalidGrid, .missingAttention:
         return .failure(.malformed)
       }
     }

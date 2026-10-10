@@ -156,3 +156,57 @@ public struct AttentionHandoffRequest: Sendable, Equatable, Codable {
     self.init(locator: locator)
   }
 }
+
+/// The latest redacted summaries a phone sends its paired watch, as one
+/// application-context entry beside the companion status. Bounded in
+/// count and size; decoding re-applies the redaction limits so a watch
+/// never shows more than the policy allows.
+public struct AttentionSummaryBatch: Sendable, Equatable, Codable {
+  public static let dictionaryKey = "attention"
+  public static let maxSummaries = 20
+  public static let maxEncodedBytes = 32 * 1024
+
+  public var summaries: [AttentionSummary]
+  public var sentAt: Date
+
+  public init(summaries: [AttentionSummary], sentAt: Date = .now) {
+    self.summaries = Array(summaries.prefix(Self.maxSummaries))
+    self.sentAt = sentAt
+  }
+
+  public enum CodecError: Error, Equatable {
+    case tooLarge, malformed
+  }
+
+  public func encoded() throws(CodecError) -> Data {
+    guard let data = try? JSONEncoder().encode(self),
+      data.count <= Self.maxEncodedBytes
+    else { throw .tooLarge }
+    return data
+  }
+
+  public static func decode(_ data: Data) throws(CodecError) -> Self {
+    guard data.count <= maxEncodedBytes else { throw .tooLarge }
+    guard var batch = try? JSONDecoder().decode(Self.self, from: data),
+      batch.summaries.count <= maxSummaries
+    else { throw .malformed }
+    batch.summaries = batch.summaries.map { summary in
+      var summary = summary
+      summary.appName = AttentionSummary.sanitize(
+        summary.appName,
+        limit: AttentionSummary.maxAppNameLength
+      )
+      summary.message = AttentionSummary.sanitize(
+        summary.message,
+        limit: AttentionSummary.maxMessageLength
+      )
+      if let locator = summary.locator,
+        (try? AttentionLocator.decode(locator)) == nil
+      {
+        summary.locator = nil
+      }
+      return summary
+    }
+    return batch
+  }
+}

@@ -21,6 +21,8 @@ public struct GridSize: Hashable, Sendable, Codable {
 public struct BootstrapRequest: Hashable, Sendable, Codable {
   public enum Operation: String, Hashable, Sendable, Codable {
     case create, resume, list, terminate
+    /// Lease-free metadata (`attention` names the request).
+    case attention
   }
 
   public var operation: Operation
@@ -35,6 +37,10 @@ public struct BootstrapRequest: Hashable, Sendable, Codable {
   /// another frontend (for example the Mac app) is attached to. Without
   /// it, attaching to a held workspace fails with `writerBusy`.
   public var takeover: Bool?
+  /// For `resume`: pane to show and the exact lease to displace.
+  public var target: ResumeTarget?
+  /// For `attention`.
+  public var attention: AttentionRequest?
 
   public init(
     operation: Operation,
@@ -42,7 +48,9 @@ public struct BootstrapRequest: Hashable, Sendable, Codable {
     sessionID: SessionID? = nil,
     writerID: WriterID? = nil,
     initialGrid: GridSize? = nil,
-    takeover: Bool? = nil
+    takeover: Bool? = nil,
+    target: ResumeTarget? = nil,
+    attention: AttentionRequest? = nil
   ) {
     self.operation = operation
     self.protocols = protocols
@@ -50,10 +58,13 @@ public struct BootstrapRequest: Hashable, Sendable, Codable {
     self.writerID = writerID
     self.initialGrid = initialGrid
     self.takeover = takeover
+    self.target = target
+    self.attention = attention
   }
 
   public enum ValidationError: Error, Equatable {
     case unsupportedProtocol, missingSession, invalidGrid, tooManyProtocols
+    case missingAttention
   }
 
   public func validate() throws(ValidationError) {
@@ -70,6 +81,8 @@ public struct BootstrapRequest: Hashable, Sendable, Codable {
     case .terminate:
       guard sessionID != nil else { throw .missingSession }
     case .list: break
+    case .attention:
+      guard attention != nil else { throw .missingAttention }
     }
   }
 }
@@ -191,11 +204,14 @@ public enum BootstrapResponse: Hashable, Sendable {
   case granted(BootstrapGrant)
   case sessions([SessionSummary])
   case terminated(SessionID)
+  case metadata(HostMetadata)
   case failure(BootstrapErrorCode)
 }
 
 extension BootstrapResponse: Codable {
-  enum Keys: String, CodingKey { case result, grant, sessions, sessionID, error }
+  enum Keys: String, CodingKey {
+    case result, grant, sessions, sessionID, metadata, error
+  }
 
   public init(from decoder: any Decoder) throws {
     let c = try decoder.container(keyedBy: Keys.self)
@@ -213,6 +229,8 @@ extension BootstrapResponse: Codable {
       self = .sessions(list)
     case "terminated":
       self = .terminated(try c.decode(SessionID.self, forKey: .sessionID))
+    case "metadata":
+      self = .metadata(try c.decode(HostMetadata.self, forKey: .metadata))
     case "error":
       self = .failure(try c.decode(BootstrapErrorCode.self, forKey: .error))
     default:
@@ -236,6 +254,9 @@ extension BootstrapResponse: Codable {
     case let .terminated(id):
       try c.encode("terminated", forKey: .result)
       try c.encode(id, forKey: .sessionID)
+    case let .metadata(metadata):
+      try c.encode("metadata", forKey: .result)
+      try c.encode(metadata, forKey: .metadata)
     case let .failure(code):
       try c.encode("error", forKey: .result)
       try c.encode(code, forKey: .error)

@@ -12,6 +12,8 @@ struct VisionClientApp: App {
       RoamingRootView(model: model)
         .environment(\.terminalSurfaceFactory, .live(model))
     }
+    // Links reuse an open window rather than spawning one per link.
+    .handlesExternalEvents(matching: ["*"])
     .defaultSize(width: 960, height: 640)
   }
 }

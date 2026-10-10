@@ -6,6 +6,7 @@ import SwiftUI
 public struct RoamingRootView: View {
   @Bindable var model: RoamingAppModel
   @Environment(\.scenePhase) private var scenePhase
+  @State private var inbox: RoamingInboxModel?
 
   public init(model: RoamingAppModel) {
     self.model = model
@@ -15,6 +16,18 @@ public struct RoamingRootView: View {
     NavigationStack {
       HostListView(model: model)
         .toolbar {
+          if let inbox {
+            ToolbarItem(placement: .automatic) {
+              NavigationLink {
+                AttentionInboxView(inbox: inbox, model: model)
+              } label: {
+                Label(
+                  inbox.needsYouCount > 0 ? "Inbox (\(inbox.needsYouCount))" : "Inbox",
+                  systemImage: inbox.needsYouCount > 0 ? "tray.full" : "tray"
+                )
+              }
+            }
+          }
           if model.profile.companionBridge {
             ToolbarItem(placement: .automatic) {
               NavigationLink {
@@ -34,8 +47,17 @@ public struct RoamingRootView: View {
     .privacyShield(when: hidesContent)
     // Attention deep links resolve only through this device's hosts.
     .attentionLinks(model)
-    .task { model.load() }
+    .task {
+      model.load()
+      if inbox == nil {
+        inbox = RoamingInboxModel(model: model)
+        inbox?.refresh(interactive: false)
+      }
+    }
     .onChange(of: scenePhase, initial: true) { _, phase in
+      // Foreground recovery fetches the inbox again (no push delivery);
+      // never prompting for a password in the background.
+      if phase == .active { inbox?.refresh(interactive: false) }
       // Suspension pauses bulk SFTP work; a Mac window losing focus does
       // not (spec §10).
       switch model.profile.kind {

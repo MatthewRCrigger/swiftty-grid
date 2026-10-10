@@ -16,6 +16,8 @@ struct MobileClientApp: App {
         .environment(\.terminalSurfaceFactory, .live(model))
         .task { watchBridge.attach(to: model) }
     }
+    // Links reuse an open window rather than spawning a scene per link.
+    .handlesExternalEvents(matching: ["*"])
     .onChange(of: scenePhase, initial: true) { _, phase in
       watchBridge.setForeground(phase == .active)
     }

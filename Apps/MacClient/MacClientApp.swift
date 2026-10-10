@@ -18,6 +18,8 @@ struct MacClientApp: App {
         .frame(minWidth: 640, minHeight: 420)
         .task { delegate.model = model }
     }
+    // Links reuse an open window rather than spawning one per link.
+    .handlesExternalEvents(matching: ["*"])
   }
 }
 

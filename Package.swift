@@ -147,7 +147,10 @@ let package = Package(
       dependencies: [.product(name: "Crypto", package: "swift-crypto")]
     ),
     // RST/1 messages, framing, snapshots, validation, bounded scheduler.
-    .target(name: "ScreenProtocol", dependencies: ["SessionCore"]),
+    .target(
+      name: "ScreenProtocol",
+      dependencies: ["SessionCore", "SwiftMuxProtocol"]
+    ),
     // SSH authentication, host trust, exec, shell and the SFTP v3 client.
     .target(
       name: "SSHClient",

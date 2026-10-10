@@ -20,6 +20,8 @@ struct CatalystClientApp: App {
         .environment(\.terminalSurfaceFactory, .live(delegate.model))
         .frame(minWidth: 640, minHeight: 420)
     }
+    // Links reuse an open window rather than spawning one per link.
+    .handlesExternalEvents(matching: ["*"])
   }
 }
 

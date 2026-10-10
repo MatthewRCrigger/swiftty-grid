@@ -179,6 +179,8 @@ actor FakeHost {
       return .terminated(sessionID)
     case .list:
       return .sessions([])
+    case .attention:
+      return .failure(.unsupportedVersion)
     }
   }
 

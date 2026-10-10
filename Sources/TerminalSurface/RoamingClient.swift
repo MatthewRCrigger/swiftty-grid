@@ -151,6 +151,13 @@ public actor RoamingClient {
         sessionID: id,
         initialGrid: desiredGrid
       )
+    case let .reveal(id, revealed):
+      request = BootstrapRequest(
+        operation: .resume,
+        sessionID: id,
+        initialGrid: desiredGrid,
+        target: revealed
+      )
     }
     let response: BootstrapResponse
     do {
@@ -185,7 +192,7 @@ public actor RoamingClient {
     case let .failure(code):
       noteFailure(.bootstrapRejected(code))
       throw .rejected(code)
-    case .sessions, .terminated:
+    case .sessions, .terminated, .metadata:
       noteFailure(.protocolViolation)
       throw .protocolViolation
     }
@@ -508,7 +515,7 @@ public actor RoamingClient {
     case let .failure(code):
       noteFailure(.bootstrapRejected(code))
       return .retry
-    case .sessions, .terminated:
+    case .sessions, .terminated, .metadata:
       noteFailure(.protocolViolation)
       return .retry
     }
@@ -1007,7 +1014,9 @@ public actor RoamingClient {
 
 extension RoamingTarget {
   var sessionID: SessionID? {
-    if case let .resume(id) = self { return id }
-    return nil
+    switch self {
+    case let .resume(id), let .reveal(id, _): id
+    case .create: nil
+    }
   }
 }

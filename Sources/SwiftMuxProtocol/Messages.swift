@@ -191,7 +191,7 @@ public struct WorkspaceSnapshot: Codable, Sendable, Equatable {
   }
 }
 
-public struct WorkspaceSummary: Codable, Sendable, Equatable {
+public struct WorkspaceSummary: Codable, Sendable, Hashable {
   public var id: WorkspaceID
   public var name: String
   public var tabCount: Int
@@ -224,7 +224,7 @@ public struct WorkspaceSummary: Codable, Sendable, Equatable {
   }
 }
 
-public struct LeaseHolder: Codable, Sendable, Equatable {
+public struct LeaseHolder: Codable, Sendable, Hashable {
   public enum Transport: String, Codable, Sendable { case local, remote }
   public var transport: Transport
   public var frontend: FrontendKind

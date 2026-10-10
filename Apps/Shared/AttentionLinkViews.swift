@@ -17,14 +17,6 @@ struct RoamingHostDirectory: AttentionHostDirectory {
   }
 }
 
-extension RoamingAppModel {
-  /// Resolves attention links for roaming hosts. RST/1 has no attention
-  /// messages yet, so this reports a recoverable unavailable state; a
-  /// future RST attention service plugs in here without changing the
-  /// navigator or the views.
-  static let attentionConnector: any AttentionServiceConnector =
-    UnavailableAttentionConnector(reason: "attention not yet available over roaming")
-}
 
 /// One followed link: a navigator bound to this app's hosts.
 @MainActor
@@ -49,6 +41,18 @@ extension View {
   }
 }
 
+/// Opens an attention destination in the current scene's navigator.
+struct OpenAttentionAction {
+  var handler: @MainActor (AttentionDestination) -> Void = { _ in }
+  @MainActor func callAsFunction(_ destination: AttentionDestination) {
+    handler(destination)
+  }
+}
+
+extension EnvironmentValues {
+  @Entry var openAttention = OpenAttentionAction()
+}
+
 struct AttentionLinkRouting: ViewModifier {
   let model: RoamingAppModel
   @State private var session: AttentionLinkSession?
@@ -68,6 +72,15 @@ struct AttentionLinkRouting: ViewModifier {
         else { return }
         open { await $0.open(destination) }
       }
+      // Inbox entries open through the same navigator, in this scene.
+      .environment(
+        \.openAttention,
+        OpenAttentionAction { destination in open { await $0.open(destination) } }
+      )
+      // iPadOS/visionOS/Catalyst: an attention link goes to an existing
+      // window (this one, when it is frontmost) instead of a new scene;
+      // every scene shares the one app model and its single terminal.
+      .handlesExternalEvents(preferring: ["attention", "/a/"], allowing: ["*"])
       .sheet(item: $session) { session in
         AttentionDestinationView(navigator: session.navigator) { self.session = nil }
           .macSheetFrame(width: 440, height: 320)
@@ -78,7 +91,7 @@ struct AttentionLinkRouting: ViewModifier {
   /// results are dropped with it.
   private func open(_ start: @escaping @MainActor (AttentionNavigator) async -> Void) {
     session?.navigator.cancel()
-    let next = AttentionLinkSession(model: model, connector: RoamingAppModel.attentionConnector)
+    let next = AttentionLinkSession(model: model, connector: RoamingAttentionConnector(model: model))
     session = next
     Task { await start(next.navigator) }
   }

@@ -85,6 +85,9 @@ public final class RoamingSession: @unchecked Sendable {
   /// Set by the registry from the current credential: a lease held by
   /// another frontend may be taken over (bootstrap `takeover`).
   var allowTakeover = false
+  /// From the current credential: the pane to focus once the lease is
+  /// held, and the exact lease generation a takeover may displace.
+  var target: ResumeTarget?
 
   init(
     id: SessionID,
@@ -262,8 +265,11 @@ public final class RoamingSession: @unchecked Sendable {
           guard case let .success(.workspaces(summaries)) = list,
             let summary = summaries.first(where: { $0.id == workspace })
           else { return failAttach(.unknownSession, completion) }
+          // A link names the lease the user agreed to displace; a plain
+          // takeover names the one just listed.
+          let expected = self.target?.expectedLease ?? summary.leaseGeneration
           session.request(
-            .takeover(target, expectedLease: summary.leaseGeneration)
+            .takeover(target, expectedLease: expected)
           ) { [self] result in
             guard case let .success(.attached(attachment, ws)) = result else {
               return failAttach(.writerBusy, completion)
@@ -306,6 +312,12 @@ public final class RoamingSession: @unchecked Sendable {
     muxAttachment = smx
     mux?.resetInput()
     apply(ws)
+    if let pane = target?.pane, pane != activePane,
+      ws.panes.contains(where: { $0.id == pane })
+    {
+      // Show the pane an attention link named; layout events follow.
+      mux?.request(.focusPane(pane)) { _ in }
+    }
     epoch += 1
     attachment = a
     a.epoch = epoch

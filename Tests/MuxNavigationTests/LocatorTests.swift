@@ -192,3 +192,34 @@ func sampleItem(
     revision: 1
   )
 }
+
+@Suite("Watch summary batches")
+struct SummaryBatchTests {
+  @Test func batchesAreBoundedAndReRedacted() throws {
+    let long = String(repeating: "x", count: 500)
+    var summaries = (0..<30).map { i in
+      AttentionSummary(
+        category: .needsYou,
+        appName: "app\u{202E}\(i)",
+        counts: InboxCounts(needsYou: 1),
+        updatedAt: .now,
+        message: long,
+        locator: "not-a-locator"
+      )
+    }
+    let batch = AttentionSummaryBatch(summaries: summaries)
+    #expect(batch.summaries.count == AttentionSummaryBatch.maxSummaries)
+    let decoded = try AttentionSummaryBatch.decode(try batch.encoded())
+    for summary in decoded.summaries {
+      #expect(summary.appName?.unicodeScalars.contains("\u{202E}") == false)
+      #expect((summary.message?.count ?? 0) <= AttentionSummary.maxMessageLength)
+      // An invalid locator is dropped rather than handed off.
+      #expect(summary.locator == nil)
+    }
+    summaries = []
+    let oversized = Data(repeating: 0x20, count: AttentionSummaryBatch.maxEncodedBytes + 1)
+    #expect(throws: AttentionSummaryBatch.CodecError.tooLarge) {
+      try AttentionSummaryBatch.decode(oversized)
+    }
+  }
+}

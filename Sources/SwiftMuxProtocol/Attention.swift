@@ -49,7 +49,7 @@ public enum AttentionBlockedKind: String, Codable, Sendable {
 }
 
 /// The current reported status of one record (model 1).
-public struct AttentionStatus: Codable, Sendable, Equatable {
+public struct AttentionStatus: Codable, Sendable, Hashable {
   public var source: AttentionSource
   public var state: AttentionState
   public var kind: AttentionBlockedKind?
@@ -105,7 +105,7 @@ public enum AttentionResolution: String, Codable, Sendable {
 
 /// One attention occurrence (model 2), or a source's retained result
 /// (model 3).
-public struct AttentionItem: Codable, Sendable, Equatable {
+public struct AttentionItem: Codable, Sendable, Hashable {
   public var occurrence: OccurrenceID
   public var source: AttentionSource
   public var workspace: WorkspaceID
@@ -166,7 +166,7 @@ public struct AttentionReference: Codable, Sendable, Hashable {
   }
 }
 
-public struct InboxCounts: Codable, Sendable, Equatable {
+public struct InboxCounts: Codable, Sendable, Hashable {
   /// Distinct sources with a current unsnoozed request or an unreviewed
   /// failure: the main badge.
   public var needsYou: Int
@@ -179,7 +179,7 @@ public struct InboxCounts: Codable, Sendable, Equatable {
   }
 }
 
-public struct InboxQuery: Codable, Sendable, Equatable {
+public struct InboxQuery: Codable, Sendable, Hashable {
   public enum Section: String, Codable, Sendable {
     /// Open needsYou and failure items.
     case needsYou
@@ -201,7 +201,7 @@ public struct InboxQuery: Codable, Sendable, Equatable {
   }
 }
 
-public struct InboxPage: Codable, Sendable, Equatable {
+public struct InboxPage: Codable, Sendable, Hashable {
   public var items: [AttentionItem]
   public var counts: InboxCounts
   /// Inbox revision the page was read at.
@@ -222,7 +222,7 @@ public struct InboxPage: Codable, Sendable, Equatable {
 }
 
 /// Coalesced inbox change, sent to subscribers after reduction.
-public struct InboxUpdate: Codable, Sendable, Equatable {
+public struct InboxUpdate: Codable, Sendable, Hashable {
   public var revision: UInt64
   public var counts: InboxCounts
   public var changed: [AttentionItem]
@@ -246,7 +246,7 @@ public struct InboxUpdate: Codable, Sendable, Equatable {
 }
 
 /// Where an occurrence lives now, read without a lease.
-public struct AttentionLocation: Codable, Sendable, Equatable {
+public struct AttentionLocation: Codable, Sendable, Hashable {
   public enum Availability: String, Codable, Sendable {
     /// The pane is live and the occurrence is current.
     case available

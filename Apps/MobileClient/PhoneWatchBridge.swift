@@ -1,5 +1,6 @@
 import CompanionModel
 import Foundation
+import MuxNavigation
 import Observation
 import RoamingApp
 import Synchronization
@@ -24,6 +25,8 @@ final class PhoneWatchBridge {
   @ObservationIgnored private let core = SharedBridge(
     PhoneCompanionBridge(now: .now)
   )
+  /// Latest encoded `AttentionSummaryBatch`, sent beside the status.
+  @ObservationIgnored private let attention = AttentionCache()
   @ObservationIgnored private var lastPreviewCapture = Date.distantPast
   @ObservationIgnored private weak var model: RoamingAppModel?
   #if canImport(WatchConnectivity)
@@ -41,6 +44,9 @@ final class PhoneWatchBridge {
     model.onSessionObservation = { [weak self] observation in
       self?.observe(observation)
     }
+    model.onAttentionSummaries = { [weak self] summaries in
+      self?.publishAttention(summaries)
+    }
     model.onCompanionSettingsChange = { [weak self] settings in
       guard let self else { return }
       if let context = core.withLock({ $0.update(settings, now: .now) }) {
@@ -49,7 +55,7 @@ final class PhoneWatchBridge {
     }
     #if canImport(WatchConnectivity)
       guard WCSession.isSupported() else { return }
-      let delegate = SessionDelegate(core: core)
+      let delegate = SessionDelegate(core: core, attention: attention)
       self.delegate = delegate
       WCSession.default.delegate = delegate
       WCSession.default.activate()
@@ -93,8 +99,32 @@ final class PhoneWatchBridge {
         let dictionary = try? context.dictionary()
       else { return }
       // Latest-state only; status metadata, never preview text.
-      try? session.updateApplicationContext(dictionary)
+      try? session.updateApplicationContext(attention.merged(into: dictionary))
     #endif
+  }
+
+  /// Redacted attention summaries (no message text, no terminal output).
+  /// Replaces the previous batch; the companion status is resent with it.
+  private func publishAttention(_ summaries: [AttentionSummary]) {
+    guard let data = try? AttentionSummaryBatch(summaries: summaries).encoded()
+    else { return }
+    attention.set(data)
+    publish(core.withLock { $0.applicationContext })
+  }
+}
+
+/// The encoded attention batch, shared with the delegate queue.
+final class AttentionCache: Sendable {
+  private let data = Mutex<Data?>(nil)
+
+  func set(_ value: Data) { data.withLock { $0 = value } }
+
+  func merged(into dictionary: [String: Data]) -> [String: Data] {
+    var dictionary = dictionary
+    if let value = data.withLock({ $0 }) {
+      dictionary[AttentionSummaryBatch.dictionaryKey] = value
+    }
+    return dictionary
   }
 }
 
@@ -116,9 +146,11 @@ final class SharedBridge: Sendable {
   /// Answers watch requests from the shared core on the delegate queue.
   final class SessionDelegate: NSObject, WCSessionDelegate, Sendable {
     private let core: SharedBridge
+    private let attention: AttentionCache
 
-    init(core: SharedBridge) {
+    init(core: SharedBridge, attention: AttentionCache) {
       self.core = core
+      self.attention = attention
     }
 
     func session(
@@ -129,7 +161,7 @@ final class SharedBridge: Sendable {
       guard activationState == .activated, session.isPaired,
         let dictionary = try? core.withLock({ $0.applicationContext }).dictionary()
       else { return }
-      try? session.updateApplicationContext(dictionary)
+      try? session.updateApplicationContext(attention.merged(into: dictionary))
     }
 
     func sessionDidBecomeInactive(_ session: WCSession) {}

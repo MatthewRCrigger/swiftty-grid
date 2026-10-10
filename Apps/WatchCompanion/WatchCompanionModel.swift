@@ -13,9 +13,8 @@ import Observation
 @Observable
 final class WatchCompanionModel {
   private(set) var store = WatchCompanionStore()
-  /// Redacted attention summaries. Empty until a paired device can
-  /// deliver them: the roaming transport has no attention data yet, and
-  /// no new watch messages are defined for it.
+  /// Redacted attention summaries from the paired iPhone's last inbox
+  /// refresh (`AttentionSummaryBatch`). Read-only: no SSH, no input.
   private(set) var attention: [AttentionSummary] = []
   #if canImport(WatchConnectivity)
     @ObservationIgnored private var delegate: WatchSessionDelegate?
@@ -85,6 +84,8 @@ final class WatchCompanionModel {
       store.setReachable(reachable)
     case .context(let context):
       store.receive(context)
+    case .attention(let batch):
+      attention = batch.summaries
     }
   }
 }
@@ -92,6 +93,7 @@ final class WatchCompanionModel {
 enum WatchSessionEvent: Sendable {
   case reachability(Bool)
   case context(CompanionApplicationContext)
+  case attention(AttentionSummaryBatch)
 }
 
 #if canImport(WatchConnectivity)
@@ -124,6 +126,13 @@ enum WatchSessionEvent: Sendable {
     }
 
     private func deliver(_ dictionary: [String: Any]) {
+      var dictionary = dictionary
+      if let data = dictionary.removeValue(forKey: AttentionSummaryBatch.dictionaryKey)
+        as? Data,
+        let batch = try? AttentionSummaryBatch.decode(data)
+      {
+        sink(.attention(batch))
+      }
       guard !dictionary.isEmpty,
         let context = try? CompanionApplicationContext(dictionary: dictionary)
       else { return }

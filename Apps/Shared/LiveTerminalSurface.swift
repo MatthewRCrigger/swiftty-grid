@@ -185,9 +185,16 @@ final class RoamingTerminalController: TerminalSurfaceController {
 
     if choice == .newSession { app.forgetSession(for: host) }
     let resume = app.resumableSessionID(for: host)
+    let reveal = app.takeReveal(for: host)
     phase = .preparing(resume == nil ? "Starting session" : "Resuming session")
     do {
-      try await client.start(resume.map { .resume($0) } ?? .create(grid))
+      let target: RoamingTarget =
+        switch (resume, reveal) {
+        case let (id?, reveal?): .reveal(id, reveal)
+        case let (id?, nil): .resume(id)
+        case (nil, _): .create(grid)
+        }
+      try await client.start(target)
       guard !closed else { return }
       if case .preparing = phase { phase = .running }
     } catch {
