@@ -133,6 +133,38 @@ in section 11 of [spec.multiplexer.md](spec.multiplexer.md).
 The service enforces the limits in `MuxLimits`: 32 panes, a 256 KiB input
 buffer per pane, 16 MiB frames, 1 MiB pastes and a bounded history per pane.
 
+### Attention inbox
+
+Every SwiftMux pane parses OSC 7501 program status (protocol revision 0.3),
+whether or not it is shown, attached or leased. The service reduces each change
+in stream order, then sends coalesced updates
+([swiftty-unified-spec.md](swiftty-unified-spec.md) §8):
+
+- `MuxAttention` is a pure reducer with three separate models: the current
+  status of each record, **Needs you** occurrences (one per stretch of
+  `blocked`), and the latest unreviewed failure and result of each source. A
+  source is identified by service epoch, pane, terminal epoch (new after RIS),
+  record path and record incarnation, never by program name or text. A fast
+  `blocked → working → blocked` sequence produces two occurrences. `done →
+  working` keeps the result. Prompts, process exit and `clear` resolve
+  requests; silence never does.
+- The SMX commands `subscribeInbox`, `inbox` (100 rows per page, opaque
+  cursor), `locateAttention`, `markSeen`, `snooze` and `markReviewed` need no
+  lease. They never resize panes and must match the occurrence exactly.
+  Opening an item marks it seen but does not resolve it. Only failures and
+  results can be reviewed. `locateAttention` reports whether another frontend
+  holds the workspace lease.
+- Limits: 64 records per pane, 16 MiB of decoded status text (resolved history
+  is evicted first, then the oldest results), 256 resolved items kept for
+  stale links, and 16 subscribers. A subscriber can have at most 64
+  unacknowledged updates; if it falls further behind, it gets a single
+  `resync` update instead.
+- The native window's toolbar shows the Needs-you count. Its popover lists
+  requests, failures and results as sanitized plain text. **Open in Pane**
+  reveals the pane, and opening a workspace controlled elsewhere asks before
+  taking over. **Mark Reviewed** dismisses failures and results. OSC 7501
+  reports status only: Swiftty never answers a request for the program.
+
 ## Roaming SSH (RST/1)
 
 [spec.roaming.md](spec.roaming.md) (with its Swiftty integration in Appendix A) defines SSH clients for Apple
