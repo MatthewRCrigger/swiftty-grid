@@ -64,6 +64,36 @@ External transports call `programExited()` when the program or connection ends.
 The [program-status contract](spec.md#osc-7501-program-status) specifies validation,
 lifecycle and reply provenance.
 
+## SwiftMux
+
+[spec.multiplexer.md](spec.multiplexer.md) describes a persistent session
+service for Swiftty. A per-user LaunchAgent (`swiftmux-agent`) owns the shells,
+PTYs, terminal engines, history and workspace layouts. Frontends connect to it
+over one Mach/XPC endpoint using `SMX/1`: tagged JSON records that carry full,
+validated pane frames.
+
+- `swmux` is the terminal client. It runs only inside Swiftty
+  (`TERM_PROGRAM=swiftty`, or pass `--allow-host`). Commands: `new`, `attach`,
+  `list`, `detach`, `end`, `status`. The prefix is `C-b`; press `C-b ?` for the
+  bindings. Settings live in `~/.config/swmux/settings.json`: `prefix`,
+  `escapeDelayMilliseconds` and `remainOnExit`.
+- The Swiftty app's SwiftMux menu attaches a native window. Its panes render
+  service frames directly through Metal. Quitting the app detaches; the shells
+  keep running.
+- Panes start through `swmux-launcher`, which calls `login_tty` and then execs
+  the shell. They run with `TERM=swmux-256color`; the agent compiles that
+  terminfo entry into `~/Library/Application Support/SwiftMux/terminfo`.
+
+```sh
+swift build
+.build/debug/swmux agent install   # development LaunchAgent for this build
+.build/debug/swmux new -s work     # inside Swiftty
+Scripts/package-swiftmux.sh [identity]   # Swiftty.app with the bundled agent (SMAppService)
+```
+
+The service enforces the limits in `MuxLimits`: 32 panes, a 256 KiB input
+buffer per pane, 16 MiB frames, 1 MiB pastes and a bounded history per pane.
+
 ## API and storage contracts
 
 The session, snapshot, input, configuration, and frontend APIs are the embedding

@@ -12,7 +12,7 @@ final class SnapshotStorage: @unchecked Sendable {
   private var scalarCapacity = 64
   private(set) var entryCount = 0
   private var entryCapacity = 16
-  private(set) var hasGraphemes = false
+  var hasGraphemes = false
 
   /// Damage accumulated since this storage was last filled.
   var pending = DamageRegion.full
@@ -104,7 +104,7 @@ final class SnapshotStorage: @unchecked Sendable {
     )
   }
 
-  private func appendGrapheme(_ scalars: borrowing Span<UInt32>) -> UInt32 {
+  func appendGrapheme(_ scalars: borrowing Span<UInt32>) -> UInt32 {
     if scalarCount + scalars.count > scalarCapacity {
       let grown = UnsafeMutablePointer<UInt32>
         .allocate(

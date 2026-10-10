@@ -30,6 +30,10 @@ run = "swift run -c release swiftty-bench"
 description = "Launch the swiftty macOS app"
 run = "swift run -c release swiftty"
 
+[tasks.package-swiftmux]
+description = "Assemble and sign Swiftty.app with the SwiftMux agent: mise run package-swiftmux [identity]"
+run = "Scripts/package-swiftmux.sh"
+
 [tasks.unicode]
 description = "Regenerate Unicode width tables"
 run = "Scripts/update-unicode-tables.sh"

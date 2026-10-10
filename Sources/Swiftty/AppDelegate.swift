@@ -1,10 +1,14 @@
 import AppKit
+import SwiftMuxProtocol
 import SwifttyCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
   private var windows: [TerminalWindowController] = []
   private var config = Configuration.load()
+  /// The one native SwiftMux workspace window (one lease at a time).
+  private var mux: MuxWorkspaceController?
+  private let muxUpdate = MuxUpdateController()
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.mainMenu = makeMenu()
@@ -16,6 +20,137 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   func applicationShouldTerminateAfterLastWindowClosed(
     _ sender: NSApplication
   ) -> Bool { true }
+
+  /// Quit only detaches: service-owned panes keep running and the agent
+  /// stays registered.
+  func applicationShouldTerminate(
+    _ sender: NSApplication
+  ) -> NSApplication.TerminateReply {
+    guard let mux else { return .terminateNow }
+    self.mux = nil
+    Task {
+      await mux.detach()
+      sender.reply(toApplicationShouldTerminate: true)
+    }
+    return .terminateLater
+  }
+
+  // MARK: SwiftMux
+
+  @objc
+  func muxStageUpdate(_ sender: Any?) { muxUpdate.stage() }
+
+  @objc
+  func muxInstallUpdate(_ sender: Any?) {
+    muxUpdate.install { [weak self] in
+      guard let mux = self?.mux else { return }
+      self?.mux = nil
+      await mux.detach()
+      mux.close()
+    }
+  }
+
+  @objc
+  func muxCancelUpdate(_ sender: Any?) { muxUpdate.cancel() }
+
+  private func openMux(_ selector: WorkspaceSelector?) {
+    if let mux {
+      mux.showWindow(nil)
+      return
+    }
+    let config = config
+    Task {
+      do {
+        let controller = try await MuxWorkspaceController.open(
+          selector,
+          configuration: config
+        )
+        controller.onClose = { [weak controller] in
+          if self.mux === controller { self.mux = nil }
+        }
+        mux = controller
+        controller.showWindow(nil)
+      } catch { NSAlert(error: error).runModal() }
+    }
+  }
+
+  @objc
+  func muxNewWorkspace(_ sender: Any?) { openMux(nil) }
+
+  @objc
+  func muxAttach(_ sender: Any?) {
+    Task {
+      do {
+        let list = try await MuxWorkspaceController.listWorkspaces()
+        guard !list.isEmpty else {
+          let alert = NSAlert()
+          alert.messageText = "No SwiftMux workspaces"
+          alert.informativeText = "Create one with New Workspace."
+          alert.runModal()
+          return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Attach to Workspace"
+        let popup = NSPopUpButton(
+          frame: NSRect(x: 0, y: 0, width: 280, height: 26)
+        )
+        for ws in list {
+          popup.addItem(
+            withTitle: "\(ws.name) — \(ws.tabCount) tabs, \(ws.paneCount) panes"
+              + (ws.isAttached ? " (attached)" : "")
+          )
+        }
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Attach")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        openMux(.id(list[popup.indexOfSelectedItem].id))
+      } catch { NSAlert(error: error).runModal() }
+    }
+  }
+
+  @objc
+  func muxDetach(_ sender: Any?) {
+    guard let mux else { return }
+    self.mux = nil
+    Task {
+      await mux.detach()
+      mux.close()
+    }
+  }
+
+  @objc
+  func muxNewTab(_ sender: Any?) { mux?.newTab() }
+
+  @objc
+  func muxSplitLeftRight(_ sender: Any?) { mux?.split(.leftRight) }
+
+  @objc
+  func muxSplitTopBottom(_ sender: Any?) { mux?.split(.topBottom) }
+
+  @objc
+  func muxZoom(_ sender: Any?) { mux?.toggleZoom() }
+
+  @objc
+  func muxEndPane(_ sender: Any?) { mux?.endPane() }
+
+  @objc
+  func muxNextTab(_ sender: Any?) { mux?.cycleTab(1) }
+
+  @objc
+  func muxPreviousTab(_ sender: Any?) { mux?.cycleTab(-1) }
+
+  @objc
+  func validateMenuItem(_ item: NSMenuItem) -> Bool {
+    switch item.action {
+    case #selector(muxDetach(_:)), #selector(muxNewTab(_:)),
+      #selector(muxSplitLeftRight(_:)), #selector(muxSplitTopBottom(_:)),
+      #selector(muxZoom(_:)), #selector(muxEndPane(_:)),
+      #selector(muxNextTab(_:)), #selector(muxPreviousTab(_:)):
+      mux != nil
+    default: true
+    }
+  }
 
   @objc
   func newWindow(_ sender: Any?) {
@@ -102,6 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item("Close", #selector(NSWindow.performClose(_:)), key: "w"),
       ]
     )
+    submenu("SwiftMux", muxMenuItems())
     submenu(
       "Edit",
       [
@@ -195,6 +331,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   /// A menu item whose shortcut is whatever `action` is bound to (the
   /// view's key bindings handle the key itself; this only shows it).
+  private func muxMenuItems() -> [NSMenuItem] {
+    [
+      item("New Workspace", #selector(muxNewWorkspace(_:))),
+      item("Attach to Workspace…", #selector(muxAttach(_:))),
+      item("Detach", #selector(muxDetach(_:))), .separator(),
+      item("New Tab", #selector(muxNewTab(_:))),
+      item("Split Left/Right", #selector(muxSplitLeftRight(_:))),
+      item("Split Top/Bottom", #selector(muxSplitTopBottom(_:))),
+      item("Zoom Pane", #selector(muxZoom(_:))),
+      item("End Pane", #selector(muxEndPane(_:))), .separator(),
+      item("Next Tab", #selector(muxNextTab(_:))),
+      item("Previous Tab", #selector(muxPreviousTab(_:))), .separator(),
+      item("Stage Update…", #selector(muxStageUpdate(_:))),
+      item("Install Staged Update…", #selector(muxInstallUpdate(_:))),
+      item("Cancel Update", #selector(muxCancelUpdate(_:))),
+    ]
+  }
+
   private func item(
     _ title: String,
     _ selector: Selector,

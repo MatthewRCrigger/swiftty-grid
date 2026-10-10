@@ -1,0 +1,315 @@
+import Foundation
+import SwiftMuxProtocol
+
+/// What the compositor draws over one pane.
+public struct PaneOverlay: Sendable {
+  /// Inclusive selection in viewport cells.
+  public var selection:
+    (start: (row: Int, column: Int), end: (row: Int, column: Int), lines: Bool)?
+  /// Copy-mode cursor.
+  public var cursor: (row: Int, column: Int)?
+
+  public init(
+    selection: (
+      start: (row: Int, column: Int), end: (row: Int, column: Int), lines: Bool
+    )? = nil,
+    cursor: (row: Int, column: Int)? = nil
+  ) {
+    self.selection = selection
+    self.cursor = cursor
+  }
+}
+
+/// Composes owned pane frames into one terminal-sized workspace with
+/// one-cell dividers and a status row. Decoration belongs to this
+/// frontend; the shared layout has no border.
+public struct Compositor {
+  public static let divider = 1
+
+  public var columns: Int
+  public var rows: Int
+
+  public init(columns: Int, rows: Int) {
+    self.columns = max(1, columns)
+    self.rows = max(1, rows)
+  }
+
+  /// Area for panes: everything above the status row.
+  public var paneArea: LayoutRect {
+    LayoutRect(x: 0, y: 0, width: columns, height: max(0, rows - 1))
+  }
+
+  /// Visible pane rectangles of a tab, honouring zoom.
+  public func frames(for tab: TabSnapshot) -> [PaneID: LayoutRect] {
+    if let zoomed = tab.zoomedPane { return [zoomed: paneArea] }
+    return LayoutGeometry.frames(
+      tab.layout,
+      in: paneArea,
+      divider: Self.divider
+    )
+  }
+
+  public func dividers(for tab: TabSnapshot) -> [LayoutDivider] {
+    guard tab.zoomedPane == nil else { return [] }
+    return LayoutGeometry.dividers(
+      tab.layout,
+      in: paneArea,
+      divider: Self.divider
+    )
+  }
+
+  public func compose(
+    workspace: WorkspaceSnapshot,
+    frames: [PaneID: PaneFrame],
+    overlays: [PaneID: PaneOverlay] = [:],
+    status: StatusLine,
+    showCursor: Bool
+  ) -> ScreenBuffer {
+    var screen = ScreenBuffer(columns: columns, rows: rows)
+    guard let tab = workspace.activeTabSnapshot else {
+      drawStatus(status, into: &screen)
+      return screen
+    }
+    let rects = self.frames(for: tab)
+    for (pane, rect) in rects {
+      if let frame = frames[pane] {
+        draw(frame, in: rect, overlay: overlays[pane], into: &screen)
+      } else {
+        screen.fill(rect)
+      }
+      if let exit = workspace.pane(pane)?.exitStatus, rect.height > 0 {
+        let note = " [exited \(exit)] "
+        screen.write(
+          note,
+          x: rect.x + max(0, rect.width - note.count),
+          y: rect.y,
+          style: OuterStyle(foreground: .palette(0), background: .palette(3))
+        )
+      }
+    }
+    drawDividers(tab: tab, active: rects[tab.activePane], into: &screen)
+    drawStatus(status, into: &screen)
+    if showCursor, let rect = rects[tab.activePane],
+      let frame = frames[tab.activePane],
+      overlays[tab.activePane]?.cursor == nil, frame.cursor.visible,
+      frame.cursor.x < rect.width, frame.cursor.y < rect.height
+    {
+      screen.cursor = (
+        rect.x + frame.cursor.x, rect.y + frame.cursor.y, frame.cursor.style
+      )
+    }
+    return screen
+  }
+
+  /// Draws a frame clipped to `rect`; uncovered space stays blank while
+  /// a resize is pending.
+  func draw(
+    _ frame: PaneFrame,
+    in rect: LayoutRect,
+    overlay: PaneOverlay?,
+    into screen: inout ScreenBuffer
+  ) {
+    screen.fill(rect)
+    let g = frame.grid
+    let w = min(rect.width, g.columns)
+    let h = min(rect.height, g.rows)
+    var styleCache: [Int: OuterStyle] = [:]
+    let reverse = frame.modes.contains(.reverseVideo)
+    for y in 0 ..< h {
+      for x in 0 ..< w {
+        let i = y * g.columns + x
+        let kind = g.kind(at: i)
+        if kind == .continuation { continue }
+        let si = g.style(at: i)
+        var style = styleCache[si] ?? OuterStyle(frame.styles[si])
+        styleCache[si] = style
+        if reverse { style = style.toggling(OuterStyle.inverse) }
+        if let overlay,
+          Self.selected(overlay, row: y, column: x, columns: g.columns)
+        {
+          style = style.toggling(OuterStyle.inverse)
+        }
+        if let c = overlay?.cursor, c.row == y, c.column == x {
+          style = style.toggling(OuterStyle.inverse)
+        }
+        let text: String
+        var width: UInt8 = 1
+        switch kind {
+        case .padding: text = " "
+        case .wideLead:
+          // Clip a wide character that would cross the pane edge.
+          if x + 1 >= w {
+            text = " "
+          } else {
+            text = String(
+              String.UnicodeScalarView(frame.scalars(row: y, column: x))
+            )
+            width = 2
+          }
+        default:
+          text = String(
+            String.UnicodeScalarView(frame.scalars(row: y, column: x))
+          )
+        }
+        screen.put(
+          ScreenCell(text: text, width: width, style: style),
+          x: rect.x + x,
+          y: rect.y + y
+        )
+      }
+    }
+    if let search = frame.search {
+      for (n, span) in search.visible.enumerated() {
+        let style = OuterStyle(
+          foreground: .palette(0),
+          background: .palette(n == search.selectedVisible ? 3 : 11)
+        )
+        for row in max(0, span.startRow) ... min(h - 1, span.endRow) where h > 0
+        {
+          let from = row == span.startRow ? span.startColumn : 0
+          let to = row == span.endRow ? span.endColumn : g.columns - 1
+          guard from <= to else { continue }
+          for x in from ... to where x < w {
+            var cell = screen[rect.x + x, rect.y + row]
+            guard cell.width != 0 else { continue }
+            cell.style.foreground = style.foreground
+            cell.style.background = style.background
+            screen[rect.x + x, rect.y + row] = cell
+          }
+        }
+      }
+    }
+  }
+
+  static func selected(
+    _ overlay: PaneOverlay,
+    row: Int,
+    column: Int,
+    columns: Int
+  ) -> Bool {
+    guard let s = overlay.selection else { return false }
+    var (a, b) = (s.start, s.end)
+    if (b.row, b.column) < (a.row, a.column) { swap(&a, &b) }
+    guard row >= a.row, row <= b.row else { return false }
+    if s.lines { return true }
+    if row == a.row, column < a.column { return false }
+    if row == b.row, column > b.column { return false }
+    return true
+  }
+
+  private func drawDividers(
+    tab: TabSnapshot,
+    active: LayoutRect?,
+    into screen: inout ScreenBuffer
+  ) {
+    let dividers = self.dividers(for: tab)
+    guard !dividers.isEmpty else { return }
+    var mask = [Bool](repeating: false, count: columns * rows)
+    for d in dividers {
+      for y in d.rect.y ..< min(rows - 1, d.rect.maxY) {
+        for x in d.rect.x ..< min(columns, d.rect.maxX) {
+          mask[y * columns + x] = true
+        }
+      }
+    }
+    func on(_ x: Int, _ y: Int) -> Bool {
+      x >= 0 && y >= 0 && x < columns && y < rows - 1 && mask[y * columns + x]
+    }
+    let normal = OuterStyle(foreground: .palette(8))
+    let highlight = OuterStyle(foreground: .palette(2))
+    for y in 0 ..< max(0, rows - 1) {
+      for x in 0 ..< columns where mask[y * columns + x] {
+        let u = on(x, y - 1)
+        let d = on(x, y + 1)
+        let l = on(x - 1, y)
+        let r = on(x + 1, y)
+        let ch: String =
+          switch (u || d, l || r) {
+          case (true, false): "│"
+          case (false, _): "─"
+          case (true, true):
+            switch (u, d, l, r) {
+            case (true, true, true, true): "┼"
+            case (true, true, false, true): "├"
+            case (true, true, true, false): "┤"
+            case (false, true, _, _): "┬"
+            default: "┴"
+            }
+          }
+        let touchesActive =
+          active.map { a in
+            (x >= a.x - 1 && x <= a.maxX && y >= a.y - 1 && y <= a.maxY)
+          } ?? false
+        screen.put(
+          ScreenCell(text: ch, style: touchesActive ? highlight : normal),
+          x: x,
+          y: y
+        )
+      }
+    }
+  }
+
+  private func drawStatus(_ status: StatusLine, into screen: inout ScreenBuffer)
+  {
+    let y = rows - 1
+    let base = OuterStyle(foreground: .palette(0), background: .palette(2))
+    screen.fill(LayoutRect(x: 0, y: y, width: columns, height: 1), style: base)
+    if let prompt = status.prompt {
+      screen.write(
+        prompt,
+        x: 0,
+        y: y,
+        style: OuterStyle(foreground: .palette(0), background: .palette(3))
+      )
+      if status.promptCursor {
+        screen.cursor = (min(columns - 1, prompt.count), y, 2)
+      }
+      return
+    }
+    let right = status.right
+    let rightWidth = min(columns, right.count)
+    var x = 0
+    screen.write(
+      status.left,
+      x: x,
+      y: y,
+      style: base,
+      limit: max(0, columns - rightWidth - 1)
+    )
+    x = min(columns, status.left.count)
+    for item in status.items where x < columns - rightWidth - 1 {
+      let style =
+        item.active
+        ? OuterStyle(
+          foreground: .palette(0),
+          background: .palette(2),
+          flags: OuterStyle.bold | OuterStyle.inverse
+        ) : base
+      screen.write(
+        item.text,
+        x: x,
+        y: y,
+        style: style,
+        limit: columns - rightWidth - 1 - x
+      )
+      x += item.text.count
+    }
+    screen.write(right, x: columns - rightWidth, y: y, style: base)
+  }
+}
+
+public struct StatusLine: Sendable {
+  public struct Item: Sendable {
+    public var text: String
+    public var active: Bool
+  }
+
+  public var left = ""
+  public var items: [Item] = []
+  public var right = ""
+  /// Replaces the whole line (messages, prompts).
+  public var prompt: String?
+  public var promptCursor = false
+
+  public init() {}
+}

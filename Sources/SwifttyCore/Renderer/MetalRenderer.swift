@@ -262,6 +262,41 @@ public final class MetalRenderer {
     commandBuffer.commit()
   }
 
+  /// Outcome of a nonblocking submission.
+  public enum SubmitResult: Sendable, Equatable {
+    case submitted
+    /// The previous frame's GPU work still owns the instance buffer.
+    case busy
+    case noDrawable
+  }
+
+  /// Like `draw(_:in:)` but never waits for in-flight GPU work. Only a
+  /// `.submitted` result means the snapshot is being presented; on
+  /// `.busy` or `.noDrawable` keep it pending and retry later.
+  @MainActor
+  public func tryDraw(
+    _ snapshot: RenderSnapshot,
+    in view: MTKView
+  ) -> SubmitResult {
+    guard inFlight.wait(timeout: .now()) == .success else { return .busy }
+    guard let drawable = view.currentDrawable,
+      let pass = view.currentRenderPassDescriptor
+    else {
+      inFlight.signal()
+      return .noDrawable
+    }
+    let commandBuffer = encode(
+      snapshot,
+      options: options,
+      pass: pass,
+      size: view.drawableSize,
+      acquired: true
+    )
+    commandBuffer.present(drawable)
+    commandBuffer.commit()
+    return .submitted
+  }
+
   /// Renders into the layer's next drawable and presents it. Returns false
   /// when no drawable was available.
   @discardableResult
@@ -321,8 +356,10 @@ public final class MetalRenderer {
     options: RenderOptions,
     pass: MTLRenderPassDescriptor,
     size: CGSize,
+    acquired: Bool = false,
   ) -> MTLCommandBuffer {
-    inFlight.wait()  // the instance buffer is about to be mutated
+    // The instance buffer is about to be mutated.
+    if !acquired { inFlight.wait() }
     let palette = effectivePalette(snapshot)
     let bg = palette.background
     let alpha = Double(Self.backgroundAlpha(options.backgroundOpacity)) / 255

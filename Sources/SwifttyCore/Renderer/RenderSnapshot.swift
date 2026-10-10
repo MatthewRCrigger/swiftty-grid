@@ -11,6 +11,20 @@ public struct CursorState: Sendable, Equatable {
   public var isVisible: Bool
   public var style: CursorStyle
   public var isBlinking: Bool
+
+  public init(
+    x: Int,
+    y: Int,
+    isVisible: Bool,
+    style: CursorStyle,
+    isBlinking: Bool
+  ) {
+    self.x = x
+    self.y = y
+    self.isVisible = isVisible
+    self.style = style
+    self.isBlinking = isBlinking
+  }
 }
 
 /// A highlighted span in snapshot rows (inclusive; rows may lie outside

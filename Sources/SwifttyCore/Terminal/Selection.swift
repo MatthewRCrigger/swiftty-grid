@@ -413,7 +413,7 @@ extension TerminalState {
     damage.setFull()
   }
 
-  internal mutating func markSearchDirty() {
+  package mutating func markSearchDirty() {
     searchNeedsRefresh = searchQuery != nil
   }
 
@@ -483,7 +483,7 @@ extension TerminalState {
     damage.setFull()
   }
 
-  internal mutating func refreshSearchIfNeeded() {
+  package mutating func refreshSearchIfNeeded() {
     if searchNeedsRefresh { refreshSearch() }
   }
 
