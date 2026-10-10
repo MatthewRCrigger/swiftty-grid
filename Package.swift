@@ -253,7 +253,7 @@ let package = Package(
       name: "SwifttyAppTests",
       dependencies: [
         "Swiftty", "SwifttyMac", "SwifttyCore", "TestSupport", "SwiftMuxService",
-        "SwiftMuxClient", "SwiftMuxProtocol",
+        "SwiftMuxClient", "SwiftMuxProtocol", "MuxNavigation", "MuxNavigationSMX",
       ]
     ),
     .testTarget(

@@ -15,7 +15,8 @@ final class AttentionLinkRouter {
   static let thisMac = NavigationHost(id: localHostID(), name: "This Mac")
 
   private let navigator: AttentionNavigator
-  /// Whether this app's own window already holds `workspace`'s lease.
+  /// Whether this app's own window holds `workspace`'s lease right now
+  /// (not merely shows it: a detached window holds none).
   private let ownsWorkspace: @MainActor (WorkspaceID) -> Bool
   /// The last state rendered, so one state never shows two alerts.
   private var shown: AttentionNavigationState?
@@ -79,13 +80,16 @@ final class AttentionLinkRouter {
       }
     case let .ready(preview):
       if navigator.destination?.intent == .reveal {
-        await navigator.didView()
+        // Nothing is shown before the pane: seen only once it opens.
         await navigator.openInPane()
         return
       }
       let alert = itemAlert(preview, headline: headline(preview.item))
-      if preview.leaseHeldElsewhere, !ownsWorkspace(preview.target.workspace) {
-        alert.informativeText += "\n\nAnother client controls this workspace."
+      if let note = Self.leaseNote(
+        preview,
+        owned: ownsWorkspace(preview.target.workspace)
+      ) {
+        alert.informativeText += "\n\n" + note
       }
       alert.addButton(withTitle: "Open in Pane")
       alert.addButton(withTitle: "Close")
@@ -137,6 +141,14 @@ final class AttentionLinkRouter {
         navigator.cancel()
       }
     }
+  }
+
+  /// The `.ready` note about another controller. `owned` is whether this
+  /// app's window holds the lease now; a window detached by another
+  /// frontend does not, so the note names that controller.
+  static func leaseNote(_ preview: AttentionPreview, owned: Bool) -> String? {
+    preview.leaseHeldElsewhere && !owned
+      ? "Another client controls this workspace." : nil
   }
 
   private func headline(_ item: AttentionItem) -> String {
@@ -205,7 +217,7 @@ final class AttentionLinkRouter {
     return id
   }
 
-  private struct Opener: AttentionPaneOpener {
+  struct Opener: AttentionPaneOpener {
     let reveal: @MainActor @Sendable (PaneTarget, UInt64?) async throws -> Void
 
     func open(

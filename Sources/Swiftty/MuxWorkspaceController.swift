@@ -1,5 +1,7 @@
 import AppKit
+import MuxNavigation
 import ServiceManagement
+import Synchronization
 import SwiftMuxClient
 import SwiftMuxProtocol
 import SwifttyCore
@@ -50,6 +52,10 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private var geometryScheduled = false
   private var subscribed: [PaneID] = []
   private var detached = false
+  /// Whether this window still holds its workspace's lease: false once
+  /// it detached, lost its connection or another frontend took over
+  /// (the window then shows "SwiftMux — detached").
+  var holdsLease: Bool { !detached && attachedWorkspace != nil }
   var onClose: (() -> Void)?
   private(set) var searchBar: SearchBar?
   private var appearanceObservation: NSKeyValueObservation?
@@ -264,6 +270,43 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       await current.detach()
       current.close()
     }
+    return controller
+  }
+
+  /// Shows `target` for an attention link: in `current` while it holds
+  /// that workspace's lease, otherwise attached on a new connection
+  /// (`replace`; a takeover only with a confirmed `expectedLease`), so a
+  /// detached window reattaches rather than sending commands without a
+  /// lease. `attached` receives a new controller as soon as it holds the
+  /// lease. Throws when the pane is not shown: `leaseHeld` (keeping
+  /// `current`) lets the caller offer a takeover.
+  static func reveal(
+    _ target: PaneTarget,
+    in current: MuxWorkspaceController?,
+    configuration: Configuration,
+    connect: @MainActor () async throws -> MuxConnection,
+    takeover expectedLease: UInt64? = nil,
+    attached: (MuxWorkspaceController) -> Void = { _ in }
+  ) async throws -> MuxWorkspaceController {
+    if let current, current.attachedWorkspace == target.workspace,
+      current.holdsLease
+    {
+      do {
+        try await current.revealAttention(pane: target.pane, tab: target.tab)
+        return current
+      } catch let error as MuxError where error.code == .notAttached {
+        // The lease moved before the detach event arrived: attach afresh.
+      }
+    }
+    let controller = try await replace(
+      current,
+      with: .id(target.workspace),
+      configuration: configuration,
+      connection: connect(),
+      takeover: expectedLease
+    )
+    attached(controller)
+    try await controller.revealAttention(pane: target.pane, tab: target.tab)
     return controller
   }
 
@@ -800,6 +843,50 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     showWindow(nil)
     window?.makeKeyAndOrderFront(nil)
     if let view = views[pane] { window?.makeFirstResponder(view) }
+  }
+
+  /// `reveal(pane:tab:)` that reports failure: `notAttached` once this
+  /// window no longer holds the lease, or the service's refusal.
+  func revealAttention(pane: PaneID, tab: TabID?) async throws {
+    guard holdsLease else { throw MuxError(.notAttached) }
+    if let tab = tab ?? workspace?.tab(containing: pane)?.id,
+      tab != workspace?.activeTab
+    {
+      try await execute(.selectTab(tab))
+    }
+    if pane != activePane { try await execute(.focusPane(pane)) }
+    reveal(pane: pane, tab: nil)
+  }
+
+  /// Runs `command` in order with the others and waits for its outcome.
+  /// A command dropped unrun (the queue ended on detach) fails
+  /// `notAttached`.
+  private func execute(_ command: MuxCommand) async throws {
+    try await withCheckedThrowingContinuation {
+      (done: CheckedContinuation<Void, any Error>) in
+      let once = Once(done)
+      self.command(
+        command,
+        failed: { error in once.resume(throwing: error) },
+        then: { once.resume() }
+      )
+    }
+  }
+
+  /// Resumes a continuation exactly once; released unresumed, it fails.
+  private final class Once: Sendable {
+    private let done: Mutex<CheckedContinuation<Void, any Error>?>
+
+    init(_ done: CheckedContinuation<Void, any Error>) {
+      self.done = Mutex(done)
+    }
+
+    func resume(throwing error: (any Error)? = nil) {
+      guard let done = self.done.withLock({ $0.take() }) else { return }
+      if let error { done.resume(throwing: error) } else { done.resume() }
+    }
+
+    deinit { resume(throwing: MuxError(.notAttached)) }
   }
 
   func selectTab(_ tab: TabID) {
