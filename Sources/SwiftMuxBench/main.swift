@@ -341,6 +341,133 @@ func load(
   return (cpu, mb, Double(frames) / elapsed)
 }
 
+// MARK: Configured limits
+
+/// A full 1 MiB paste (32 KiB chunks under writer credit) into a reader.
+func pasteLimit() async throws -> Double {
+  let c = try await connect()
+  let ws = try await create(
+    c,
+    spec("stty raw -echo; exec cat > /dev/null"),
+    columns: 120,
+    rows: 40
+  )
+  let pane = ws.tabs[0].activePane
+  try await show(c, ws, panes: [pane], columns: 120, rows: 40)
+  try await Task.sleep(for: .milliseconds(200))
+  let text = String(repeating: "paste line of text\n", count: (1 << 20) / 19)
+  let t0 = now()
+  let state = try await c.paste(String(text.prefix(1 << 20)), to: pane)
+  let elapsed = (now() - t0) * 1000
+  precondition(state == .completed)
+  _ = try? await c.execute(.endWorkspace(.id(ws.id)))
+  await c.close()
+  return elapsed
+}
+
+/// Literal search across a full history (10,000 rows retained).
+func historySearch() async throws -> (rows: Int, ms: Double) {
+  let c = try await connect()
+  let ws = try await create(
+    c,
+    spec(
+      "i=0; while [ $i -lt 12000 ]; do echo history-row-$i; i=$((i+1)); done; exec cat"
+    ),
+    columns: 120,
+    rows: 40
+  )
+  let pane = ws.tabs[0].activePane
+  try await show(c, ws, panes: [pane], columns: 80, rows: 24)
+  var rows = 0
+  while rows < MuxLimits.standard.historyRowsPerPane {
+    if case let .frame(f)? = try await c.nextEvent() {
+      rows = f.history.scrollbackRows
+    }
+  }
+  try await Task.sleep(for: .milliseconds(300))
+  let t0 = now()
+  guard
+    case let .search(result) = try await c.execute(
+      .search(pane: pane, query: "history-row-1999")
+    )
+  else { fatalError() }
+  let elapsed = (now() - t0) * 1000
+  precondition(result.matchCount >= 1)
+  _ = try? await c.execute(.endWorkspace(.id(ws.id)))
+  await c.close()
+  return (rows, elapsed)
+}
+
+/// 32 visible noisy panes in one tab at the 512x256 maximum area.
+func visibleLimit(
+  seconds: Double
+) async throws -> (cpu: Double, mb: Double, fps: Double, panes: Int) {
+  let c = try await connect()
+  let noisy = spec("while :; do cat \(corpusURL.path); done")
+  var ws = try await create(c, noisy, columns: 512, rows: 255)
+  guard case let .attached(_, snap) = try await c.execute(.attach(.id(ws.id)))
+  else { fatalError() }
+  ws = snap
+  var panes = ws.tabs[0].layout.panes
+  var axis = SplitAxis.leftRight
+  while panes.count < MuxLimits.standard.maxPanes {
+    var next: [PaneID] = []
+    for pane in panes
+    where panes.count + next.count < MuxLimits.standard.maxPanes {
+      guard
+        case let .layout(l) = try await c.execute(
+          .split(pane: pane, axis: axis, launch: noisy)
+        )
+      else { fatalError() }
+      ws = l
+      next.append(l.tabs[0].activePane)
+    }
+    panes += next
+    axis = axis == .leftRight ? .topBottom : .leftRight
+  }
+  let tab = ws.tabs[0]
+  let frames = LayoutGeometry.frames(
+    tab.layout,
+    in: LayoutRect(x: 0, y: 0, width: 512, height: 255),
+    divider: 1
+  )
+  try await c.execute(
+    .setGeometry(
+      GeometryBatch(
+        layoutRevision: ws.layoutRevision,
+        generation: 1,
+        entries: tab.layout.panes.map {
+          .init(
+            pane: $0,
+            columns: max(1, frames[$0]!.width),
+            rows: max(1, frames[$0]!.height)
+          )
+        }
+      )
+    )
+  )
+  try await c.execute(.setSubscriptions(tab.layout.panes))
+  let cpu0 = cpuSeconds()
+  let t0 = now()
+  var count = 0
+  while now() - t0 < seconds {
+    if case .frame? = try await c.nextEvent() { count += 1 }
+  }
+  let elapsed = now() - t0
+  let result = (
+    (cpuSeconds() - cpu0) / elapsed * 100, footprint(), Double(count) / elapsed,
+    tab.layout.panes.count
+  )
+  try await c.execute(.detach)
+  try await c.execute(.endAllWorkspaces)
+  try await c.execute(.quiesce(false))
+  while case let .status(s) = try await c.execute(.status), s.panes > 0 {
+    try await Task.sleep(for: .milliseconds(50))
+  }
+  await c.close()
+  return result
+}
+
 // MARK: Run
 
 signal(SIGPIPE, SIG_IGN)
@@ -403,6 +530,29 @@ print(
     withClient.cpu,
     withClient.mb,
     withClient.framesPerSecond
+  )
+)
+let pasteMs = try await pasteLimit()
+print(
+  String(format: "1 MiB paste (32 KiB chunks, acknowledged): %.1f ms", pasteMs)
+)
+let search = try await historySearch()
+print(
+  String(
+    format: "literal search over %d history rows: %.2f ms",
+    search.rows,
+    search.ms
+  )
+)
+let visible = try await visibleLimit(seconds: 5)
+print(
+  String(
+    format:
+      "%d visible noisy panes (512x255 area): service+client CPU %.1f%%, footprint %.1f MiB, %.1f frames/s",
+    visible.panes,
+    visible.cpu,
+    visible.mb,
+    visible.fps
   )
 )
 print(String(format: "idle footprint before load: %.1f MiB", idleMB))

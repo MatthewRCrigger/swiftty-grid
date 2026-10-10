@@ -23,6 +23,8 @@ final class PaneRuntime: @unchecked Sendable {
   let workspace: WorkspaceID
   let queue: DispatchQueue
   let limits: MuxLimits
+  /// This pane's share of the service's logical history budget.
+  let historyBytes: Int
 
   /// Admitted, unwritten input bytes; shared with the service for
   /// admission decisions.
@@ -66,6 +68,7 @@ final class PaneRuntime: @unchecked Sendable {
     workspace: WorkspaceID,
     columns: Int,
     rows: Int,
+    historyBytes: Int,
     limits: MuxLimits
   ) {
     self.id = id
@@ -75,11 +78,7 @@ final class PaneRuntime: @unchecked Sendable {
       label: "swiftmux.pane.\(id.short)",
       qos: .userInitiated
     )
-    // A per-pane share keeps total logical history within budget.
-    let historyBytes = min(
-      limits.historyBytesPerPane,
-      limits.totalHistoryBytes / max(1, limits.maxPanes)
-    )
+    self.historyBytes = historyBytes
     state = TerminalState(
       columns: columns,
       rows: rows,

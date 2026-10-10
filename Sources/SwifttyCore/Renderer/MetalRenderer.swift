@@ -119,7 +119,7 @@ public final class MetalRenderer {
   private var lastSequence: UInt64 = 0
   private var lastSource: SnapshotSource?
   private var needsFullRebuild = true
-  private let inFlight = DispatchSemaphore(value: 1)
+  let inFlight = DispatchSemaphore(value: 1)
   /// Rows whose cells include SGR 5 text, as last built.
   private var blinkingRows: [Bool] = []
   private var postProcess: PostProcess?

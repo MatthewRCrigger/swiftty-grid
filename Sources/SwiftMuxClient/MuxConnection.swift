@@ -86,12 +86,31 @@ public actor MuxConnection {
     channel.activate { [weak self] event in
       self?.assumeIsolated { $0.receive(event) }
     }
+    // A peer the service refuses (for example, a different signing team)
+    // gets no reply; fail the handshake instead of waiting forever.
+    let timeout = queue
+    let deadline = Self.handshakeTimeout
+    timeout.asyncAfter(deadline: .now() + deadline) { [weak self] in
+      self?
+        .assumeIsolated { connection in
+          guard connection.handshake != nil else { return }
+          connection.fail(
+            MuxError(
+              .connectionLost,
+              "the service did not answer; it may be signed by a different team or not running"
+            )
+          )
+          connection.channel.cancel()
+        }
+    }
     let welcome = try await withCheckedThrowingContinuation { continuation in
       handshake = continuation
       transmit(.hello(hello))
     }
     self.welcome = welcome
   }
+
+  public static let handshakeTimeout: TimeInterval = 5
 
   // MARK: Receiving
 

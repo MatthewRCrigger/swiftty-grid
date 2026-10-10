@@ -234,4 +234,53 @@ struct MuxNativeTests {
     #expect(list.first?.paneCount == 2)
     #expect(await f.service.panePID(first) == pid)
   }
+
+  @Test(.enabled(if: hasMetal))
+  func `slow GPU and missing drawables never advance the presented baseline`()
+    async throws
+  {
+    let f = try await open()
+    defer { f.controller.close() }
+    let view = try #require(activeView(f.controller))
+    f.controller.send(.text("echo first-frame\r"), to: view.pane)
+    let first = try #require(
+      await waitPresented(view) { $0.lines.contains("first-frame") }
+    )
+    // A stalled GPU: every in-flight buffer is still owned by the GPU.
+    let taken = view.renderer.occupyInFlightSlots()
+    #expect(taken > 0)
+    f.controller.send(.text("echo second-frame\r"), to: view.pane)
+    for _ in 0 ..< 50 {
+      view.draw(in: view)
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    // Pending content is not the interaction baseline while busy.
+    #expect(view.presented?.frame.identity.revision == first.identity.revision)
+    #expect(
+      (view.accessibilityValue() as? String)?.contains("second-frame") == false
+    )
+    view.renderer.releaseInFlightSlots(taken)
+    #expect(
+      await waitPresented(view) { $0.lines.contains("second-frame") } != nil
+    )
+    // No drawable (view out of the window): the baseline is retained.
+    let presented = try #require(view.presented)
+    let superview = try #require(view.superview)
+    let frame = view.frame
+    view.removeFromSuperview()
+    f.controller.send(.text("echo third-frame\r"), to: view.pane)
+    for _ in 0 ..< 30 {
+      view.draw(in: view)
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(
+      view.presented?.frame.identity.revision
+        == presented.frame.identity.revision
+    )
+    superview.addSubview(view)
+    view.frame = frame
+    #expect(
+      await waitPresented(view) { $0.lines.contains("third-frame") } != nil
+    )
+  }
 }

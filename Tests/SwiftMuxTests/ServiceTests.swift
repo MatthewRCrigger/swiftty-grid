@@ -345,3 +345,26 @@ struct LateSpawnTests {
     #expect(list.first?.paneCount == 1)
   }
 }
+
+@Suite(.timeLimit(.minutes(1)))
+struct PeerIdentityTests {
+  /// A peer failing the code-signing requirement is never served, and the
+  /// client fails its handshake instead of waiting forever.
+  @Test
+  func refusedPeerFailsFast() async throws {
+    var config = MuxServiceConfiguration(launcherPath: try launcherPath())
+    config.peerRequirement = "identifier \"com.example.not-this-client\""
+    let service = MuxService(configuration: config)
+    let endpoint = service.listenAnonymously()
+    let start = ContinuousClock.now
+    await #expect(throws: MuxError.self) {
+      _ = try await MuxConnection.connect(
+        endpoint: endpoint,
+        frontend: .control
+      )
+    }
+    #expect(
+      ContinuousClock.now - start < .seconds(MuxConnection.handshakeTimeout + 2)
+    )
+  }
+}

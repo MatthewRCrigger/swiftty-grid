@@ -140,3 +140,35 @@ struct BoundsTests {
     }
   }
 }
+
+@Suite(.serialized, .timeLimit(.minutes(1)))
+struct HistoryBudgetTests {
+  /// Early panes get the full per-pane cap; later ones share what is
+  /// left without the total ever exceeding the service budget.
+  @Test
+  func sharesStayWithinTheTotal() async throws {
+    var limits = MuxLimits()
+    limits.maxPanes = 4
+    limits.historyBytesPerPane = 4 << 20
+    limits.totalHistoryBytes = 8 << 20
+    limits.minHistoryBytesPerPane = 1 << 20
+    let h = try Harness(limits: limits)
+    let c = try await h.connect(.control)
+    var shares: [Int] = []
+    var total = 0
+    for _ in 0 ..< 4 {
+      guard
+        case let .created(ws) = try await c.execute(
+          .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
+        )
+      else { return }
+      let budget = try #require(
+        await h.service.historyBudget(ws.tabs[0].activePane)
+      )
+      shares.append(budget.pane >> 20)
+      total = budget.total
+    }
+    #expect(shares == [4, 2, 1, 1])
+    #expect(total == 8 << 20)
+  }
+}

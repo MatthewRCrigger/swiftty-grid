@@ -4,6 +4,9 @@ public struct MuxLimits: Codable, Sendable, Equatable {
   public var historyRowsPerPane = 10_000
   public var historyBytesPerPane = 16 << 20
   public var totalHistoryBytes = 128 << 20
+  /// History kept back for every pane that could still be created, so
+  /// early panes cannot starve later ones of the shared budget.
+  public var minHistoryBytesPerPane = 1 << 20
   /// Admitted, unwritten PTY input per pane.
   public var inputBytesPerPane = 256 << 10
   /// Terminal replies (and paste closing markers) held beyond input.

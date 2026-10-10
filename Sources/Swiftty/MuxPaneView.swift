@@ -250,7 +250,12 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
       drawn = candidate?.snapshot
     }
     guard let candidate, let drawn else { return }
-    switch renderer.tryDraw(drawn, in: self) {
+    // Offscreen views still vend drawables; content drawn there is never
+    // seen and must not become the interaction baseline.
+    let result: MetalRenderer.SubmitResult =
+      window == nil || isHiddenOrHasHiddenAncestor
+      ? .noDrawable : renderer.tryDraw(drawn, in: self)
+    switch result {
     case .submitted:
       if frozen == nil {
         presented = candidate
@@ -262,7 +267,7 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
       }
     case .busy, .noDrawable:
       // Keep the newest pending frame; redraw when capacity returns.
-      guard !retryScheduled else { return }
+      guard !retryScheduled, window != nil else { return }
       retryScheduled = true
       DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(8)) {
         [weak self] in

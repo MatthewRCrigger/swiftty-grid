@@ -43,6 +43,7 @@ public actor MuxService {
   private var clients: [UUID: Client] = [:]
   private var lease: Lease?
   private var pendingLaunches = 0
+  private var pendingHistoryBytes = 0
   private var quiescing = false
   private var inflightFrameBytes = 0
   private var pumpScheduled = false
@@ -542,6 +543,24 @@ public actor MuxService {
 
   private var paneCount: Int { panes.count + pendingLaunches }
 
+  /// Logical history committed to live and starting panes.
+  private var allocatedHistoryBytes: Int {
+    panes.values.reduce(pendingHistoryBytes) { $0 + $1.runtime.historyBytes }
+  }
+
+  /// Up to the per-pane cap from the shared budget, keeping the minimum
+  /// back for every pane that may still be created. The sum of shares
+  /// never exceeds `totalHistoryBytes`; ended panes return theirs.
+  private func nextHistoryShare() -> Int {
+    let reserve =
+      max(0, limits.maxPanes - paneCount - 1) * limits.minHistoryBytesPerPane
+    let available = limits.totalHistoryBytes - allocatedHistoryBytes - reserve
+    return min(
+      limits.historyBytesPerPane,
+      max(limits.minHistoryBytesPerPane, available)
+    )
+  }
+
   private func spawnPane(
     workspace: WorkspaceID,
     columns: Int,
@@ -568,11 +587,13 @@ public actor MuxService {
     let id = PaneID()
     let columns = min(max(columns, 1), limits.maxColumns)
     let rows = min(max(rows, 1), limits.maxRows)
+    let historyBytes = nextHistoryShare()
     let runtime = PaneRuntime(
       id: id,
       workspace: workspace,
       columns: columns,
       rows: rows,
+      historyBytes: historyBytes,
       limits: limits
     )
     runtime.onChange = { [weak self] in self?.onQueue { $0.paneChanged(id) } }
@@ -580,6 +601,7 @@ public actor MuxService {
       self?.onQueue { $0.paneEvent(id, event) }
     }
     pendingLaunches += 1
+    pendingHistoryBytes += historyBytes
     let launcher = self.launcher
     runtime.queue.async { [weak self] in
       let result: Result<Void, MuxError>
@@ -590,6 +612,7 @@ public actor MuxService {
       self?
         .onQueue { service in
           service.pendingLaunches -= 1
+          service.pendingHistoryBytes -= historyBytes
           switch result {
           case .success:
             service.panes[id] = PaneRecord(
@@ -1142,6 +1165,11 @@ public actor MuxService {
   /// Visible text of a pane (tests).
   public func screenLines(_ pane: PaneID) -> [String]? {
     panes[pane]?.runtime.screenLines()
+  }
+
+  /// A pane's history share and the service total (tests, diagnostics).
+  public func historyBudget(_ pane: PaneID) -> (pane: Int, total: Int)? {
+    panes[pane].map { ($0.runtime.historyBytes, allocatedHistoryBytes) }
   }
 
   public func panePID(_ pane: PaneID) -> Int32? {

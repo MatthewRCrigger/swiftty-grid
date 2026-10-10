@@ -9,8 +9,14 @@ import Testing
 @Suite(.serialized)
 struct FrameTimeTests {
   static let device = MTLCreateSystemDefaultDevice()
+  /// Budgets are for optimized code: `swift test -c release`.
+  #if DEBUG
+  static let measurable = false
+  #else
+  static let measurable = device != nil
+  #endif
 
-  @Test(.enabled(if: device != nil))
+  @Test(.enabled(if: measurable))
   func `dense search highlights fit a 60 Hz frame`() throws {
     let renderer = try MetalRenderer(
       device: #require(Self.device),
@@ -56,7 +62,7 @@ struct FrameTimeTests {
     #expect(p95 < 16.7)
   }
 
-  @Test(.enabled(if: device != nil))
+  @Test(.enabled(if: measurable))
   func `full redraws fit a 60 Hz frame`() throws {
     let device = try #require(Self.device)
     let renderer = try MetalRenderer(
