@@ -12,7 +12,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private var mux: MuxWorkspaceController?
   private let muxUpdate = MuxUpdateController()
   private lazy var attentionLinks = AttentionLinkRouter(
-    ownsWorkspace: { [weak self] id in self?.mux?.workspace?.id == id },
+    ownsWorkspace: { [weak self] id in
+      guard let mux = self?.mux else { return false }
+      return mux.holdsLease && mux.attachedWorkspace == id
+    },
     reveal: { [weak self] target, lease in
       try await self?.revealAttention(target, takeover: lease)
     }
@@ -41,38 +44,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   /// Opens (or reuses) the SwiftMux window on `target`'s workspace and
   /// activates the pane. `lease` is set only after the user confirmed a
-  /// takeover; without it a held workspace fails with `leaseHeld`.
+  /// takeover; without it a held workspace fails with `leaseHeld`. A
+  /// window that lost its lease (detached by another frontend) is never
+  /// reused: it reattaches, and failures reach the navigator.
   private func revealAttention(
     _ target: PaneTarget,
     takeover lease: UInt64?
   ) async throws {
     NSApp.activate()
-    if let mux, mux.workspace?.id == target.workspace {
-      mux.reveal(pane: target.pane, tab: target.tab)
-      return
-    }
     // One SwiftMux window and lease at a time: the current one is left
     // only once the target is attached, so a refused attach (held
     // elsewhere, before the takeover is confirmed) keeps it.
     let previous = mux
-    let controller = try await MuxWorkspaceController.replace(
-      previous,
-      with: .id(target.workspace),
+    _ = try await MuxWorkspaceController.reveal(
+      target,
+      in: previous,
       configuration: config,
-      connection: MuxWorkspaceController.connect(),
+      connect: { try await MuxWorkspaceController.connect() },
       takeover: lease
-    )
+    ) { controller in
+      self.install(controller, replacing: previous)
+    }
+  }
+
+  /// Makes `controller` the SwiftMux window after it replaced `previous`.
+  private func install(
+    _ controller: MuxWorkspaceController,
+    replacing previous: MuxWorkspaceController?
+  ) {
     if let mux, mux !== previous {
       // Another window opened meanwhile: keep one lease.
       self.mux = nil
-      await mux.detach()
-      mux.close()
+      Task {
+        await mux.detach()
+        mux.close()
+      }
     }
     controller.onClose = { [weak controller] in
       if self.mux === controller { self.mux = nil }
     }
     mux = controller
-    controller.reveal(pane: target.pane, tab: target.tab)
   }
 
   func applicationDidFinishLaunching(_ notification: Notification) {

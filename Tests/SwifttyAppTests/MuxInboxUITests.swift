@@ -1,4 +1,6 @@
 import AppKit
+import MuxNavigation
+import MuxNavigationSMX
 import SwiftMuxClient
 import SwiftMuxProtocol
 @testable import Swiftty
@@ -610,5 +612,186 @@ extension MuxNativeTests {
     c.split(.leftRight)
     #expect(await until { c.workspace?.panes.count == 2 })
     #expect(c.workspace?.pane(pane) != nil)
+  }
+
+  /// A window on workspace W with an open request, then detached because
+  /// `phone` took W over: the window still shows W but holds no lease.
+  struct DetachedFixture {
+    let fixture: Fixture
+    let phone: MuxConnection
+    let item: AttentionItem
+    let pane: PaneID
+    let host = NavigationHost(id: UUID(), name: "This Mac")
+  }
+
+  func detachedByTakeover() async throws -> DetachedFixture {
+    let f = try await open()
+    let c = f.controller
+    let pane = try #require(c.activePane)
+    c.send(.text(Self.osc("state=blocked:kind=question:app=tool")), to: pane)
+    #expect(await until { c.inbox.counts.needsYou == 1 })
+    let item = try #require(c.inbox.sorted.first)
+    #expect(c.holdsLease)
+    let phone = try await MuxConnection.connect(
+      endpoint: f.endpoint,
+      frontend: .native
+    )
+    guard
+      case let .workspaces(list) = try await phone.execute(.listWorkspaces),
+      let summary = list.first(where: { $0.id == f.workspace }),
+      case .attached = try await phone.execute(
+        .takeover(.id(f.workspace), expectedLease: summary.leaseGeneration)
+      )
+    else { throw MuxError(.invalidRequest, "no takeover") }
+    #expect(await until { !c.holdsLease })
+    // Still showing W: the old ownership check matched here.
+    #expect(c.workspace?.id == f.workspace)
+    return DetachedFixture(fixture: f, phone: phone, item: item, pane: pane)
+  }
+
+  /// The router's opener over `AppDelegate`-style window replacement.
+  func navigator(
+    _ d: DetachedFixture,
+    window: @escaping @MainActor (MuxWorkspaceController) -> Void
+  ) -> AttentionNavigator {
+    let endpoint = d.fixture.endpoint
+    let connect: @Sendable () async throws -> MuxConnection = {
+      try await MuxConnection.connect(endpoint: endpoint, frontend: .native)
+    }
+    var current: MuxWorkspaceController? = d.fixture.controller
+    let opener = AttentionLinkRouter.Opener { target, lease in
+      let shown = try await MuxWorkspaceController.reveal(
+        target,
+        in: current,
+        configuration: Configuration(),
+        connect: { try await connect() },
+        takeover: lease
+      )
+      current = shown
+      window(shown)
+    }
+    return AttentionNavigator(
+      configuration: AttentionLinkConfiguration(),
+      hosts: StaticHostDirectory([d.host]),
+      connector: SMXAttentionConnector(opener: opener, connect: connect)
+    )
+  }
+
+  func isSeen(
+    _ d: DetachedFixture,
+    _ destination: AttentionDestination
+  ) async throws -> Bool {
+    guard
+      case let .attention(location) = try await d.phone.execute(
+        .locateAttention(destination.reference)
+      )
+    else { return false }
+    return location.item?.seen == true
+  }
+
+  @Test(.enabled(if: hasMetal))
+  func `a window detached by a takeover does not own its workspace`()
+    async throws
+  {
+    let d = try await detachedByTakeover()
+    let c = d.fixture.controller
+    defer { c.close() }
+    defer { Task { await d.phone.close() } }
+    // Commands without a lease fail rather than only being logged.
+    await #expect {
+      try await c.revealAttention(pane: d.pane, tab: nil)
+    } throws: { ($0 as? MuxError)?.code == .notAttached }
+    let preview = AttentionPreview(
+      item: d.item,
+      target: PaneTarget(workspace: d.fixture.workspace, tab: nil, pane: d.pane),
+      leaseHeldElsewhere: true
+    )
+    #expect(
+      AttentionLinkRouter.leaseNote(preview, owned: false)
+        == "Another client controls this workspace."
+    )
+    #expect(AttentionLinkRouter.leaseNote(preview, owned: true) == nil)
+  }
+
+  @Test(.enabled(if: hasMetal))
+  func `revealing in a detached window offers a takeover, never silently`()
+    async throws
+  {
+    let d = try await detachedByTakeover()
+    let c = d.fixture.controller
+    var shown: MuxWorkspaceController?
+    defer {
+      c.close()
+      shown?.close()
+    }
+    defer { Task { await d.phone.close() } }
+    let navigator = navigator(d) { shown = $0 }
+    let destination = AttentionDestination(
+      hostProfileID: d.host.id,
+      item: d.item,
+      intent: .reveal
+    )
+    await navigator.open(destination)
+    guard case .ready = navigator.state else {
+      Issue.record("not ready: \(navigator.state)")
+      return
+    }
+    await navigator.openInPane()
+    // The plain attach is refused: an explicit offer, not `.opened`.
+    guard case let .confirmTakeover(offer) = navigator.state else {
+      Issue.record("no takeover offer: \(navigator.state)")
+      return
+    }
+    #expect(shown == nil)
+    #expect(try await isSeen(d, destination) == false)
+    // The phone still controls W and the old window is kept.
+    #expect(
+      (try? await d.phone.execute(.newTab(name: nil, launch: nil))) != nil
+    )
+    #expect(c.window?.isVisible == true)
+    #expect(!c.holdsLease)
+
+    // Confirmed: the new window takes W over and shows the pane.
+    await navigator.confirmTakeover()
+    #expect(navigator.state == .opened(offer.preview.target))
+    let window = try #require(shown)
+    #expect(window !== c)
+    #expect(window.holdsLease)
+    #expect(window.attachedWorkspace == d.fixture.workspace)
+    #expect(await until { window.activePane == d.pane })
+    #expect(c.window?.isVisible != true)
+    #expect(try await isSeen(d, destination))
+  }
+
+  @Test(.enabled(if: hasMetal))
+  func `revealing in a detached window reattaches once the lease is free`()
+    async throws
+  {
+    let d = try await detachedByTakeover()
+    let c = d.fixture.controller
+    var shown: MuxWorkspaceController?
+    defer {
+      c.close()
+      shown?.close()
+    }
+    defer { Task { await d.phone.close() } }
+    _ = try await d.phone.execute(.detach)
+    let navigator = navigator(d) { shown = $0 }
+    let destination = AttentionDestination(
+      hostProfileID: d.host.id,
+      item: d.item,
+      intent: .reveal
+    )
+    await navigator.open(destination)
+    await navigator.openInPane()
+    guard case .opened = navigator.state else {
+      Issue.record("not opened: \(navigator.state)")
+      return
+    }
+    let window = try #require(shown)
+    #expect(window !== c)
+    #expect(window.holdsLease)
+    #expect(await until { window.activePane == d.pane })
+    #expect(c.window?.isVisible != true)
   }
 }
