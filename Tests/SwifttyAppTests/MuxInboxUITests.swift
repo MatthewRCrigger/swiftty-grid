@@ -46,7 +46,9 @@ extension MuxNativeTests {
     #expect(result.category == .result)
     c.markReviewed(result)
     #expect(await until { c.inbox.items.isEmpty })
-    #expect(c.inbox.counts == InboxCounts())
+    // Counts arrive with the service's coalesced update, after the item
+    // leaves the local list.
+    #expect(await until { c.inbox.counts == InboxCounts() })
   }
 
   @Test
@@ -232,7 +234,9 @@ extension MuxNativeTests {
       )
     }
     #expect(await until { c.inbox.counts.needsYou == 3 })
-    #expect(await until { c.inbox.items.count == 3 })
+    // Items held before the reload depend on whether the window's first
+    // page load (two rows) ran before or after the reports; the reload
+    // below is the deterministic start.
     await c.reloadInbox()
     #expect(c.inbox.items.count == 2)
     #expect(c.inbox.hasMore)

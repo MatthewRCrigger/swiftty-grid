@@ -99,6 +99,10 @@ SMX client inside the service process.
 
 It does not hold the shell.
 
+- **Takeover and focus are one-shot.** They come from the credential and
+  reach the session on its own queue. After the first successful attachment
+  the registry clears them, so a reconnect with the same token neither
+  displaces a newer holder nor moves focus back.
 - **Attach:**
   1. Fence the previous RST/1 attachment.
   2. Release its lease. If input is in flight, release only after that input
@@ -122,10 +126,19 @@ It does not hold the shell.
   - `key` becomes `MuxInput.key`.
   - `paste` becomes `MuxInput.paste`.
   - `resize` becomes `setGeometry` for the active pane.
-  - **Retries:** after `resourceLimit` or a stale layout/geometry error, the
-    host retries; nothing was written.
-  - **Any other error:** the host stops admitting input and never reports the
-    failed operation as applied.
+  - **One at a time.** The next operation is sent on a later queue turn, so a
+    synchronous answer never recurses. Nothing is sent once the in-process
+    client is closed.
+  - **Retries:** after `resourceLimit` or a stale layout/geometry error,
+    nothing was written; the host retries after a 20 ms backoff.
+  - **Pane gone:** if the target pane exited or vanished (`paneExited`,
+    `notFound`, or an exit observed with input still queued), every admitted
+    operation is retired (`HostInputLedger.discard`). Retired operations are
+    acknowledged as complete so the client's queue drains and a new writer
+    can authorize. They are never written, retried, or delivered to the next
+    pane shown.
+  - **Any other refusal:** only that operation is retired; the writer stays
+    usable.
 - **Lease loss:** if another frontend takes over, the RST/1 attachment fails
   with `writerBusy`. If the workspace ended, the client receives
   `terminated`.
@@ -152,7 +165,15 @@ It does not hold the shell.
   |---|---|---|
   | Reserved, never attached | 60 s | Ended only if this host created it |
   | Detached | 24 h | Grant revoked; the workspace keeps running |
-  | Exited | 5 min | Ended if this host created it |
+  | Exited (shown pane) | 5 min | Ended only if this host created it and every pane exited |
+
+  - An entry whose session is attached is never swept.
+  - "Exited" follows the pane being shown. If the active pane changes to a
+    live pane, the state returns to attached or detached.
+  - A removed entry leaves its revision floor (epoch, screen and resize
+    revisions; up to 1,024 kept). A later resume of the same workspace
+    starts above it, so a warm client's screen store keeps installing
+    screens.
 
 - **Terminate:** an explicit `terminate` ends the workspace.
 
@@ -185,6 +206,14 @@ closed or wrong fd 3/4.
   SPKI hash to match **and** the leaf to equal the delivered certificate
   byte for byte (defence in depth). Rotating the certificate, even under the
   same key, still needs a fresh grant over SSH.
+- **Renewal while running.** With roaming on, the service never
+  idle-exits, so it cannot rely on a restart to renew. `RoamingHost` checks
+  hourly. Inside the renewal margin (3 days of a 30-day certificate) it
+  stops the listener and starts one on the same configured port with a
+  renewed certificate and key, and new grants pin it
+  (`SessionRegistry.replaceIdentity`). Attached clients are disconnected
+  once; their reconnects fetch a fresh grant over SSH after the old pin
+  stops matching.
 - **Validation.** A present `serverSPKISHA256` must be exactly 64 lowercase
   hex digits and must match the delivered certificate's key; otherwise the
   grant is refused before connecting. The field is optional on the wire:
@@ -603,6 +632,23 @@ These suites all pass with `mise exec -- swift test`:
     missing payload is refused;
   - a reveal focuses the linked pane, and takes over only the confirmed
     lease generation (a stale one leaves the Mac in control).
+- **Review regressions:**
+  - `LedgerTests`: discarded operations are retired, never retried, and free
+    the writer;
+  - `RemoteAttentionTests`:
+    - a confirmed takeover applies to one attachment only;
+    - a resumed workspace continues above the retired session's revisions;
+    - input pending at shell exit is retired and the writer can change;
+    - an exited pane in a split workspace never ends the live panes;
+  - `RenewalTests`: the certificate is renewed before it expires and new
+    grants pin it;
+  - `RoamingClientTests`: resume requests the configured grid; reattaching
+    re-requests the grid after another client resized;
+  - `CompanionBridgeTests`: re-enabling sharing accepts the active session's
+    observation;
+  - `MuxInboxUITests`: a page read before a removal never resurrects the
+    item; a late layout event for the previous workspace is ignored; a
+    refused attach keeps the current window and closes its connection.
 - **`MuxNavigationTests` (35):**
   - locator round trips, corruption and canonical encoding;
   - watch summary batches are bounded and re-redacted on decode;
