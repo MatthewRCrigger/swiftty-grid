@@ -151,13 +151,6 @@ final class RoamingAttentionService: AttentionService, @unchecked Sendable {
   }
 }
 
-extension SessionID {
-  /// RST/1 session IDs are SwiftMux workspace IDs (spec.inbox.md §1.3).
-  init(_ workspace: WorkspaceID) {
-    self.init(bytes: withUnsafeBytes(of: workspace.rawValue.uuid) { Array($0) })!
-  }
-}
-
 // MARK: Inbox across configured hosts
 
 /// The attention inbox of every configured Mac, keyed by

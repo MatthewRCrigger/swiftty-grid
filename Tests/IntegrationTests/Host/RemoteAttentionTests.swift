@@ -263,5 +263,97 @@ struct RemoteAttentionTests {
       #expect(await registry.service.panePID(live) != nil)
     }
   }
+
+  @Test
+  func `a new writer resumes even with input the pane never took`() async throws {
+    // Raw mode: the tty holds unread input instead of discarding it, so
+    // the PTY stops accepting and the pane's input budget fills.
+    try await withRegistry(launch: { shellLaunch("stty raw -echo; exec sleep 30") }) {
+      registry in
+      let grant = try await registry.create(grid: GridSize(columns: 80, rows: 24))
+      let client = TestClient(registry)
+      _ = try await client.attached(grant)
+      // A program that never reads: the pane's input budget fills and the
+      // last admitted paste waits, unsent.
+      let chunk = String(repeating: "y", count: 30_000)
+      let session = try #require(registry.session(grant.sessionID))
+      // One paste at a time (the ledger admits one 30 KB paste), until
+      // the pane refuses one for lack of room.
+      var sequence: UInt64 = 0
+      while session.diagnostics.pendingInputOperations == 0, sequence < 20 {
+        sequence += 1
+        try await client.send(
+          .input(.init(attachmentEpoch: 1, sequence: sequence, operation: .paste(chunk)))
+        )
+        let n = sequence
+        try await hostEventually("ack or wait") {
+          client.inputAck(n) || session.diagnostics.pendingInputOperations > 0
+            ? true : nil
+        }
+      }
+      #expect(session.diagnostics.pendingInputOperations > 0)
+      client.connection.sever()
+      try await hostEventually("detached") { session.status.isAttached ? nil : true }
+      // A cold-started client (new writer) is not refused with writerBusy.
+      let fresh = try await registry.resume(grant.sessionID)
+      #expect(fresh.writerID != grant.writerID)
+      #expect(session.diagnostics.pendingInputOperations == 0)
+    }
+  }
+
+  @Test
+  func `a shell that exits while detached is noticed by the sweep`() async throws {
+    try await withRegistry(launch: { shellLaunch("sleep 1; exit 0") }) { registry in
+      let grant = try await registry.create(grid: GridSize(columns: 40, rows: 10))
+      let client = TestClient(registry)
+      _ = try await client.attached(grant)
+      client.connection.sever()
+      let session = try #require(registry.session(grant.sessionID))
+      try await hostEventually("detached") { session.status.isAttached ? nil : true }
+      try await hostEventuallyAsync("pane exited", timeout: .seconds(10)) {
+        await registry.workspaces().first?.livePaneCount == 0 ? true : nil
+      }
+      #expect(session.status.state == .detached)
+      #expect(await registry.sweep(now: .now + .seconds(301)) == [grant.sessionID])
+      try await hostEventuallyAsync("workspace ended") {
+        await registry.workspaces().isEmpty ? true : nil
+      }
+    }
+  }
+
+  @Test
+  func `concurrent attaches leave exactly one lease and no orphan`() async throws {
+    try await withRegistry { registry in
+      let grant = try await registry.create(grid: GridSize(columns: 80, rows: 24))
+      let first = TestClient(registry)
+      _ = try await first.attached(grant)
+      for n in 1 ... 20 {
+        try await first.send(
+          .input(.init(attachmentEpoch: 1, sequence: UInt64(n), operation: .committedText("x")))
+        )
+      }
+      // Two more attaches race the in-flight input.
+      let second = TestClient(registry)
+      let third = TestClient(registry)
+      try await second.attach(grant)
+      try await third.attach(grant)
+      try await hostEventually("settled") {
+        let decided = [second, third].filter { client in
+          client.isClosed || client.messages.contains {
+            if case .attached = $0 { return true }
+            return false
+          }
+        }
+        return decided.count == 2 ? true : nil
+      }
+      for client in [first, second, third] { client.connection.sever() }
+      let session = try #require(registry.session(grant.sessionID))
+      try await hostEventually("detached") { session.status.isAttached ? nil : true }
+      // No in-process client kept the workspace lease.
+      try await hostEventuallyAsync("lease released") {
+        await registry.workspaces().first?.isAttached == false ? true : nil
+      }
+    }
+  }
 }
 #endif

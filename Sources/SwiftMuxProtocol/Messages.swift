@@ -202,6 +202,8 @@ public struct WorkspaceSummary: Codable, Sendable, Hashable {
   public var leaseGeneration: UInt64
   /// Who holds the lease, for takeover prompts.
   public var leaseHolder: LeaseHolder?
+  /// Panes whose process has not exited (nil from older services).
+  public var livePaneCount: Int?
 
   public init(
     id: WorkspaceID,
@@ -211,7 +213,8 @@ public struct WorkspaceSummary: Codable, Sendable, Hashable {
     createdAt: Date,
     isAttached: Bool,
     leaseGeneration: UInt64 = 0,
-    leaseHolder: LeaseHolder? = nil
+    leaseHolder: LeaseHolder? = nil,
+    livePaneCount: Int? = nil
   ) {
     self.id = id
     self.name = name
@@ -221,6 +224,7 @@ public struct WorkspaceSummary: Codable, Sendable, Hashable {
     self.isAttached = isAttached
     self.leaseGeneration = leaseGeneration
     self.leaseHolder = leaseHolder
+    self.livePaneCount = livePaneCount
   }
 }
 

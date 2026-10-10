@@ -216,6 +216,12 @@ public actor RoamingClient {
       publish()
       return .refused(state.isTerminal ? .closed : .notActive(state))
     }
+    // The record must fit RST/1's control record limit once encoded
+    // (escaped control characters grow a paste): an operation that could
+    // never be sent would stall every later sequence behind it.
+    guard Self.fitsControlRecord(input.operation) else {
+      return .refused(.invalid)
+    }
     let entry: ClientInputQueue.Entry
     do {
       entry = try queue.enqueue(input.operation)
@@ -228,6 +234,19 @@ public actor RoamingClient {
     sendInput(entry, epoch: epoch)
     publish()
     return .accepted(sequence: entry.sequence)
+  }
+
+  /// Whether `operation` encodes within the control record limit at the
+  /// largest epoch and sequence numbers.
+  static func fitsControlRecord(_ operation: InputOperation) -> Bool {
+    switch operation {
+    case .key, .resize: return true
+    case .committedText, .paste:
+      let probe = ControlMessage.input(
+        .init(attachmentEpoch: .max, sequence: .max, operation: operation)
+      )
+      return (try? ControlRecord.encode(probe)) != nil
+    }
   }
 
   /// Requests a grid from local view geometry. Sent as a `.resize`

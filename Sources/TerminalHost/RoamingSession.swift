@@ -85,6 +85,8 @@ public final class RoamingSession: @unchecked Sendable {
   private var afterClose: [() -> Void] = []
   private var closing = false
   private var inputInFlight = false
+  /// Increments per attach; only the newest may acquire the lease.
+  private var attachGeneration: UInt64 = 0
   /// A refused operation waits for its backoff before resubmission.
   private var retryScheduled = false
   private var epoch: UInt64 = 0
@@ -176,6 +178,12 @@ public final class RoamingSession: @unchecked Sendable {
   ) throws(HostInputLedger.Rejection) {
     let result: Result<Void, HostInputLedger.Rejection> = queue.sync {
       do throws(HostInputLedger.Rejection) {
+        if ledger.writerID != writer, !inputInFlight {
+          // Operations here are written whole or not at all, and none is
+          // with the pane now: the old writer's unsent input is dropped,
+          // never replayed for the new one.
+          ledger.abandonUnsent()
+        }
         try ledger.authorize(writer)
         return .success(())
       } catch {
@@ -263,18 +271,43 @@ public final class RoamingSession: @unchecked Sendable {
       previous.fence()
       attachment = nil
     }
+    // Only the newest attach may acquire: one queued behind an earlier
+    // close is superseded and fails instead of orphaning a lease.
+    attachGeneration &+= 1
+    let generation = attachGeneration
     closeMux { [self] in
-      acquireLease(a, writer: writer, completion: completion)
+      guard generation == attachGeneration else {
+        return completion(.failure(.staleEpoch))
+      }
+      acquireLease(a, writer: writer, generation: generation, completion: completion)
     }
   }
 
   private func acquireLease(
     _ a: HostAttachment,
     writer: WriterID,
+    generation: UInt64,
     completion: @escaping (AttachOutcome<UInt64>) -> Void
   ) {
     guard !terminated else { return completion(.failure(.unknownSession)) }
     let session = MuxLocalSession(queue: queue)
+    // Fails this attach without touching a newer one's client.
+    let failAttach = { [self] (code: RSTErrorCode) in
+      if mux === session {
+        closeMux {}
+      } else {
+        session.close()
+      }
+      completion(.failure(code))
+    }
+    let leaseGranted = { [self] (attachment: AttachmentID, ws: WorkspaceSnapshot) in
+      guard mux === session, generation == attachGeneration else {
+        // Superseded while acquiring: give the lease back.
+        session.close()
+        return completion(.failure(.staleEpoch))
+      }
+      self.leaseGranted(a, writer: writer, attachment: attachment, ws, completion)
+    }
     session.onEvent = { [weak self, weak session] event in
       guard let self, let session, self.mux === session else { return }
       self.muxEvent(event)
@@ -287,20 +320,26 @@ public final class RoamingSession: @unchecked Sendable {
       guard let self, let session, self.mux === session else { return }
       self.leaseLost(reason: .internalError)
     }
+    if let stale = mux {
+      // Never two in-process clients for one session.
+      mux = nil
+      muxAttachment = nil
+      stale.close()
+    }
     mux = session
     session.connect(to: service, frontend: .native, remote: true)
     let target = WorkspaceSelector.id(workspace)
     session.request(.attach(target)) { [self] result in
       switch result {
       case let .success(.attached(attachment, ws)):
-        leaseGranted(a, writer: writer, attachment: attachment, ws, completion)
+        leaseGranted(attachment, ws)
       case let .failure(error) where error.code == .leaseHeld && allowTakeover:
         // Explicitly requested at bootstrap: name the lease being
         // displaced so a newer holder is never taken over by accident.
         session.request(.listWorkspaces) { [self] list in
           guard case let .success(.workspaces(summaries)) = list,
             let summary = summaries.first(where: { $0.id == workspace })
-          else { return failAttach(.unknownSession, completion) }
+          else { return failAttach(.unknownSession) }
           // A link names the lease the user agreed to displace; a plain
           // takeover names the one just listed.
           let expected = self.target?.expectedLease ?? summary.leaseGeneration
@@ -308,25 +347,17 @@ public final class RoamingSession: @unchecked Sendable {
             .takeover(target, expectedLease: expected)
           ) { [self] result in
             guard case let .success(.attached(attachment, ws)) = result else {
-              return failAttach(.writerBusy, completion)
+              return failAttach(.writerBusy)
             }
-            leaseGranted(a, writer: writer, attachment: attachment, ws, completion)
+            leaseGranted(attachment, ws)
           }
         }
       case let .failure(error):
-        failAttach(Self.code(error), completion)
+        failAttach(Self.code(error))
       case .success:
-        failAttach(.internalError, completion)
+        failAttach(.internalError)
       }
     }
-  }
-
-  private func failAttach(
-    _ code: RSTErrorCode,
-    _ completion: (AttachOutcome<UInt64>) -> Void
-  ) {
-    closeMux {}
-    completion(.failure(code))
   }
 
   private static func code(_ error: MuxError) -> RSTErrorCode {
@@ -610,8 +641,9 @@ public final class RoamingSession: @unchecked Sendable {
         a.send(.error(.init(.internalError, sequence: sequence)))
         return
       }
-      // The pane encodes with its authoritative modes when written.
-      ledger.record(sequence, operation: input.operation, bytes: [])
+      // The pane encodes with its authoritative modes when written; the
+      // bound is reserved meanwhile so admission stays bounded.
+      ledger.reserve(sequence, operation: input.operation)
       pumpInput()
     }
   }
@@ -664,6 +696,15 @@ public final class RoamingSession: @unchecked Sendable {
 
   private func inputAnswered(_ sequence: UInt64, _ error: MuxError?) {
     inputInFlight = false
+    defer {
+      // The shown pane exited while this was in flight (`exited` could
+      // not retire then): nothing left may reach another pane.
+      if exitStatus != nil, ledger.hasPending {
+        for done in ledger.discard(through: ledger.lastAdmitted) {
+          acknowledge(done)
+        }
+      }
+    }
     if closing {
       closeMux {}
       return

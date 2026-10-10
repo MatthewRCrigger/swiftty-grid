@@ -1,4 +1,5 @@
 import Foundation
+import SessionCore
 import SwiftMuxProtocol
 
 /// Lease-free host metadata over the SSH bootstrap channel (spec.inbox.md
@@ -51,5 +52,34 @@ public struct ResumeTarget: Hashable, Sendable, Codable {
   public init(pane: PaneID? = nil, expectedLease: UInt64? = nil) {
     self.pane = pane
     self.expectedLease = expectedLease
+  }
+}
+
+// MARK: Identity mapping (spec.inbox.md §1.3)
+
+extension SessionID {
+  /// RST/1 session IDs are SwiftMux workspace IDs: the same 16 bytes.
+  public init(_ workspace: WorkspaceID) {
+    self.init(bytes: workspace.rawValue.uuidBytes)!
+  }
+
+  public var workspace: WorkspaceID { WorkspaceID(rawValue: UUID(uuidBytes: bytes)) }
+}
+
+extension SessionCore.ServerInstanceID {
+  /// The one service epoch: the SwiftMux service instance.
+  public init(_ instance: SwiftMuxProtocol.ServerInstanceID) {
+    self.init(bytes: instance.rawValue.uuidBytes)!
+  }
+}
+
+extension UUID {
+  var uuidBytes: [UInt8] { withUnsafeBytes(of: uuid) { Array($0) } }
+
+  init(uuidBytes bytes: [UInt8]) {
+    precondition(bytes.count == 16)
+    var value = UUID().uuid
+    withUnsafeMutableBytes(of: &value) { $0.copyBytes(from: bytes) }
+    self.init(uuid: value)
   }
 }

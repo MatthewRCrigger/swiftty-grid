@@ -732,7 +732,8 @@ public actor MuxService {
         createdAt: ws.createdAt,
         isAttached: leases[ws.id] != nil,
         leaseGeneration: leaseGenerations[ws.id, default: 0],
-        leaseHolder: leases[ws.id]?.holder
+        leaseHolder: leases[ws.id]?.holder,
+        livePaneCount: ws.allPanes.filter { panes[$0]?.exitStatus == nil }.count
       )
     }
   }

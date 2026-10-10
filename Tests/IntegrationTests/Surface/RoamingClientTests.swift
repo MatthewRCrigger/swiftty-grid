@@ -336,4 +336,14 @@ struct RoamingClientTests {
     #expect(!text.contains(hexString(token.bytes)))
     await f.client.close()
   }
+
+  @Test
+  func `input whose record cannot fit is refused rather than stalling`() {
+    // Control characters escape to six bytes each in JSON.
+    let controls = String(repeating: "\u{01}", count: RSTLimits.maxPasteBytes)
+    #expect((try? InputOperation.paste(controls).validate()) != nil)
+    #expect(!RoamingClient.fitsControlRecord(.paste(controls)))
+    #expect(RoamingClient.fitsControlRecord(.paste(String(repeating: "x", count: 32_000))))
+    #expect(RoamingClient.fitsControlRecord(.key(SemanticKey(.enter))))
+  }
 }

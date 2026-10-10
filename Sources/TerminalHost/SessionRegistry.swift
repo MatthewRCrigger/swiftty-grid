@@ -519,6 +519,12 @@ public final class SessionRegistry: @unchecked Sendable {
   /// other workspace keeps running and only loses its remote grant.
   @discardableResult
   public func sweep(now: ContinuousClock.Instant = .now) async -> [SessionID] {
+    // A detached session sees no layout events, so a shell that exits
+    // while no remote client is attached is learned from the service.
+    let workspaces = Dictionary(
+      await workspaces().map { ($0.id, $0) },
+      uniquingKeysWith: { first, _ in first }
+    )
     let (removed, end) = state.withLock { s -> ([SessionID], [SessionID]) in
       var removed: [SessionID] = []
       var end: [SessionID] = []
@@ -526,17 +532,29 @@ public final class SessionRegistry: @unchecked Sendable {
         let status = entry.session.status
         // An attached entry is never dropped: its session holds the lease.
         if status.isAttached, status.state != .terminated { continue }
+        let summary = workspaces[id.workspace]
+        let gone = summary == nil
+        let allExited =
+          status.allPanesExited
+          || (summary.map { $0.paneCount > 0 && $0.livePaneCount == 0 } ?? false)
         let expire: Bool =
-          switch status.state {
-          case .reserved:
-            now - entry.createdAt >= policy.reservationLifetime
-          case .detached:
-            now - status.lastActivity >= policy.detachedRetention
-          case .exited:
-            now - (status.exitedAt ?? status.lastActivity)
-              >= policy.exitedRetention
-          case .terminated: true
-          case .attached: false
+          if gone {
+            // Ended elsewhere (the Mac app): nothing left to authorize.
+            true
+          } else {
+            switch status.state {
+            case .reserved:
+              now - entry.createdAt >= policy.reservationLifetime
+            case .detached where allExited:
+              now - status.lastActivity >= policy.exitedRetention
+            case .detached:
+              now - status.lastActivity >= policy.detachedRetention
+            case .exited:
+              now - (status.exitedAt ?? status.lastActivity)
+                >= policy.exitedRetention
+            case .terminated: true
+            case .attached: false
+            }
           }
         guard expire else { continue }
         s.entries.removeValue(forKey: id)
@@ -544,9 +562,8 @@ public final class SessionRegistry: @unchecked Sendable {
         removed.append(id)
         // Only a workspace this host created, and only when nothing in it
         // still runs (a never-attached reservation, or every pane exited).
-        if entry.createdHere,
-          status.state == .reserved
-            || (status.state == .exited && status.allPanesExited)
+        if entry.createdHere, !gone,
+          status.state == .reserved || allExited
         {
           end.append(id)
         }

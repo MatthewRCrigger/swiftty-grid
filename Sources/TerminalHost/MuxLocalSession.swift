@@ -135,32 +135,4 @@ final class MuxLocalSession: @unchecked Sendable {
   }
 }
 
-// MARK: Identity mapping
-
-extension SessionID {
-  /// RST/1 session identifiers are SwiftMux workspace identities.
-  init(_ workspace: WorkspaceID) {
-    self.init(bytes: workspace.rawValue.bytes)!
-  }
-
-  var workspace: WorkspaceID { WorkspaceID(rawValue: UUID(bytes: bytes)) }
-}
-
-extension SessionCore.ServerInstanceID {
-  /// The one service epoch: the SwiftMux service instance.
-  init(_ instance: SwiftMuxProtocol.ServerInstanceID) {
-    self.init(bytes: instance.rawValue.bytes)!
-  }
-}
-
-extension UUID {
-  var bytes: [UInt8] { withUnsafeBytes(of: uuid) { Array($0) } }
-
-  init(bytes: [UInt8]) {
-    precondition(bytes.count == 16)
-    var value = UUID().uuid
-    withUnsafeMutableBytes(of: &value) { $0.copyBytes(from: bytes) }
-    self.init(uuid: value)
-  }
-}
 #endif

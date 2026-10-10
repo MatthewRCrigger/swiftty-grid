@@ -82,6 +82,9 @@ public struct HostInputLedger: Sendable {
     public var bytes: [UInt8]
     /// Bytes already accepted by the PTY.
     public var offset: Int
+    /// Budget held for an operation recorded before its encoding exists
+    /// (a host that encodes at write time), released on completion.
+    public var reserved: Int = 0
     public var remaining: Int { bytes.count - offset }
   }
 
@@ -114,7 +117,9 @@ public struct HostInputLedger: Sendable {
   }
 
   public var lastAdmitted: UInt64 { lastApplied + UInt64(admitted.count) }
-  public var pendingBytes: Int { admitted.reduce(0) { $0 + $1.remaining } }
+  public var pendingBytes: Int {
+    admitted.reduce(0) { $0 + $1.remaining + $1.reserved }
+  }
   public var hasPending: Bool { !admitted.isEmpty }
   /// The head operation when part of it already reached the PTY.
   public var partialSequence: UInt64? {
@@ -147,9 +152,11 @@ public struct HostInputLedger: Sendable {
     }
     guard sequence == lastAdmitted + 1 else { return .rejected(.gap) }
     do { try operation.validate() } catch { return .rejected(.invalid) }
-    guard pendingBytes + operation.expansionBound <= byteLimit else {
-      return .rejected(.backpressure)
-    }
+    // An empty ledger always admits one valid operation: a maximal
+    // paste's bound (2 × 32 KiB + markers) exceeds the byte limit, and
+    // refusing it would stall the writer forever.
+    guard admitted.isEmpty || pendingBytes + operation.expansionBound <= byteLimit
+    else { return .rejected(.backpressure) }
     return .admit
   }
 
@@ -163,6 +170,23 @@ public struct HostInputLedger: Sendable {
     admitted.append(
       Admitted(sequence: sequence, operation: operation, bytes: bytes, offset: 0)
     )
+  }
+
+  /// Records an operation whose bytes are produced later by the writer;
+  /// its `expansionBound` counts against the byte limit until it
+  /// completes, so admission stays bounded.
+  public mutating func reserve(_ sequence: UInt64, operation: InputOperation) {
+    precondition(sequence == lastAdmitted + 1, "admission out of order")
+    var entry = Admitted(sequence: sequence, operation: operation, bytes: [], offset: 0)
+    entry.reserved = operation.expansionBound
+    admitted.append(entry)
+  }
+
+  /// Drops every admitted operation that was never handed to the writer,
+  /// so a new writer can take over (a cold-started client never replays
+  /// uncertain input). Only valid when none of them was sent.
+  public mutating func abandonUnsent() {
+    admitted.removeAll()
   }
 
   /// The next bytes to write: the unwritten suffix of the head operation.
