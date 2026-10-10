@@ -65,6 +65,12 @@ final class Client {
   let id = UUID()
   let channel: SMXChannel
   var hello: Hello?
+  /// Receives `workspaces` events (metadata only, no lease).
+  var observesWorkspaces = false
+  /// Receives `inbox` events.
+  var subscribesInbox = false
+  /// Bridged from the roaming transport rather than local XPC.
+  var remote = false
 
   init(channel: SMXChannel) { self.channel = channel }
 }
@@ -81,10 +87,17 @@ struct ActivePaste {
   var bytes = 0
 }
 
+/// One interactive lease on one workspace (unified spec §6). A client
+/// holds at most one; a workspace has at most one holder.
 struct Lease {
   let client: UUID
   let attachment = AttachmentID()
   var workspace: WorkspaceID
+  /// The workspace's lease generation when this lease was granted.
+  var generation: UInt64
+  var holder: LeaseHolder
+  /// Next input sequence this attachment may submit (watermark + 1).
+  var nextInput: UInt64 = 1
   var subscriptions: [PaneID] = []
   var frames: [PaneID: FrameSlot] = [:]
   var geometryGeneration: UInt64 = 0

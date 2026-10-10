@@ -25,6 +25,12 @@ public struct MuxError: Error, Codable, Sendable, Equatable,
     case staleLayout, paneExited, historyUnavailable, resourceLimit
     case incompatibleVersion, notFound, invalidRequest, unauthorized
     case launchFailed, quiescing, serverInstanceChanged, connectionLost
+    /// Another attachment holds the workspace lease; take over explicitly.
+    case leaseHeld
+    /// A mutation named an expected revision or generation that moved on.
+    case staleRevision
+    /// Input skipped a sequence number; resend from `nextExpected`.
+    case inputGap
   }
 
   public var code: Code
@@ -192,6 +198,10 @@ public struct WorkspaceSummary: Codable, Sendable, Equatable {
   public var paneCount: Int
   public var createdAt: Date
   public var isAttached: Bool
+  /// Generation of the current (or last) lease; `takeover` names it.
+  public var leaseGeneration: UInt64
+  /// Who holds the lease, for takeover prompts.
+  public var leaseHolder: LeaseHolder?
 
   public init(
     id: WorkspaceID,
@@ -199,7 +209,9 @@ public struct WorkspaceSummary: Codable, Sendable, Equatable {
     tabCount: Int,
     paneCount: Int,
     createdAt: Date,
-    isAttached: Bool
+    isAttached: Bool,
+    leaseGeneration: UInt64 = 0,
+    leaseHolder: LeaseHolder? = nil
   ) {
     self.id = id
     self.name = name
@@ -207,6 +219,21 @@ public struct WorkspaceSummary: Codable, Sendable, Equatable {
     self.paneCount = paneCount
     self.createdAt = createdAt
     self.isAttached = isAttached
+    self.leaseGeneration = leaseGeneration
+    self.leaseHolder = leaseHolder
+  }
+}
+
+public struct LeaseHolder: Codable, Sendable, Equatable {
+  public enum Transport: String, Codable, Sendable { case local, remote }
+  public var transport: Transport
+  public var frontend: FrontendKind
+  public var since: Date
+
+  public init(transport: Transport, frontend: FrontendKind, since: Date) {
+    self.transport = transport
+    self.frontend = frontend
+    self.since = since
   }
 }
 
@@ -363,8 +390,26 @@ public enum MuxCommand: Codable, Sendable, Equatable {
 
   // Attachment.
   case attach(WorkspaceSelector)
+  /// Fences the current holder of the workspace's lease and attaches.
+  /// `expectedLease` must name the lease generation the user saw, so a
+  /// stale prompt cannot displace a newer holder.
+  case takeover(WorkspaceSelector, expectedLease: UInt64)
   case detach
   case switchWorkspace(WorkspaceSelector)
+
+  // Metadata observation (no lease, never resizes panes).
+  /// Workspace list and lease changes as `workspaces` events.
+  case observeWorkspaces(Bool)
+  case subscribeInbox(Bool)
+  case inbox(InboxQuery)
+  case locateAttention(AttentionReference)
+  /// Marks exactly this occurrence seen; never resolves it.
+  case markSeen(AttentionReference)
+  /// Nil `until` clears the snooze.
+  case snooze(AttentionReference, until: Date?)
+  /// Dismisses a failure or result (`reviewed`); a request stays until
+  /// the program resolves it.
+  case markReviewed(AttentionReference)
 
   // Layout (lease required).
   case newTab(name: String?, launch: LaunchSpec?)
@@ -393,7 +438,9 @@ public enum MuxCommand: Codable, Sendable, Equatable {
     switch self {
     case .status, .listWorkspaces, .detachActive, .detach, .endWorkspace,
       .endAllWorkspaces, .quiesce, .endPane, .endTab, .setGeometry,
-      .setSubscriptions, .scroll, .searchStep, .endSearch, .setTheme:
+      .setSubscriptions, .scroll, .searchStep, .endSearch, .setTheme,
+      .observeWorkspaces, .subscribeInbox, .inbox, .locateAttention,
+      .markSeen, .snooze, .markReviewed:
       true
     default: false
     }
@@ -404,7 +451,8 @@ public enum MuxCommand: Codable, Sendable, Equatable {
     switch self {
     case .status, .listWorkspaces, .newWorkspace, .endWorkspace,
       .renameWorkspace, .detachActive, .endAllWorkspaces, .quiesce, .attach,
-      .setTheme:
+      .setTheme, .takeover, .observeWorkspaces, .subscribeInbox, .inbox,
+      .locateAttention, .markSeen, .snooze, .markReviewed:
       false
     default: true
     }
@@ -447,6 +495,8 @@ public enum MuxReply: Codable, Sendable, Equatable {
   case layout(WorkspaceSnapshot)
   case pane(PaneID)
   case search(SearchResult)
+  case inbox(InboxPage)
+  case attention(AttentionLocation)
 }
 
 // MARK: Input
@@ -483,6 +533,8 @@ public enum InputPayload: Codable, Sendable, Equatable {
 }
 
 public struct InputRecord: Codable, Sendable, Equatable {
+  /// Per attachment, starting at 1 and increasing by one. The service
+  /// drops duplicates (at or below its watermark) and rejects gaps.
   public var sequence: UInt64
   public var attachment: AttachmentID
   public var pane: PaneID
@@ -528,6 +580,10 @@ public enum MuxEvent: Codable, Sendable {
   case paste(id: UInt64, state: PasteState)
   /// A frame could not be exported; the session is preserved.
   case frameUnavailable(PaneID, MuxError)
+  /// Observers only (`observeWorkspaces`).
+  case workspaces([WorkspaceSummary])
+  /// Subscribers only (`subscribeInbox`), after reduction.
+  case inbox(InboxUpdate)
 }
 
 public enum PasteState: String, Codable, Sendable {
@@ -538,7 +594,8 @@ public enum ServerMessage: Codable, Sendable {
   case welcome(Welcome)
   case rejected(MuxError)
   case reply(id: UInt64, result: MuxResult)
-  /// Admission to the ordered writer, not execution by the shell.
+  /// Admission to the ordered writer, not execution by the shell. A
+  /// duplicate is acknowledged again without being written.
   case inputAck(sequence: UInt64, error: MuxError?)
   case event(MuxEvent)
 }

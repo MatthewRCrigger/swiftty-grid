@@ -148,7 +148,9 @@ public actor MuxConnection {
       }
     case let .reply(id, result):
       if case let .success(.attached(attachment, _)) = result {
+        // Input sequences are per attachment and start at 1.
         self.attachment = attachment
+        nextInput = 1
       }
       if let callback = callbacks.removeValue(forKey: id) {
         switch result {
@@ -272,6 +274,19 @@ public actor MuxConnection {
         )
       )
     )
+  }
+
+  /// Sends one record with a caller-chosen sequence and waits for its
+  /// acknowledgement (ledger tests); does not advance `nextInput`.
+  package func submit(raw record: InputRecord) async throws {
+    if let closedError { throw closedError }
+    try await withCheckedThrowingContinuation {
+      (c: CheckedContinuation<Void, any Error>) in
+      inputs[record.sequence] = { error in
+        if let error { c.resume(throwing: error) } else { c.resume() }
+      }
+      transmit(.input(record))
+    }
   }
 
   private func submit(_ pane: PaneID, _ payload: InputPayload) async throws {

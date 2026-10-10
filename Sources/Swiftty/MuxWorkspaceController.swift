@@ -303,7 +303,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
         workspace?.panes[i].exitStatus = status
       }
       refreshChrome()
-    case .paste, .frameUnavailable, .frame: break
+    case .paste, .frameUnavailable, .frame, .workspaces, .inbox: break
     }
   }
 

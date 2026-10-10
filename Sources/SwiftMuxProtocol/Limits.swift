@@ -28,6 +28,15 @@ public struct MuxLimits: Codable, Sendable, Equatable {
   public var maxSearchBytes = 1024
   public var minPaneColumns = 10
   public var minPaneRows = 2
+  /// OSC 7501 inbox (unified spec §8).
+  public var statusRecordsPerPane = 64
+  public var statusTextBytes = 16 << 20
+  public var inboxPageSize = 100
+  public var inboxSubscribers = 16
+  /// Pending coalesced inbox updates per subscriber before resync.
+  public var inboxPendingUpdates = 64
+  /// Resolved occurrences retained for stale-link answers.
+  public var resolvedHistory = 256
 
   public init() {}
 

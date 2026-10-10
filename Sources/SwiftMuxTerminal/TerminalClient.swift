@@ -204,6 +204,7 @@ public final class TerminalClient {
     case let .paste(_, state):
       if state != .completed { show("paste \(state.rawValue)") }
     case let .frameUnavailable(_, error): show("frame unavailable: \(error)")
+    case .workspaces, .inbox: break
     }
   }
 
