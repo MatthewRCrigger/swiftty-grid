@@ -103,6 +103,10 @@ It does not hold the shell.
   reach the session on its own queue. After the first successful attachment
   the registry clears them, so a reconnect with the same token neither
   displaces a newer holder nor moves focus back.
+- **Newest attach wins.** Each attach takes a generation number. One that
+  was queued behind a lease release and has since been superseded fails
+  with `staleEpoch` and gives back any lease it got. A session never has two
+  in-process clients.
 - **Attach:**
   1. Fence the previous RST/1 attachment.
   2. Release its lease. If input is in flight, release only after that input
@@ -126,6 +130,18 @@ It does not hold the shell.
   - `key` becomes `MuxInput.key`.
   - `paste` becomes `MuxInput.paste`.
   - `resize` becomes `setGeometry` for the active pane.
+  - **Bounded admission.** An operation is recorded before the pane encodes
+    it (`HostInputLedger.reserve`), so its `expansionBound` counts against
+    the 64 KiB limit until it completes. An empty ledger always admits one
+    valid operation, because a maximal paste's bound exceeds the limit.
+  - **Unsent input never blocks a new writer.** Operations are written whole
+    or not at all. When a resume authorizes a different writer and nothing is
+    with the pane, the old writer's unsent operations are dropped
+    (`abandonUnsent`), never replayed.
+  - **Unsendable input is refused by the client.** The client refuses
+    (`.invalid`) any operation whose control record could not fit the RST/1
+    limit at the largest epoch and sequence. For example, a 32 KiB paste of
+    control characters escapes to more than 64 KiB.
   - **One at a time.** The next operation is sent on a later queue turn, so a
     synchronous answer never recurses. Nothing is sent once the in-process
     client is closed.
@@ -168,6 +184,10 @@ It does not hold the shell.
   | Exited (shown pane) | 5 min | Ended only if this host created it and every pane exited |
 
   - An entry whose session is attached is never swept.
+  - A detached session sees no layout events, so the sweep also reads the
+    service's workspace list. `WorkspaceSummary.livePaneCount == 0` counts as
+    every pane exited, and an entry whose workspace was ended elsewhere is
+    dropped.
   - "Exited" follows the pane being shown. If the active pane changes to a
     live pane, the state returns to attached or detached.
   - A removed entry leaves its revision floor (epoch, screen and resize
@@ -254,6 +274,18 @@ closed or wrong fd 3/4.
 - **Gaps:** a gap fails with `inputGap` and consumes nothing.
 - **Outcomes:** every in-order record consumes its sequence, whatever its
   outcome.
+- **Paste envelopes:**
+  - `pasteEnd` must name the paste's pane; otherwise it fails with
+    `invalidRequest` and the paste stays open.
+  - A client that gives up on a paste (its retries run out, or a chunk
+    fails) sends `pasteCancel(id:)`. The service discards unwritten chunks,
+    closes the bracket and frees input credit, so the pane never stays in
+    paste mode.
+- **Frame delivery:**
+  - Each capture carries a token. A capture that completes after its pane
+    was unsubscribed and resubscribed is discarded, so in-flight frame bytes
+    cannot leak.
+  - Leases take turns from an ordered list, each with its own pane cursor.
 - **Bounded paste:** `MuxInput.paste(String)` is a bounded paste of at most
   `maxPasteChunkBytes`. The service admits or refuses it whole and brackets
   it according to the pane's modes.
@@ -648,7 +680,26 @@ These suites all pass with `mise exec -- swift test`:
     observation;
   - `MuxInboxUITests`: a page read before a removal never resurrects the
     item; a late layout event for the previous workspace is ignored; a
-    refused attach keeps the current window and closes its connection.
+    refused attach keeps the current window and closes its connection; a
+    window detached by a takeover does not own its workspace, and revealing
+    there offers a takeover (never silently) or reattaches once the lease is
+    free.
+- **Second review regressions:**
+  - `LedgerTests`: reserved operations count against the limit; an empty
+    ledger admits a maximal paste; unsent operations are abandoned for a new
+    writer.
+  - `RemoteAttentionTests`: a new writer resumes even with input the pane
+    never took; a shell that exits while detached is noticed by the sweep;
+    concurrent attaches leave one lease and no orphan.
+  - `RoamingClientTests`: input whose record cannot fit is refused.
+  - `ServiceTests`: an abandoned paste closes its envelope; resubscribing
+    never leaks frame budget.
+  - `LeaseTests`: `pasteEnd` from another pane is refused.
+  - `FrameFairnessTests`: two leases share a one-byte frame budget. This is
+    a fairness guard only; the old cursor bug could not starve a lease in
+    practice.
+  - `TerminalClientTests`: `swmux` keeps the newest layout across reordered
+    replies.
 - **`MuxNavigationTests` (35):**
   - locator round trips, corruption and canonical encoding;
   - watch summary batches are bounded and re-redacted on decode;
