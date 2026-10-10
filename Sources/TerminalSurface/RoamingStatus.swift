@@ -1,0 +1,160 @@
+import Foundation
+import ScreenProtocol
+import SessionCore
+
+/// Time sources for the client, injectable so tests can run fast.
+public struct SurfaceTiming: Sendable {
+  /// Monotonic time for liveness, heartbeats and deadlines.
+  public var now: @Sendable () -> ContinuousClock.Instant
+  /// Wall-clock seconds since 1970, for `tokenExpiresAt` and status.
+  public var wallClock: @Sendable () -> Double
+  /// Suspends for a duration measured on `now`'s clock; throws when the
+  /// task is canceled.
+  public var sleep: @Sendable (Duration) async throws -> Void
+
+  public init(
+    now: @escaping @Sendable () -> ContinuousClock.Instant,
+    wallClock: @escaping @Sendable () -> Double,
+    sleep: @escaping @Sendable (Duration) async throws -> Void
+  ) {
+    self.now = now
+    self.wallClock = wallClock
+    self.sleep = sleep
+  }
+
+  public static let system = SurfaceTiming(
+    now: { ContinuousClock.now },
+    wallClock: { Date().timeIntervalSince1970 },
+    sleep: { try await Task.sleep(for: $0) }
+  )
+}
+
+public struct RoamingClientConfiguration: Sendable {
+  /// Grid requested when creating a session.
+  public var initialGrid: GridSize
+  /// Bound on waiting for `Detached`/`Terminated` when closing or
+  /// entering the background (spec §9).
+  public var detachDeadline: Duration
+  /// Bound on connect + `Attached` + first current snapshot.
+  public var attachTimeout: Duration
+  /// Idle heartbeat interval (spec §9: 20 s).
+  public var heartbeatInterval: Duration
+  /// How often liveness is evaluated.
+  public var livenessTick: Duration
+  /// Renew credentials through SSH this long before `tokenExpiresAt`.
+  public var tokenRefreshMargin: Duration
+  /// Reconnect delay jitter (fraction of each `ReconnectBackoff` step).
+  public var backoffJitter: Double
+  /// Bound on queued outbound control records before the connection is
+  /// treated as failed.
+  public var maxOutboundRecords: Int
+
+  public init(
+    initialGrid: GridSize = GridSize(columns: 80, rows: 24),
+    detachDeadline: Duration = .seconds(2),
+    attachTimeout: Duration = .seconds(15),
+    heartbeatInterval: Duration = RSTLimits.heartbeatInterval,
+    livenessTick: Duration = .milliseconds(250),
+    tokenRefreshMargin: Duration = .seconds(60),
+    backoffJitter: Double = 0.2,
+    maxOutboundRecords: Int = 512
+  ) {
+    self.initialGrid = initialGrid
+    self.detachDeadline = detachDeadline
+    self.attachTimeout = attachTimeout
+    self.heartbeatInterval = heartbeatInterval
+    self.livenessTick = livenessTick
+    self.tokenRefreshMargin = tokenRefreshMargin
+    self.backoffJitter = backoffJitter
+    self.maxOutboundRecords = maxOutboundRecords
+  }
+}
+
+/// Which session `RoamingClient.start(_:)` attaches to.
+public enum RoamingTarget: Hashable, Sendable {
+  /// A new session with this grid.
+  case create(GridSize)
+  /// A retained session after a cold launch (fresh writer identity).
+  case resume(SessionID)
+}
+
+/// Nonsecret reason for the latest failure, for display.
+public enum RoamingFailure: Hashable, Sendable {
+  case unreachable
+  case hostKeyRejected
+  case authenticationFailed
+  case protocolViolation
+  case attachRejected(RSTErrorCode)
+  case bootstrapRejected(BootstrapErrorCode)
+  case attachTimedOut
+  case connectionLost
+  case stale
+  case snapshotRejected
+  /// Retained operations were abandoned because the host issued a new
+  /// writer identity; they are not replayed.
+  case pendingInputAbandoned(count: Int)
+}
+
+/// Observable client status for the UI and the watch companion bridge.
+/// Contains no tokens, certificates, endpoints or terminal input.
+public struct RoamingStatus: Hashable, Sendable {
+  public var state: ClientConnectionState
+  public var sessionID: SessionID?
+  /// Wall-clock time the newest complete screen was installed.
+  public var lastScreenAt: Date?
+  public var screenRevision: UInt64?
+  /// Submitted operations not yet acknowledged by the host PTY.
+  public var pendingInputCount: Int
+  /// Input refused because the client was not active (cumulative).
+  public var refusedInputCount: Int
+  public var title: String
+  public var exitStatus: Int32?
+  public var lastFailure: RoamingFailure?
+  /// Consecutive reconnect attempts since the last success.
+  public var reconnectAttempt: Int
+
+  public init(
+    state: ClientConnectionState = .idle,
+    sessionID: SessionID? = nil,
+    lastScreenAt: Date? = nil,
+    screenRevision: UInt64? = nil,
+    pendingInputCount: Int = 0,
+    refusedInputCount: Int = 0,
+    title: String = "",
+    exitStatus: Int32? = nil,
+    lastFailure: RoamingFailure? = nil,
+    reconnectAttempt: Int = 0
+  ) {
+    self.state = state
+    self.sessionID = sessionID
+    self.lastScreenAt = lastScreenAt
+    self.screenRevision = screenRevision
+    self.pendingInputCount = pendingInputCount
+    self.refusedInputCount = refusedInputCount
+    self.title = title
+    self.exitStatus = exitStatus
+    self.lastFailure = lastFailure
+    self.reconnectAttempt = reconnectAttempt
+  }
+}
+
+public enum RoamingClientError: Error, Hashable, Sendable {
+  /// `start` was called in a state that does not allow it.
+  case invalidState(ClientConnectionState)
+  case unreachable
+  case hostKeyRejected
+  case authenticationFailed
+  case protocolViolation
+  case rejected(BootstrapErrorCode)
+  /// The requested session no longer exists.
+  case sessionLost
+  case sessionExited
+}
+
+/// How `RoamingClient.close(_:)` ends the attachment.
+public enum RoamingCloseMode: Hashable, Sendable {
+  /// Keep the host shell for a later resume.
+  case detach
+  /// Destroy the host session.
+  case terminate
+}

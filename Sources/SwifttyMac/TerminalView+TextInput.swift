@@ -4,7 +4,7 @@ import SwifttyCore
 /// IME composition: marked text is drawn as the renderer's preedit at the
 /// cursor, and the candidate window is placed over the cursor cell.
 extension TerminalView: @MainActor NSTextInputClient {
-  func insertText(_ string: Any, replacementRange: NSRange) {
+  public func insertText(_ string: Any, replacementRange: NSRange) {
     let text =
       (string as? NSAttributedString)?.string ?? string as? String ?? ""
     let wasComposing = hasMarkedText()
@@ -27,14 +27,14 @@ extension TerminalView: @MainActor NSTextInputClient {
 
   /// Selectors the input method did not turn into text (for example a
   /// dead key followed by an arrow); send the key as typed.
-  override func doCommand(by selector: Selector) {
+  public override func doCommand(by selector: Selector) {
     guard let event = interpretingEvent, !sendKey(event),
       let text = event.characters, !text.isEmpty
     else { return }
     session.send(.text(text))
   }
 
-  func setMarkedText(
+  public func setMarkedText(
     _ string: Any,
     selectedRange: NSRange,
     replacementRange: NSRange
@@ -45,7 +45,7 @@ extension TerminalView: @MainActor NSTextInputClient {
     )
   }
 
-  func unmarkText() {
+  public func unmarkText() {
     guard !markedText.isEmpty else { return }
     insertText(
       markedText,
@@ -77,29 +77,29 @@ extension TerminalView: @MainActor NSTextInputClient {
     needsDisplay = true
   }
 
-  func hasMarkedText() -> Bool { !markedText.isEmpty }
+  public func hasMarkedText() -> Bool { !markedText.isEmpty }
 
-  func markedRange() -> NSRange {
+  public func markedRange() -> NSRange {
     hasMarkedText()
       ? NSRange(location: 0, length: markedText.utf16.count)
       : NSRange(location: NSNotFound, length: 0)
   }
 
-  func selectedRange() -> NSRange {
+  public func selectedRange() -> NSRange {
     hasMarkedText() ? markedSelection : NSRange(location: NSNotFound, length: 0)
   }
 
-  func validAttributesForMarkedText() -> [NSAttributedString.Key] { [] }
+  public func validAttributesForMarkedText() -> [NSAttributedString.Key] { [] }
 
-  func attributedSubstring(
+  public func attributedSubstring(
     forProposedRange range: NSRange,
     actualRange: NSRangePointer?
   ) -> NSAttributedString? { nil }
 
-  func characterIndex(for point: NSPoint) -> Int { NSNotFound }
+  public func characterIndex(for point: NSPoint) -> Int { NSNotFound }
 
   /// The composition range in screen coordinates, where the candidate window goes.
-  func firstRect(
+  public func firstRect(
     forCharacterRange range: NSRange,
     actualRange: NSRangePointer?
   ) -> NSRect {

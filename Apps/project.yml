@@ -1,0 +1,174 @@
+# XcodeGen spec for the roaming SSH client apps (spec.roaming.md §11).
+#
+# Each app target is a thin wrapper around package products; all shared
+# logic lives in the `RoamingApp` and `CompanionModel` SwiftPM targets.
+# Generate with Scripts/build-platforms.sh (the .xcodeproj is not
+# committed). `swifttyd` is a SwiftPM executable and is not built here.
+name: RoamingClients
+
+options:
+  bundleIdPrefix: dev.swiftty.roaming
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "27.0"
+    macOS: "27.0"
+    tvOS: "27.0"
+    visionOS: "27.0"
+    watchOS: "27.0"
+
+packages:
+  Swiftty:
+    path: ..
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    IPHONEOS_DEPLOYMENT_TARGET: "27.0"
+    MACOSX_DEPLOYMENT_TARGET: "27.0"
+    TVOS_DEPLOYMENT_TARGET: "27.0"
+    XROS_DEPLOYMENT_TARGET: "27.0"
+    WATCHOS_DEPLOYMENT_TARGET: "27.0"
+    GENERATE_INFOPLIST_FILE: YES
+    MARKETING_VERSION: "0.1"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+
+# Shared Info.plist keys for direct clients. No UIBackgroundModes: the
+# clients never claim background execution (spec §9).
+directClientSettings: &directClientSettings
+  INFOPLIST_KEY_NSLocalNetworkUsageDescription: >-
+    Roaming SSH connects to Macs on your local network over SSH and QUIC.
+  INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+  INFOPLIST_KEY_CFBundleDisplayName: Roaming SSH
+  INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: YES
+
+targets:
+  # iOS/iPadOS full client and iPhone side of the watch companion bridge.
+  MobileClient:
+    type: application
+    platform: iOS
+    sources: [MobileClient]
+    scheme: {}
+    dependencies:
+      - package: Swiftty
+        product: RoamingApp
+      - package: Swiftty
+        product: CompanionModel
+      # Paired watch companion, embedded in Watch/ (spec §2.1).
+      - target: WatchCompanion
+        embed: true
+        codeSign: false
+        copy:
+          destination: wrapper
+          subpath: Watch
+    settings:
+      base:
+        <<: *directClientSettings
+        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mobile
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: >-
+          UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft
+          UIInterfaceOrientationLandscapeRight
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: >-
+          UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown
+          UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+
+  # Native macOS full client; the only target with an app-local PTY.
+  MacClient:
+    type: application
+    platform: macOS
+    sources:
+      - path: MacClient
+        excludes: ["*.entitlements"]
+    scheme: {}
+    dependencies:
+      - package: Swiftty
+        product: RoamingApp
+    settings:
+      base:
+        <<: *directClientSettings
+        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mac
+        CODE_SIGN_ENTITLEMENTS: MacClient/MacClient.entitlements
+        ENABLE_HARDENED_RUNTIME: YES
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+
+  # UIKit-derived full remote client, built only as a Mac Catalyst
+  # destination. No local PTY; never the swifttyd agent.
+  CatalystClient:
+    type: application
+    platform: iOS
+    sources:
+      - path: CatalystClient
+        excludes: ["*.entitlements"]
+    scheme: {}
+    dependencies:
+      - package: Swiftty
+        product: RoamingApp
+    settings:
+      base:
+        <<: *directClientSettings
+        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.catalyst
+        SUPPORTS_MACCATALYST: YES
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
+        TARGETED_DEVICE_FAMILY: "2,6"
+        CODE_SIGN_ENTITLEMENTS: CatalystClient/CatalystClient.entitlements
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+
+  # Windowed visionOS full remote client.
+  VisionClient:
+    type: application
+    platform: visionOS
+    sources: [VisionClient]
+    scheme: {}
+    dependencies:
+      - package: Swiftty
+        product: RoamingApp
+    settings:
+      base:
+        <<: *directClientSettings
+        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.vision
+        TARGETED_DEVICE_FAMILY: "7"
+
+  # Focus-first tvOS SSH/roaming client; no SFTP.
+  TVClient:
+    type: application
+    platform: tvOS
+    sources: [TVClient]
+    scheme: {}
+    dependencies:
+      - package: Swiftty
+        product: RoamingApp
+    settings:
+      base:
+        <<: *directClientSettings
+        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.tv
+        TARGETED_DEVICE_FAMILY: "3"
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+
+  # Read-only watch companion. Links ONLY CompanionModel: no Swiftty,
+  # NIO/SSH, QUIC, SFTP or PTY code may reach the watch (spec §2.2).
+  WatchCompanion:
+    type: application
+    platform: watchOS
+    sources: [WatchCompanion]
+    scheme: {}
+    dependencies:
+      - package: Swiftty
+        product: CompanionModel
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mobile.watchkitapp
+        TARGETED_DEVICE_FAMILY: "4"
+        INFOPLIST_KEY_CFBundleDisplayName: Roaming SSH
+        INFOPLIST_KEY_WKCompanionAppBundleIdentifier: dev.swiftty.roaming.mobile
+        INFOPLIST_KEY_WKRunsIndependentlyOfCompanionApp: NO
+        SKIP_INSTALL: YES

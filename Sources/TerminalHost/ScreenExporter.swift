@@ -1,0 +1,243 @@
+#if os(macOS)
+import ScreenProtocol
+import SessionCore
+import SwifttyCore
+
+/// Converts the authoritative `TerminalState` into an owned RST/1
+/// `ScreenSnapshot` (spec §6, §A.4.2).
+///
+/// Runs while the state is borrowed on its owner's queue (for example
+/// inside `TerminalSession.withState` called from outside that queue) and
+/// copies everything it needs, so nothing borrowed outlives the call.
+/// Never use `TerminalSession.snapshot()` for this: it consumes renderer
+/// damage and synchronizes on the session queue.
+public enum ScreenExporter {
+  /// Revision and identity metadata stamped on an exported snapshot.
+  public struct Stamp: Sendable, Hashable {
+    public var sessionID: SessionID
+    public var attachmentEpoch: UInt64
+    public var screenRevision: UInt64
+    public var resizeRevision: UInt64
+    public var lastFullyAppliedInputSequence: UInt64
+
+    public init(
+      sessionID: SessionID,
+      attachmentEpoch: UInt64 = 0,
+      screenRevision: UInt64 = 0,
+      resizeRevision: UInt64 = 0,
+      lastFullyAppliedInputSequence: UInt64 = 0
+    ) {
+      self.sessionID = sessionID
+      self.attachmentEpoch = attachmentEpoch
+      self.screenRevision = screenRevision
+      self.resizeRevision = resizeRevision
+      self.lastFullyAppliedInputSequence = lastFullyAppliedInputSequence
+    }
+  }
+
+  /// Copies the active screen. The result always passes
+  /// `ScreenSnapshot.validate()` for grids within the RST/1 limits; larger
+  /// host grids are clipped to `RSTLimits.maxColumns` × `maxRows`.
+  public static func export(
+    _ state: borrowing TerminalState,
+    stamp: Stamp
+  ) -> ScreenSnapshot {
+    let columns = min(max(state.columns, 1), RSTLimits.maxColumns)
+    let rows = min(max(state.rows, 1), RSTLimits.maxRows)
+    var styles = StyleTable(palette: state.palette)
+    var cells: [[ScreenCell]] = []
+    cells.reserveCapacity(rows)
+    var wrapped: [Bool] = []
+    wrapped.reserveCapacity(rows)
+    var scalars: [UInt32] = []
+    scalars.reserveCapacity(16)
+
+    for y in 0 ..< rows {
+      var row: [ScreenCell] = []
+      row.reserveCapacity(columns)
+      let source = state.grid.cells(row: y)
+      var x = 0
+      while x < columns {
+        let cell = source[x]
+        let style = styles.index(for: cell.attributes, in: state)
+        let flags = cell.flags
+        // Spacers that are not the tail of an exported wide lead (a
+        // padding head, or an orphan) present as blank narrow cells.
+        if flags.contains(.spacerHead) || flags.contains(.spacerTail)
+          || cell.width == 0
+        {
+          row.append(ScreenCell("", width: 1, style: style))
+          x += 1
+          continue
+        }
+        scalars.removeAll(keepingCapacity: true)
+        state.appendScalars(of: cell, to: &scalars)
+        let text = Self.text(scalars)
+        let hasTail =
+          x + 1 < columns && source[x + 1].flags.contains(.spacerTail)
+        if cell.width == 2, hasTail {
+          row.append(ScreenCell(text, width: 2, style: style))
+          row.append(ScreenCell("", width: 0, style: style))
+          x += 2
+        } else {
+          row.append(ScreenCell(text, width: 1, style: style))
+          x += 1
+        }
+      }
+      cells.append(row)
+      wrapped.append(state.grid.isWrapped(y))
+    }
+
+    let cursor = state.cursor
+    let shape: CursorShape =
+      switch state.cursorStyle {
+      case .block: .block
+      case .underline: .underline
+      case .bar: .bar
+      }
+    return ScreenSnapshot(
+      sessionID: stamp.sessionID,
+      attachmentEpoch: stamp.attachmentEpoch,
+      screenRevision: stamp.screenRevision,
+      resizeRevision: stamp.resizeRevision,
+      columns: columns,
+      rows: rows,
+      activeBuffer: state.isAlternateScreen ? .alternate : .primary,
+      cursor: ScreenCursor(
+        row: min(max(cursor.y, 0), rows - 1),
+        column: min(max(cursor.x, 0), columns),
+        visible: state.modes.contains(.cursorVisible),
+        shape: shape,
+        blinking: state.modes.contains(.cursorBlink)
+      ),
+      reverseVideo: state.modes.contains(.reverseVideo),
+      title: boundedTitle(state.title),
+      wrapped: wrapped,
+      styles: styles.styles,
+      cells: cells,
+      lastFullyAppliedInputSequence: stamp.lastFullyAppliedInputSequence
+    )
+  }
+
+  /// Complete grapheme text without control scalars; clusters over the
+  /// grapheme limit display as `RSTLimits.graphemePlaceholder`.
+  static func text(_ scalars: [UInt32]) -> String {
+    var view = String.UnicodeScalarView()
+    var bytes = 0
+    for value in scalars {
+      guard let scalar = Unicode.Scalar(value), !isControl(scalar) else {
+        continue
+      }
+      bytes += UTF8.width(scalar)
+      guard bytes <= RSTLimits.maxGraphemeBytes else {
+        return RSTLimits.graphemePlaceholder
+      }
+      view.append(scalar)
+    }
+    return String(view)
+  }
+
+  /// At most `RSTLimits.maxTitleBytes` UTF-8 bytes, cut on a character
+  /// boundary, without control characters. Presentation only.
+  static func boundedTitle(_ title: String) -> String {
+    var out = ""
+    var bytes = 0
+    for character in title {
+      let filtered = String(
+        String.UnicodeScalarView(
+          character.unicodeScalars.filter { !isControl($0) }
+        )
+      )
+      let size = filtered.utf8.count
+      guard bytes + size <= RSTLimits.maxTitleBytes else { break }
+      out += filtered
+      bytes += size
+    }
+    return out
+  }
+
+  static func isControl(_ scalar: Unicode.Scalar) -> Bool {
+    scalar.value < 0x20 || (0x7F ... 0x9F).contains(scalar.value)
+  }
+}
+
+/// Deduplicating style table; index 0 is always the plain style.
+struct StyleTable {
+  private(set) var styles: [CellStyle] = [.plain]
+  private var indices: [CellStyle: Int] = [.plain: 0]
+  private var cache: [CellAttributes: Int] = [:]
+  let palette: Palette
+
+  init(palette: Palette) { self.palette = palette }
+
+  mutating func index(
+    for attributes: CellAttributes,
+    in state: borrowing TerminalState
+  ) -> Int {
+    if let cached = cache[attributes] { return cached }
+    let style = Self.style(attributes, palette: palette, state: state)
+    let index: Int
+    if let existing = indices[style] {
+      index = existing
+    } else {
+      index = styles.count
+      styles.append(style)
+      indices[style] = index
+    }
+    cache[attributes] = index
+    return index
+  }
+
+  static func style(
+    _ attributes: CellAttributes,
+    palette: Palette,
+    state: borrowing TerminalState
+  ) -> CellStyle {
+    let underline = state.underlineColor(attributes.underlineColor)
+      .flatMap { resolve($0, palette) }
+    return CellStyle(
+      foreground: resolve(attributes.foreground, palette),
+      background: resolve(attributes.background, palette),
+      underlineColor: underline,
+      attributes: textAttributes(attributes.flags)
+    )
+  }
+
+  /// Palette and direct colors resolve to RGB; the default color is nil
+  /// so the client applies its own default.
+  static func resolve(_ color: TerminalColor, _ palette: Palette) -> RGBColor?
+  {
+    switch color.kind {
+    case .default: nil
+    case let .palette(index): RGBColor(palette.colors[Int(index)])
+    case let .rgb(value): RGBColor(value)
+    }
+  }
+
+  /// Presentation attributes only: hyperlinks and protection are dropped.
+  static func textAttributes(_ flags: CellFlags) -> TextAttributes {
+    var out: TextAttributes = []
+    if flags.contains(.bold) { out.insert(.bold) }
+    if flags.contains(.faint) { out.insert(.faint) }
+    if flags.contains(.italic) { out.insert(.italic) }
+    if flags.contains(.blink) { out.insert(.blink) }
+    if flags.contains(.inverse) { out.insert(.inverse) }
+    if flags.contains(.invisible) { out.insert(.invisible) }
+    if flags.contains(.strikethrough) { out.insert(.strikethrough) }
+    if flags.contains(.overline) { out.insert(.overline) }
+    if flags.contains(.doubleUnderline) {
+      out.insert(.doubleUnderline)
+    } else if flags.contains(.underline) {
+      let a = flags.contains(.underlineStyleA)
+      let b = flags.contains(.underlineStyleB)
+      switch (a, b) {
+      case (true, true): out.insert(.dashedUnderline)
+      case (true, false): out.insert(.curlyUnderline)
+      case (false, true): out.insert(.dottedUnderline)
+      case (false, false): out.insert(.underline)
+      }
+    }
+    return out
+  }
+}
+#endif

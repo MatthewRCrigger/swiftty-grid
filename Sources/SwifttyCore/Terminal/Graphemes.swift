@@ -42,6 +42,15 @@ struct GraphemeTable: ~Copyable {
     return UInt32(entries.count - 1)
   }
 
+  /// Stores a complete cluster of at least two scalars and returns its id.
+  mutating func insert(_ cluster: [UInt32]) -> UInt32 {
+    precondition(cluster.count >= 2, "a grapheme entry joins scalars")
+    let start = scalars.count
+    scalars.append(contentsOf: cluster)
+    entries.append(UInt64(start) << 32 | UInt64(cluster.count))
+    return UInt32(entries.count - 1)
+  }
+
   /// Last scalar of a cell's content.
   func lastScalar(of cell: Cell) -> UInt32 {
     guard cell.isGrapheme else { return cell.glyph }

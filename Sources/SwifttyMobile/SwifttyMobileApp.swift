@@ -103,7 +103,7 @@ open class TerminalViewController: UIViewController {
       view.backgroundColor = .clear
       if configuration.backgroundBlur > 0 {
         let blur = UIVisualEffectView(
-          effect: UIBlurEffect(style: .systemUltraThinMaterialDark)
+          effect: UIBlurEffect(style: Self.backgroundMaterial)
         )
         blur.frame = view.bounds
         blur.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -146,6 +146,15 @@ open class TerminalViewController: UIViewController {
     terminal?.becomeFirstResponder()
   }
 
+  #if os(tvOS)
+  private static let backgroundMaterial = UIBlurEffect.Style.dark
+  #else
+  private static let backgroundMaterial = UIBlurEffect.Style
+    .systemUltraThinMaterialDark
+  #endif
+
+  #if !os(tvOS)
   override open var preferredStatusBarStyle: UIStatusBarStyle { .default }
+  #endif
 }
 #endif

@@ -22,7 +22,11 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   /// Point size set by the user (pinch, key bindings); nil follows
   /// the configuration, or Dynamic Type when it sets no size.
   private var explicitFontSize: CGFloat?
+  /// Modes of the last drawn frame, as `capabilities` lets the view act
+  /// on them (mouse tracking is masked without mouse reporting).
   var lastModes: Modes = .initial
+  /// The same frame's modes as the terminal reported them.
+  private var programModes: Modes = .initial
   /// Cursor of the last drawn frame, for placing IME candidates.
   var lastCursor: CursorState?
   private(set) var gridSize = (columns: 0, rows: 0)
@@ -66,8 +70,35 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   /// Key commands and their actions, keyed by unique issued identifiers.
   var keyCommandCache: [UIKeyCommand]?
   var keyCommandBindings: [String: Keybindings.Binding] = [:]
+  #if !os(tvOS)
   /// Defaults to the system clipboard; tests can use a local pasteboard.
   var pasteboard = UIPasteboard.general
+  #endif
+
+  /// What this surface offers for its session (`.full` by default; a
+  /// remote presentation uses `.roaming`). Unavailable actions are hidden
+  /// or disabled: program clipboard writes (OSC 52), link opening, search,
+  /// scrollback, mouse reporting, paste and local terminal resets.
+  public var capabilities = SurfaceCapabilities.full {
+    didSet { capabilitiesChanged() }
+  }
+
+  /// `capabilities` within what the platform provides (no clipboard on
+  /// tvOS).
+  var effectiveCapabilities: SurfaceCapabilities {
+    #if os(tvOS)
+    capabilities.withoutClipboard
+    #else
+    capabilities
+    #endif
+  }
+
+  /// Covers the terminal with an opaque view while the scene is inactive
+  /// or in the background, so app-switcher snapshots omit its content.
+  public var hidesContentWhenInactive = false {
+    didSet { updatePrivacyCover() }
+  }
+  private(set) var privacyCover: UIView?
 
   enum SelectionUnit { case cell, word, line }
   var selectionUnit = SelectionUnit.cell
@@ -77,7 +108,9 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   var hasSelection = false
   /// Whether the active pointer drag reported its initial press.
   var reportsPointerMouseGesture = false
+  #if !os(tvOS)
   lazy var editMenu = UIEditMenuInteraction(delegate: self)
+  #endif
   lazy var searchBar: TerminalSearchBar = makeSearchBar()
   var isSearchVisible = false
 
@@ -106,7 +139,9 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   var overLink = false
   /// OSC 22 shape the application asked for; empty for the default.
   var pointerShapeName = ""
+  #if !os(tvOS)
   var pointerInteraction: UIPointerInteraction?
+  #endif
 
   private var blink = BlinkState()
   private var blinkTimer: Timer?
@@ -213,7 +248,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
     updateAccessibilityElements()
 
     let center = NotificationCenter.default
-    #if !os(visionOS)
+    #if !os(visionOS) && !os(tvOS)
     // The visionOS keyboard occupies its own window and does
     // not send these screen-coordinate notifications.
     center.addObserver(
@@ -256,15 +291,25 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
 
   private func handle(_ event: TerminalEvent) {
     switch event {
-    case let .title(title): onTitle?(title) #if !os(visionOS)
+    case let .title(title): onTitle?(title) #if !os(visionOS) && !os(tvOS)
     case .bell:
       UIImpactFeedbackGenerator(style: .light, view: self).impactOccurred()
     #endif
-    case let .clipboard(text): UIPasteboard.general.string = text
+    case let .clipboard(text):
+      // Program-initiated writes pass the policy gate (spec §A.7).
+      #if !os(tvOS)
+      if effectiveCapabilities.remoteClipboardWrites {
+        pasteboard.string = text
+      }
+      #else
+      _ = text
+      #endif
     case .exited: onExit?()
     case let .pointerShape(name):
       pointerShapeName = name
+      #if !os(tvOS)
       pointerInteraction?.invalidate()
+      #endif
     default: break
     }
   }
@@ -417,6 +462,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
       window?.windowScene.map { $0.activationState == .foregroundActive }
       ?? true
     isRenderingPaused = window?.windowScene?.activationState == .background
+    updatePrivacyCover()
     updateFocus()
     updateFrameDriving()
     guard let scene = window?.windowScene else {
@@ -456,6 +502,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   func sceneDidEnterBackground() {
     isRenderingPaused = true
     isSceneActive = false
+    updatePrivacyCover()
     updateFocus()
     stopMomentum()
     releaseHardwareKeys()
@@ -473,6 +520,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   @objc
   func sceneWillDeactivate() {
     isSceneActive = false
+    updatePrivacyCover()
     updateFocus()
   }
 
@@ -480,6 +528,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   func sceneDidActivate() {
     isRenderingPaused = false
     isSceneActive = true
+    updatePrivacyCover()
     updateFocus()
     updateFrameDriving()
     setNeedsDisplay()
@@ -509,7 +558,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
     setNeedsDisplay()
   }
 
-  #if !os(visionOS)
+  #if !os(visionOS) && !os(tvOS)
   /// Follows the docked keyboard: rows it covers leave the grid. A
   /// floating or undocked keyboard covers nothing.
   @objc
@@ -635,9 +684,13 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
     guard !isRenderingPaused else { return }
     let surfaceVisible = isSurfaceVisible
     let snapshot = session.snapshot()
-    let modesChanged = lastModes != snapshot.modes
-    lastModes = snapshot.modes
+    programModes = snapshot.modes
+    let modes = effectiveCapabilities.effectiveModes(snapshot.modes)
+    let modesChanged = lastModes != modes
+    lastModes = modes
+    #if !os(tvOS)
     if modesChanged { pointerInteraction?.invalidate() }
+    #endif
     if let point = hoverPoint,
       modesChanged || !snapshot.damage.isEmpty
         || hoverViewportOffset != snapshot.viewportOffset
@@ -883,6 +936,49 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
     guard blinkTimer != nil else { return }
     stopBlinking()
     updateBlinkTimer()
+  }
+
+  // MARK: Capabilities and privacy
+
+  private func capabilitiesChanged() {
+    let available = effectiveCapabilities
+    lastModes = available.effectiveModes(programModes)
+    if !available.search, isSearchVisible { hideSearch() }
+    if !available.scrollback {
+      stopMomentum()
+      session.mutateAsync { state in
+        if state.viewportOffset != 0 { state.scrollViewportToBottom() }
+      }
+    }
+    #if !os(tvOS)
+    editMenu.dismissMenu()
+    pointerInteraction?.invalidate()
+    #endif
+    keyCommandCache = nil
+    if let point = hoverPoint { refreshHoveredLink(at: point) }
+    setNeedsDisplay()  // re-derives the routing modes
+  }
+
+  /// Shows the cover while hiding is enabled and the scene is not
+  /// active; removes it otherwise.
+  func updatePrivacyCover() {
+    let covered =
+      hidesContentWhenInactive && (!isSceneActive || isRenderingPaused)
+    if covered, privacyCover == nil {
+      let cover = UIView(frame: bounds)
+      cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+      cover.backgroundColor =
+        backgroundColor.flatMap {
+          $0 == .clear ? nil : $0.withAlphaComponent(1)
+        } ?? .black
+      cover.isUserInteractionEnabled = false
+      cover.accessibilityElementsHidden = true
+      addSubview(cover)
+      privacyCover = cover
+    } else if !covered, let cover = privacyCover {
+      cover.removeFromSuperview()
+      privacyCover = nil
+    }
   }
 
   // MARK: Accessibility notifications

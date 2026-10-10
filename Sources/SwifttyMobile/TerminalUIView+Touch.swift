@@ -14,15 +14,17 @@ import UIKit
 /// - pointer hover: motion reports (mode 1003), link underline, the
 ///   OSC 22 pointer shape; secondary click: menu;
 /// - pinch: font size.
-extension TerminalUIView: UIPointerInteractionDelegate,
-  @MainActor UIEditMenuInteractionDelegate
-{
+///
+/// tvOS has no touch screen, pointer or edit menu: the select button
+/// focuses the terminal and keyboards provide input.
+extension TerminalUIView {
   func installGestures() {
     let tap = UITapGestureRecognizer(
       target: self,
       action: #selector(handleTap(_:))
     )
     addGestureRecognizer(tap)
+    #if !os(tvOS)
 
     let secondary = UITapGestureRecognizer(
       target: self,
@@ -76,6 +78,16 @@ extension TerminalUIView: UIPointerInteractionDelegate,
     addInteraction(pointer)
     pointerInteraction = pointer
     addInteraction(editMenu)
+    #endif
+  }
+
+  /// Modifier keys held during a gesture (none on tvOS).
+  static func modifiers(of gesture: UIGestureRecognizer) -> KeyModifiers {
+    #if os(tvOS)
+    []
+    #else
+    modifiers(gesture.modifierFlags)
+    #endif
   }
 
   // MARK: Mouse reporting
@@ -113,9 +125,11 @@ extension TerminalUIView: UIPointerInteractionDelegate,
   private func handleTap(_ tap: UITapGestureRecognizer) {
     stopMomentum()
     let point = tap.location(in: self)
-    let mods = Self.modifiers(tap.modifierFlags)
+    let mods = Self.modifiers(of: tap)
     if !isFirstResponder { becomeFirstResponder() }
+    #if !os(tvOS)
     editMenu.dismissMenu()
+    #endif
     // Shift selects even while the application tracks the mouse.
     if tracking, !mods.contains(.shift) {
       sendMouse(.press, .left, at: point, modifiers: mods)
@@ -134,18 +148,21 @@ extension TerminalUIView: UIPointerInteractionDelegate,
         state.link(at: p, detectURLs: detect), state.promptCursorMoves(to: p)
       )
     }
-    if let link, let url = LinkPolicy.openableURL(link.url) {
+    if effectiveCapabilities.openURLs, let link,
+      let url = LinkPolicy.openableURL(link.url)
+    {
       UIApplication.shared.open(url)
     } else if configuration.cursorClickToMove, let moves, moves != 0 {
       send(ClickToMove.keys(moves).map { .key($0) })
     }
   }
 
+  #if !os(tvOS)
   @objc
   private func handleSecondaryClick(_ tap: UITapGestureRecognizer) {
     stopMomentum()
     let point = tap.location(in: self)
-    let mods = Self.modifiers(tap.modifierFlags)
+    let mods = Self.modifiers(of: tap)
     if tracking, !mods.contains(.shift) {
       sendMouse(.press, .right, at: point, modifiers: mods)
       sendMouse(.release, .right, at: point, modifiers: mods)
@@ -159,7 +176,7 @@ extension TerminalUIView: UIPointerInteractionDelegate,
   @objc
   private func handlePointerDrag(_ pan: UIPanGestureRecognizer) {
     let point = pan.location(in: self)
-    let mods = Self.modifiers(pan.modifierFlags)
+    let mods = Self.modifiers(of: pan)
     var start = point
     if pan.state == .began {
       stopMomentum()
@@ -213,7 +230,7 @@ extension TerminalUIView: UIPointerInteractionDelegate,
     }
     let point = hover.location(in: self)
     let c = cell(at: point)
-    let modifiers = Self.modifiers(hover.modifierFlags)
+    let modifiers = Self.modifiers(of: hover)
     hoverPoint = point
     guard
       (hoverCell.map { $0 != c } ?? true) || hoverModifiers != modifiers
@@ -227,10 +244,11 @@ extension TerminalUIView: UIPointerInteractionDelegate,
     }
     refreshHoveredLink(at: point)
   }
+  #endif
 
   /// Updates link presentation independently of mouse motion reports.
   func refreshHoveredLink(at point: CGPoint) {
-    if tracking {
+    if tracking || !effectiveCapabilities.openURLs {
       setHoveredLink(nil)
       return
     }
@@ -267,11 +285,14 @@ extension TerminalUIView: UIPointerInteractionDelegate,
     renderer.options.underlinedSpan = span
     if overLink != isOver {
       overLink = isOver
+      #if !os(tvOS)
       pointerInteraction?.invalidate()
+      #endif
     }
     setNeedsDisplay()
   }
 
+  #if !os(tvOS)
   public func pointerInteraction(
     _ interaction: UIPointerInteraction,
     styleFor region: UIPointerRegion
@@ -338,9 +359,11 @@ extension TerminalUIView: UIPointerInteractionDelegate,
     let size = (pinchStartSize * pinch.scale).rounded()
     if size != fontSize { setFontSize(size) }
   }
+  #endif
 
   // MARK: Selection
 
+  #if !os(tvOS)
   @objc
   private func handleLongPress(_ press: UILongPressGestureRecognizer) {
     let point = press.location(in: self)
@@ -362,6 +385,7 @@ extension TerminalUIView: UIPointerInteractionDelegate,
     default: break
     }
   }
+  #endif
 
   func beginSelection(at point: CGPoint, unit: SelectionUnit, rectangle: Bool) {
     stopMomentum()
@@ -394,6 +418,7 @@ extension TerminalUIView: UIPointerInteractionDelegate,
     let c = geometry.cell(at: point)
     let unit = selectionUnit
     let requiresSelection = hasSelection
+    let scrollback = effectiveCapabilities.scrollback
     let extended = session.mutate {
       state -> (extended: Bool, hasSelection: Bool) in
       // Output may invalidate an active drag before the next frame.
@@ -403,7 +428,7 @@ extension TerminalUIView: UIPointerInteractionDelegate,
         !requiresSelection || state.selection != nil
       else { return (false, state.selection != nil) }
       // Dragging past the top or bottom edge scrolls the viewport.
-      if scrollEdges {
+      if scrollEdges, scrollback {
         state.scrollViewport(
           by: SelectionMath.edgeScroll(row: c.row, rows: state.rows)
         )
@@ -430,7 +455,10 @@ extension TerminalUIView: UIPointerInteractionDelegate,
 
   func endSelection() {
     selectionOrigin = nil
-    if hasSelection, configuration.copyOnSelect { copy(nil) }
+    if hasSelection, configuration.copyOnSelect, effectiveCapabilities.localCopy
+    {
+      copy(nil)
+    }
   }
 
   func clearSelection() {
@@ -439,6 +467,7 @@ extension TerminalUIView: UIPointerInteractionDelegate,
     session.mutateAsync { $0.setSelection(nil) }
   }
 
+  #if !os(tvOS)
   public func editMenuInteraction(
     _ interaction: UIEditMenuInteraction,
     menuFor configuration: UIEditMenuConfiguration,
@@ -490,7 +519,7 @@ extension TerminalUIView: UIPointerInteractionDelegate,
   @objc
   private func handleScroll(_ pan: UIPanGestureRecognizer) {
     let point = pan.location(in: self)
-    let modifiers = Self.modifiers(pan.modifierFlags)
+    let modifiers = Self.modifiers(of: pan)
     switch pan.state {
     case .began:
       stopMomentum()
@@ -525,6 +554,7 @@ extension TerminalUIView: UIPointerInteractionDelegate,
       )
     }
   }
+  #endif
 
   /// Scrolls by `lines` (positive reveals history, as content follows
   /// the finger down), routed the way the application asked.
@@ -561,11 +591,12 @@ extension TerminalUIView: UIPointerInteractionDelegate,
       }
     case .viewport:
       horizontalScrollAccumulator.reset()
-      guard n != 0 else { return }
+      guard n != 0, effectiveCapabilities.scrollback else { return }
       session.scrollViewport(by: n)
     }
   }
 
+  #if !os(tvOS)
   private func startMomentum(
     velocity: CGFloat,
     horizontalVelocity: CGFloat,
@@ -607,6 +638,7 @@ extension TerminalUIView: UIPointerInteractionDelegate,
     )
     if !momentum.isActive, !horizontalMomentum.isActive { stopMomentum() }
   }
+  #endif
 
   func stopMomentum() {
     momentum.stop()
@@ -617,4 +649,10 @@ extension TerminalUIView: UIPointerInteractionDelegate,
     momentumLink = nil
   }
 }
+
+#if !os(tvOS)
+extension TerminalUIView: UIPointerInteractionDelegate,
+  @MainActor UIEditMenuInteractionDelegate
+{}
+#endif
 #endif

@@ -1,6 +1,7 @@
 import AppKit
 import MetalKit
 @testable import Swiftty
+@testable import SwifttyMac
 import SwifttyCore
 import Testing
 

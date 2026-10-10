@@ -12,6 +12,8 @@ final class SessionCallbacks: @unchecked Sendable {
     var onStateChange: (@Sendable (borrowing TerminalState) -> Void)?
     var onProgramOutput: (@Sendable ([UInt8]) -> Void)?
     var onControlModeData: (@Sendable ([UInt8]) -> Void)?
+    var semanticInput: (@Sendable (TerminalInput) -> Void)?
+    var gridProposal: (@Sendable (Int, Int) -> Void)?
   }
 
   private let lock = NSLock()
@@ -154,6 +156,38 @@ final class SessionCallbacks: @unchecked Sendable {
       lock.lock()
       let previous = state.onControlModeData
       state.onControlModeData = newValue
+      lock.unlock()
+      withExtendedLifetime(previous) {}
+    }
+  }
+
+  var semanticInput: (@Sendable (TerminalInput) -> Void)? {
+    get {
+      lock.lock()
+      let handler = state.semanticInput
+      lock.unlock()
+      return handler
+    }
+    set {
+      lock.lock()
+      let previous = state.semanticInput
+      state.semanticInput = newValue
+      lock.unlock()
+      withExtendedLifetime(previous) {}
+    }
+  }
+
+  var gridProposal: (@Sendable (Int, Int) -> Void)? {
+    get {
+      lock.lock()
+      let handler = state.gridProposal
+      lock.unlock()
+      return handler
+    }
+    set {
+      lock.lock()
+      let previous = state.gridProposal
+      state.gridProposal = newValue
       lock.unlock()
       withExtendedLifetime(previous) {}
     }

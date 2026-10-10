@@ -1,0 +1,142 @@
+#!/bin/sh
+# XCUITest of a real roaming SSH client app against a real OpenSSH server
+# and a real swifttyd agent (Scripts/real-ssh-env.sh).
+#
+#   Scripts/test-app-ui.sh <destination> [extra xcodebuild args...]
+#
+# destination selects the app:
+#   'platform=iOS Simulator,id=<udid>'       MobileClient
+#   'platform=macOS'                         MacClient
+#   'platform=macOS,variant=Mac Catalyst'    CatalystClient
+# Mac destinations sign with Apple Development for team $RST_UI_TEAM
+# (default 72KB9YQR7B) using locally installed profiles; nothing is
+# provisioned. Extra args go to xcodebuild, e.g.
+#   -only-testing:AppUITests/RoamingAppUITests/testRejectUnknownHostKey
+#
+# The project (app target + AppUITests UI-test target) is generated with
+# XcodeGen into a temporary workspace; the server details reach the test
+# runner as TEST_RUNNER_RST_UI_* variables.
+set -eu
+[ "$#" -ge 1 ] || { echo "usage: $0 <destination> [xcodebuild args...]" >&2; exit 2; }
+destination=$1
+shift
+command -v xcodegen >/dev/null || { echo "xcodegen required" >&2; exit 1; }
+repository_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
+apps="$repository_root/Apps"
+team=${RST_UI_TEAM:-72KB9YQR7B}
+
+catalyst=NO
+case $destination in
+  *"Mac Catalyst"*) platform=iOS; app=CatalystClient; catalyst=YES ;;
+  *"iOS Simulator"*) platform=iOS; app=MobileClient ;;
+  *macOS*) platform=macOS; app=MacClient ;;
+  *) echo "unsupported destination: $destination" >&2; exit 2 ;;
+esac
+
+env_file=$("$repository_root/Scripts/real-ssh-env.sh" start)
+workspace=$(dirname "$env_file")
+trap '"$repository_root/Scripts/real-ssh-env.sh" stop "$workspace"' EXIT INT TERM
+. "$env_file"
+# A file for the SFTP browser to list.
+container exec "$(cat "$workspace/container.name")" \
+  sh -c 'echo note > /home/rst/files/ui-note.txt && chown rst:rst /home/rst/files/ui-note.txt'
+
+if [ $platform = macOS ] || [ $catalyst = YES ]; then
+  signing="CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: $team
+        CODE_SIGN_IDENTITY: Apple Development"
+else
+  signing="CODE_SIGN_IDENTITY: \"-\""
+fi
+
+case $app in
+  MobileClient)
+    sources="[{ path: \"$apps/MobileClient\" }]"
+    deps="- { package: Swiftty, product: RoamingApp }
+      - { package: Swiftty, product: CompanionModel }"
+    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mobile
+        TARGETED_DEVICE_FAMILY: \"1,2\"
+        SUPPORTS_MACCATALYST: NO
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES" ;;
+  CatalystClient)
+    sources="[{ path: \"$apps/CatalystClient\", excludes: [\"*.entitlements\"] }]"
+    deps="- { package: Swiftty, product: RoamingApp }"
+    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.catalyst
+        SUPPORTS_MACCATALYST: YES
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
+        TARGETED_DEVICE_FAMILY: \"2,6\"
+        CODE_SIGN_ENTITLEMENTS: $apps/CatalystClient/CatalystClient.entitlements
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES" ;;
+  MacClient)
+    sources="[{ path: \"$apps/MacClient\", excludes: [\"*.entitlements\"] }]"
+    deps="- { package: Swiftty, product: RoamingApp }"
+    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mac
+        CODE_SIGN_ENTITLEMENTS: $apps/MacClient/MacClient.entitlements
+        ENABLE_HARDENED_RUNTIME: YES" ;;
+esac
+
+project="$workspace/project"
+mkdir -p "$project"
+cat >"$project/project.yml" <<YML
+name: RoamingUITests
+options:
+  deploymentTarget: { iOS: "27.0", macOS: "27.0" }
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    GENERATE_INFOPLIST_FILE: YES
+    MARKETING_VERSION: "0.1"
+    CURRENT_PROJECT_VERSION: "1"
+packages:
+  Swiftty: { path: "$repository_root" }
+targets:
+  $app:
+    type: application
+    platform: $platform
+    sources: $sources
+    dependencies:
+      $deps
+    settings:
+      base:
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Roaming SSH
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
+        $app_settings
+        $signing
+  AppUITests:
+    type: bundle.ui-testing
+    platform: $platform
+    sources: [{ path: "$repository_root/Tests/AppUITests" }]
+    dependencies: [{ target: $app }]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.uitests
+        TEST_TARGET_NAME: $app
+        SUPPORTS_MACCATALYST: $catalyst
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
+        TARGETED_DEVICE_FAMILY: "$( [ $catalyst = YES ] && echo 2,6 || echo 1,2 )"
+        $signing
+schemes:
+  RoamingUITests:
+    build: { targets: { $app: all, AppUITests: [test] } }
+    test: { targets: [AppUITests] }
+YML
+(cd "$project" && xcodegen generate --quiet --spec project.yml)
+
+echo "Testing $app on $destination (result bundle: $workspace/result.xcresult)"
+status=0
+TEST_RUNNER_RST_UI_HOST=$RST_REAL_SSH_HOST \
+TEST_RUNNER_RST_UI_PORT=$RST_REAL_SSH_PORT \
+TEST_RUNNER_RST_UI_USER=$RST_REAL_SSH_USER \
+TEST_RUNNER_RST_UI_PASSWORD=$RST_REAL_SSH_PASSWORD \
+TEST_RUNNER_RST_UI_FINGERPRINT=$RST_REAL_SSH_FINGERPRINT \
+  xcodebuild -project "$project/RoamingUITests.xcodeproj" -scheme RoamingUITests \
+  -destination "$destination" -derivedDataPath "$workspace/build" \
+  -resultBundlePath "$workspace/result.xcresult" -collect-test-diagnostics never \
+  "$@" test >"$workspace/xcodebuild.log" 2>&1 || status=$?
+grep -E "Test Case|error:|XCTAssert|failed|TEST (SUCCEEDED|FAILED)|Signing Identity" \
+  "$workspace/xcodebuild.log" | grep -Ev "^ *[0-9]+ \|" | uniq | tail -60
+[ $status -eq 0 ] || echo "xcodebuild failed ($status); log: $workspace/xcodebuild.log" >&2
+exit $status
