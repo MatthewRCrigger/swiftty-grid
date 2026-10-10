@@ -261,6 +261,8 @@ final class RoamingTerminalController: TerminalSurfaceController {
       rows: min(max(rows, 1), RSTLimits.maxRows)
     )
     guard next != grid else { return }
+    // Kept even without a client (e.g. during SSH sign-in): the next
+    // client starts from `grid`, so the latest proposal is never lost.
     grid = next
     serial { await $0.proposeGrid(columns: next.columns, rows: next.rows) }
   }

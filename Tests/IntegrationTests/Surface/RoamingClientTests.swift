@@ -261,6 +261,42 @@ struct RoamingClientTests {
   }
 
   @Test
+  func `resume requests the configured grid instead of adopting the grant`() async throws {
+    // The view proposed 30x5 while signing in; the session is 20x4.
+    let f = RoamingFixture(initialGrid: GridSize(columns: 30, rows: 5))
+    try await f.client.start(.resume(f.host.sessionID))
+    #expect(await f.waitFor(.active))
+    let requested = f.bootstrapper.requests.withLock { $0.first?.initialGrid }
+    #expect(requested == GridSize(columns: 30, rows: 5))
+    #expect(await eventually { f.sink.last?.columns == 30 })
+    #expect(await f.host.resizes == [.resize(columns: 30, rows: 5, resizeRevision: 1)])
+    await f.client.close()
+  }
+
+  @Test
+  func `reattaching re-requests the grid after another client resized`() async throws {
+    let f = RoamingFixture()
+    #expect(try await f.startActive())
+    await f.client.proposeGrid(columns: 30, rows: 5)
+    #expect(await eventually { f.sink.last?.columns == 30 })
+
+    await f.client.enterBackground()
+    // Another client takes over and resizes the session.
+    await f.host.resizeExternally(columns: 50, rows: 10)
+    await f.client.enterForeground()
+    #expect(await f.waitFor(.active))
+    #expect(await eventually { f.sink.last?.columns == 30 })
+    #expect(f.sink.last?.rows == 5)
+    #expect(
+      await f.host.resizes == [
+        .resize(columns: 30, rows: 5, resizeRevision: 1),
+        .resize(columns: 30, rows: 5, resizeRevision: 3),
+      ]
+    )
+    await f.client.close()
+  }
+
+  @Test
   func `unanswered input marks the connection stale and recovers`() async throws {
     let f = RoamingFixture()
     let states = Mutex<[ClientConnectionState]>([])

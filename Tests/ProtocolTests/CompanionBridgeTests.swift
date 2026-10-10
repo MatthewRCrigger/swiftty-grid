@@ -250,6 +250,40 @@ struct CompanionBridgeTests {
   }
 
   @Test
+  func `re-enabling sharing accepts the active session's observation`() throws {
+    var bridge = PhoneCompanionBridge(
+      settings: CompanionSettings(sharingEnabled: true, previewEnabled: false),
+      now: t0
+    )
+    let active = observation(.active, at: t0.addingTimeInterval(5))
+    _ = bridge.observe(active)
+    let off = bridge.update(
+      CompanionSettings(sharingEnabled: false, previewEnabled: false),
+      now: t0.addingTimeInterval(60)
+    )
+    #expect(off == .cleared(at: t0.addingTimeInterval(60)))
+    let on = bridge.update(
+      CompanionSettings(sharingEnabled: true, previewEnabled: false),
+      now: t0.addingTimeInterval(120)
+    )
+    #expect(bridge.status?.state == .noSession)
+
+    // The session's state has not changed since t0+5; its re-sent
+    // observation is still the newest real one and must be accepted.
+    let observed = bridge.observe(active)
+    let context = try #require(observed)
+    #expect(bridge.status?.state == .active)
+    #expect(bridge.status?.capturedAt == t0.addingTimeInterval(5))
+
+    // The watch, cleared and then re-enabled, ends up showing it too.
+    var watch = WatchCompanionStore()
+    watch.receive(try #require(off))
+    watch.receive(try #require(on))
+    watch.receive(context)
+    #expect(watch.status?.state == .active)
+  }
+
+  @Test
   func `watch clears preview when inactive`() throws {
     var bridge = PhoneCompanionBridge(
       settings: CompanionSettings(sharingEnabled: true, previewEnabled: true),
