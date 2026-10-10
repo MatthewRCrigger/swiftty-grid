@@ -35,6 +35,12 @@ let allowHost = arguments.contains("--allow-host")
 arguments.removeAll { $0 == "--allow-host" }
 let command = arguments.first.map { $0.hasPrefix("-") ? "" : $0 } ?? ""
 var rest = command.isEmpty ? arguments : Array(arguments.dropFirst())
+/// Everything after `--` is the program and its arguments, never options.
+var trailing: [String]?
+if let i = rest.firstIndex(of: "--") {
+  trailing = Array(rest[(i + 1)...])
+  rest = Array(rest[..<i])
+}
 
 @MainActor
 func option(_ flag: String) -> String? {
@@ -274,8 +280,7 @@ case "new":
   let detached = flag("-d")
   let name = option("-s")
   let dir = option("-c")
-  var cmd: [String]?
-  if let i = rest.firstIndex(of: "--") { cmd = Array(rest[(i + 1)...]) }
+  let cmd = trailing
   if !detached { checkHost() }
   let c = await connect(detached ? .control : .terminal)
   let ws = await newWorkspace(

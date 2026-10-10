@@ -16,6 +16,7 @@ let package = Package(
     .executable(name: "swmux", targets: ["SwiftMuxCLI"]),
     .executable(name: "swiftmux-agent", targets: ["SwiftMuxAgent"]),
     .executable(name: "swmux-launcher", targets: ["SwiftMuxLauncher"]),
+    .executable(name: "swiftmux-bench", targets: ["SwiftMuxBench"]),
   ],
   targets: [
     .target(
@@ -44,6 +45,14 @@ let package = Package(
     // Fresh-process terminal setup: login_tty, then exec the shell in place.
     .executableTarget(name: "SwiftMuxLauncher"),
     .target(name: "SwiftMuxClient", dependencies: ["SwiftMuxProtocol"]),
+    // §10 measurements: throughput, latency, CPU, memory, export and GPU.
+    .executableTarget(
+      name: "SwiftMuxBench",
+      dependencies: [
+        "SwiftMuxService", "SwiftMuxClient", "SwiftMuxProtocol",
+        "SwiftMuxBridge", "SwifttyCore",
+      ]
+    ),
     .target(
       name: "SwiftMuxTerminal",
       dependencies: ["SwiftMuxClient", "SwiftMuxProtocol"]

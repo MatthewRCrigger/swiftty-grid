@@ -1,0 +1,410 @@
+// swiftmux-bench: spec §10 measurements on the machine it runs on.
+//
+// Runs the real service in-process behind an anonymous XPC endpoint, with
+// real shells on PTYs. Reports parser throughput (detached and attached),
+// input-to-frame latency, frame export/import cost, service CPU and memory
+// at the pane limit, and GPU time for imported frames.
+import Darwin
+import Foundation
+import Metal
+import SwiftMuxBridge
+import SwiftMuxClient
+import SwiftMuxProtocol
+import SwiftMuxService
+import SwifttyCore
+
+func percentile(_ values: [Double], _ p: Double) -> Double {
+  let sorted = values.sorted()
+  return sorted[min(sorted.count - 1, Int(Double(sorted.count) * p))]
+}
+
+func ms(_ v: Double) -> String { String(format: "%.3f ms", v) }
+
+func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e9 }
+
+/// Physical footprint of this process (service plus bench client).
+func footprint() -> Double {
+  var info = task_vm_info_data_t()
+  var count = mach_msg_type_number_t(
+    MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size
+  )
+  let kr = withUnsafeMutablePointer(to: &info) {
+    $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+      task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+    }
+  }
+  return kr == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576 : 0
+}
+
+func cpuSeconds() -> Double {
+  var usage = rusage()
+  getrusage(RUSAGE_SELF, &usage)
+  return Double(usage.ru_utime.tv_sec) + Double(usage.ru_utime.tv_usec) / 1e6
+    + Double(usage.ru_stime.tv_sec) + Double(usage.ru_stime.tv_usec) / 1e6
+}
+
+let exe = URL(fileURLWithPath: CommandLine.arguments[0])
+  .resolvingSymlinksInPath()
+let launcher = exe.deletingLastPathComponent().appending(path: "swmux-launcher")
+  .path
+var config = MuxServiceConfiguration(launcherPath: launcher)
+let service = MuxService(configuration: config)
+let endpoint = service.listenAnonymously()
+let env = [
+  "PATH": "/usr/bin:/bin", "PS1": "$ ", "HOME": NSTemporaryDirectory(),
+  "LANG": "en_US.UTF-8",
+]
+
+func spec(_ script: String) -> LaunchSpec {
+  LaunchSpec(
+    command: ["/bin/sh", "-c", script],
+    workingDirectory: "/tmp",
+    environment: env
+  )
+}
+
+func connect(_ kind: FrontendKind = .native) async throws -> MuxConnection {
+  try await MuxConnection.connect(endpoint: endpoint, frontend: kind)
+}
+
+func create(
+  _ c: MuxConnection,
+  _ launch: LaunchSpec,
+  columns: Int = 200,
+  rows: Int = 50
+) async throws -> WorkspaceSnapshot {
+  guard
+    case let .created(ws) = try await c.execute(
+      .newWorkspace(
+        NewWorkspaceRequest(columns: columns, rows: rows, launch: launch)
+      )
+    )
+  else { fatalError("create") }
+  return ws
+}
+
+func show(
+  _ c: MuxConnection,
+  _ ws: WorkspaceSnapshot,
+  panes: [PaneID],
+  columns: Int = 200,
+  rows: Int = 50
+) async throws {
+  guard case let .attached(_, snap) = try await c.execute(.attach(.id(ws.id)))
+  else { fatalError() }
+  try await c.execute(
+    .setGeometry(
+      GeometryBatch(
+        layoutRevision: snap.layoutRevision,
+        generation: 1,
+        entries: panes.map { .init(pane: $0, columns: columns, rows: rows) }
+      )
+    )
+  )
+  try await c.execute(.setSubscriptions(panes))
+}
+
+// MARK: Corpus
+
+let corpusURL = URL(fileURLWithPath: NSTemporaryDirectory())
+  .appending(path: "swiftmux-bench.txt")
+let corpusBytes: Int = {
+  var line = ""
+  for i in 0 ..< 400 {
+    line += i % 7 == 0 ? "\u{1B}[3\(i % 8)m" : ""
+    line += i % 11 == 0 ? "界面 " : "word\(i % 97) "
+    line += i % 13 == 0 ? "\u{1B}[0m" : ""
+  }
+  var block = ""
+  for _ in 0 ..< 64 { block += line + "\r\n" }
+  let data = Data(block.utf8)
+  var out = Data()
+  while out.count < 32 << 20 { out.append(data) }
+  do { try out.write(to: corpusURL) } catch { fatalError("corpus: \(error)") }
+  return out.count
+}()
+
+// MARK: Throughput
+
+func throughput(attached: Bool) async throws -> (mbps: Double, frames: Int) {
+  let c = try await connect()
+  let start = now()
+  let ws = try await create(c, spec("cat \(corpusURL.path)"))
+  let pane = ws.tabs[0].activePane
+  var frames = 0
+  if attached {
+    try await show(c, ws, panes: [pane])
+    loop: while let event = try await c.nextEvent() {
+      switch event {
+      case .frame: frames += 1
+      case .paneExited: break loop
+      default: break
+      }
+    }
+  } else {
+    while true {
+      guard case let .status(s) = try await c.execute(.status) else { break }
+      if s.panes == 0 { break }
+      try await Task.sleep(for: .milliseconds(2))
+    }
+  }
+  let elapsed = now() - start
+  await c.close()
+  return (Double(corpusBytes) / 1_048_576 / elapsed, frames)
+}
+
+// MARK: Latency
+
+func latency(samples: Int) async throws -> [Double] {
+  let c = try await connect()
+  // Echo through the line discipline: the shell is not involved.
+  let ws = try await create(
+    c,
+    spec("stty -icanon; exec cat > /dev/null"),
+    columns: 120,
+    rows: 40
+  )
+  let pane = ws.tabs[0].activePane
+  try await show(c, ws, panes: [pane], columns: 120, rows: 40)
+  var lastX = -1
+  var lastY = -1
+  // The first complete frame is the baseline.
+  while true {
+    if case let .frame(f)? = try await c.nextEvent() {
+      lastX = f.cursor.x
+      lastY = f.cursor.y
+      break
+    }
+  }
+  try await Task.sleep(for: .milliseconds(200))
+  var times: [Double] = []
+  for i in 0 ..< samples {
+    let t0 = now()
+    try await c.send(.text(i % 100 == 99 ? "\r" : "x"), to: pane)
+    while true {
+      guard case let .frame(f)? = try await c.nextEvent() else { continue }
+      if f.cursor.x != lastX || f.cursor.y != lastY {
+        lastX = f.cursor.x
+        lastY = f.cursor.y
+        break
+      }
+    }
+    times.append((now() - t0) * 1000)
+    // Stay below the 60 Hz export cap so each sample measures a fresh frame.
+    try await Task.sleep(for: .milliseconds(20))
+  }
+  _ = try? await c.execute(.endWorkspace(.id(ws.id)))
+  await c.close()
+  return times
+}
+
+// MARK: Export/import and GPU
+
+func filledState(columns: Int, rows: Int) -> TerminalSession {
+  let session = TerminalSession(columns: columns, rows: rows)
+  var text = ""
+  for y in 0 ..< rows {
+    text +=
+      "\u{1B}[\(y + 1);1H\u{1B}[38;5;\(y % 256)m\u{1B}[48;2;10;\(y % 255);40m"
+    var line = ""
+    while line.unicodeScalars.count < columns - 4 {
+      line += y % 5 == 0 ? "界👍🏽 " : "abc\(y) "
+    }
+    text += line
+  }
+  session.feed(Array(text.utf8))
+  return session
+}
+
+func exportImport(
+  columns: Int,
+  rows: Int
+) throws -> (export: [Double], importing: [Double], bytes: Int, gpu: [Double]) {
+  let session = filledState(columns: columns, rows: rows)
+  var exportTimes: [Double] = []
+  var importTimes: [Double] = []
+  var bytes = 0
+  var frame: PaneFrame?
+  let identity = FrameIdentity(
+    server: ServerInstanceID(),
+    attachment: AttachmentID(),
+    pane: PaneID(),
+    revision: 1,
+    layoutRevision: 1,
+    geometryGeneration: 1,
+    viewportRevision: 0
+  )
+  for _ in 0 ..< 50 {
+    let t0 = now()
+    let data = try session.withState { state in
+      let f = try FrameExporter.frame(
+        from: state.captureOwnedScreen(),
+        identity: identity
+      )
+      return try SMXCodec.encode(
+        ServerMessage.event(.frame(f)),
+        limit: 32 << 20
+      )
+    }
+    exportTimes.append((now() - t0) * 1000)
+    bytes = data.count
+    let t1 = now()
+    guard
+      case let .event(.frame(decoded)) = try SMXCodec.decode(
+        ServerMessage.self,
+        from: data,
+        limit: 32 << 20
+      )
+    else { fatalError() }
+    _ = try FrameImporter.snapshot(from: decoded, sequence: 1)
+    importTimes.append((now() - t1) * 1000)
+    frame = decoded
+  }
+  var gpu: [Double] = []
+  if let device = MTLCreateSystemDefaultDevice(), let frame {
+    let renderer = try MetalRenderer(
+      device: device,
+      fontManager: CoreTextFontManager(),
+      font: FontDescriptor()
+    )
+    let d = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: .bgra8Unorm,
+      width: Int(renderer.cellSize.width) * columns + 16,
+      height: Int(renderer.cellSize.height) * rows + 16,
+      mipmapped: false
+    )
+    d.usage = [.renderTarget, .shaderRead]
+    d.storageMode = .private
+    let texture = device.makeTexture(descriptor: d)!
+    for i in 0 ..< 45 {
+      let snapshot = try FrameImporter.snapshot(
+        from: frame,
+        sequence: UInt64(i + 1)
+      )
+      let t0 = now()
+      let command = renderer.render(snapshot, to: texture)
+      command.waitUntilCompleted()
+      if i >= 5 { gpu.append((now() - t0) * 1000) }
+    }
+  }
+  return (
+    Array(exportTimes.dropFirst(5)), Array(importTimes.dropFirst(5)), bytes, gpu
+  )
+}
+
+// MARK: Load at the pane limit
+
+func load(
+  seconds: Double,
+  visible: Int
+) async throws -> (cpu: Double, mb: Double, framesPerSecond: Double) {
+  let limits = MuxLimits.standard
+  let c = try await connect()
+  let noisy = spec("while :; do cat \(corpusURL.path); done")
+  var workspaces: [WorkspaceSnapshot] = []
+  for _ in 0 ..< limits.maxPanes {
+    workspaces.append(try await create(c, noisy, columns: 120, rows: 40))
+  }
+  // One workspace gets `visible` panes by splitting; others stay detached.
+  var frames = 0
+  if visible > 0 {
+    let target = workspaces[0]
+    // Reuse other workspaces' panes is not possible; attach to one and
+    // subscribe its single pane, the remaining load runs detached.
+    try await show(
+      c,
+      target,
+      panes: [target.tabs[0].activePane],
+      columns: 120,
+      rows: 40
+    )
+  }
+  let cpu0 = cpuSeconds()
+  let t0 = now()
+  if visible > 0 {
+    while now() - t0 < seconds {
+      if case .frame? = try await c.nextEvent() { frames += 1 }
+    }
+  } else {
+    try await Task.sleep(for: .seconds(seconds))
+  }
+  let elapsed = now() - t0
+  let cpu = (cpuSeconds() - cpu0) / elapsed * 100
+  let mb = footprint()
+  if visible > 0 { try await c.execute(.detach) }
+  try await c.execute(.endAllWorkspaces)
+  try await c.execute(.quiesce(false))
+  while case let .status(s) = try await c.execute(.status), s.panes > 0 {
+    try await Task.sleep(for: .milliseconds(50))
+  }
+  await c.close()
+  return (cpu, mb, Double(frames) / elapsed)
+}
+
+// MARK: Run
+
+signal(SIGPIPE, SIG_IGN)
+setvbuf(stdout, nil, _IOLBF, 0)
+print("swiftmux-bench (\(SMX.build)); host \(ProcessInfo.processInfo.hostName)")
+print(
+  "  \(ProcessInfo.processInfo.operatingSystemVersionString), \(ProcessInfo.processInfo.activeProcessorCount) cores"
+)
+#if DEBUG
+print("  WARNING: debug build; use swift run -c release swiftmux-bench")
+#endif
+print("corpus: \(corpusBytes / 1_048_576) MiB of SGR/UTF-8/wide text")
+let idleMB = footprint()
+let detached = try await throughput(attached: false)
+print(
+  String(
+    format: "throughput, detached pane:            %7.1f MiB/s",
+    detached.mbps
+  )
+)
+let attached = try await throughput(attached: true)
+print(
+  String(
+    format: "throughput, attached 200x50 client:   %7.1f MiB/s (%d frames)",
+    attached.mbps,
+    attached.frames
+  )
+)
+let lat = try await latency(samples: 200)
+print(
+  "input-to-frame latency (XPC, PTY echo, export, decode): p50 \(ms(percentile(lat, 0.5))) p95 \(ms(percentile(lat, 0.95))) p99 \(ms(percentile(lat, 0.99)))"
+)
+for (cols, rows) in [(200, 50), (512, 256)] {
+  let r = try exportImport(columns: cols, rows: rows)
+  print(
+    "frame \(cols)x\(rows): \(r.bytes / 1024) KiB; "
+      + "export+encode p50 \(ms(percentile(r.export, 0.5))) "
+      + "p95 \(ms(percentile(r.export, 0.95))); "
+      + "decode+validate+import p50 \(ms(percentile(r.importing, 0.5))) "
+      + "p95 \(ms(percentile(r.importing, 0.95)))"
+      + (r.gpu.isEmpty
+        ? ""
+        : "; GPU render p50 \(ms(percentile(r.gpu, 0.5))) p95 \(ms(percentile(r.gpu, 0.95)))")
+  )
+}
+let noClient = try await load(seconds: 5, visible: 0)
+print(
+  String(
+    format:
+      "32 noisy panes, no client:   service CPU %6.1f%%, footprint %6.1f MiB",
+    noClient.cpu,
+    noClient.mb
+  )
+)
+let withClient = try await load(seconds: 5, visible: 1)
+print(
+  String(
+    format:
+      "32 noisy panes, 1 visible:   service CPU %6.1f%%, footprint %6.1f MiB, %.1f frames/s",
+    withClient.cpu,
+    withClient.mb,
+    withClient.framesPerSecond
+  )
+)
+print(String(format: "idle footprint before load: %.1f MiB", idleMB))
+try? FileManager.default.removeItem(at: corpusURL)
+exit(0)

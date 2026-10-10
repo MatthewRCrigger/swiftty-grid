@@ -91,6 +91,9 @@ swift build
 Scripts/package-swiftmux.sh [identity]   # Swiftty.app with the bundled agent (SMAppService)
 ```
 
+Acceptance evidence and measurements (`mise run bench-swiftmux`) are recorded
+in [spec.multiplexer.results.md](spec.multiplexer.results.md).
+
 The service enforces the limits in `MuxLimits`: 32 panes, a 256 KiB input
 buffer per pane, 16 MiB frames, 1 MiB pastes and a bounded history per pane.
 
