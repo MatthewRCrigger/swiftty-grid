@@ -252,6 +252,33 @@
       #expect(listener.activeConnectionCount == 0)
     }
 
+    @Test func `changed SPKI pin fails the handshake before application data`()
+      async throws
+    {
+      let (listener, accepted) = try await startListener()
+      defer { listener.stop() }
+      // The grant names another key: the server's leaf fails the SPKI
+      // check in the verify block, so no connection (and no Attach with
+      // the token) ever reaches the server.
+      let other = try HostIdentity.generate(hostnames: ["localhost"])
+      let pin = try CertificatePin(
+        certificateDER: other.certificateDER,
+        sha256: other.certificateSHA256,
+        spkiSHA256: other.spkiSHA256
+      )
+      #expect(throws: CertificatePinError.spkiMismatch) {
+        try pin.validate(leafDER: loopbackIdentity.certificateDER)
+      }
+      await #expect(throws: RSTTransportError.pinMismatch) {
+        _ = try await connector().connect(
+          host: "127.0.0.1", port: listener.port, pin: pin
+        )
+      }
+      try await Task.sleep(for: .milliseconds(200))
+      #expect(accepted.count == 0)
+      #expect(listener.activeConnectionCount == 0)
+    }
+
     @Test func `pin with matching hash but different DER cannot be built`()
       throws
     {

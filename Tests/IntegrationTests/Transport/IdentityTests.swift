@@ -71,6 +71,81 @@
       }
     }
 
+    @Test func `SPKI pin is the hash of the certificate's SubjectPublicKeyInfo`()
+      throws
+    {
+      let identity = try HostIdentity.generate(ipAddresses: ["127.0.0.1"])
+      // Independent derivation: the fixed P-256 SPKI header followed by the
+      // uncompressed point the Security framework reports for the key.
+      let certificate = try #require(
+        SecCertificateCreateWithData(nil, identity.certificateDER as CFData)
+      )
+      let key = try #require(SecCertificateCopyKey(certificate))
+      let point = try #require(
+        SecKeyCopyExternalRepresentation(key, nil) as Data?
+      )
+      let header = try #require(
+        bytes(
+          fromHex: "3059301306072a8648ce3d020106082a8648ce3d030107034200",
+          count: 26
+        )
+      )
+      let expected = hexString(SHA256.hash(data: header + Array(point)))
+      #expect(identity.spkiSHA256 == expected)
+      #expect(try CertificatePin.spkiFingerprint(identity.certificateDER) == expected)
+      #expect(identity.pin.spkiSHA256 == expected)
+      #expect(identity.spkiSHA256 != identity.certificateSHA256)
+      #expect(throws: CertificatePinError.malformedCertificate) {
+        try CertificatePin.spkiFingerprint(Data([0x30, 0x03, 0x02, 0x01, 0x01]))
+      }
+    }
+
+    @Test func `SPKI pin is verified before the exact certificate`() throws {
+      let now = Date()
+      let identity = try HostIdentity.generate(now: now)
+      let other = try HostIdentity.generate(now: now)
+      let pin = try CertificatePin(
+        certificateDER: identity.certificateDER,
+        sha256: identity.certificateSHA256,
+        spkiSHA256: identity.spkiSHA256
+      )
+      try pin.validate(leafDER: identity.certificateDER, now: now)
+      // A different key fails on the SPKI pin first.
+      #expect(throws: CertificatePinError.spkiMismatch) {
+        try pin.validate(leafDER: other.certificateDER, now: now)
+      }
+      // A grant whose SPKI pin names another key is inconsistent.
+      #expect(throws: CertificatePinError.inconsistentPin) {
+        try CertificatePin(
+          certificateDER: identity.certificateDER,
+          sha256: identity.certificateSHA256,
+          spkiSHA256: other.spkiSHA256
+        )
+      }
+      // The SPKI pin must be exactly 64 lowercase hex digits.
+      for malformed in [
+        identity.spkiSHA256.uppercased(), "zz", String(identity.spkiSHA256.dropLast()),
+      ] {
+        #expect(throws: CertificatePinError.malformedFingerprint) {
+          try CertificatePin(
+            certificateDER: identity.certificateDER,
+            sha256: identity.certificateSHA256,
+            spkiSHA256: malformed
+          )
+        }
+      }
+      // Grants from older hosts carry no SPKI pin: exact DER still applies.
+      let legacy = try CertificatePin(
+        certificateDER: identity.certificateDER,
+        sha256: identity.certificateSHA256
+      )
+      #expect(legacy.spkiSHA256 == nil)
+      try legacy.validate(leafDER: identity.certificateDER, now: now)
+      #expect(throws: CertificatePinError.fingerprintMismatch) {
+        try legacy.validate(leafDER: other.certificateDER, now: now)
+      }
+    }
+
     @Test func `identity persists owner-only and renews on name change`() throws {
       let base = FileManager.default.temporaryDirectory
         .appending(path: "rst-identity-\(UUID().uuidString)")

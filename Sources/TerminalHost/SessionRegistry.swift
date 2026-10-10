@@ -1,4 +1,5 @@
 #if os(macOS)
+import AppleTransport
 import CryptoKit
 import Dispatch
 import Foundation
@@ -8,23 +9,33 @@ import SwiftMuxProtocol
 import SwiftMuxService
 import Synchronization
 
-/// The QUIC server certificate delivered through SSH (spec §5.2).
+/// The QUIC server certificate delivered through SSH (spec §5.2) and its
+/// SPKI pin (spec.inbox.md §1.8).
 public struct HostCertificate: Sendable, Hashable {
   public var der: Data
   /// Lowercase hex SHA-256 of `der`.
   public var sha256Hex: String
+  /// Lowercase hex SHA-256 of the certificate's DER SubjectPublicKeyInfo
+  /// (the QUIC pin). Nil only when `der` is not an X.509 certificate,
+  /// which `init?(der:sha256Hex:)` — the production path — refuses.
+  public var spkiSHA256Hex: String?
 
   public init(der: Data) {
     self.der = der
     sha256Hex = hexString(SHA256.hash(data: der))
+    spkiSHA256Hex = try? CertificatePin.spkiFingerprint(der)
   }
 
-  /// Fails unless `sha256Hex` is the lowercase fingerprint of `der`.
+  /// Fails unless `sha256Hex` is the lowercase fingerprint of `der` and
+  /// `der` is a certificate whose SPKI pin can be computed.
   public init?(der: Data, sha256Hex: String) {
     let expected = hexString(SHA256.hash(data: der))
-    guard expected == sha256Hex else { return nil }
+    guard expected == sha256Hex,
+      let spki = try? CertificatePin.spkiFingerprint(der)
+    else { return nil }
     self.der = der
     self.sha256Hex = sha256Hex
+    spkiSHA256Hex = spki
   }
 }
 
@@ -498,6 +509,7 @@ public final class SessionRegistry: @unchecked Sendable {
       endpoint: identity.endpoint,
       serverCertificateDER: identity.certificate.der,
       serverCertificateSHA256: identity.certificate.sha256Hex,
+      serverSPKISHA256: identity.certificate.spkiSHA256Hex,
       applicationToken: credential.token,
       tokenExpiresAt: Date().timeIntervalSince1970 + max(0, seconds),
       initialGrid: grid

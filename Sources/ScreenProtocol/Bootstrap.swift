@@ -109,6 +109,11 @@ public struct BootstrapGrant: Hashable, Sendable, Codable,
   public var serverCertificateDER: Data
   /// Lowercase hex SHA-256 of `serverCertificateDER`.
   public var serverCertificateSHA256: String
+  /// The QUIC pin: lowercase hex SHA-256 of the certificate's DER
+  /// SubjectPublicKeyInfo. Optional on the wire for older hosts; this host
+  /// always sets it. When present it must be 64 lowercase hex digits and
+  /// the client verifies it in the TLS handshake, before the token is sent.
+  public var serverSPKISHA256: String?
   public var applicationToken: ApplicationToken
   /// Seconds since 1970.
   public var tokenExpiresAt: Double
@@ -122,6 +127,7 @@ public struct BootstrapGrant: Hashable, Sendable, Codable,
     endpoint: BootstrapEndpoint,
     serverCertificateDER: Data,
     serverCertificateSHA256: String,
+    serverSPKISHA256: String? = nil,
     applicationToken: ApplicationToken,
     tokenExpiresAt: Double,
     initialGrid: GridSize,
@@ -134,6 +140,7 @@ public struct BootstrapGrant: Hashable, Sendable, Codable,
     self.endpoint = endpoint
     self.serverCertificateDER = serverCertificateDER
     self.serverCertificateSHA256 = serverCertificateSHA256
+    self.serverSPKISHA256 = serverSPKISHA256
     self.applicationToken = applicationToken
     self.tokenExpiresAt = tokenExpiresAt
     self.initialGrid = initialGrid

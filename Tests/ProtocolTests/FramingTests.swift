@@ -214,13 +214,21 @@ struct FramingTests {
       tokenExpiresAt: 1_000,
       initialGrid: GridSize(columns: 80, rows: 24)
     )
+    var pinned = grant
+    pinned.serverSPKISHA256 = String(repeating: "b", count: 64)
     for response in [
-      BootstrapResponse.granted(grant), .sessions([]), .failure(.writerBusy),
-      .terminated(grant.sessionID),
+      BootstrapResponse.granted(grant), .granted(pinned), .sessions([]),
+      .failure(.writerBusy), .terminated(grant.sessionID),
     ] {
       let data = try BootstrapEnvelope.encode(response)
       #expect(try BootstrapEnvelope.decode(BootstrapResponse.self, from: data) == response)
     }
     #expect(!grant.description.contains(Data(grant.applicationToken.bytes).base64EncodedString()))
+    // The SPKI pin is optional on the wire: a grant from an older host
+    // omits the key and decodes with no pin.
+    let legacy = try BootstrapEnvelope.encode(BootstrapResponse.granted(grant))
+    #expect(!String(decoding: legacy.dropFirst(4), as: UTF8.self).contains("serverSPKISHA256"))
+    let modern = try BootstrapEnvelope.encode(BootstrapResponse.granted(pinned))
+    #expect(String(decoding: modern.dropFirst(4), as: UTF8.self).contains("serverSPKISHA256"))
   }
 }

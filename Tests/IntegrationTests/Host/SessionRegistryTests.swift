@@ -1,4 +1,5 @@
 #if os(macOS)
+import AppleTransport
 import Foundation
 import ScreenProtocol
 import SessionCore
@@ -30,11 +31,20 @@ struct SessionRegistryTests {
       )
       #expect(grant.endpoint == testIdentity().endpoint)
       #expect(grant.serverCertificateDER == testIdentity().certificate.der)
+      let certificate = HostCertificate(
+        der: grant.serverCertificateDER,
+        sha256Hex: grant.serverCertificateSHA256
+      )
+      #expect(certificate != nil)
+      // Every grant carries the SPKI pin of the delivered certificate.
+      #expect(grant.serverSPKISHA256 != nil)
+      #expect(grant.serverSPKISHA256 == certificate?.spkiSHA256Hex)
       #expect(
-        HostCertificate(
-          der: grant.serverCertificateDER,
-          sha256Hex: grant.serverCertificateSHA256
-        ) != nil
+        try CertificatePin(
+          certificateDER: grant.serverCertificateDER,
+          sha256: grant.serverCertificateSHA256,
+          spkiSHA256: grant.serverSPKISHA256
+        ).spkiSHA256 == grant.serverSPKISHA256
       )
       let lifetime = grant.tokenExpiresAt - Date().timeIntervalSince1970
       #expect(lifetime > 8 * 3600 - 60 && lifetime <= 8 * 3600)
