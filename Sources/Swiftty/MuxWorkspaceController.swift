@@ -631,7 +631,13 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
 
   // MARK: Actions
 
-  private func command(_ command: MuxCommand) {
+  /// Queues `command` in order. Without `failed`, a failure is only
+  /// logged; with it, the failure is handed back and `then` is skipped.
+  private func command(
+    _ command: MuxCommand,
+    failed: (@MainActor @Sendable (any Error) -> Void)? = nil,
+    then: (@MainActor @Sendable () -> Void)? = nil
+  ) {
     let connection = connection
     commands?
       .yield {
@@ -642,7 +648,12 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
             await MainActor.run { [weak self] in self?.apply(ws) }
           default: break
           }
+          if let then { await then() }
         } catch {
+          if let failed {
+            await failed(error)
+            return
+          }
           await MainActor.run {
             FileHandle.standardError.write(
               Data("swiftty: swiftmux: \(error)\n".utf8)
@@ -934,34 +945,111 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
 
   // MARK: Attention inbox
 
+  /// Rows requested per inbox page (the service caps it at 100).
+  var inboxPageLimit = 100
+  /// The last failed inbox command, shown inline in the popover until
+  /// the popover is next opened.
+  private(set) var inboxMessage: String?
+
   /// Subscribes to inbox metadata: no lease, frames or resize involved.
   func startInbox() {
     let connection = connection
     Task { [weak self] in
-      guard case .inbox? = try? await connection.execute(.subscribeInbox(true))
-      else { return }
-      await self?.reloadInbox()
+      do {
+        _ = try await connection.execute(.subscribeInbox(true))
+        await self?.reloadInbox()
+      } catch { self?.inboxFailed(error, alert: false) }
     }
   }
 
-  /// Rereads the first page of each section (after subscribing or a
-  /// `resync`).
+  /// Rereads the first page of each section (after subscribing, a
+  /// `resync` or a stale or missing item).
   func reloadInbox() async {
-    var pages: [InboxPage] = []
-    for section in [InboxQuery.Section.needsYou, .results] {
-      if case let .inbox(page)? = try? await connection.execute(
-        .inbox(InboxQuery(section: section))
-      ) {
-        pages.append(page)
+    var pages: [InboxQuery.Section: InboxPage] = [:]
+    for section in MuxInboxModel.sections {
+      do {
+        guard
+          case let .inbox(page) = try await connection.execute(
+            .inbox(InboxQuery(section: section, limit: inboxPageLimit))
+          )
+        else { throw MuxError(.invalidRequest, "unexpected inbox reply") }
+        pages[section] = page
+      } catch {
+        inboxFailed(error, alert: false)
+        return
       }
     }
     inbox.reset(pages)
     refreshInbox()
   }
 
+  /// Reads the next page of every section that has one ("Load More").
+  func loadMoreInbox() async {
+    for section in MuxInboxModel.sections {
+      guard let cursor = inbox.cursors[section] else { continue }
+      do {
+        guard
+          case let .inbox(page) = try await connection.execute(
+            .inbox(
+              InboxQuery(
+                section: section,
+                cursor: cursor,
+                limit: inboxPageLimit
+              )
+            )
+          )
+        else { throw MuxError(.invalidRequest, "unexpected inbox reply") }
+        inbox.append(page, section: section)
+      } catch {
+        // A cursor the service no longer accepts: start over.
+        inboxFailed(error, alert: true)
+        await reloadInbox()
+        return
+      }
+    }
+    refreshInbox()
+  }
+
   private func refreshInbox() {
     inboxToolbar.update(inbox.counts)
-    if inboxPopover?.isShown == true { inboxView?.update(inbox) }
+    if inboxPopover?.isShown == true {
+      inboxView?.update(inbox, message: inboxMessage)
+    }
+  }
+
+  /// Reports a failed inbox command: inline while the popover is open,
+  /// otherwise as an alert when `alert` (user-initiated commands).
+  private func inboxFailed(_ error: any Error, alert: Bool) {
+    inboxProblem(MuxInboxModel.describe(error), alert: alert)
+  }
+
+  private func inboxProblem(_ message: String, alert: Bool) {
+    inboxMessage = message
+    if inboxPopover?.isShown == true {
+      inboxView?.update(inbox, message: message)
+    } else if alert {
+      notice(message)
+    }
+  }
+
+  /// Checks a lookup reply: a stale or missing item is reported, dropped
+  /// and the list reread. Returns the location while the item is there.
+  private func checked(
+    _ reply: MuxReply,
+    _ item: AttentionItem,
+    alert: Bool
+  ) -> AttentionLocation? {
+    guard case let .attention(location) = reply else {
+      inboxFailed(MuxError(.invalidRequest, "unexpected reply"), alert: alert)
+      return nil
+    }
+    if let problem = MuxInboxModel.describe(location.availability) {
+      inbox.forget(item.occurrence)
+      inboxProblem(problem, alert: alert)
+      Task { [weak self] in await self?.reloadInbox() }
+      return nil
+    }
+    return location
   }
 
   func toggleInbox() {
@@ -969,9 +1057,14 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       popover.performClose(nil)
       return
     }
+    inboxMessage = nil
     let view = inboxView ?? MuxInboxViewController()
     view.onOpen = { [weak self] item in self?.openAttention(item) }
     view.onReview = { [weak self] item in self?.markReviewed(item) }
+    view.onSnooze = { [weak self] item, until in
+      self?.snooze(item, until: until)
+    }
+    view.onLoadMore = { [weak self] in Task { await self?.loadMoreInbox() } }
     // Showing an item marks it seen; it never resolves it.
     view.onShown = { [weak self] items in
       for item in items where !item.seen { self?.markSeen(item) }
@@ -999,79 +1092,131 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     AttentionReference(source: item.source, occurrence: item.occurrence)
   }
 
-  private func markSeen(_ item: AttentionItem) {
+  /// Runs one inbox command against `item`, reporting failures and
+  /// stale or missing items.
+  private func attention(
+    _ command: MuxCommand,
+    _ item: AttentionItem,
+    alert: Bool,
+    then: (@MainActor (AttentionLocation) -> Void)? = nil
+  ) {
     let connection = connection
-    let ref = reference(item)
-    Task { _ = try? await connection.execute(.markSeen(ref)) }
+    Task { [weak self] in
+      do {
+        let reply = try await connection.execute(command)
+        guard let self, let location = checked(reply, item, alert: alert) else {
+          return
+        }
+        then?(location)
+      } catch { self?.inboxFailed(error, alert: alert) }
+    }
+  }
+
+  private func markSeen(_ item: AttentionItem) {
+    attention(.markSeen(reference(item)), item, alert: false)
   }
 
   func markReviewed(_ item: AttentionItem) {
     guard item.category != .needsYou else { return }
-    let connection = connection
-    let ref = reference(item)
-    Task { _ = try? await connection.execute(.markReviewed(ref)) }
+    attention(.markReviewed(reference(item)), item, alert: true)
+  }
+
+  /// Snoozes a waiting request until `until`, or clears its snooze.
+  func snooze(_ item: AttentionItem, until: Date?) {
+    guard MuxInboxModel.canSnooze(item) else { return }
+    attention(.snooze(reference(item), until: until), item, alert: true)
   }
 
   /// Opens the item's pane: marks it seen, then reveals the pane in this
   /// workspace. Another workspace is switched to, and one controlled
   /// elsewhere is taken over only after explicit confirmation.
   func openAttention(_ item: AttentionItem) {
-    let connection = connection
-    let ref = reference(item)
-    Task { [weak self] in
-      guard
-        case let .attention(location)? = try? await connection.execute(
-          .markSeen(ref)
-        )
-      else { return }
-      self?.reveal(location)
+    attention(.markSeen(reference(item)), item, alert: true) {
+      [weak self] location in self?.reveal(location)
     }
   }
 
   private func reveal(_ location: AttentionLocation) {
-    switch location.availability {
-    case .missing:
-      notice("This item is no longer available.")
-      return
-    case .stale:
-      notice("The program has already moved on from this request.")
-      return
-    case .available, .paneExited: break
-    }
     guard let wsID = location.workspace, let pane = location.pane else {
+      inboxProblem("This item is no longer available.", alert: true)
       return
     }
     inboxPopover?.performClose(nil)
     if wsID == workspace?.id {
-      if workspace?.pane(pane) != nil { command(.focusPane(pane)) }
+      guard workspace?.pane(pane) != nil else {
+        notice("That pane is no longer open.")
+        return
+      }
+      if pane != activePane { command(.focusPane(pane)) }
       return
     }
     guard location.leaseHeldElsewhere else {
-      command(.switchWorkspace(.id(wsID)))
-      command(.focusPane(pane))
+      command(
+        .switchWorkspace(.id(wsID)),
+        failed: { [weak self] error in
+          // Another frontend attached in between: ask before taking over.
+          if (error as? MuxError)?.code == .leaseHeld {
+            self?.confirmTakeover(wsID, pane: pane, moved: false)
+          } else {
+            self?.inboxFailed(error, alert: true)
+          }
+        },
+        then: { [weak self] in self?.focusRevealed(pane) }
+      )
       return
     }
+    confirmTakeover(wsID, pane: pane, moved: false)
+  }
+
+  /// Focuses `pane` after a switch or takeover, reporting a pane that
+  /// ended in the meantime.
+  private func focusRevealed(_ pane: PaneID) {
+    command(
+      .focusPane(pane),
+      failed: { [weak self] error in self?.inboxFailed(error, alert: true) }
+    )
+  }
+
+  /// Asks before taking over `wsID` at the lease generation listed now.
+  /// If the lease moves while asking, the takeover fails `staleRevision`
+  /// and the user is asked again about the new holder.
+  private func confirmTakeover(_ wsID: WorkspaceID, pane: PaneID, moved: Bool) {
     let connection = connection
     Task { [weak self] in
-      guard
-        case let .workspaces(list)? = try? await connection.execute(
-          .listWorkspaces
-        ),
-        let summary = list.first(where: { $0.id == wsID })
-      else { return }
+      let summary: WorkspaceSummary
+      do {
+        guard
+          case let .workspaces(list) = try await connection.execute(
+            .listWorkspaces
+          ), let found = list.first(where: { $0.id == wsID })
+        else { throw MuxError(.notFound) }
+        summary = found
+      } catch {
+        self?.inboxFailed(error, alert: true)
+        return
+      }
       let name = DisplayText.sanitize(summary.name)
       self?
         .confirmThen(
           true,
-          "Take control of workspace “\(name)”?",
+          moved
+            ? "Control of workspace “\(name)” changed while you were deciding. Take control now?"
+            : "Take control of workspace “\(name)”?",
           "Another window or device controls it. Taking over disconnects it there; its programs keep running.",
           button: "Take Over"
         ) { [weak self] in
           self?
             .command(
-              .takeover(.id(wsID), expectedLease: summary.leaseGeneration)
+              .takeover(.id(wsID), expectedLease: summary.leaseGeneration),
+              failed: { [weak self] error in
+                if (error as? MuxError)?.code == .staleRevision {
+                  self?.confirmTakeover(wsID, pane: pane, moved: true)
+                } else {
+                  self?.inboxFailed(error, alert: true)
+                }
+              },
+              then: { [weak self] in self?.focusRevealed(pane) }
             )
-          self?.command(.focusPane(pane))
         }
     }
   }
@@ -1089,7 +1234,6 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       alert.runModal()
     }
   }
-
 
   func windowWillClose(_ notification: Notification) {
     Task { await detach() }

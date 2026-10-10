@@ -8,6 +8,15 @@ struct MuxInboxModel: Equatable {
   private(set) var items: [OccurrenceID: AttentionItem] = [:]
   private(set) var counts = InboxCounts()
   private(set) var revision: UInt64 = 0
+  /// Cursor for the next page of each section; nil when fully read.
+  private(set) var cursors: [InboxQuery.Section: String] = [:]
+
+  /// The sections the inbox reads (the service's `all` includes
+  /// resolved history, which the window never lists).
+  static let sections: [InboxQuery.Section] = [.needsYou, .results]
+
+  /// Whether any section has rows beyond those read so far.
+  var hasMore: Bool { !cursors.isEmpty }
 
   /// Whether the inbox shows `item`: a waiting request or an unreviewed
   /// failure or result.
@@ -19,20 +28,34 @@ struct MuxInboxModel: Equatable {
     }
   }
 
-  /// Adopts freshly read pages, keeping items a newer update already
-  /// delivered.
-  mutating func reset(_ pages: [InboxPage]) {
-    guard let read = pages.map(\.revision).min() else { return }
-    let listed = Set(pages.flatMap(\.items).map(\.occurrence))
+  /// Adopts freshly read first pages, keeping items a newer update
+  /// already delivered. Rows past the first page are dropped until read
+  /// again with `append`.
+  mutating func reset(_ pages: [InboxQuery.Section: InboxPage]) {
+    guard let read = pages.values.map(\.revision).min() else { return }
+    let listed = Set(pages.values.flatMap(\.items).map(\.occurrence))
     items = items.filter { listed.contains($0.key) || $0.value.revision > read }
-    for item in pages.flatMap(\.items) { merge(item) }
-    if let newest = pages.max(by: { $0.revision < $1.revision }),
-      newest.revision >= revision
-    {
-      counts = newest.counts
-      revision = newest.revision
+    cursors = pages.compactMapValues(\.nextCursor)
+    for page in pages.values { adopt(page) }
+  }
+
+  /// Adds a further page of `section` (read with its cursor).
+  mutating func append(_ page: InboxPage, section: InboxQuery.Section) {
+    cursors[section] = page.nextCursor
+    adopt(page)
+  }
+
+  private mutating func adopt(_ page: InboxPage) {
+    for item in page.items { merge(item) }
+    if page.revision >= revision {
+      counts = page.counts
+      revision = page.revision
     }
   }
+
+  /// Forgets an item the service reported stale or missing; the caller
+  /// rereads the inbox.
+  mutating func forget(_ occurrence: OccurrenceID) { items[occurrence] = nil }
 
   /// Applies one update; true when the caller must refetch (`resync`).
   mutating func apply(_ update: InboxUpdate) -> Bool {
@@ -52,11 +75,14 @@ struct MuxInboxModel: Equatable {
     items[item.occurrence] = Self.shows(item) ? item : nil
   }
 
-  /// Requests, then failures, then results; newest first within each.
-  var sorted: [AttentionItem] {
+  /// Requests, then failures, then results, then snoozed requests;
+  /// newest first within each.
+  var sorted: [AttentionItem] { sorted(at: Date()) }
+
+  func sorted(at now: Date) -> [AttentionItem] {
     items.values.sorted {
-      let a = Self.rank($0.category)
-      let b = Self.rank($1.category)
+      let a = Self.rank($0.category) + ($0.isSnoozed(at: now) ? 3 : 0)
+      let b = Self.rank($1.category) + ($1.isSnoozed(at: now) ? 3 : 0)
       return a != b ? a < b : $0.createdAt > $1.createdAt
     }
   }
@@ -94,18 +120,112 @@ struct MuxInboxModel: Equatable {
     }
     return (heading, detail)
   }
+
+  // MARK: Snooze
+
+  /// Only a waiting request can be snoozed: snoozing hides it from the
+  /// badge until the time passes or the program moves on.
+  static func canSnooze(_ item: AttentionItem) -> Bool {
+    item.category == .needsYou && item.resolution == .open
+  }
+
+  /// The snooze choices offered at `now`: 15 minutes, an hour and 9:00
+  /// tomorrow (in `calendar`'s time zone).
+  static func snoozeChoices(
+    at now: Date,
+    calendar: Calendar = .current
+  ) -> [(title: String, until: Date)] {
+    var choices: [(title: String, until: Date)] = [
+      ("15 Minutes", now.addingTimeInterval(15 * 60)),
+      ("1 Hour", now.addingTimeInterval(60 * 60)),
+    ]
+    if let tomorrow = calendar.date(byAdding: .day, value: 1, to: now),
+      let nine = calendar.date(
+        bySettingHour: 9,
+        minute: 0,
+        second: 0,
+        of: tomorrow
+      )
+    {
+      choices.append(("Tomorrow at 9:00", nine))
+    }
+    return choices
+  }
+
+  /// "Snoozed until …" for a snoozed item, else nil.
+  static func snoozeText(
+    _ item: AttentionItem,
+    at now: Date,
+    calendar: Calendar = .current
+  ) -> String? {
+    guard let until = item.snoozedUntil, until > now else { return nil }
+    var style = Date.FormatStyle(date: .omitted, time: .shortened)
+    if !calendar.isDate(until, inSameDayAs: now) {
+      style = Date.FormatStyle(date: .abbreviated, time: .shortened)
+    }
+    style.timeZone = calendar.timeZone
+    return "Snoozed until \(until.formatted(style))"
+  }
+
+  // MARK: Failures
+
+  /// Plain wording for a failed inbox or navigation command.
+  static func describe(_ error: any Error) -> String {
+    guard let error = error as? MuxError else {
+      return "SwiftMux could not complete the request: \(error)"
+    }
+    switch error.code {
+    case .leaseHeld:
+      return
+        "Another window or device controls this workspace. Open the item again to take over."
+    case .staleRevision:
+      return
+        "Control of the workspace changed while you were deciding. Nothing was taken over."
+    case .connectionLost, .quiescing:
+      return "The SwiftMux service is not reachable."
+    case .serverInstanceChanged:
+      return "The SwiftMux service restarted; the inbox was reloaded."
+    case .notFound: return "That workspace or pane no longer exists."
+    case .resourceLimit:
+      return "SwiftMux is at a limit: \(DisplayText.sanitize(error.message))"
+    default:
+      let detail = DisplayText.sanitize(error.message)
+      return detail.isEmpty
+        ? "SwiftMux refused the request (\(error.code.rawValue))."
+        : "SwiftMux refused the request: \(detail)"
+    }
+  }
+
+  /// Wording for an occurrence the service no longer offers, or nil when
+  /// it is still available.
+  static func describe(
+    _ availability: AttentionLocation.Availability
+  ) -> String? {
+    switch availability {
+    case .available, .paneExited: nil
+    case .stale: "The program has already moved on from this request."
+    case .missing: "This item is no longer available."
+    }
+  }
 }
 
-/// The inbox popover: one row per item with "Open in Pane" and, for
-/// failures and results, "Mark Reviewed".
+/// The inbox popover: one row per item with "Open in Pane", a Snooze
+/// menu for waiting requests and, for failures and results, "Mark
+/// Reviewed"; an inline message line reports failed commands.
 @MainActor
 final class MuxInboxViewController: NSViewController {
   var onOpen: ((AttentionItem) -> Void)?
   var onReview: ((AttentionItem) -> Void)?
+  /// Snoozes until the date, or clears the snooze with nil.
+  var onSnooze: ((AttentionItem, Date?) -> Void)?
+  var onLoadMore: (() -> Void)?
   /// Items shown since the popover opened (marked seen once).
   var onShown: (([AttentionItem]) -> Void)?
   private let stack = NSStackView()
   private(set) var shown: [AttentionItem] = []
+  /// The inline failure line, empty when there is none.
+  let messageLabel = NSTextField(wrappingLabelWithString: "")
+  private(set) var loadMoreButton: ActionButton?
 
   override func loadView() {
     stack.orientation = .vertical
@@ -129,29 +249,54 @@ final class MuxInboxViewController: NSViewController {
       stack.bottomAnchor.constraint(equalTo: document.bottomAnchor),
       document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
     ])
+    messageLabel.textColor = .systemRed
+    messageLabel.isSelectable = false
+    messageLabel.allowsEditingTextAttributes = false
+    messageLabel.preferredMaxLayoutWidth = 340
+    messageLabel.setAccessibilityRole(.staticText)
     view = scroll
     preferredContentSize = scroll.frame.size
   }
 
-  func update(_ model: MuxInboxModel) {
+  func update(_ model: MuxInboxModel, message: String? = nil) {
     _ = view
-    let items = model.sorted
+    let now = Date()
+    let items = model.sorted(at: now)
     shown = items
     for row in stack.arrangedSubviews { row.removeFromSuperview() }
+    messageLabel.stringValue = message ?? ""
+    if let message, !message.isEmpty {
+      stack.addArrangedSubview(messageLabel)
+      NSAccessibility.post(
+        element: messageLabel,
+        notification: .announcementRequested,
+        userInfo: [.announcement: message]
+      )
+    }
     if items.isEmpty {
       stack.addArrangedSubview(
         NSTextField(labelWithString: "Nothing needs you.")
       )
     }
-    for item in items { stack.addArrangedSubview(row(item)) }
+    for item in items { stack.addArrangedSubview(row(item, at: now)) }
+    loadMoreButton = nil
+    if model.hasMore {
+      let more = ActionButton(title: "Load More") { [weak self] in
+        self?.onLoadMore?()
+      }
+      loadMoreButton = more
+      stack.addArrangedSubview(more)
+    }
     onShown?(items)
   }
 
-  private func row(_ item: AttentionItem) -> NSView {
+  private func row(_ item: AttentionItem, at now: Date) -> NSView {
     let text = MuxInboxModel.text(item)
+    let snoozed = MuxInboxModel.snoozeText(item, at: now)
     let heading = NSTextField(labelWithString: text.heading)
     heading.font = .boldSystemFont(ofSize: NSFont.systemFontSize)
     heading.lineBreakMode = .byTruncatingTail
+    if snoozed != nil { heading.textColor = .secondaryLabelColor }
     // Plain labels: no link detection, rich text or editing.
     let detail = NSTextField(wrappingLabelWithString: text.detail)
     detail.allowsEditingTextAttributes = false
@@ -159,10 +304,17 @@ final class MuxInboxViewController: NSViewController {
     detail.textColor = .secondaryLabelColor
     detail.preferredMaxLayoutWidth = 340
     detail.isHidden = text.detail.isEmpty
+    let status = NSTextField(labelWithString: snoozed ?? "")
+    status.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+    status.textColor = .tertiaryLabelColor
+    status.isHidden = snoozed == nil
     let open = ActionButton(title: "Open in Pane") { [weak self] in
       self?.onOpen?(item)
     }
     var buttons: [NSView] = [open]
+    if MuxInboxModel.canSnooze(item) {
+      buttons.append(snoozeMenu(item, snoozed: snoozed != nil, at: now))
+    }
     if item.category != .needsYou {
       buttons.append(
         ActionButton(title: "Mark Reviewed") { [weak self] in
@@ -172,15 +324,46 @@ final class MuxInboxViewController: NSViewController {
     }
     let actions = NSStackView(views: buttons)
     actions.orientation = .horizontal
-    let row = NSStackView(views: [heading, detail, actions])
+    let row = NSStackView(views: [heading, detail, status, actions])
     row.orientation = .vertical
     row.alignment = .leading
     row.spacing = 4
     row.setAccessibilityElement(true)
     row.setAccessibilityLabel(
-      [text.heading, text.detail].filter { !$0.isEmpty }.joined(separator: ". ")
+      [text.heading, text.detail, snoozed ?? ""].filter { !$0.isEmpty }
+        .joined(separator: ". ")
     )
     return row
+  }
+
+  /// A pull-down: the snooze choices, plus "Unsnooze" while snoozed.
+  private func snoozeMenu(
+    _ item: AttentionItem,
+    snoozed: Bool,
+    at now: Date
+  ) -> NSPopUpButton {
+    let button = NSPopUpButton(frame: .zero, pullsDown: true)
+    button.controlSize = .small
+    button.addItem(withTitle: snoozed ? "Snoozed" : "Snooze")
+    for choice in MuxInboxModel.snoozeChoices(at: now) {
+      button.menu?
+        .addItem(
+          ActionMenuItem(title: choice.title) { [weak self] in
+            self?.onSnooze?(item, choice.until)
+          }
+        )
+    }
+    if snoozed {
+      button.menu?.addItem(.separator())
+      button.menu?
+        .addItem(
+          ActionMenuItem(title: "Unsnooze") { [weak self] in
+            self?.onSnooze?(item, nil)
+          }
+        )
+    }
+    button.setAccessibilityLabel(snoozed ? "Change snooze" : "Snooze")
+    return button
   }
 
   private final class FlippedView: NSView {
@@ -199,6 +382,20 @@ final class MuxInboxViewController: NSViewController {
       self.handler = handler
       target = self
       action = #selector(run)
+    }
+
+    @objc
+    private func run() { handler() }
+  }
+
+  /// A menu item running a closure.
+  final class ActionMenuItem: NSMenuItem {
+    private var handler: () -> Void = {}
+
+    convenience init(title: String, _ handler: @escaping () -> Void) {
+      self.init(title: title, action: #selector(run), keyEquivalent: "")
+      self.handler = handler
+      target = self
     }
 
     @objc
