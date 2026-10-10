@@ -16,20 +16,36 @@ import Synchronization
 public final class RoamingHost: Sendable {
   public let registry: SessionRegistry
   private let control: ControlSocketServer
-  private let listener: any RSTListener
+  private let configuration: HostConfiguration
+  private let transport: Mutex<Transport>
+  private let renewal = Mutex<DispatchSourceTimer?>(nil)
+
+  struct Transport {
+    var listener: any RSTListener
+    var notValidAfter: Date
+  }
+
+  /// How often the certificate's remaining validity is checked.
+  static let renewalCheckInterval: DispatchTimeInterval = .seconds(3600)
 
   private init(
     registry: SessionRegistry,
     control: ControlSocketServer,
-    listener: any RSTListener
+    configuration: HostConfiguration,
+    transport: Transport
   ) {
     self.registry = registry
     self.control = control
-    self.listener = listener
+    self.configuration = configuration
+    self.transport = Mutex(transport)
   }
 
+  deinit { renewal.withLock { $0?.cancel() } }
+
   /// Binds the listener first (grants advertise its actual port), then
-  /// serves bootstrap requests and sweeps expired grants.
+  /// serves bootstrap requests, sweeps expired grants and renews the QUIC
+  /// certificate before it expires (the service never idle-exits while
+  /// roaming, so startup alone cannot renew it).
   public static func start(
     service: MuxService,
     configuration config: HostConfiguration,
@@ -37,20 +53,14 @@ public final class RoamingHost: Sendable {
     launch: @escaping @Sendable () -> LaunchSpec = RoamingHost.defaultLaunch
   ) async throws -> RoamingHost {
     try ControlDirectory.prepare(config.stateDirectoryURL)
-    let (listener, certificate) = try makeTransport(config: config)
     let target = Mutex<SessionRegistry?>(nil)
-    try await listener.start { connection in
-      target.withLock { $0 }?.accept(connection)
-    }
+    let (transport, identity) = try await startTransport(
+      config: config,
+      now: Date()
+    ) { connection in target.withLock { $0 }?.accept(connection) }
     let registry = SessionRegistry(
       service: service,
-      identity: HostIdentity(
-        endpoint: BootstrapEndpoint(
-          host: config.advertisedHost,
-          port: listener.port
-        ),
-        certificate: certificate
-      ),
+      identity: identity,
       policy: policy,
       launch: launch
     )
@@ -61,7 +71,78 @@ public final class RoamingHost: Sendable {
     ) { request in await bootstrap.respond(toEnvelope: request) }
     try control.start()
     registry.startSweeping()
-    return RoamingHost(registry: registry, control: control, listener: listener)
+    let host = RoamingHost(
+      registry: registry,
+      control: control,
+      configuration: config,
+      transport: transport
+    )
+    host.startRenewing()
+    return host
+  }
+
+  private static func startTransport(
+    config: HostConfiguration,
+    now: Date,
+    accept: @escaping @Sendable (any RSTConnection) -> Void
+  ) async throws -> (Transport, HostIdentity) {
+    let (listener, certificate, notValidAfter) = try makeTransport(
+      config: config,
+      now: now
+    )
+    try await listener.start(onConnection: accept)
+    let identity = HostIdentity(
+      endpoint: BootstrapEndpoint(host: config.advertisedHost, port: listener.port),
+      certificate: certificate
+    )
+    return (Transport(listener: listener, notValidAfter: notValidAfter), identity)
+  }
+
+  /// When the certificate is within its renewal margin, replaces the
+  /// listener with one presenting a renewed certificate and advertises it
+  /// in new grants. Attached clients are disconnected once; they reattach
+  /// with a fresh grant over SSH. Returns whether it renewed.
+  @discardableResult
+  func renewIfNeeded(now: Date = Date()) async -> Bool {
+    let current = transport.withLock { $0 }
+    guard
+      current.notValidAfter.timeIntervalSince(now)
+        <= AppleTransport.HostIdentity.renewalMargin
+    else { return false }
+    // The new listener binds the same configured port, so the old one
+    // goes first.
+    current.listener.stop()
+    let registry = registry
+    do {
+      let (next, identity) = try await Self.startTransport(
+        config: configuration,
+        now: now
+      ) { connection in registry.accept(connection) }
+      transport.withLock { $0 = next }
+      registry.replaceIdentity(identity)
+      return true
+    } catch {
+      // Retried at the next check; until then roaming attaches fail and
+      // clients keep retrying.
+      FileHandle.standardError.write(
+        Data("swiftmux-agent: QUIC certificate renewal failed: \(error)\n".utf8)
+      )
+      return false
+    }
+  }
+
+  private func startRenewing() {
+    let source = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+    source.schedule(
+      deadline: .now() + Self.renewalCheckInterval,
+      repeating: Self.renewalCheckInterval
+    )
+    source.setEventHandler { [weak self] in
+      guard let self else { return }
+      Task { await self.renewIfNeeded() }
+    }
+    source.resume()
+    renewal.withLock { $0 = source }
   }
 
   /// A login shell with the agent's locale and search path; the shell's
@@ -86,15 +167,17 @@ struct IdentityMismatch: Error, CustomStringConvertible {
 /// certificate it presents. The certificate is independent of the SSH
 /// host key and reaches clients only inside SSH-authenticated grants.
 func makeTransport(
-  config: HostConfiguration
-) throws -> (any RSTListener, HostCertificate) {
+  config: HostConfiguration,
+  now: Date = Date()
+) throws -> (any RSTListener, HostCertificate, Date) {
   let advertised = config.advertisedHost
   let isAddress =
     IPv4Address(advertised) != nil || IPv6Address(advertised) != nil
   let identity = try AppleTransport.HostIdentity.loadOrCreate(
     directory: config.stateDirectoryURL.appendingPathComponent("tls"),
     hostnames: isAddress ? [] : [advertised],
-    ipAddresses: isAddress ? [advertised] : []
+    ipAddresses: isAddress ? [advertised] : [],
+    now: now
   )
   let bindAll =
     config.bindAddress == "*" || config.bindAddress == "::"
@@ -112,6 +195,6 @@ func makeTransport(
       sha256Hex: identity.certificateSHA256
     )
   else { throw IdentityMismatch() }
-  return (listener, certificate)
+  return (listener, certificate, identity.notValidAfter)
 }
 #endif

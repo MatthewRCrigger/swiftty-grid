@@ -33,6 +33,20 @@ public final class RoamingSession: @unchecked Sendable {
     /// Seconds since 1970 of `lastActivity`.
     public var lastActivityWall: Double
     public var exitedAt: ContinuousClock.Instant?
+    /// An RST attachment currently holds the workspace lease.
+    public var isAttached = false
+    /// Every pane of the workspace has exited (from the last layout seen).
+    public var allPanesExited = false
+  }
+
+  /// Revision high-water marks that a replacement session for the same
+  /// workspace must start above, so a warm client's screen store (which
+  /// never accepts an older epoch or revision) keeps installing screens.
+  public struct Floor: Sendable, Equatable {
+    public var epoch: UInt64 = 0
+    public var screenRevision: UInt64 = 0
+    public var resizeRevision: UInt64 = 0
+    public init() {}
   }
 
   /// Bounded-resource and progress counters (never terminal contents).
@@ -71,6 +85,8 @@ public final class RoamingSession: @unchecked Sendable {
   private var afterClose: [() -> Void] = []
   private var closing = false
   private var inputInFlight = false
+  /// A refused operation waits for its backoff before resubmission.
+  private var retryScheduled = false
   private var epoch: UInt64 = 0
   private var resizeRevision: UInt64 = 0
   private var screenRevision: UInt64 = 0
@@ -82,19 +98,23 @@ public final class RoamingSession: @unchecked Sendable {
   private var writerFailed = false
   private var columns: Int
   private var rows: Int
-  /// Set by the registry from the current credential: a lease held by
-  /// another frontend may be taken over (bootstrap `takeover`).
-  var allowTakeover = false
-  /// From the current credential: the pane to focus once the lease is
+  /// From the attaching credential: a lease held by another frontend may
+  /// be taken over (bootstrap `takeover`). Owner queue only.
+  private var allowTakeover = false
+  /// From the attaching credential: the pane to focus once the lease is
   /// held, and the exact lease generation a takeover may displace.
-  var target: ResumeTarget?
+  private var target: ResumeTarget?
 
   init(
     id: SessionID,
     service: MuxService,
     grid: GridSize,
+    floor: Floor = Floor(),
     pendingInputLimit: Int = RSTLimits.maxPendingInputBytes
   ) {
+    epoch = floor.epoch
+    screenRevision = floor.screenRevision
+    resizeRevision = floor.resizeRevision
     self.id = id
     self.service = service
     columns = grid.columns
@@ -131,6 +151,17 @@ public final class RoamingSession: @unchecked Sendable {
         writerFailed: writerFailed,
         activePane: activePane
       )
+    }
+  }
+
+  /// Where a replacement session must start (see `Floor`).
+  public var floor: Floor {
+    queue.sync {
+      var floor = Floor()
+      floor.epoch = epoch
+      floor.screenRevision = screenRevision
+      floor.resizeRevision = resizeRevision
+      return floor
     }
   }
 
@@ -184,10 +215,15 @@ public final class RoamingSession: @unchecked Sendable {
 
   func attach(
     _ attachment: HostAttachment,
-    writer: WriterID
+    writer: WriterID,
+    takeover: Bool = false,
+    target: ResumeTarget? = nil
   ) async -> AttachOutcome<UInt64> {
     await withCheckedContinuation { continuation in
       queue.async { [self] in
+        // Owner-queue state: read by `acquireLease` on this queue.
+        allowTakeover = takeover || target?.expectedLease != nil
+        self.target = target
         attachOnQueue(attachment, writer: writer) {
           continuation.resume(returning: $0)
         }
@@ -325,6 +361,7 @@ public final class RoamingSession: @unchecked Sendable {
     a.scheduler.reset()
     a.exitNoticeSent = false
     touch(state: exitStatus == nil ? .attached : .exited, attached: true)
+    statusBox.withLock { $0.isAttached = true }
     a.send(
       .attached(
         .init(
@@ -347,6 +384,7 @@ public final class RoamingSession: @unchecked Sendable {
     guard attachment === a else { return }
     attachment = nil
     touch(state: exitStatus == nil && !terminated ? .detached : nil)
+    statusBox.withLock { $0.isAttached = false }
     closeMux {}
   }
 
@@ -382,6 +420,7 @@ public final class RoamingSession: @unchecked Sendable {
     muxAttachment = nil
     inputInFlight = false
     lost?.close()
+    statusBox.withLock { $0.isAttached = false }
     guard let a = attachment else { return }
     attachment = nil
     a.isCurrent = false
@@ -445,6 +484,8 @@ public final class RoamingSession: @unchecked Sendable {
       return
     }
     layoutRevision = ws.layoutRevision
+    let allExited = !ws.panes.isEmpty && ws.panes.allSatisfy { $0.exitStatus != nil }
+    statusBox.withLock { $0.allPanesExited = allExited }
     let pane = ws.activeTabSnapshot?.activePane
     let summary = pane.flatMap { ws.pane($0) }
     if let summary {
@@ -458,7 +499,17 @@ public final class RoamingSession: @unchecked Sendable {
     if pane != activePane {
       activePane = pane
       exitStatus = nil
-      if let status = summary?.exitStatus { exited(status) }
+      if let status = summary?.exitStatus {
+        exited(status)
+      } else {
+        // The shown pane is live again: the session is no longer exited.
+        statusBox.withLock { s in
+          guard s.state == .exited else { return }
+          s.state = attachment == nil ? .detached : .attached
+          s.exitStatus = nil
+          s.exitedAt = nil
+        }
+      }
       contentChanged()
     } else if let status = summary?.exitStatus, exitStatus == nil {
       exited(status)
@@ -468,6 +519,12 @@ public final class RoamingSession: @unchecked Sendable {
   private func exited(_ status: Int32) {
     guard exitStatus == nil else { return }
     exitStatus = status
+    if !inputInFlight {
+      // Admitted but never written: the pane is gone, so retire it.
+      for done in ledger.discard(through: ledger.lastAdmitted) {
+        acknowledge(done)
+      }
+    }
     let now = ContinuousClock.now
     statusBox.withLock { s in
       guard s.state != .terminated else { return }
@@ -562,7 +619,8 @@ public final class RoamingSession: @unchecked Sendable {
   /// Submits the ledger's head to the pane, one operation at a time, so
   /// a refused operation can be retried without reordering.
   private func pumpInput() {
-    guard !inputInFlight, !writerFailed, let mux, let smx = muxAttachment,
+    guard !inputInFlight, !writerFailed, exitStatus == nil, !retryScheduled,
+      let mux, mux.isOpen, let smx = muxAttachment,
       let pane = activePane, let head = ledger.admitted.first
     else { return }
     inputInFlight = true
@@ -606,35 +664,41 @@ public final class RoamingSession: @unchecked Sendable {
 
   private func inputAnswered(_ sequence: UInt64, _ error: MuxError?) {
     inputInFlight = false
-    defer {
-      if closing {
-        closeMux {}
-      } else {
-        pumpInput()
-      }
+    if closing {
+      closeMux {}
+      return
     }
     guard let error else {
       if let done = ledger.completeHead() { acknowledge(done) }
+      // Next operation on a later turn: a synchronous answer never
+      // recurses through `pumpInput`.
+      queue.async { [weak self] in self?.pumpInput() }
       return
     }
     switch error.code {
     case .resourceLimit, .staleGeometry, .staleRevision:
-      // Nothing was written; retry once the pane drains or the layout
-      // settles.
+      // Nothing was written; retry after the pane drains or the layout
+      // settles, never in a tight loop.
+      retryScheduled = true
       queue.asyncAfter(deadline: .now() + .milliseconds(20)) { [weak self] in
+        self?.retryScheduled = false
         self?.pumpInput()
       }
     case .connectionLost, .notAttached, .staleAttachment:
-      // The lease ended; the head stays admitted for the next attachment.
+      // The lease ended; the head stays admitted for the next attachment,
+      // which resumes pumping.
       break
-    case .paneExited:
-      break
-    default:
-      // Never reported as success: later input is refused.
-      writerFailed = true
-      if let a = attachment, a.isCurrent {
-        a.send(.error(.init(.internalError, sequence: sequence)))
+    case .paneExited, .notFound:
+      // The target pane is gone: everything admitted for it is retired,
+      // never delivered to whichever pane is shown next.
+      for done in ledger.discard(through: ledger.lastAdmitted) {
+        acknowledge(done)
       }
+    default:
+      // A refusal of this one operation (e.g. malformed for the pane):
+      // retire it and continue; the writer stays usable.
+      for done in ledger.discard(through: sequence) { acknowledge(done) }
+      queue.async { [weak self] in self?.pumpInput() }
     }
   }
 

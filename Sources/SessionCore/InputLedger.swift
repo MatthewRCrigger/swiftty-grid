@@ -181,6 +181,19 @@ public struct HostInputLedger: Sendable {
     return admitted[0].remaining == 0 ? completeHead() : nil
   }
 
+  /// Retires admitted operations that can never be written (their
+  /// target is gone) so the writer can move on: they count as complete
+  /// and are never retried or delivered elsewhere. Returns their sequences.
+  public mutating func discard(through sequence: UInt64) -> [UInt64] {
+    var retired: [UInt64] = []
+    while let head = admitted.first, head.sequence <= sequence {
+      lastApplied = head.sequence
+      admitted.removeFirst()
+      retired.append(head.sequence)
+    }
+    return retired
+  }
+
   /// Completes the head once all of its bytes are written, or once its
   /// zero-byte effect (a resize) has been performed.
   public mutating func completeHead() -> UInt64? {

@@ -6,6 +6,30 @@ struct LedgerTests {
   let writer = WriterID.random()
 
   @Test
+  func `discarded operations are retired, never retried, and free the writer`() throws {
+    var ledger = HostInputLedger()
+    try ledger.authorize(writer)
+    for n in 1 ... 3 {
+      let op = InputOperation.committedText("x\(n)")
+      #expect(ledger.classify(writer: writer, sequence: UInt64(n), operation: op) == .admit)
+      ledger.record(UInt64(n), operation: op, bytes: [])
+    }
+    // A different writer cannot take over while operations are admitted.
+    #expect(throws: HostInputLedger.Rejection.wrongWriter) {
+      try ledger.authorize(WriterID.random())
+    }
+    #expect(ledger.discard(through: 1) == [1])
+    #expect(ledger.discard(through: ledger.lastAdmitted) == [2, 3])
+    #expect(!ledger.hasPending)
+    // A retired operation is not admitted again.
+    #expect(
+      ledger.classify(writer: writer, sequence: 2, operation: .committedText("x2"))
+        == .alreadyApplied
+    )
+    try ledger.authorize(WriterID.random())
+  }
+
+  @Test
   func `host admits only the next sequence and deduplicates retries`() throws {
     var ledger = HostInputLedger()
     try ledger.authorize(writer)

@@ -137,5 +137,131 @@ struct RemoteAttentionTests {
       await local.close()
     }
   }
+
+  @Test
+  func `a confirmed takeover applies to one attachment only`() async throws {
+    try await withRegistry { registry in
+      let endpoint = registry.service.listenAnonymously()
+      let local = try await MuxConnection.connect(endpoint: endpoint, frontend: .native)
+      guard
+        case let .created(ws) = try await local.execute(
+          .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
+        )
+      else { throw HostTestTimeout(what: "workspace") }
+      _ = try await local.execute(.attach(.id(ws.id)))
+      let id = SessionID(ws.id)
+      let seen = try #require(await registry.workspaces().first?.leaseGeneration)
+      let grant = try await registry.resume(
+        id,
+        target: ResumeTarget(pane: ws.tabs[0].activePane, expectedLease: seen)
+      )
+      let remote = TestClient(registry)
+      _ = try await remote.attached(grant)
+      // The Mac takes control back explicitly.
+      let now = try #require(await registry.workspaces().first?.leaseGeneration)
+      let mac = try await MuxConnection.connect(endpoint: endpoint, frontend: .native)
+      _ = try await mac.execute(.takeover(.id(ws.id), expectedLease: now))
+      try await hostEventually("remote fenced") { remote.isClosed ? true : nil }
+      // Reconnecting with the same token is an ordinary attach: it never
+      // takes over again.
+      let again = TestClient(registry)
+      try await again.attach(grant)
+      #expect(try await again.errorCode() == .writerBusy)
+      #expect(await mac.attachment != nil)
+      await mac.close()
+      await local.close()
+    }
+  }
+
+  @Test
+  func `a resumed workspace continues above the retired session's revisions`()
+    async throws
+  {
+    try await withRegistry { registry in
+      let grant = try await registry.create(grid: GridSize(columns: 80, rows: 24))
+      for _ in 0 ..< 3 {
+        let client = TestClient(registry)
+        _ = try await client.attached(try await registry.resume(grant.sessionID))
+        client.connection.sever()
+        try await hostEventually("detached") {
+          registry.session(grant.sessionID)?.status.isAttached == false ? true : nil
+        }
+      }
+      let retired = try #require(registry.session(grant.sessionID)).floor
+      #expect(retired.epoch >= 3)
+      #expect(
+        await registry.sweep(now: .now + .seconds(24 * 3600 + 1)) == [grant.sessionID]
+      )
+      let fresh = try await registry.resume(grant.sessionID)
+      let client = TestClient(registry)
+      let attached = try await client.attached(fresh)
+      // A warm client's store accepts only higher epochs and revisions.
+      #expect(attached.attachmentEpoch > retired.epoch)
+      let screen = try await client.snapshot("screen") { _ in true }
+      #expect(screen.screenRevision > retired.screenRevision)
+    }
+  }
+
+  @Test
+  func `input pending at shell exit is retired and the writer can change`()
+    async throws
+  {
+    try await withRegistry(launch: { shellLaunch("sleep 0.5; exit 7") }) { registry in
+      let grant = try await registry.create(grid: GridSize(columns: 40, rows: 10))
+      let client = TestClient(registry)
+      _ = try await client.attached(grant)
+      // A program that never reads: input stays admitted until exit.
+      for n in 1 ... 5 {
+        try await client.send(
+          .input(.init(attachmentEpoch: 1, sequence: UInt64(n), operation: .committedText("x")))
+        )
+      }
+      _ = try await client.message("SessionExited") {
+        if case .sessionExited = $0 { return true }
+        return false
+      }
+      let session = try #require(registry.session(grant.sessionID))
+      try await hostEventually("retired") {
+        session.diagnostics.pendingInputOperations == 0 ? true : nil
+      }
+      // Nothing is left to block a new writer (no writerBusy).
+      _ = try await registry.resume(grant.sessionID)
+    }
+  }
+
+  @Test
+  func `an exited pane in a split workspace never ends the live panes`()
+    async throws
+  {
+    try await withRegistry(launch: { shellLaunch("sleep 0.3; exit 0") }) { registry in
+      let endpoint = registry.service.listenAnonymously()
+      let grant = try await registry.create(grid: GridSize(columns: 80, rows: 24))
+      let local = try await MuxConnection.connect(endpoint: endpoint, frontend: .native)
+      guard case let .attached(_, ws) = try await local.execute(.attach(.id(grant.sessionID.workspace)))
+      else { throw HostTestTimeout(what: "attach") }
+      let first = ws.tabs[0].activePane
+      guard case let .layout(split) = try await local.execute(
+        .split(pane: first, axis: .leftRight, launch: shellLaunch())
+      ) else { throw HostTestTimeout(what: "split") }
+      let live = try #require(split.activeTabSnapshot?.activePane)
+      _ = try await local.execute(.focusPane(first))
+      await local.close()
+      try await Task.sleep(for: .milliseconds(600))
+      // The remote view shows the exited pane, but another pane lives.
+      let client = TestClient(registry)
+      _ = try await client.attached(try await registry.resume(grant.sessionID))
+      _ = try await client.message("SessionExited") {
+        if case .sessionExited = $0 { return true }
+        return false
+      }
+      client.connection.sever()
+      let session = try #require(registry.session(grant.sessionID))
+      try await hostEventually("detached") { session.status.isAttached ? nil : true }
+      #expect(session.status.allPanesExited == false)
+      _ = await registry.sweep(now: .now + .seconds(301))
+      #expect(await registry.workspaces().map(\.id) == [grant.sessionID.workspace])
+      #expect(await registry.service.panePID(live) != nil)
+    }
+  }
 }
 #endif

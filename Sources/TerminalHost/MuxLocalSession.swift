@@ -27,6 +27,8 @@ final class MuxLocalSession: @unchecked Sendable {
   var onPaneChanged: ((PaneID) -> Void)?
   var onClosed: ((String) -> Void)?
   private(set) var welcome: Welcome?
+  /// False once closed or rejected: requests then fail immediately.
+  var isOpen: Bool { connection != nil && !closed }
 
   init(queue: DispatchQueue) { self.queue = queue }
 

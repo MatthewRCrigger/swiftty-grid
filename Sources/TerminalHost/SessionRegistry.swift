@@ -95,11 +95,25 @@ public final class SessionRegistry: @unchecked Sendable {
   private struct State {
     var entries: [SessionID: Entry] = [:]
     var failures: [ContinuousClock.Instant] = []
+    /// Revision floors of removed entries whose workspace may be resumed
+    /// again (bounded, oldest dropped first).
+    var floors: [SessionID: RoamingSession.Floor] = [:]
+    var floorOrder: [SessionID] = []
+
+    mutating func retire(_ id: SessionID, _ floor: RoamingSession.Floor) {
+      if floors.updateValue(floor, forKey: id) == nil { floorOrder.append(id) }
+      while floorOrder.count > 1024 {
+        floors.removeValue(forKey: floorOrder.removeFirst())
+      }
+    }
   }
 
   /// The SwiftMux service epoch.
   public let serverInstanceID: SessionCore.ServerInstanceID
-  public let identity: HostIdentity
+  /// The endpoint and certificate every new grant advertises; replaced
+  /// when the QUIC certificate is renewed.
+  public var identity: HostIdentity { identityBox.withLock { $0 } }
+  private let identityBox: Mutex<HostIdentity>
   public let policy: RegistryPolicy
   public let service: MuxService
   private let makeLaunch: @Sendable () -> LaunchSpec
@@ -115,7 +129,7 @@ public final class SessionRegistry: @unchecked Sendable {
   ) {
     self.service = service
     serverInstanceID = SessionCore.ServerInstanceID(service.instance)
-    self.identity = identity
+    identityBox = Mutex(identity)
     var policy = policy
     policy.tokenLifetime = min(policy.tokenLifetime, RSTLimits.maxTokenLifetime)
     self.policy = policy
@@ -403,7 +417,8 @@ public final class SessionRegistry: @unchecked Sendable {
   }
 
   private func makeSession(_ id: SessionID, grid: GridSize) -> RoamingSession {
-    let session = RoamingSession(id: id, service: service, grid: grid)
+    let floor = state.withLock { $0.floors[id] } ?? RoamingSession.Floor()
+    let session = RoamingSession(id: id, service: service, grid: grid, floor: floor)
     session.onTerminateRequested = { [weak self] id in
       guard let self else { return }
       Task { _ = await self.terminate(id) }
@@ -452,11 +467,23 @@ public final class SessionRegistry: @unchecked Sendable {
       if case let .failure(code) = checked { return .failure(code) }
       return .failure(.internalError)
     }
-    session.allowTakeover =
-      credential.takeover || credential.target?.expectedLease != nil
-    session.target = credential.target
-    switch await session.attach(attachment, writer: request.writerID) {
-    case .success: return .success(session)
+    switch await session.attach(
+      attachment,
+      writer: request.writerID,
+      takeover: credential.takeover,
+      target: credential.target
+    ) {
+    case .success:
+      // Takeover and focus apply to the confirmed attachment only; a
+      // later reconnect with the same token neither displaces a newer
+      // holder nor moves focus back.
+      state.withLock { s in
+        guard s.entries[request.sessionID]?.credential?.token == credential.token
+        else { return }
+        s.entries[request.sessionID]?.credential?.takeover = false
+        s.entries[request.sessionID]?.credential?.target = nil
+      }
+      return .success(session)
     case let .failure(code):
       state.withLock { $0.failures.append(now) }
       return .failure(code)
@@ -497,6 +524,8 @@ public final class SessionRegistry: @unchecked Sendable {
       var end: [SessionID] = []
       for (id, entry) in s.entries {
         let status = entry.session.status
+        // An attached entry is never dropped: its session holds the lease.
+        if status.isAttached, status.state != .terminated { continue }
         let expire: Bool =
           switch status.state {
           case .reserved:
@@ -511,9 +540,13 @@ public final class SessionRegistry: @unchecked Sendable {
           }
         guard expire else { continue }
         s.entries.removeValue(forKey: id)
+        s.retire(id, entry.session.floor)
         removed.append(id)
+        // Only a workspace this host created, and only when nothing in it
+        // still runs (a never-attached reservation, or every pane exited).
         if entry.createdHere,
-          status.state == .reserved || status.state == .exited
+          status.state == .reserved
+            || (status.state == .exited && status.allPanesExited)
         {
           end.append(id)
         }
@@ -559,11 +592,19 @@ public final class SessionRegistry: @unchecked Sendable {
     )
   }
 
+  /// Advertises a renewed certificate (and endpoint) in later grants.
+  /// Grants already issued keep their pin; their clients fetch a fresh
+  /// grant when the old pin stops matching.
+  public func replaceIdentity(_ identity: HostIdentity) {
+    identityBox.withLock { $0 = identity }
+  }
+
   private func grant(
     _ id: SessionID,
     credential: Credential,
     grid: GridSize
   ) -> BootstrapGrant {
+    let identity = identity
     let remaining = ContinuousClock.now.duration(to: credential.expiresAt)
     let seconds =
       Double(remaining.components.seconds)
