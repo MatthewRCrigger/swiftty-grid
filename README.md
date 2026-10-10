@@ -228,7 +228,7 @@ Appendix B of the spec records the design sources.
 | `SessionCore` | IDs, limits, input ledger (client queue, host admission), lifecycle, backoff, transfer manifests |
 | `ScreenProtocol` | RST/1 messages, framing, RFC 1950 snapshots, validation, snapshot scheduler, bootstrap envelope, `RSTConnection` |
 | `SSHClient` | SwiftNIO SSH: host trust, password/Ed25519, exec, shell, SFTP v3 subset, resumable verified transfers |
-| `AppleTransport` | Network framework QUIC (ALPN `rst/1`, TLS 1.3, no 0-RTT), exact-certificate pinning, host identity |
+| `AppleTransport` | Network framework QUIC (ALPN `rst/1`, TLS 1.3, no 0-RTT), SPKI and exact-certificate pinning, host identity |
 | `TerminalHost` | macOS host: exporter, tracked PTY writer, session registry, attachment protocol, control socket |
 | `TerminalSurface` | Client: `RoamingClient`, frontend backends (roaming, ordinary SSH, local PTY), SSH and QUIC bridges |
 | `CompanionModel` | Bounded watch/iPhone status DTOs; no Swiftty, SSH or QUIC |
@@ -252,8 +252,11 @@ did not create. Firewall changes are not made automatically.
 
 Clients bootstrap with `ssh <mac> /usr/local/libexec/swifttyd bootstrap --stdio`
 (a no-PTY exec with a length-prefixed JSON request), receive a session grant
-with the agent's certificate and a bearer token, and attach over QUIC pinned to
-that exact certificate. The apps are generated with XcodeGen:
+with the agent's certificate, its SPKI pin (SHA-256 of the certificate's
+SubjectPublicKeyInfo) and a bearer token, and attach over QUIC. The TLS
+handshake must present that key and that exact certificate before the token is
+sent; a changed pin fails closed (unified spec §1.8). The apps are generated
+with XcodeGen:
 
 ```sh
 Scripts/build-platforms.sh   # iOS, macOS, Catalyst, visionOS, tvOS, watchOS, swifttyd

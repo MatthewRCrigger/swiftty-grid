@@ -53,6 +53,9 @@
     public let certificateDER: Data
     /// Lowercase hex SHA-256 of `certificateDER` for the bootstrap grant.
     public let certificateSHA256: String
+    /// Lowercase hex SHA-256 of the certificate's DER SubjectPublicKeyInfo:
+    /// the QUIC pin every bootstrap grant carries.
+    public let spkiSHA256: String
     public let notValidBefore: Date
     public let notValidAfter: Date
     public let secIdentity: SecIdentity
@@ -182,6 +185,10 @@
 
       self.certificateDER = certificateDER
       self.certificateSHA256 = CertificatePin.fingerprint(certificateDER)
+      guard
+        let spkiSHA256 = try? CertificatePin.spkiFingerprint(certificateDER)
+      else { throw HostIdentityError.certificateEncoding }
+      self.spkiSHA256 = spkiSHA256
       self.notValidBefore = certificate.notValidBefore
       self.notValidAfter = certificate.notValidAfter
       self.secIdentity = identity

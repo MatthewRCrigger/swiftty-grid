@@ -151,6 +151,27 @@ fd 5 or above before spawning. Previously, `dup2(3, 3)` kept close-on-exec,
 and crossed duplicates could overwrite each other, so the child received a
 closed or wrong fd 3/4.
 
+### 1.8 QUIC pin
+
+- **The pin is the key.** Every grant carries `serverSPKISHA256`: the
+  lowercase hex SHA-256 of the DER SubjectPublicKeyInfo of the agent's TLS
+  certificate, hashed exactly as encoded in the certificate. It travels
+  beside `serverCertificateDER` and `serverCertificateSHA256` inside the
+  SSH-authenticated bootstrap.
+- **Verified in the handshake.** The client checks the presented leaf in the
+  TLS verify block, before any application data. The `Attach` carrying the
+  resume capability (application token) is sent only after the handshake
+  succeeds, so a changed pin fails closed (`pinMismatch`) without the token
+  ever leaving the client.
+- **Key and certificate.** When the pin is present the client requires the
+  SPKI hash to match **and** the leaf to equal the delivered certificate
+  byte for byte (defence in depth). Rotating the certificate, even under the
+  same key, still needs a fresh grant over SSH.
+- **Validation.** A present `serverSPKISHA256` must be exactly 64 lowercase
+  hex digits and must match the delivered certificate's key; otherwise the
+  grant is refused before connecting. The field is optional on the wire:
+  grants from older hosts omit it and are checked by exact certificate only.
+
 ## 2. Leases, takeover and input (SMX/1 additions)
 
 ### 2.1 Per-workspace lease

@@ -237,6 +237,59 @@ struct RoamingEndToEndTests {
   }
 
   @Test
+  func `changed QUIC pin fails closed before the token is sent`() async throws {
+    let harness = try await Harness()
+    let bootstrapper = EnvelopeBootstrapper(service: harness.service)
+    guard
+      case let .granted(grant) = try await bootstrapper.bootstrap(
+        BootstrapRequest(
+          operation: .create, initialGrid: GridSize(columns: 80, rows: 24)
+        )
+      )
+    else {
+      Issue.record("expected a grant")
+      await harness.shutdown()
+      return
+    }
+    #expect(grant.serverSPKISHA256 != nil)
+    let other = try AppleTransport.HostIdentity.generate(ipAddresses: ["127.0.0.1"])
+
+    // The host's key changed since SSH delivered the pin (or the endpoint
+    // is an impostor): the grant pins `other`, the listener presents its
+    // own certificate. The SPKI check fails the handshake.
+    var rotated = grant
+    rotated.serverCertificateDER = other.certificateDER
+    rotated.serverCertificateSHA256 = other.certificateSHA256
+    rotated.serverSPKISHA256 = other.spkiSHA256
+    await #expect(throws: RSTTransportError.pinMismatch) {
+      _ = try await QUICGrantConnector().connect(to: rotated)
+    }
+
+    // Only the SPKI pin changed: the grant is inconsistent and is refused
+    // before any packet is sent.
+    var mismatched = grant
+    mismatched.serverSPKISHA256 = other.spkiSHA256
+    await #expect(throws: CertificatePinError.inconsistentPin) {
+      _ = try await QUICGrantConnector().connect(to: mismatched)
+    }
+
+    // No connection reached the server, so no Attach carried the token
+    // and the reservation was never claimed.
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(harness.serverConnections.list.withLock { $0.count } == 0)
+    #expect(harness.listener.activeConnectionCount == 0)
+    #expect((await harness.registry.list()).map(\.state) == [.reserved])
+
+    // The genuine pin still attaches.
+    let connection = try await QUICGrantConnector().connect(to: grant)
+    connection.close()
+    try await waitFor("server saw the pinned connection") {
+      harness.serverConnections.list.withLock { $0.count } == 1
+    }
+    await harness.shutdown()
+  }
+
+  @Test
   func `cold relaunch resumes the retained session by id`() async throws {
     let harness = try await Harness()
     let first = TerminalSession(presentationColumns: 80, rows: 24)

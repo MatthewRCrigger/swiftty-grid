@@ -1,4 +1,5 @@
 #if os(macOS)
+import AppleTransport
 import Darwin
 import Foundation
 import ScreenProtocol
@@ -45,10 +46,21 @@ func hostEventuallyAsync<T>(
   }
 }
 
-func testIdentity() -> HostIdentity {
-  HostIdentity(
+/// A real self-signed certificate so grants carry an SPKI pin.
+private let testCertificateDER: Data = {
+  do {
+    return try AppleTransport.HostIdentity.generate(
+      ipAddresses: ["127.0.0.1"]
+    ).certificateDER
+  } catch {
+    fatalError("test certificate: \(error)")
+  }
+}()
+
+func testIdentity() -> TerminalHost.HostIdentity {
+  TerminalHost.HostIdentity(
     endpoint: BootstrapEndpoint(host: "127.0.0.1", port: 51222),
-    certificate: HostCertificate(der: Data([0x30, 0x03, 0x02, 0x01, 0x01]))
+    certificate: HostCertificate(der: testCertificateDER)
   )
 }
 
