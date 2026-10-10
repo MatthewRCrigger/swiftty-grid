@@ -86,6 +86,9 @@ public actor RoamingClient {
   private var resendFrom: UInt64?
   private var resizeRevision: UInt64 = 0
   private var desiredGrid: GridSize?
+  private var gridProposed = false
+  /// The grid last requested within the current attachment; cleared on
+  /// every new attachment so the host's actual grid is compared again.
   private var requestedGrid: GridSize?
 
   // Detach / terminate.
@@ -112,6 +115,9 @@ public actor RoamingClient {
     self.configuration = configuration
     self.timing = timing
     backoff = ReconnectBackoff(jitter: configuration.backoffJitter)
+    // The view's latest grid: a resume asks for it rather than adopting
+    // whatever grid the session last had.
+    if configuration.initialGrid.isValid { desiredGrid = configuration.initialGrid }
     let now = timing.now()
     lastHeardAt = now
     lastSentAt = now
@@ -143,8 +149,9 @@ public actor RoamingClient {
     let request: BootstrapRequest
     switch target {
     case let .create(grid):
-      desiredGrid = desiredGrid ?? grid
-      request = BootstrapRequest(operation: .create, initialGrid: grid)
+      let initial = gridProposed ? desiredGrid ?? grid : grid
+      desiredGrid = initial
+      request = BootstrapRequest(operation: .create, initialGrid: initial)
     case let .resume(id):
       request = BootstrapRequest(
         operation: .resume,
@@ -230,6 +237,7 @@ public actor RoamingClient {
     let grid = GridSize(columns: columns, rows: rows)
     guard grid.isValid else { return }
     desiredGrid = grid
+    gridProposed = true
     maybeSendGrid()
     publish()
   }
@@ -731,6 +739,15 @@ public actor RoamingClient {
     // epoch. Admitted partial operations continue at the host.
     let retry = queue.reconcile(serverApplied: attached.lastFullyAppliedInputSequence)
     self.queue = queue
+    // Another client may have resized the session since our last
+    // request: compare with this attachment's screen, except for a
+    // resize that is being retried.
+    requestedGrid = nil
+    for entry in retry {
+      if case let .resize(columns, rows, _) = entry.operation {
+        requestedGrid = GridSize(columns: columns, rows: rows)
+      }
+    }
     for entry in retry { sendInput(entry, epoch: attached.attachmentEpoch) }
     if let early = earlySnapshot {
       earlySnapshot = nil
@@ -833,7 +850,7 @@ public actor RoamingClient {
 
   private func maybeSendGrid() {
     guard lifecycle.state == .active, let desired = desiredGrid, let epoch,
-      var queue, let screen = store?.current
+      var queue, let screen = store?.current, screen.attachmentEpoch == epoch
     else { return }
     let reference =
       requestedGrid ?? GridSize(columns: screen.columns, rows: screen.rows)

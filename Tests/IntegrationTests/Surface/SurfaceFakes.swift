@@ -195,6 +195,13 @@ actor FakeHost {
     )
   }
 
+  /// Another client (e.g. the Mac app) resized the session.
+  func resizeExternally(columns: Int, rows: Int) {
+    self.columns = columns
+    self.rows = rows
+    resizeRevision += 1
+  }
+
   /// Abrupt path loss on the current connection.
   func severCurrent() {
     guard let current, let link = links[current] else { return }
@@ -488,14 +495,16 @@ struct RoamingFixture {
   let sink = RecordingSink()
   let client: RoamingClient
 
-  init(jitter: Double = 0) {
+  init(jitter: Double = 0, initialGrid: GridSize? = nil) {
     bootstrapper = FakeBootstrapper(host: host)
     connector = FakeConnector(host: host)
+    var configuration = testConfiguration(jitter: jitter)
+    if let initialGrid { configuration.initialGrid = initialGrid }
     client = RoamingClient(
       bootstrapper: bootstrapper,
       connector: connector,
       sink: sink,
-      configuration: testConfiguration(jitter: jitter),
+      configuration: configuration,
       timing: clock.timing
     )
   }
