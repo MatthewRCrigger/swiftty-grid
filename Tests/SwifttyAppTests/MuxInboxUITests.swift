@@ -198,6 +198,23 @@ extension MuxNativeTests {
     #expect(await until { told.count == 3 })
     #expect(told.last == "This item is no longer available.")
     #expect(c.activePane == pane)
+
+    // While the popover is open, failures appear inline, not as alerts.
+    c.toggleInbox()
+    let view = try #require(c.inboxView)
+    #expect(
+      view.messageLabel.stringValue == "This item is no longer available."
+    )
+    c.snooze(request, until: Date().addingTimeInterval(900))
+    #expect(
+      await until {
+        view.messageLabel.stringValue
+          == "The program has already moved on from this request."
+      }
+    )
+    #expect(view.messageLabel.superview != nil)
+    #expect(told.count == 3)
+    c.toggleInbox()
   }
 
   @Test(.enabled(if: hasMetal))

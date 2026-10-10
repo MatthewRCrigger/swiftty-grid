@@ -258,20 +258,34 @@ final class MuxInboxViewController: NSViewController {
     preferredContentSize = scroll.frame.size
   }
 
-  func update(_ model: MuxInboxModel, message: String? = nil) {
+  /// Shows (or with nil, clears) the inline failure line. Only the line
+  /// changes: rows are not rebuilt, so `onShown` does not fire again and
+  /// a failing `markSeen` cannot retry itself in a loop.
+  func show(message: String?) {
     _ = view
-    let now = Date()
-    let items = model.sorted(at: now)
-    shown = items
-    for row in stack.arrangedSubviews { row.removeFromSuperview() }
+    let message = message.flatMap { $0.isEmpty ? nil : $0 }
     messageLabel.stringValue = message ?? ""
-    if let message, !message.isEmpty {
-      stack.addArrangedSubview(messageLabel)
+    let placed = messageLabel.superview === stack
+    if let message {
+      if !placed { stack.insertArrangedSubview(messageLabel, at: 0) }
       NSAccessibility.post(
         element: messageLabel,
         notification: .announcementRequested,
         userInfo: [.announcement: message]
       )
+    } else if placed {
+      messageLabel.removeFromSuperview()
+    }
+  }
+
+  func update(_ model: MuxInboxModel) {
+    _ = view
+    let now = Date()
+    let items = model.sorted(at: now)
+    shown = items
+    for row in stack.arrangedSubviews { row.removeFromSuperview() }
+    if !messageLabel.stringValue.isEmpty {
+      stack.addArrangedSubview(messageLabel)
     }
     if items.isEmpty {
       stack.addArrangedSubview(

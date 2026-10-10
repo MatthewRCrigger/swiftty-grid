@@ -48,7 +48,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private(set) var inbox = MuxInboxModel()
   let inboxToolbar = MuxInboxToolbar()
   private var inboxPopover: NSPopover?
-  private var inboxView: MuxInboxViewController?
+  private(set) var inboxView: MuxInboxViewController?
 
   private init(
     connection: MuxConnection,
@@ -947,8 +947,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
 
   /// Rows requested per inbox page (the service caps it at 100).
   var inboxPageLimit = 100
-  /// The last failed inbox command, shown inline in the popover until
-  /// the popover is next opened.
+  /// The last failed inbox command: shown inline while the popover is
+  /// open, otherwise kept for the next time it opens.
   private(set) var inboxMessage: String?
 
   /// Subscribes to inbox metadata: no lease, frames or resize involved.
@@ -1013,7 +1013,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private func refreshInbox() {
     inboxToolbar.update(inbox.counts)
     if inboxPopover?.isShown == true {
-      inboxView?.update(inbox, message: inboxMessage)
+      inboxView?.update(inbox)
     }
   }
 
@@ -1026,7 +1026,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private func inboxProblem(_ message: String, alert: Bool) {
     inboxMessage = message
     if inboxPopover?.isShown == true {
-      inboxView?.update(inbox, message: message)
+      inboxView?.show(message: message)
     } else if alert {
       notice(message)
     }
@@ -1057,8 +1057,10 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       popover.performClose(nil)
       return
     }
-    inboxMessage = nil
     let view = inboxView ?? MuxInboxViewController()
+    // A failure from while the popover was closed is shown once.
+    view.show(message: inboxMessage)
+    inboxMessage = nil
     view.onOpen = { [weak self] item in self?.openAttention(item) }
     view.onReview = { [weak self] item in self?.markReviewed(item) }
     view.onSnooze = { [weak self] item, until in
