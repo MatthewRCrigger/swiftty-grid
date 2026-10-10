@@ -149,4 +149,47 @@ struct LeaseTests {
     let frame = try await c.frame(of: pane) { $0.lines.contains("ab-2") }
     #expect(!frame.lines.contains { $0.contains("echo aecho a") })
   }
+
+  /// A paste is fixed to its pane: ending it from another pane is refused
+  /// and leaves it open, so only its own pane can close it.
+  @Test
+  func pasteEndFromAnotherPaneIsRefused() async throws {
+    let h = try Harness()
+    let c = try await h.connect()
+    let ws = try await create(c, "paste")
+    let a = ws.tabs[0].activePane
+    try await c.attachAndShow(.id(ws.id))
+    guard
+      case let .layout(split) = try await c.execute(
+        .split(pane: a, axis: .leftRight, launch: shellLaunch())
+      ),
+      let b = split.activeTabSnapshot?.layout.panes.first(where: { $0 != a })
+    else { throw MuxError(.invalidRequest, "split") }
+    let attachment = await c.attachment!
+    func record(
+      _ n: UInt64,
+      _ pane: PaneID,
+      _ payload: InputPayload
+    ) -> InputRecord {
+      InputRecord(
+        sequence: n,
+        attachment: attachment,
+        pane: pane,
+        payload: payload
+      )
+    }
+    try await c.submit(raw: record(1, a, .pasteBegin(id: 1)))
+    #expect(
+      await code { try await c.submit(raw: record(2, b, .pasteEnd(id: 1))) }
+        == .invalidRequest
+    )
+    // Still open on its own pane.
+    try await c.submit(raw: record(3, a, .pasteChunk(id: 1, text: "x")))
+    #expect(
+      await code { try await c.submit(raw: record(4, a, .pasteBegin(id: 2))) }
+        == .invalidRequest
+    )
+    try await c.submit(raw: record(5, a, .pasteEnd(id: 1)))
+    try await c.submit(raw: record(6, a, .pasteBegin(id: 3)))
+  }
 }

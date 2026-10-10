@@ -3,6 +3,7 @@ import Foundation
 import SwiftMuxClient
 import SwiftMuxProtocol
 import SwiftMuxService
+import Synchronization
 import Testing
 
 @Suite(.serialized, .timeLimit(.minutes(1)))
@@ -246,6 +247,65 @@ struct ServiceTests {
     #expect(text.contains("two^[[201~"))
   }
 
+  /// A paste that gives up waiting for writer credit closes its envelope
+  /// on the service, so the pane's later input and pastes are admitted.
+  @Test
+  func abandonedPasteClosesItsEnvelope() async throws {
+    let h = try Harness()
+    let c = try await h.connect()
+    await c.setPasteRetry(attempts: 3, delay: .milliseconds(10))
+    guard
+      case let .created(ws) = try await c.execute(
+        .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
+      )
+    else { return }
+    let pane = ws.tabs[0].activePane
+    try await c.attachAndShow(.id(ws.id))
+    // Nothing reads the terminal while `sleep` runs, so the writer
+    // stalls and its credit (256 KiB) fills.
+    try await c.send(.text("sleep 3\r"), to: pane)
+    try await Task.sleep(for: .milliseconds(300))
+    let line = "#" + String(repeating: "p", count: 62) + "\n"
+    let text = String(repeating: line, count: (320 << 10) / 64)
+    #expect(try await c.paste(text, to: pane) == .partial)
+    // Cancelling discarded the unstarted chunks and closed the paste.
+    #expect(try await c.paste("# again\n", to: pane) == .completed)
+    try await c.send(.text("echo after-cancel-$((1+1))\r"), to: pane)
+    _ = try await c.frame(of: pane, timeout: .seconds(20)) {
+      $0.lines.contains("after-cancel-2")
+    }
+  }
+
+  /// Captures that complete after their pane was unsubscribed and
+  /// subscribed again never leak frame budget.
+  @Test
+  func resubscribingNeverLeaksFrameBudget() async throws {
+    let h = try Harness()
+    let c = try await h.connect()
+    guard
+      case let .created(ws) = try await c.execute(
+        .newWorkspace(NewWorkspaceRequest(launch: busyLaunch()))
+      )
+    else { return }
+    let pane = ws.tabs[0].activePane
+    try await c.attachAndShow(.id(ws.id), columns: 200, rows: 60)
+    // Frames stay unacknowledged. Each burst leaves earlier captures in
+    // flight; the pause lets them land in the resubscribed slot beside
+    // that slot's own capture.
+    for k in 0 ..< 40 {
+      for _ in 0 ..< 1 + k % 3 {
+        c.enqueue(.setSubscriptions([]))
+        c.enqueue(.setSubscriptions([pane]))
+      }
+      try await Task.sleep(for: .milliseconds(10 + k % 4 * 5))
+    }
+    try await c.execute(.setSubscriptions([]))
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(await h.service.pendingFrameBytes == 0)
+    try await c.execute(.endWorkspace(.id(ws.id)))
+    await c.close()
+  }
+
   @Test
   func historyScrollAndSearch() async throws {
     let h = try Harness()
@@ -366,5 +426,61 @@ struct PeerIdentityTests {
     #expect(
       ContinuousClock.now - start < .seconds(MuxConnection.handshakeTimeout + 2)
     )
+  }
+}
+
+/// A shell printing continuously.
+func busyLaunch() -> LaunchSpec {
+  var spec = shellLaunch()
+  spec.command = [
+    "/bin/sh", "-c", "i=0; while :; do i=$((i+1)); echo $i; done",
+  ]
+  return spec
+}
+
+@Suite(.serialized, .timeLimit(.minutes(1)))
+struct FrameFairnessTests {
+  /// Two leases share a frame budget smaller than one frame; rotation
+  /// keeps either from starving the other.
+  @Test
+  func leasesShareATinyFrameBudget() async throws {
+    var limits = MuxLimits.standard
+    limits.pendingFrameBudget = 1
+    limits.frameIntervalNanoseconds = 0
+    let h = try Harness(limits: limits)
+    var shown: [(MuxConnection, PaneID, WorkspaceID)] = []
+    for name in ["one", "two"] {
+      let c = try await h.connect()
+      guard
+        case let .created(ws) = try await c.execute(
+          .newWorkspace(NewWorkspaceRequest(name: name, launch: busyLaunch()))
+        )
+      else { return }
+      try await c.attachAndShow(.id(ws.id))
+      shown.append((c, ws.tabs[0].activePane, ws.id))
+    }
+    // Both consumers keep acknowledging until each has 20 frames: one
+    // that stopped would hold the whole budget.
+    let counts = Mutex([0, 0])
+    let consumers = shown.enumerated().map { i, entry in
+      Task {
+        let (c, pane, _) = entry
+        while let event = try await c.nextEvent() {
+          if case let .frame(f) = event, f.identity.pane == pane {
+            counts.withLock { $0[i] += 1 }
+          }
+        }
+      }
+    }
+    let deadline = ContinuousClock.now + .seconds(20)
+    while counts.withLock({ $0.min()! }) < 20, ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(counts.withLock { $0.allSatisfy { $0 >= 20 } })
+    for (c, _, ws) in shown {
+      try await c.execute(.endWorkspace(.id(ws)))
+      await c.close()
+    }
+    for consumer in consumers { _ = try? await consumer.value }
   }
 }

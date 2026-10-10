@@ -55,7 +55,10 @@ public actor MuxService {
   private var quiescing = false
   private var inflightFrameBytes = 0
   private var pumpScheduled = false
-  private var pumpCursor = 0
+  /// Leases in grant order; `pump` rotates through them.
+  private var leaseOrder: [WorkspaceID] = []
+  private var workspaceCursor = 0
+  private var nextCapture: UInt64 = 0
   private var idleWork: DispatchWorkItem?
   private var listeners: [SMXListener] = []
   /// Called once the empty-state barrier holds for `idleExitDelay`.
@@ -382,6 +385,7 @@ public actor MuxService {
         moved.generation = leaseGenerations[ws.id, default: 0]
         moved.reportedActivity = []
         leases[ws.id] = moved
+        if let i = leaseOrder.firstIndex(of: from) { leaseOrder[i] = ws.id }
         clientLeases[client.id] = ws.id
         publishWorkspaces()
       }
@@ -429,6 +433,7 @@ public actor MuxService {
       )
     )
     leases[ws.id] = lease
+    leaseOrder.append(ws.id)
     clientLeases[client.id] = ws.id
     idleWork?.cancel()
     publishWorkspaces()
@@ -1270,14 +1275,17 @@ public actor MuxService {
     let now = DispatchTime.now().uptimeNanoseconds
     var wake: UInt64?
     // Rotate which workspace goes first so one cannot starve the others
-    // of the shared frame budget.
-    let order = leases.keys.sorted { $0.rawValue.uuidString < $1.rawValue.uuidString }
-    let start = order.isEmpty ? 0 : pumpCursor % order.count
-    for k in 0 ..< order.count {
-      if let due = pump(order[(start + k) % order.count], now: now) {
-        wake = min(wake ?? due, due)
-      }
+    // of the shared frame budget: start after the last lease served.
+    let n = leaseOrder.count
+    let start = n == 0 ? 0 : workspaceCursor % n
+    var served: Int?
+    for k in 0 ..< n {
+      let i = (start + k) % n
+      let (due, started) = pump(leaseOrder[i], now: now)
+      if started, served == nil { served = i }
+      if let due { wake = min(wake ?? due, due) }
     }
+    workspaceCursor = n == 0 ? 0 : ((served ?? start) + 1) % n
     if let wake, !pumpScheduled {
       pumpScheduled = true
       queue.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: wake)) {
@@ -1291,19 +1299,25 @@ public actor MuxService {
     }
   }
 
-  /// Starts captures for one lease; returns when a throttled pane is due.
-  private func pump(_ wsID: WorkspaceID, now: UInt64) -> UInt64? {
+  /// Starts captures for one lease; returns when a throttled pane is due
+  /// and whether any capture started.
+  private func pump(
+    _ wsID: WorkspaceID,
+    now: UInt64
+  ) -> (due: UInt64?, started: Bool) {
     guard let current = leases[wsID], !current.subscriptions.isEmpty else {
-      return nil
+      return (nil, false)
     }
     let interval = limits.frameIntervalNanoseconds
     var wake: UInt64?
+    var started = false
     let order = current.subscriptions
     let n = order.count
-    pumpCursor = (pumpCursor + 1) % max(1, n)
+    let first = current.paneCursor % n
+    leases[wsID]?.paneCursor = (first + 1) % n
     for k in 0 ..< n {
-      let pane = order[(pumpCursor + k) % n]
-      guard let slot = current.frames[pane], slot.dirty, !slot.capturing,
+      let pane = order[(first + k) % n]
+      guard let slot = current.frames[pane], slot.dirty, slot.capture == nil,
         slot.inflight == nil, let record = panes[pane]
       else { continue }
       if now &- slot.lastSent < interval, slot.lastSent != 0 {
@@ -1312,8 +1326,11 @@ public actor MuxService {
         continue
       }
       guard inflightFrameBytes < limits.pendingFrameBudget else { break }
+      nextCapture &+= 1
+      let token = nextCapture
       leases[wsID]?.frames[pane]?.dirty = false
-      leases[wsID]?.frames[pane]?.capturing = true
+      leases[wsID]?.frames[pane]?.capture = token
+      started = true
       let attachment = current.attachment
       let layoutRevision =
         workspaces.first { $0.id == wsID }?.layoutRevision ?? 0
@@ -1323,28 +1340,32 @@ public actor MuxService {
         layoutRevision: layoutRevision
       ) { [weak self] result in
         self?.onQueue {
-          $0.frameCaptured(pane, workspace: wsID, attachment: attachment, result)
+          $0.frameCaptured(pane, workspace: wsID, token: token, result)
         }
       }
     }
-    return wake
+    return (wake, started)
   }
 
   private func frameCaptured(
     _ pane: PaneID,
     workspace wsID: WorkspaceID,
-    attachment: AttachmentID,
+    token: UInt64,
     _ result: Result<(Data, UInt64), MuxError>
   ) {
-    guard let current = leases[wsID], current.attachment == attachment,
-      current.frames[pane] != nil
+    // The token is unique to this slot's capture: a completion for a
+    // pane since unsubscribed (or resubscribed), or for another lease,
+    // never reaches the client or the frame budget.
+    guard let current = leases[wsID], let slot = current.frames[pane],
+      slot.capture == token
     else { return }
-    leases[wsID]?.frames[pane]?.capturing = false
+    leases[wsID]?.frames[pane]?.capture = nil
     switch result {
     case let .success((data, revision)):
       guard let client = clients[current.client],
         case let .xpc(channel) = client.transport
       else { return }
+      if let stale = slot.inflight { inflightFrameBytes -= stale.bytes }
       channel.send(data)
       leases[wsID]?.frames[pane]?.inflight = (revision, data.count)
       leases[wsID]?.frames[pane]?.lastSent = DispatchTime.now().uptimeNanoseconds
@@ -1436,13 +1457,18 @@ public actor MuxService {
       runtime.pasteChunk(id: pasteID, text: text, estimate: estimate)
       ack(nil)
     case let .pasteEnd(pasteID):
-      guard current.pastes[pasteID] != nil else {
-        return ack(MuxError(.invalidRequest, "unknown paste"))
-      }
+      // The paste stays open on a mismatch, so detach still cancels it.
+      guard let paste = current.pastes[pasteID], paste.pane == record.pane
+      else { return ack(MuxError(.invalidRequest, "unknown paste")) }
       leases[wsID]?.pastes.removeValue(forKey: pasteID)
       runtime.pasteEnd(id: pasteID)
       ack(nil)
       send(.event(.paste(id: pasteID, state: .completed)), to: id)
+    case let .pasteCancel(pasteID):
+      guard let paste = current.pastes[pasteID], paste.pane == record.pane
+      else { return ack(MuxError(.invalidRequest, "unknown paste")) }
+      cancelPaste(pasteID, in: wsID, notify: id)
+      ack(nil)
     }
   }
 
@@ -1500,6 +1526,7 @@ public actor MuxService {
       if let inflight = slot.inflight { inflightFrameBytes -= inflight.bytes }
     }
     leases.removeValue(forKey: wsID)
+    leaseOrder.removeAll { $0 == wsID }
     clientLeases.removeValue(forKey: current.client)
     if notify { send(.event(.detached(reason: reason)), to: current.client) }
     publishWorkspaces()
@@ -1543,6 +1570,9 @@ public actor MuxService {
   }
 
   func runtime(_ pane: PaneID) -> PaneRuntime? { panes[pane]?.runtime }
+
+  /// Frame bytes sent and not yet acknowledged (tests, diagnostics).
+  package var pendingFrameBytes: Int { inflightFrameBytes }
 
   public func panePID(_ pane: PaneID) -> Int32? {
     panes[pane].map { $0.runtime.pid }

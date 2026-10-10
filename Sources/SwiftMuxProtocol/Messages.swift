@@ -538,6 +538,9 @@ public enum InputPayload: Codable, Sendable, Equatable {
   case pasteBegin(id: UInt64)
   case pasteChunk(id: UInt64, text: String)
   case pasteEnd(id: UInt64)
+  /// Abandons a paste: unstarted chunks are discarded and the envelope is
+  /// closed, so later input is no longer deferred behind it.
+  case pasteCancel(id: UInt64)
 }
 
 public struct InputRecord: Codable, Sendable, Equatable {

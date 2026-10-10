@@ -104,7 +104,9 @@ final class Client {
 
 struct FrameSlot {
   var dirty = true
-  var capturing = false
+  /// Token of the capture in progress; a completion carrying any other
+  /// token belongs to an earlier subscription and is dropped.
+  var capture: UInt64?
   var inflight: (revision: UInt64, bytes: Int)?
   var lastSent: UInt64 = 0
 }
@@ -127,6 +129,8 @@ struct Lease {
   var nextInput: UInt64 = 1
   var subscriptions: [PaneID] = []
   var frames: [PaneID: FrameSlot] = [:]
+  /// Rotates which subscribed pane is captured first.
+  var paneCursor = 0
   var geometryGeneration: UInt64 = 0
   var pastes: [UInt64: ActivePaste] = [:]
   /// Unsubscribed panes already reported through `activity`.

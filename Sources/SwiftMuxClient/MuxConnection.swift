@@ -444,11 +444,17 @@ public actor MuxConnection {
           break
         } catch let error as MuxError
           where error.code == .resourceLimit
-          && error.message.contains("buffer is full") && attempts < 200
+          && error.message.contains("buffer is full")
+          && attempts < pasteRetry.attempts
         {
           attempts += 1
-          try? await Task.sleep(for: .milliseconds(25))
-        } catch { return .success(sent > 0 ? .partial : .aborted) }
+          try? await Task.sleep(for: pasteRetry.delay)
+        } catch {
+          // Close the envelope on the service: an open paste would keep
+          // deferring this pane's later input and refuse a new paste.
+          try? await submit(pane, .pasteCancel(id: id))
+          return .success(sent > 0 ? .partial : .aborted)
+        }
       }
       sent += chunk.utf8.count
     }
@@ -456,6 +462,16 @@ public actor MuxConnection {
       return .failure(error as? MuxError ?? MuxError(.connectionLost))
     }
     return .success(.completed)
+  }
+
+  /// How long a paste waits for writer credit before giving up.
+  private var pasteRetry: (attempts: Int, delay: Duration) = (
+    200, .milliseconds(25)
+  )
+
+  /// Shortens the paste retry budget (tests).
+  package func setPasteRetry(attempts: Int, delay: Duration) {
+    pasteRetry = (attempts, delay)
   }
 
   /// Pastes in bounded chunks admitted under writer credit, waiting while
