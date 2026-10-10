@@ -1,0 +1,158 @@
+import Foundation
+import SwiftMuxProtocol
+
+/// What a constrained surface (watchOS, complications, lock screen) may
+/// show about an attention item. Defaults to fully redacted program text.
+public struct AttentionSummaryPolicy: Sendable, Equatable, Codable {
+  /// Show the program's self-reported app name (untrusted, short).
+  public var showsAppName: Bool
+  /// Show the program's message text. Off unless the user opts in.
+  public var showsMessage: Bool
+
+  public init(showsAppName: Bool = true, showsMessage: Bool = false) {
+    self.showsAppName = showsAppName
+    self.showsMessage = showsMessage
+  }
+
+  public static let redacted = AttentionSummaryPolicy(
+    showsAppName: false,
+    showsMessage: false
+  )
+}
+
+/// Redacted attention metadata for watchOS (swiftty-unified-spec.md §9,
+/// scenario 20): a category, optional app name, inbox counts and a time.
+/// No title, no message unless the policy allows it, no IDs beyond the
+/// opaque handoff locator, never terminal output.
+public struct AttentionSummary: Sendable, Equatable, Codable {
+  public static let maxAppNameLength = 32
+  public static let maxMessageLength = 120
+
+  public var category: AttentionCategory
+  public var appName: String?
+  public var counts: InboxCounts
+  /// When the item last changed, for a relative time display.
+  public var updatedAt: Date
+  /// Only when `AttentionSummaryPolicy.showsMessage` was set.
+  public var message: String?
+  /// Opaque, non-secret locator for a handoff to a paired device.
+  public var locator: String?
+
+  public init(
+    category: AttentionCategory,
+    appName: String? = nil,
+    counts: InboxCounts,
+    updatedAt: Date,
+    message: String? = nil,
+    locator: String? = nil
+  ) {
+    self.category = category
+    self.appName = appName
+    self.counts = counts
+    self.updatedAt = updatedAt
+    self.message = message
+    self.locator = locator
+  }
+
+  /// Summarizes `item` under `policy`. Program text is sanitized (no
+  /// controls, no newlines) and truncated.
+  public init(
+    item: AttentionItem,
+    counts: InboxCounts,
+    policy: AttentionSummaryPolicy = AttentionSummaryPolicy(),
+    destination: AttentionDestination? = nil
+  ) {
+    self.init(
+      category: item.category,
+      appName: policy.showsAppName
+        ? Self.sanitize(item.status.app, limit: Self.maxAppNameLength) : nil,
+      counts: counts,
+      updatedAt: item.updatedAt,
+      message: policy.showsMessage
+        ? Self.sanitize(item.status.message, limit: Self.maxMessageLength) : nil,
+      locator: destination.map(AttentionLocator.encode)
+    )
+  }
+
+  /// "2 min ago" style text relative to `now`.
+  public func relativeTime(now: Date) -> String {
+    let formatter = RelativeDateTimeFormatter()
+    formatter.unitsStyle = .short
+    return formatter.localizedString(for: min(updatedAt, now), relativeTo: now)
+  }
+
+  /// A one-line, non-secret label: never the program title or message.
+  public var categoryLabel: String {
+    switch category {
+    case .needsYou: "Needs you"
+    case .failure: "Failed"
+    case .result: "Result"
+    }
+  }
+
+  static func sanitize(_ text: String?, limit: Int) -> String? {
+    guard let text else { return nil }
+    let cleaned = String(
+      String.UnicodeScalarView(
+        text.unicodeScalars.map {
+          $0.properties.generalCategory == .control
+            || $0.properties.generalCategory == .format
+            || $0.properties.generalCategory == .lineSeparator
+            || $0.properties.generalCategory == .paragraphSeparator ? " " : $0
+        }
+      )
+    ).trimmingCharacters(in: .whitespaces)
+    guard !cleaned.isEmpty else { return nil }
+    return cleaned.count <= limit ? cleaned : String(cleaned.prefix(limit - 1)) + "…"
+  }
+}
+
+/// A user-confirmed request from a constrained device (watchOS) asking
+/// a paired, authorized device to open an attention item. It carries
+/// only the opaque locator and an intent: it can never acquire a writer
+/// lease, take over, or send terminal input, and the receiving device
+/// resolves it through its own configured hosts like any other link.
+public struct AttentionHandoffRequest: Sendable, Equatable, Codable {
+  /// `NSUserActivity` type for Handoff continuation.
+  public static let activityType = "dev.swiftty.attention.open"
+  /// `userInfo` key holding `locator`.
+  public static let locatorKey = "ref"
+
+  public enum Intent: String, Sendable, Codable {
+    case review, reveal
+  }
+
+  public var locator: String
+  public var intent: Intent
+  public var requestedAt: Date
+
+  /// Fails unless `locator` decodes; a watch never forwards free text.
+  public init?(locator: String, intent: Intent = .review, requestedAt: Date = .now) {
+    guard (try? AttentionLocator.decode(locator)) != nil else { return nil }
+    self.locator = locator
+    self.intent = intent
+    self.requestedAt = requestedAt
+  }
+
+  /// Handoff never grants these, by construction.
+  public var grantsWriterLease: Bool { false }
+  public var allowsInput: Bool { false }
+
+  /// The destination for the receiving device; `.reveal` narrows intent.
+  public func destination() throws(AttentionLocator.DecodeError) -> AttentionDestination {
+    var destination = try AttentionLocator.decode(locator)
+    if intent == .reveal { destination.intent = .reveal }
+    return destination
+  }
+
+  /// `userInfo` for an `NSUserActivity` of `activityType`.
+  public var userInfo: [String: String] { [Self.locatorKey: locator] }
+
+  /// Parses a continued activity's `userInfo`, strictly.
+  public init?(userInfo: [AnyHashable: Any]?) {
+    guard let userInfo, userInfo.count == 1,
+      let locator = userInfo[Self.locatorKey] as? String
+    else { return nil }
+    self.init(locator: locator)
+  }
+}
