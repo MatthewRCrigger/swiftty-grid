@@ -10,6 +10,11 @@ struct MuxInboxModel: Equatable {
   private(set) var revision: UInt64 = 0
   /// Cursor for the next page of each section; nil when fully read.
   private(set) var cursors: [InboxQuery.Section: String] = [:]
+  /// Inbox revision at which each recently removed occurrence left the
+  /// inbox, so a page read before the removal cannot resurrect it.
+  private var removedAt: [OccurrenceID: UInt64] = [:]
+  /// Bound on `removedAt`; the oldest removals are forgotten first.
+  static let tombstoneLimit = 512
 
   /// The sections the inbox reads (the service's `all` includes
   /// resolved history, which the window never lists).
@@ -46,7 +51,13 @@ struct MuxInboxModel: Equatable {
   }
 
   private mutating func adopt(_ page: InboxPage) {
-    for item in page.items { merge(item) }
+    for item in page.items {
+      // Removed by an update newer than this page: stay removed.
+      if let removed = removedAt[item.occurrence], removed > page.revision {
+        continue
+      }
+      merge(item)
+    }
     if page.revision >= revision {
       counts = page.counts
       revision = page.revision
@@ -59,13 +70,34 @@ struct MuxInboxModel: Equatable {
 
   /// Applies one update; true when the caller must refetch (`resync`).
   mutating func apply(_ update: InboxUpdate) -> Bool {
-    for id in update.removed { items[id] = nil }
-    for item in update.changed { merge(item) }
+    for id in update.removed {
+      items[id] = nil
+      tombstone(id, at: update.revision)
+    }
+    for item in update.changed {
+      if let removed = removedAt[item.occurrence], removed > update.revision {
+        continue  // removed by a newer update
+      }
+      merge(item)
+      if items[item.occurrence] == nil {
+        tombstone(item.occurrence, at: update.revision)
+      } else {
+        removedAt[item.occurrence] = nil
+      }
+    }
     if update.revision >= revision {
       counts = update.counts
       revision = update.revision
     }
     return update.resync
+  }
+
+  private mutating func tombstone(_ id: OccurrenceID, at revision: UInt64) {
+    removedAt[id] = max(removedAt[id] ?? 0, revision)
+    guard removedAt.count > Self.tombstoneLimit else { return }
+    let oldest = removedAt.sorted { $0.value < $1.value }
+      .prefix(removedAt.count - Self.tombstoneLimit)
+    for (old, _) in oldest { removedAt[old] = nil }
   }
 
   private mutating func merge(_ item: AttentionItem) {

@@ -51,18 +51,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       mux.reveal(pane: target.pane, tab: target.tab)
       return
     }
-    // One SwiftMux window and lease at a time: leave the current one.
-    if let mux {
-      self.mux = nil
-      await mux.detach()
-      mux.close()
-    }
-    let controller = try await MuxWorkspaceController.open(
-      .id(target.workspace),
+    // One SwiftMux window and lease at a time: the current one is left
+    // only once the target is attached, so a refused attach (held
+    // elsewhere, before the takeover is confirmed) keeps it.
+    let previous = mux
+    let controller = try await MuxWorkspaceController.replace(
+      previous,
+      with: .id(target.workspace),
       configuration: config,
       connection: MuxWorkspaceController.connect(),
       takeover: lease
     )
+    if let mux, mux !== previous {
+      // Another window opened meanwhile: keep one lease.
+      self.mux = nil
+      await mux.detach()
+      mux.close()
+    }
     controller.onClose = { [weak controller] in
       if self.mux === controller { self.mux = nil }
     }
