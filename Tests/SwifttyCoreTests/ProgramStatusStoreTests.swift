@@ -1,4 +1,5 @@
 @testable import SwifttyCore
+@testable import SwifttyEngine
 import Testing
 
 /// OSC 7501 record semantics.

@@ -1,5 +1,6 @@
 import TestSupport
 @testable import SwifttyCore
+@testable import SwifttyEngine
 import Testing
 
 // Byte-level ports of Ghostty Terminal.zig, original lines >=14035.

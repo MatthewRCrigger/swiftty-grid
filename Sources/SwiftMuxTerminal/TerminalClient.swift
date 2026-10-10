@@ -185,7 +185,10 @@ public final class TerminalClient {
         mode = .normal
       }
       syncLayout()
-    case let .paneExited(pane, status):
+    case let .paneExited(pane, status, truncated):
+      if truncated {
+        show("pane was force-killed; its final output may be incomplete")
+      }
       if let i = workspace.panes.firstIndex(where: { $0.id == pane }) {
         workspace.panes[i].exitStatus = status
       }

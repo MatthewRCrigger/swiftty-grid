@@ -57,18 +57,19 @@ struct UnicodeGeneratorTests {
     """
     .write(to: main, atomically: true, encoding: .utf8)
     let sources = [
-      "Sources/SwifttyCore/Unicode/Tables.swift",
-      "Sources/SwifttyCore/Unicode/Width.swift",
-      "Sources/SwifttyCore/Unicode/ScalarInfo.swift",
-      "Sources/SwifttyCore/Terminal/GraphemeBreak.swift",
+      "Sources/SwifttyEngine/Unicode/Tables.swift",
+      "Sources/SwifttyEngine/Unicode/Width.swift",
+      "Sources/SwifttyEngine/Unicode/ScalarInfo.swift",
+      "Sources/SwifttyEngine/Terminal/GraphemeBreak.swift",
     ]
     .map { root.appendingPathComponent($0).path }
     let binary = directory.appendingPathComponent("runtime")
     let compilation = try run(
       URL(fileURLWithPath: "/usr/bin/env"),
-      arguments: ["swiftc", "-O", "-whole-module-optimization"] + sources + [
-        properties.path, main.path, "-o", binary.path,
-      ],
+      arguments: [
+        "swiftc", "-O", "-whole-module-optimization", "-package-name",
+        "swiftty",
+      ] + sources + [properties.path, main.path, "-o", binary.path],
       directory: directory,
     )
     try #require(

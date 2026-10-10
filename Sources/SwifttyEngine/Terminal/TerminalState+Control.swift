@@ -4,13 +4,13 @@ extension TerminalState {
   // MARK: DCS
 
   /// The terminal-owned half of a pending parser control string.
-  struct ControlStringContinuation: Sendable {
+  package struct ControlStringContinuation: Sendable {
     var kind: DCSKind
     var buffer: [UInt8]
     var isControlMode: Bool
   }
 
-  var controlStringContinuation: ControlStringContinuation {
+  package var controlStringContinuation: ControlStringContinuation {
     ControlStringContinuation(
       kind: dcsKind,
       buffer: dcsBuffer,
@@ -18,8 +18,9 @@ extension TerminalState {
     )
   }
 
-  mutating func restoreControlString(_ continuation: ControlStringContinuation)
-  {
+  package mutating func restoreControlString(
+    _ continuation: ControlStringContinuation
+  ) {
     if continuation.isControlMode != isControlMode {
       if continuation.isControlMode {
         events.append(.controlModeStarted)
@@ -105,11 +106,11 @@ extension TerminalState {
       let name = Self.unhex(hexName)
       let value: String? =
         switch name {
-        case "TN", "name": "xterm-256color"
+        case "TN", "name": terminfoName
         case "Co", "colors": "256"
         case "RGB": "8"
         case "Tc": ""
-        case "Ms": #"\E]52;%p1%s;%p2%s\007"#
+        case "Ms" where clipboardWritesAdvertised: #"\E]52;%p1%s;%p2%s\007"#
         case "Ss": #"\E[%p1%d q"#
         case "Se": #"\E[2 q"#
         case "Smulx": #"\E[4:%p1%dm"#

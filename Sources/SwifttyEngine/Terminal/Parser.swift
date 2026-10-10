@@ -89,7 +89,7 @@ public struct Parser: ~Copyable {
 
   /// Owned parsing state for continuing a stream on another session.
   /// Scratch buffers stay local; only the pending sequence is copied.
-  struct Continuation: Sendable {
+  package struct Continuation: Sendable {
     var state: State
     var csi: CSISequence
     var currentParam: UInt32
@@ -104,7 +104,7 @@ public struct Parser: ~Copyable {
     var oscOverflow: Bool
   }
 
-  var continuation: Continuation {
+  package var continuation: Continuation {
     Continuation(
       state: state,
       csi: csi,
@@ -121,7 +121,7 @@ public struct Parser: ~Copyable {
     )
   }
 
-  mutating func restore(_ continuation: Continuation) {
+  package mutating func restore(_ continuation: Continuation) {
     state = continuation.state
     csi = continuation.csi
     currentParam = continuation.currentParam

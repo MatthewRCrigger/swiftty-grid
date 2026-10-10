@@ -39,7 +39,7 @@ public final class PTYProcess: @unchecked Sendable {
   }
 
   /// For a session that observes process exit and drains before teardown.
-  static func spawn(
+  package static func spawn(
     _ configuration: SessionConfiguration,
     columns: Int,
     rows: Int,

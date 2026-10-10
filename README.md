@@ -77,8 +77,13 @@ validated pane frames.
   `list`, `detach`, `end`, `status`. The prefix is `C-b`; press `C-b ?` for the
   bindings. Settings live in `~/.config/swmux/settings.json`: `prefix`,
   `escapeDelayMilliseconds` and `remainOnExit`.
+- The service links only `SwifttyEngine`: the parser, terminal state, history,
+  input encoding and PTY code, with no Metal, fonts or AppKit. `SwifttyCore`
+  re-exports the engine and adds the renderer, fonts and sessions.
 - The Swiftty app's SwiftMux menu attaches a native window. Its panes render
-  service frames directly through Metal. Quitting the app detaches; the shells
+  service frames directly through Metal. Find (⌘F, ⌘G, ⇧⌘G) searches the
+  service-side history, and app theme changes update the colours panes
+  report to programs. Quitting the app detaches; the shells
   keep running.
 - Panes start through `swmux-launcher`, which calls `login_tty` and then execs
   the shell. They run with `TERM=swmux-256color`; the agent compiles that

@@ -13,7 +13,7 @@ if [ "$#" -eq 1 ]; then
 fi
 
 cd "$(dirname "$0")/.."
-destination=Sources/SwifttyCore/Unicode/Tables.swift
+destination=Sources/SwifttyEngine/Unicode/Tables.swift
 temporary=$(mktemp "$destination.tmp.XXXXXX")
 trap 'rm -f "$temporary"' EXIT
 trap 'exit 1' HUP INT TERM

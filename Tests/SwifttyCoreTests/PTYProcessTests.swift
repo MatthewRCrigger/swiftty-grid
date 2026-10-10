@@ -3,6 +3,7 @@ import TestSupport
 import Darwin
 import Foundation
 @testable import SwifttyCore
+@testable import SwifttyEngine
 import Synchronization
 import Testing
 

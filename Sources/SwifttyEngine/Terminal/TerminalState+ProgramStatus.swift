@@ -2,7 +2,7 @@
 /// cleanup, all applied in stream order (see `ProgramStatus.swift`).
 extension TerminalState {
   /// `OSC 7501 ; data`. Ignored entirely (no reply) while disabled.
-  internal mutating func programStatusCommand(
+  package mutating func programStatusCommand(
     _ data: UnsafeBufferPointer<UInt8>,
     terminator st: String
   ) {
@@ -22,7 +22,7 @@ extension TerminalState {
   }
 
   /// OSC 133 ; A starting a new prompt: the previous command is over.
-  internal mutating func programStatusPromptStarted() {
+  package mutating func programStatusPromptStarted() {
     if programStatus.removeTransient() { programStatusChanged = true }
   }
 

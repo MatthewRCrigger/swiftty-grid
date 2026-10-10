@@ -112,7 +112,7 @@ extension TerminalState {
   }
 
   /// Cells of absolute row `row`, or nil once it has left history.
-  internal func line(
+  package func line(
     absoluteRow row: Int
   ) -> (cells: UnsafeBufferPointer<Cell>, wrapped: Bool)? {
     guard row >= firstAbsoluteRow else { return nil }
@@ -217,7 +217,7 @@ extension TerminalState {
   /// Preserve the surviving part of a selection after rows disappear.
   /// Linear selections include complete intervening rows; rectangles
   /// keep their original column boundaries.
-  internal mutating func clipSelectionToAvailableRows(_ value: Selection) {
+  package mutating func clipSelectionToAvailableRows(_ value: Selection) {
     let first = firstAbsoluteRow
     let last = first + addressableRows - 1
     guard value.end.row >= first, value.start.row <= last else {
@@ -263,7 +263,7 @@ extension TerminalState {
 
   /// Selection was made on content that is gone (screen switch, resize,
   /// clear): drop it.
-  internal mutating func invalidateSelection() {
+  package mutating func invalidateSelection() {
     if selection != nil {
       selection = nil
       damage.setFull()
@@ -273,7 +273,7 @@ extension TerminalState {
 
   /// Moving cells in place replaces their selected content. Selections
   /// elsewhere, including scrollback and cells outside margins, survive.
-  internal mutating func invalidateSelection(
+  package mutating func invalidateSelection(
     rows range: Range<Int>,
     from left: Int,
     to right: Int
@@ -294,7 +294,7 @@ extension TerminalState {
   /// Selected cells in a screen row, including both halves of wide glyphs.
   /// Capture before writing so splitting a wide glyph cannot hide a selected half.
   @inline(__always)
-  internal func selectedColumns(inScreenRow y: Int) -> Range<Int>? {
+  package func selectedColumns(inScreenRow y: Int) -> Range<Int>? {
     guard let selection else { return nil }
     let row = screenAbsoluteRow(y)
     let start = selection.start
@@ -390,7 +390,7 @@ extension TerminalState {
     return TerminalPoint(row: p.row + 1, column: 0)
   }
 
-  internal static func isWordScalar(_ s: Unicode.Scalar) -> Bool {
+  package static func isWordScalar(_ s: Unicode.Scalar) -> Bool {
     if s.properties.isAlphabetic || s.properties.numericType != nil {
       return true
     }
@@ -419,7 +419,7 @@ extension TerminalState {
 
   /// Moves existing ranges with retained rows before refreshing their
   /// contents, so the selected occurrence keeps its identity.
-  internal mutating func shiftSearchRows(by delta: Int) {
+  package mutating func shiftSearchRows(by delta: Int) {
     guard delta != 0 else { return }
     for i in searchMatches.indices {
       searchMatches[i].start.row += delta
@@ -427,7 +427,7 @@ extension TerminalState {
     }
   }
 
-  internal struct SearchReflowMark {
+  package struct SearchReflowMark {
     var matchIndex: Int
     var start: Cursor
     var end: Cursor
@@ -436,7 +436,7 @@ extension TerminalState {
 
   /// Reflow tracks insertion positions. For an inclusive match ending
   /// on a wide tail, track its lead and restore the tail afterward.
-  internal func selectedSearchReflowMark() -> SearchReflowMark? {
+  package func selectedSearchReflowMark() -> SearchReflowMark? {
     guard let index = searchSelected, searchMatches.indices.contains(index)
     else { return nil }
     let range = searchMatches[index]

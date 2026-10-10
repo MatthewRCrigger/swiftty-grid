@@ -26,7 +26,7 @@ extension TerminalState {
   }
 
   /// History line `index` (0 = oldest) of the primary screen.
-  internal func scrollbackLine(
+  package func scrollbackLine(
     _ index: Int
   ) -> (cells: UnsafeBufferPointer<Cell>, wrapped: Bool) {
     isAlternateScreen
@@ -34,7 +34,7 @@ extension TerminalState {
   }
 
   /// Cells shown at visible row `y`, which may come from scrollback.
-  internal func viewportRow(
+  package func viewportRow(
     _ y: Int
   ) -> (cells: UnsafeBufferPointer<Cell>, wrapped: Bool) {
     if viewportOffset == 0 {
@@ -81,13 +81,13 @@ extension TerminalState {
   }
 
   @_lifetime(borrow self)
-  internal func graphemeScalars(_ id: UInt32) -> Span<UInt32> {
+  package func graphemeScalars(_ id: UInt32) -> Span<UInt32> {
     graphemes.scalars(id)
   }
 
   /// Appends rendered cell text without allocating a temporary scalar array.
   /// Blank cells and clusters containing no valid scalars become one space.
-  internal func appendText(
+  package func appendText(
     of cell: Cell,
     to text: inout String.UnicodeScalarView
   ) {

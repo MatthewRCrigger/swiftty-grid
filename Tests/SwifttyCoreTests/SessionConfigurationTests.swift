@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import SwifttyCore
+@testable import SwifttyEngine
 import Testing
 
 struct SessionConfigurationTests {

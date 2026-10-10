@@ -169,6 +169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     config = Configuration.load()
     NSApp.mainMenu = makeMenu()
     for window in windows { window.apply(config) }
+    mux?.apply(config)
     reportProblems()
   }
 

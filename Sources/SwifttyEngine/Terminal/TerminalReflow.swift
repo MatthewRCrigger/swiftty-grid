@@ -3,7 +3,7 @@
 /// which rows remain on screen.
 enum TerminalReflow {
   private struct RowBoundary {
-    var line: Int
+    package var line: Int
     var offset: Int
     var bits: UInt8
   }

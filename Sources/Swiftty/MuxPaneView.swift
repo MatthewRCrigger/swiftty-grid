@@ -379,6 +379,17 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
   }
 
   @objc
+  func performFindPanelAction(_ sender: Any?) {
+    let tag =
+      (sender as? NSMenuItem)?.tag
+      ?? Int(NSFindPanelAction.showFindPanel.rawValue)
+    controller?
+      .performFind(
+        UInt(exactly: tag).flatMap { NSFindPanelAction(rawValue: $0) }
+      )
+  }
+
+  @objc
   func validateMenuItem(_ item: NSMenuItem) -> Bool {
     switch item.action {
     case #selector(copy(_:)): selection != nil

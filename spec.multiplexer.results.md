@@ -21,6 +21,17 @@ Native resource lifetime: in "slow GPU and missing drawables never advance the p
 
 Frontend gates: the decoder, diff renderer and full client are exercised against a fake outer terminal parsed by the Swiftty engine (`TerminalFrontendTests`). Native rendering, IME, selection, accessibility, layout and lifetime are covered by `SwifttyAppTests/MuxNativeTests`. These tests use real Metal and real shells, but run without a display link.
 
+## Follow-up gaps closed
+
+| Spec item | Change and evidence |
+|---|---|
+| §1, §7.5 native search | Find (⌘F, ⌘G, ⇧⌘G) in the native window runs the shared service-side literal search. Test: "native search highlights history and follows the theme". |
+| §5 consistent inner identity | Panes answer XTVERSION with `swmux 0.2` and XTGETTCAP `TN` with the inner `TERM`. Kitty keyboard negotiation is not offered, and OSC 52 is not advertised. Tests: `EngineIdentityTests`, `InnerProfileTests.programsSeeOneConsistentIdentity`. While adding the switch, I made the condition explicit on every kitty pattern, because Swift applies a `where` clause only to the last pattern of a `case`. |
+| §7.1 theme to the engine | `setTheme` updates every pane's default palette and light/dark scheme, and new panes inherit it. The native app sends it on open, on appearance change and on configuration reload. Tests: `themeUpdatesReportedDefaultColours` (OSC 11 reply) and the native search/theme test. |
+| §5 truncation reported | `paneExited` carries `truncated` when an explicit end had to SIGKILL. `swmux` shows a message and the native window shows a subtitle. Test: `forcedTerminationIsReportedAsTruncated`. |
+| §8 barrier freezes mutations | While quiescing, only status, detaching, ending sessions, viewing and theme updates are admitted. Test: `barrierRefusesMutationsButAllowsStatusAndEnding`. |
+| §7.2 headless engine target | The new `SwifttyEngine` target holds the terminal model, Unicode, input encoding, PTY processes and `SessionConfiguration`. `SwiftMuxService` depends on `SwifttyEngine`, `SwiftMuxProtocol` and `SwiftMuxExport` only, and `swiftmux-agent` links no Metal, CoreText or AppKit (checked with `otool -L` and `nm`). `SwifttyCore` re-exports the engine, so existing users are unchanged. The iOS Simulator build of `SwifttyMobile` succeeds. |
+
 ## Measurements
 
 From `swift run -c release swiftmux-bench` (`mise run bench-swiftmux`): an in-process service behind real XPC, with real PTY shells and a 32 MiB corpus of SGR, UTF‑8 and wide text.

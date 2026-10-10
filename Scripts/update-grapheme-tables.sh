@@ -19,5 +19,5 @@ trap 'exit 1' HUP INT TERM
 swift Scripts/gen-grapheme-tables.swift "$ucd_directory" > "$temporary/properties.swift"
 swift Scripts/gen-grapheme-tables.swift "$ucd_directory" --test-data > "$temporary/test-data.swift"
 chmod 644 "$temporary/properties.swift" "$temporary/test-data.swift"
-mv -f "$temporary/properties.swift" Sources/SwifttyCore/Terminal/GraphemeBreakTables.swift
+mv -f "$temporary/properties.swift" Sources/SwifttyEngine/Terminal/GraphemeBreakTables.swift
 mv -f "$temporary/test-data.swift" Tests/SwifttyCoreTests/GraphemeBreakTestData.swift

@@ -357,6 +357,9 @@ public enum MuxCommand: Codable, Sendable, Equatable {
   case endAllWorkspaces
   /// Stops (or resumes) admitting new workspaces and panes, for updates.
   case quiesce(Bool)
+  /// Default colours and light/dark scheme reported by every pane's
+  /// engine (OSC 10/11/4 queries, mode 2031); also used for new panes.
+  case setTheme(MuxTheme)
 
   // Attachment.
   case attach(WorkspaceSelector)
@@ -383,14 +386,45 @@ public enum MuxCommand: Codable, Sendable, Equatable {
   case searchStep(pane: PaneID, forward: Bool)
   case endSearch(pane: PaneID)
 
+  /// Admitted at the update barrier: status, leaving, ending sessions
+  /// and toggling quiescence. Everything that changes the workspace
+  /// graph or starts work is refused.
+  public var allowedWhileQuiescing: Bool {
+    switch self {
+    case .status, .listWorkspaces, .detachActive, .detach, .endWorkspace,
+      .endAllWorkspaces, .quiesce, .endPane, .endTab, .setGeometry,
+      .setSubscriptions, .scroll, .searchStep, .endSearch, .setTheme:
+      true
+    default: false
+    }
+  }
+
   /// Whether this command needs the interactive lease.
   public var requiresLease: Bool {
     switch self {
     case .status, .listWorkspaces, .newWorkspace, .endWorkspace,
-      .renameWorkspace, .detachActive, .endAllWorkspaces, .quiesce, .attach:
+      .renameWorkspace, .detachActive, .endAllWorkspaces, .quiesce, .attach,
+      .setTheme:
       false
     default: true
     }
+  }
+}
+
+public struct MuxTheme: Codable, Sendable, Equatable {
+  public var palette: FramePalette
+  public var dark: Bool
+
+  public init(palette: FramePalette, dark: Bool) {
+    self.palette = palette
+    self.dark = dark
+  }
+
+  public var isValid: Bool {
+    palette.colors.count == 256
+      && ([palette.foreground, palette.background, palette.cursor]
+        + palette.colors)
+        .allSatisfy { $0 <= 0xFF_FFFF }
   }
 }
 
@@ -480,7 +514,9 @@ public enum ClientMessage: Codable, Sendable {
 public enum MuxEvent: Codable, Sendable {
   case frame(PaneFrame)
   case layout(WorkspaceSnapshot)
-  case paneExited(PaneID, status: Int32)
+  /// `truncated`: an explicit end had to force-kill the processes, so
+  /// final output may be incomplete.
+  case paneExited(PaneID, status: Int32, truncated: Bool)
   case title(PaneID, String)
   case bell(PaneID)
   /// The lease ended without this client asking (e.g. another client

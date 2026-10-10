@@ -1,9 +1,9 @@
 import Darwin
 import Dispatch
 import Foundation
-import SwiftMuxBridge
+import SwiftMuxExport
 import SwiftMuxProtocol
-import SwifttyCore
+import SwifttyEngine
 import Synchronization
 
 /// Events a pane reports to the service, on the pane queue.
@@ -69,6 +69,7 @@ final class PaneRuntime: @unchecked Sendable {
     columns: Int,
     rows: Int,
     historyBytes: Int,
+    innerTerm: String = SMX.fallbackInnerTerm,
     limits: MuxLimits
   ) {
     self.id = id
@@ -85,6 +86,13 @@ final class PaneRuntime: @unchecked Sendable {
       scrollbackLimitBytes: historyBytes,
       scrollbackLimitRows: limits.historyRowsPerPane
     )
+    // The inner identity matches the TERM panes run under; enhanced
+    // keyboard reporting and clipboard writes are not offered.
+    state.terminalVersion =
+      "swmux \(SMX.build.split(separator: "-").last ?? "")"
+    state.terminfoName = innerTerm
+    state.keyboardProtocolEnabled = false
+    state.clipboardWritesAdvertised = false
     writer = PaneWriter(replyReserve: limits.replyReserveBytes)
     readBuffer = .allocate(byteCount: limits.readTurnBytes, alignment: 16)
   }
@@ -415,6 +423,28 @@ final class PaneRuntime: @unchecked Sendable {
           selected: state.searchSelected
         )
       )
+    }
+  }
+
+  /// Frontend theme: default colours and scheme, as a theme change does.
+  func setTheme(_ theme: MuxTheme) {
+    queue.async { [self] in
+      var colors = InlineArray<256, UInt32>(repeating: 0)
+      for i in 0 ..< 256 { colors[i] = theme.palette.colors[i] }
+      let p = theme.palette
+      state.setDefaultPalette(
+        Palette(
+          colors: colors,
+          foreground: p.foreground,
+          background: p.background,
+          cursor: p.cursor,
+          cursorText: p.cursorText,
+          selectionForeground: p.selectionForeground,
+          selectionBackground: p.selectionBackground
+        )
+      )
+      state.setColorScheme(theme.dark ? .dark : .light)
+      publish()
     }
   }
 

@@ -1,4 +1,4 @@
-// Generates Sources/SwifttyCore/Terminal/GraphemeBreakTables.swift (default)
+// Generates Sources/SwifttyEngine/Terminal/GraphemeBreakTables.swift (default)
 // or Tests/SwifttyCoreTests/GraphemeBreakTestData.swift (`--test-data`).
 //
 // The per-scalar properties replicate Ghostty's unicode props table

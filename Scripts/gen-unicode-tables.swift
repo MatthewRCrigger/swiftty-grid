@@ -1,4 +1,4 @@
-// Generates Sources/SwifttyCore/Unicode/Tables.swift.
+// Generates Sources/SwifttyEngine/Unicode/Tables.swift.
 //
 // Widths follow wcwidth conventions: zero for nonspacing/enclosing marks,
 // format characters (except prepended concatenation marks) and Hangul

@@ -163,7 +163,7 @@ struct ServiceTests {
     while ContinuousClock.now < deadline, status == nil || !sawFinal {
       switch try await c.nextEvent() {
       case let .frame(f)?: sawFinal = sawFinal || f.lines.contains("final-line")
-      case let .paneExited(_, s)?: status = s
+      case let .paneExited(_, s, _)?: status = s
       default: break
       }
     }

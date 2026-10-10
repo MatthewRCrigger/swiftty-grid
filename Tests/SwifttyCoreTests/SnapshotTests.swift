@@ -1,5 +1,6 @@
 import Dispatch
 @testable import SwifttyCore
+@testable import SwifttyEngine
 import Synchronization
 import Testing
 import TestSupport

@@ -1,5 +1,6 @@
 import CoreGraphics
 @testable import SwifttyCore
+@testable import SwifttyEngine
 import Testing
 
 struct BoxDrawingTests {

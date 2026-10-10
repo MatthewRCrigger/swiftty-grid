@@ -2,6 +2,7 @@ import CAllocCounter
 import Darwin
 import Metal
 @testable import SwifttyCore
+@testable import SwifttyEngine
 import Testing
 import TestSupport
 

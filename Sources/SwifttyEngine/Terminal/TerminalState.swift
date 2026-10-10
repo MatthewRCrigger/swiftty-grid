@@ -37,7 +37,7 @@ public struct TerminalState: ~Copyable {
   public internal(set) var modes: Modes = .initial
   /// Identifies each new synchronized frame, even when a single parser
   /// batch ends one frame and begins the next.
-  private(set) var synchronizedOutputGeneration: UInt64 = 0
+  package private(set) var synchronizedOutputGeneration: UInt64 = 0
   public internal(set) var cursorStyle = CursorStyle.block
   public internal(set) var palette: Palette
   var defaultPalette: Palette
@@ -61,6 +61,16 @@ public struct TerminalState: ~Copyable {
   /// Drop replies to queries: set when another terminal (e.g. tmux) has
   /// already answered the application.
   public var discardsReplies = false
+  /// Identity the terminal reports: XTVERSION and XTGETTCAP `TN`. Keep it
+  /// consistent with the `TERM` programs run under.
+  public var terminalVersion = "swiftty 0.1"
+  public var terminfoName = "xterm-256color"
+  /// When false, kitty keyboard negotiation is not offered: queries get
+  /// no reply and requested flags are ignored, so programs keep legacy
+  /// key encodings.
+  public var keyboardProtocolEnabled = true
+  /// Whether XTGETTCAP advertises OSC 52 clipboard writes (`Ms`).
+  public var clipboardWritesAdvertised = true
   /// With `discardsReplies`, still answer the OSC 7501 support query: the
   /// other terminal passes it through unanswered (tmux does).
   public var answersProgramStatusWhileDiscarding = false
@@ -97,12 +107,12 @@ public struct TerminalState: ~Copyable {
   /// tmux control-mode bytes received since the host last drained them.
   public var controlModeData: [UInt8] = []
   /// Byte offsets for pending end events, keeping multiple streams apart.
-  var controlModeEndOffsets: [Int] = []
+  package var controlModeEndOffsets: [Int] = []
   public internal(set) var isControlMode = false
   var dcsKind = DCSKind.ignored
   var dcsBuffer: [UInt8] = []
 
-  enum DCSKind: Sendable { case ignored, tmux, termcap, statusString }
+  package enum DCSKind: Sendable { case ignored, tmux, termcap, statusString }
 
   /// Pixel size of one cell, for XTWINOPS and in-band resize reports.
   public var cellPixelSize = (width: 0, height: 0) {
@@ -130,7 +140,7 @@ public struct TerminalState: ~Copyable {
   }
 
   /// Shell integration and host-facing state (`TerminalState+Shell.swift`).
-  public internal(set) var semanticState = SemanticState.none
+  public package(set) var semanticState = SemanticState.none
   /// Which prompt rows the shell redraws after a resize (OSC 133 `redraw`).
   var promptRedraw = PromptRedraw.none
   /// Where the command line being typed starts (OSC 133 ; B), as an
@@ -146,7 +156,7 @@ public struct TerminalState: ~Copyable {
   var penStack: [CellAttributes] = []
   /// Appearance the host reports for color-scheme queries (mode 2031).
   public internal(set) var colorScheme = ColorScheme.dark
-  var underlineColors: [TerminalColor] = []
+  package var underlineColors: [TerminalColor] = []
   var pointerShape = ""
 
   /// Consume OSC 7501 program status (and answer its support query).
@@ -684,7 +694,7 @@ public struct TerminalState: ~Copyable {
   }
 
   /// An empty narrow cell keeping `cell`'s style.
-  static func narrowed(_ cell: Cell) -> Cell {
+  package static func narrowed(_ cell: Cell) -> Cell {
     var attributes = cell.attributes
     attributes.flags.subtract(.structural)
     return Cell(glyph: 0, attributes: attributes, width: 1)
@@ -838,7 +848,8 @@ public struct TerminalState: ~Copyable {
       let state = Modes.ansi(n).map { modes.contains($0) ? 1 : 2 } ?? 0
       reply("\u{1B}[\(n);\(state)$y")
     case (0x3E, 0, 0x63): reply("\u{1B}[>1;10;0c")  // DA2
-    case (0x3E, 0, 0x71): reply("\u{1B}P>|swiftty 0.1\u{1B}\\")  // XTVERSION
+    // XTVERSION
+    case (0x3E, 0, 0x71): reply("\u{1B}P>|\(terminalVersion)\u{1B}\\")
     case (0, 0x20, 0x71):  // DECSCUSR
       let p = csi.value(0)
       guard csi.count <= 1, (0 ... 6).contains(p) else { return }
@@ -849,6 +860,11 @@ public struct TerminalState: ~Copyable {
         modes.remove(.cursorBlink)
       }
     case (0, 0x21, 0x70): softReset()  // DECSTR
+    case (0x3F, 0, 0x75) where !keyboardProtocolEnabled,
+      (0x3E, 0, 0x75) where !keyboardProtocolEnabled,
+      (0x3C, 0, 0x75) where !keyboardProtocolEnabled,
+      (0x3D, 0, 0x75) where !keyboardProtocolEnabled:
+      break  // not offered in this profile
     // kitty keyboard query
     case (0x3F, 0, 0x75): reply("\u{1B}[?\(keyboardFlags)u")
     case (0x3E, 0, 0x75):  // push

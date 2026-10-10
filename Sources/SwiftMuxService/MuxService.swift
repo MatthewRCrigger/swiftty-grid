@@ -44,6 +44,8 @@ public actor MuxService {
   private var lease: Lease?
   private var pendingLaunches = 0
   private var pendingHistoryBytes = 0
+  /// Latest frontend theme, applied to every pane and to new ones.
+  private var theme: MuxTheme?
   private var quiescing = false
   private var inflightFrameBytes = 0
   private var pumpScheduled = false
@@ -242,9 +244,8 @@ public actor MuxService {
   ) {
     let ok = { reply(.success(.ok)) }
     let fail = { (e: MuxError) in reply(.failure(e)) }
-    if command.requiresLease, lease?.client != client.id {
-      fail(MuxError(.notAttached, "this connection holds no attachment"))
-      return
+    if let refusal = admission(of: command, from: client) {
+      return fail(refusal)
     }
     switch command {
     case .status: reply(.success(.status(status)))
@@ -311,6 +312,16 @@ public actor MuxService {
       _ = setSubscriptions([])
       lease?.workspace = ws.id
       reply(.success(.layout(snapshot(ws))))
+    case let .quiesce(on):
+      quiescing = on
+      ok()
+    case let .setTheme(theme):
+      guard theme.isValid else {
+        return fail(MuxError(.invalidRequest, "theme"))
+      }
+      self.theme = theme
+      for record in panes.values { record.runtime.setTheme(theme) }
+      ok()
     default: handleLeased(command, reply: reply)
     }
   }
@@ -423,14 +434,27 @@ public actor MuxService {
         return fail(MuxError(.notFound, "pane"))
       }
       runtime.search(nil, step: nil) { reply(.success(.search($0))) }
-    case let .quiesce(on):
-      quiescing = on
-      ok()
     case .status, .listWorkspaces, .newWorkspace, .endWorkspace,
       .renameWorkspace, .detachActive, .endAllWorkspaces, .attach, .detach,
-      .switchWorkspace:
+      .switchWorkspace, .quiesce, .setTheme:
       ok()  // handled by `handle`
     }
+  }
+
+  /// Lease and update-barrier admission for a command.
+  private func admission(
+    of command: MuxCommand,
+    from client: Client
+  ) -> MuxError? {
+    if command.requiresLease, lease?.client != client.id {
+      return MuxError(.notAttached, "this connection holds no attachment")
+    }
+    // At the update barrier only status, ending sessions and leaving are
+    // admitted; the workspace graph is otherwise frozen.
+    if quiescing, !command.allowedWhileQuiescing {
+      return MuxError(.quiescing, "service is preparing to update")
+    }
+    return nil
   }
 
   private func notFound(_ selector: WorkspaceSelector) -> MuxError {
@@ -594,8 +618,10 @@ public actor MuxService {
       columns: columns,
       rows: rows,
       historyBytes: historyBytes,
+      innerTerm: configuration.innerTerm,
       limits: limits
     )
+    if let theme { runtime.setTheme(theme) }
     runtime.onChange = { [weak self] in self?.onQueue { $0.paneChanged(id) } }
     runtime.onEvent = { [weak self] event in
       self?.onQueue { $0.paneEvent(id, event) }
@@ -859,7 +885,10 @@ public actor MuxService {
       }
       panes[id]?.exitStatus = status
       if let client {
-        send(.event(.paneExited(id, status: status)), to: client)
+        send(
+          .event(.paneExited(id, status: status, truncated: forced)),
+          to: client
+        )
       }
       let record = panes[id]!
       if record.detachedFromLayout {

@@ -284,3 +284,42 @@ struct MuxNativeTests {
     )
   }
 }
+
+extension MuxNativeTests {
+  @Test(.enabled(if: hasMetal))
+  func `native search highlights history and follows the theme`() async throws {
+    let f = try await open()
+    defer { f.controller.close() }
+    let c = f.controller
+    let view = try #require(activeView(c))
+    c.send(
+      .text("i=0; while [ $i -lt 80 ]; do echo row-$i; i=$((i+1)); done\r"),
+      to: view.pane
+    )
+    _ = try #require(await waitPresented(view) { $0.lines.contains("row-79") })
+    c.showSearch()
+    let bar = try #require(c.searchBar)
+    bar.text = "row-3"
+    bar.onChange?("row-3")
+    let found = try #require(
+      await waitPresented(view) {
+        ($0.search?.matchCount ?? 0) > 0 && $0.history.viewportOffset > 0
+      }
+    )
+    #expect(found.search?.visible.isEmpty == false)
+    c.hideSearch()
+    #expect(
+      await waitPresented(view) {
+        $0.search == nil && $0.history.viewportOffset == 0
+      } != nil
+    )
+    // The engine's reported defaults follow the app theme.
+    let scheme = TerminalView.scheme(
+      of: c.window?.effectiveAppearance ?? NSApp.effectiveAppearance
+    )
+    let expected = Configuration().palette(for: scheme).background
+    #expect(
+      await waitPresented(view) { $0.palette.background == expected } != nil
+    )
+  }
+}

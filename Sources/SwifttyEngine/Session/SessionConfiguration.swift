@@ -30,7 +30,7 @@ public struct SessionConfiguration: Sendable {
   }
 
   /// Matches Ghostty's launch heuristic; Finder and `open` are desktop launches.
-  static var isCommandLineLaunch: Bool {
+  package static var isCommandLineLaunch: Bool {
     getppid() != 1
       && (!(ProcessInfo.processInfo.environment["TERM_PROGRAM"] ?? "").isEmpty
         || CommandLine.arguments.count > 1)

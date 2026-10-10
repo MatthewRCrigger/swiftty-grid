@@ -31,6 +31,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private var subscribed: [PaneID] = []
   private var detached = false
   var onClose: (() -> Void)?
+  private(set) var searchBar: SearchBar?
+  private var appearanceObservation: NSKeyValueObservation?
 
   private init(
     connection: MuxConnection,
@@ -131,8 +133,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     {
       // Preserve the running service and its sessions.
       throw MuxUnavailable(
-        message:
-          "The running SwiftMux service is a different version "
+        message: "The running SwiftMux service is a different version "
           + "(\(error.message)). Reopen the Swiftty version that started "
           + "it, or end its sessions with `swmux end-all` before updating."
       )
@@ -198,6 +199,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     )
     controller.apply(ws)
     controller.startEvents()
+    controller.sendTheme()
+    controller.observeAppearance()
     return controller
   }
 
@@ -279,7 +282,12 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       }
     case .bell: NSSound.beep()
     case let .detached(reason): connectionEnded(reason)
-    case .paneExited, .paste, .frameUnavailable, .frame: break
+    case let .paneExited(_, _, truncated):
+      if truncated {
+        window?.subtitle =
+          "A pane was force-killed; its final output may be incomplete"
+      }
+    case .paste, .frameUnavailable, .frame: break
     }
   }
 
@@ -533,6 +541,101 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     await connection.detach()
     await connection.close()
     for task in tasks { task.cancel() }
+  }
+
+  // MARK: Theme
+
+  /// Default colours and scheme reported by the service-side engines
+  /// follow the app's theme (spec §7.1).
+  func sendTheme() {
+    let appearance = window?.effectiveAppearance ?? NSApp.effectiveAppearance
+    let scheme = TerminalView.scheme(of: appearance)
+    let p = config.palette(for: scheme)
+    var colors: [UInt32] = []
+    colors.reserveCapacity(256)
+    for i in 0 ..< 256 { colors.append(p.colors[i]) }
+    command(
+      .setTheme(
+        MuxTheme(
+          palette: FramePalette(
+            colors: colors,
+            foreground: p.foreground,
+            background: p.background,
+            cursor: p.cursor,
+            cursorText: p.cursorText,
+            selectionForeground: p.selectionForeground,
+            selectionBackground: p.selectionBackground
+          ),
+          dark: scheme == .dark
+        )
+      )
+    )
+  }
+
+  func observeAppearance() {
+    appearanceObservation = NSApp.observe(\.effectiveAppearance) {
+      [weak self] _, _ in
+      DispatchQueue.main.async {
+        MainActor.assumeIsolated { self?.sendTheme() }
+      }
+    }
+  }
+
+  /// A configuration reload: new colours reach the engines.
+  func apply(_ configuration: Configuration) {
+    config = configuration
+    sendTheme()
+  }
+
+  // MARK: Search
+
+  /// Literal search over the active pane's service-side history; the
+  /// viewport follows the selected match and frames carry highlights.
+  func performFind(_ action: NSFindPanelAction?) {
+    guard let pane = activePane else { return }
+    switch action {
+    case .next: command(.searchStep(pane: pane, forward: false))
+    case .previous: command(.searchStep(pane: pane, forward: true))
+    default: showSearch()
+    }
+  }
+
+  func showSearch() {
+    guard let content = window?.contentView else { return }
+    if searchBar == nil {
+      let bar = SearchBar()
+      bar.onChange = { [weak self] query in self?.search(query) }
+      bar.onNavigate = { [weak self] older in
+        guard let pane = self?.activePane else { return }
+        self?.command(.searchStep(pane: pane, forward: !older))
+      }
+      bar.onClose = { [weak self] in self?.hideSearch() }
+      bar.autoresizingMask = [.minXMargin, .minYMargin]
+      content.addSubview(bar)
+      searchBar = bar
+    }
+    searchBar?.position(in: content.bounds)
+    searchBar?.isHidden = false
+    window?.makeFirstResponder(searchBar?.field)
+  }
+
+  private func search(_ query: String) {
+    guard let pane = activePane else { return }
+    guard !query.isEmpty, query.utf8.count <= limits.maxSearchBytes else {
+      command(.endSearch(pane: pane))
+      return
+    }
+    command(.search(pane: pane, query: query))
+  }
+
+  func hideSearch() {
+    searchBar?.isHidden = true
+    searchBar?.text = ""
+    if let pane = activePane {
+      command(.endSearch(pane: pane))
+      command(.scroll(pane: pane, .bottom))
+      if let view = views[pane] { window?.makeFirstResponder(view) }
+    }
   }
 
   func windowWillClose(_ notification: Notification) {
