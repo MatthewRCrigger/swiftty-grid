@@ -53,7 +53,9 @@ state. It serves:
 
 - `swifttyd bootstrap --stdio` reads one length-prefixed request envelope.
   It relays the envelope to the service's control socket and writes back
-  exactly one response envelope.
+  exactly one response envelope. Besides `create`, `resume`, `list` and
+  `terminate`, the envelope can carry a lease-free `attention` request
+  (§3.6); the helper treats every operation the same way.
 - `swifttyd status` sends a `list` request to report whether roaming is
   available.
 - It refuses to run as root and owns no sessions.
@@ -104,9 +106,15 @@ It does not hold the shell.
   3. Request `attach` on the workspace.
   4. On success, send `Attached` and a full snapshot.
 - **Takeover:** a client gets a takeover only when it resumed with
-  `takeover: true`. In that case a `leaseHeld` refusal leads to
-  `takeover(expectedLease:)`, naming the generation it just listed. Without
-  the flag, a held workspace returns `writerBusy`.
+  `takeover: true` or with a `target.expectedLease` (§3.6). In that case a
+  `leaseHeld` refusal leads to `takeover(expectedLease:)`. The generation is
+  `target.expectedLease` when given (the lease the user confirmed); otherwise
+  it is the generation the session just listed. If that generation moved, the
+  attachment fails `writerBusy`. Without either, a held workspace returns
+  `writerBusy`.
+- **Focus:** when the credential carries `target.pane` and that pane is in
+  the workspace, the session sends `focusPane` once it holds the lease, so
+  the screen it exports is the pane an attention link named.
 - **Input:** admitted RST/1 operations go to the pane one at a time, in
   ledger order. Each RST/1 sequence is acknowledged after the service admits
   it to the pane's ordered writer.
@@ -131,7 +139,13 @@ It does not hold the shell.
   `PATH`/`USER`/`LOGNAME`/`SHELL`/`LANG`/`TMPDIR`).
 - **Resume:** works for any existing workspace. It issues a fresh token and
   revokes the previous one. It keeps the writer only when the client names
-  the current writer.
+  the current writer. The credential records `takeover` and `target`
+  (`ResumeTarget{pane, expectedLease}`), and they apply only to the
+  attachment made with that credential; later automatic reconnects resume
+  without them.
+- **Attention:** `operation: .attention` answers lease-free metadata through
+  the registry's control client (§3.6). It creates no grant and needs no
+  session.
 - **Remote authorization is separate from shell lifetime:**
 
   | Grant state | Expiry | What happens to the workspace |
@@ -142,7 +156,11 @@ It does not hold the shell.
 
 - **Terminate:** an explicit `terminate` ends the workspace.
 
-`BootstrapRequest.takeover` is an optional field. Older clients omit it.
+`BootstrapRequest.takeover`, `target` and `attention`, and
+`BootstrapResponse.metadata`, are additions. Requests from older clients omit
+the new fields. An older host rejects `attention` as malformed or as an
+unsupported version, and the client reports that the Mac does not serve
+attention metadata.
 
 ### 1.7 Launcher fix
 
