@@ -81,16 +81,59 @@ public struct HostListView: View {
       }
     }
     #if !os(tvOS)
-      .sheet(item: $browsing) { host in
+      .adaptiveSheet(item: $browsing) { host in
         SFTPBrowserView(host: host, app: model)
+          .macSheetFrame(width: 560, height: 480)
       }
     #endif
-    .sheet(isPresented: $adding) {
-      HostEditorView(model: model, host: nil) { adding = false }
-    }
-    .sheet(item: $editing) { host in
-      HostEditorView(model: model, host: host) { editing = nil }
-    }
+    .hostEditorPresentation(adding: $adding, editing: $editing, model: model)
+  }
+}
+
+extension View {
+  /// A sheet, except on Mac Catalyst, where SwiftUI's programmatic sheet
+  /// dismissal (Save, Cancel, Done) did not close the sheet; there the
+  /// content is pushed onto the enclosing navigation stack instead, and
+  /// the same dismissal pops it.
+  @ViewBuilder
+  func adaptiveSheet<Content: View>(
+    isPresented: Binding<Bool>,
+    @ViewBuilder content: @escaping () -> Content
+  ) -> some View {
+    #if targetEnvironment(macCatalyst)
+      navigationDestination(isPresented: isPresented, destination: content)
+    #else
+      sheet(isPresented: isPresented, content: content)
+    #endif
+  }
+
+  @ViewBuilder
+  func adaptiveSheet<Item: Hashable & Identifiable, Content: View>(
+    item: Binding<Item?>,
+    @ViewBuilder content: @escaping (Item) -> Content
+  ) -> some View {
+    #if targetEnvironment(macCatalyst)
+      navigationDestination(item: item, destination: content)
+    #else
+      sheet(item: item, content: content)
+    #endif
+  }
+
+  /// Add/Edit Host forms.
+  func hostEditorPresentation(
+    adding: Binding<Bool>,
+    editing: Binding<HostProfile?>,
+    model: RoamingAppModel
+  ) -> some View {
+    self
+      .adaptiveSheet(isPresented: adding) {
+        HostEditorView(model: model, host: nil) { adding.wrappedValue = false }
+          .macSheetFrame()
+      }
+      .adaptiveSheet(item: editing) { host in
+        HostEditorView(model: model, host: host) { editing.wrappedValue = nil }
+          .macSheetFrame()
+      }
   }
 }
 
@@ -108,6 +151,9 @@ public struct HostEditorView: View {
   @State private var usesKey: Bool
   @State private var keyLabel: String
   @State private var error: HostProfile.ValidationError?
+  /// The presenting binding alone does not always close the sheet on Mac
+  /// Catalyst; dismiss through the environment as well.
+  @Environment(\.dismiss) private var dismissSheet
 
   public init(model: RoamingAppModel, host: HostProfile?, dismiss: @escaping () -> Void) {
     self.model = model
@@ -160,7 +206,7 @@ public struct HostEditorView: View {
       .navigationTitle(original == nil ? "Add Host" : "Edit Host")
       .toolbar {
         ToolbarItem(placement: .cancellationAction) {
-          Button("Cancel", action: dismiss)
+          Button("Cancel", action: close)
         }
         ToolbarItem(placement: .confirmationAction) {
           Button("Save", action: save)
@@ -168,6 +214,11 @@ public struct HostEditorView: View {
         }
       }
     }
+  }
+
+  private func close() {
+    dismiss()
+    dismissSheet()
   }
 
   private func save() {
@@ -181,7 +232,7 @@ public struct HostEditorView: View {
     )
     do {
       try model.save(profile)
-      dismiss()
+      close()
     } catch {
       self.error = error
     }
@@ -216,6 +267,17 @@ extension View {
       self
     #else
       self.textSelection(.enabled)
+    #endif
+  }
+
+  /// macOS sheets size to their content; a `NavigationStack` + `Form`
+  /// sheet otherwise collapses to nothing while still making the window
+  /// modal. Gives such sheets a usable minimum size there.
+  func macSheetFrame(width: CGFloat = 460, height: CGFloat = 380) -> some View {
+    #if os(macOS)
+      self.frame(minWidth: width, minHeight: height)
+    #else
+      self
     #endif
   }
 

@@ -107,8 +107,9 @@ struct RoamingSurfaceView: View {
         Text("The shell on the Mac and every program running in it will be ended.")
       }
       #if !os(tvOS)
-        .sheet(isPresented: $showsFiles) {
+        .adaptiveSheet(isPresented: $showsFiles) {
           SFTPBrowserView(host: controller.model.host, app: app)
+            .macSheetFrame(width: 560, height: 480)
         }
       #endif
   }
@@ -189,8 +190,9 @@ struct SSHSurfaceView: View {
           }
         }
       }
-      .sheet(isPresented: $showsFiles) {
+      .adaptiveSheet(isPresented: $showsFiles) {
         SFTPBrowserView(host: controller.model.host, app: app)
+            .macSheetFrame(width: 560, height: 480)
       }
     #endif
   }

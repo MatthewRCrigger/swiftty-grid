@@ -58,9 +58,9 @@ final class RoamingAppUITests: XCTestCase {
 
     let fingerprint = element("trust.fingerprint")
     XCTAssertTrue(fingerprint.waitForExistence(timeout: 30), "no trust prompt")
-    XCTAssertEqual(fingerprint.label, server.fingerprint)
-    XCTAssertTrue(app.staticTexts["Unknown host key"].exists)
-    element("trust.accept").tap()
+    XCTAssertEqual(text(of: fingerprint), server.fingerprint)
+    XCTAssertTrue(anyText("Unknown host key").exists)
+    press(element("trust.accept"))
 
     signIn()
     waitForConnected()
@@ -98,22 +98,22 @@ final class RoamingAppUITests: XCTestCase {
     waitUntil("SFTP home listed") { self.path(path) == "/home/rst" }
     let folder = app.buttons["files"].firstMatch
     XCTAssertTrue(folder.waitForExistence(timeout: 10))
-    folder.tap()
+    press(folder)
     waitUntil("SFTP entered /home/rst/files") { self.path(path) == "/home/rst/files" }
-    XCTAssertTrue(app.staticTexts["ui-note.txt"].waitForExistence(timeout: 10))
-    element("sftp.done").tap()
+    XCTAssertTrue(anyText("ui-note.txt").waitForExistence(timeout: 10))
+    press(element("sftp.done"))
     XCTAssertTrue(path.waitForNonExistence(timeout: 10))
 
     // Detach keeps the shell on the host; reopening resumes it.
     openSessionMenuItem(id: "session.detach", title: "Detach")
-    let resumable = app.staticTexts["Detached session — open to resume"]
+    let resumable = anyText("Detached session — open to resume")
     XCTAssertTrue(resumable.waitForExistence(timeout: 10), "no resumable session listed")
     openHost("UI Box")
     waitForConnected()
     typeLine("echo again-$UI_MARK")
     waitForScreen(containing: "again-kept-7")
 
-    element("terminal.close").tap()
+    press(element("terminal.close"))
     XCTAssertTrue(element("hosts.add").waitForExistence(timeout: 10))
   }
 
@@ -125,10 +125,10 @@ final class RoamingAppUITests: XCTestCase {
 
     let fingerprint = element("trust.fingerprint")
     XCTAssertTrue(fingerprint.waitForExistence(timeout: 30), "no trust prompt")
-    XCTAssertEqual(fingerprint.label, server.fingerprint)
-    element("trust.reject").tap()
+    XCTAssertEqual(text(of: fingerprint), server.fingerprint)
+    press(element("trust.reject"))
 
-    XCTAssertTrue(app.staticTexts["Host key not trusted"].waitForExistence(timeout: 15))
+    XCTAssertTrue(anyText("Host key not trusted").waitForExistence(timeout: 15))
     XCTAssertFalse(element("password.field").waitForExistence(timeout: 3))
     XCTAssertFalse(statusLabel().hasPrefix("Connected"), statusLabel())
     XCTAssertFalse(element("trust.fingerprint").exists)
@@ -138,28 +138,31 @@ final class RoamingAppUITests: XCTestCase {
 
   private func addHost(nickname: String) {
     let add = element("hosts.add")
-    XCTAssertTrue(add.waitForExistence(timeout: 20))
-    add.tap()
+    XCTAssertTrue(add.waitForExistence(timeout: 20), "no Add Host button")
+    press(add)
     replaceText(in: element("host.nickname"), with: nickname)
     replaceText(in: element("host.address"), with: server.host)
     replaceText(in: element("host.port"), with: server.port)
     replaceText(in: element("host.username"), with: server.user)
-    element("host.save").tap()
-    XCTAssertTrue(app.staticTexts[nickname].waitForExistence(timeout: 10), "host not saved")
+    press(element("host.save"))
+    XCTAssertTrue(
+      hostRow(nickname).waitForExistence(timeout: 10),
+      "host not saved"
+    )
   }
 
   private func openHost(_ nickname: String) {
-    let row = app.staticTexts[nickname].firstMatch
+    let row = hostRow(nickname)
     XCTAssertTrue(row.waitForExistence(timeout: 10))
-    row.tap()
+    press(row)
   }
 
   private func signIn() {
     let field = element("password.field")
     XCTAssertTrue(field.waitForExistence(timeout: 30), "no password prompt")
-    field.tap()
+    press(field)
     field.typeText(server.password)
-    element("password.submit").tap()
+    press(element("password.submit"))
     XCTAssertTrue(field.waitForNonExistence(timeout: 10))
   }
 
@@ -196,36 +199,101 @@ final class RoamingAppUITests: XCTestCase {
   private func openSessionMenuItem(id: String, title: String) {
     let menu = element("session.menu")
     XCTAssertTrue(menu.waitForExistence(timeout: 10))
-    menu.tap()
+    press(menu)
     let byID = app.descendants(matching: .any).matching(identifier: id).firstMatch
     if byID.waitForExistence(timeout: 3) {
-      byID.tap()
+      press(byID)
       return
     }
     let item = app.menuItems[title].exists ? app.menuItems[title] : app.buttons[title]
     XCTAssertTrue(item.waitForExistence(timeout: 5), "no \(title) menu item")
-    item.tap()
+    press(item)
   }
 
   // MARK: Helpers
 
+  /// Displayed text: `label` on iOS; static text exposes `value` on macOS.
+  private func text(of element: XCUIElement) -> String {
+    if !element.label.isEmpty { return element.label }
+    return element.value as? String ?? ""
+  }
+
+  /// Text shown anywhere, matched by label or (macOS) value.
+  private func anyText(_ text: String) -> XCUIElement {
+    app.descendants(matching: .any).matching(
+      NSPredicate(format: "label == %@ OR value == %@ OR label CONTAINS %@", text, text, text)
+    ).firstMatch
+  }
+
+  /// A saved host's row: a static text on iOS, one combined button whose
+  /// label starts with the nickname on macOS.
+  private func hostRow(_ nickname: String) -> XCUIElement {
+    app.descendants(matching: .any).matching(
+      NSPredicate(format: "label == %@ OR label BEGINSWITH %@", nickname, nickname + ",")
+    ).firstMatch
+  }
+
+  /// A click on macOS (synthesized taps do not focus fields there), a tap
+  /// elsewhere.
+  private func press(_ element: XCUIElement) {
+    #if os(macOS) || targetEnvironment(macCatalyst)
+      // Rows can report not hittable while a sheet finishes closing.
+      let deadline = Date.now.addingTimeInterval(5)
+      while !element.isHittable, Date.now < deadline {
+        RunLoop.current.run(until: .now.addingTimeInterval(0.2))
+      }
+      if element.isHittable {
+        element.click()
+      } else {
+        element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
+      }
+    #else
+      element.tap()
+    #endif
+  }
+
   private func element(_ id: String) -> XCUIElement {
-    app.descendants(matching: .any).matching(identifier: id).firstMatch
+    // Mac Catalyst's toolbar bridge keeps labels but drops SwiftUI
+    // identifiers, so toolbar items also match by their label.
+    let labels: [String: [String]] = [
+      "hosts.add": ["Add Host"], "host.save": ["Save"], "terminal.close": ["Close"],
+      // Catalyst shows a toolbar menu as "More".
+      "session.menu": ["Session", "More"], "sftp.done": ["Done"],
+    ]
+    if let names = labels[id] {
+      return app.descendants(matching: .any).matching(
+        NSPredicate(
+          format: "identifier == %@ OR (elementType IN %@ AND (label IN %@ OR title IN %@))",
+          id,
+          [XCUIElement.ElementType.button, .menuButton, .popUpButton].map(\.rawValue),
+          names,
+          names
+        )
+      ).firstMatch
+    }
+    return app.descendants(matching: .any).matching(identifier: id).firstMatch
   }
 
   private func statusLabel() -> String {
     let status = element("terminal.status")
-    return status.exists ? status.label : ""
+    return status.exists ? text(of: status) : ""
   }
 
   private func screenText() -> String {
+    #if os(macOS) || targetEnvironment(macCatalyst)
+      // The AppKit terminal is itself an accessible text view.
+      let view = app.textViews.firstMatch
+      if view.exists, let value = view.value as? String, !value.isEmpty {
+        return value
+      }
+    #endif
     let probe = element("terminal.screen")
     guard probe.exists else { return "" }
     return probe.value as? String ?? ""
   }
 
   private func path(_ element: XCUIElement) -> String {
-    element.exists ? element.label : ""
+    element.exists ? text(of: element) : ""
   }
 
   /// The terminal has keyboard focus once shown; type into it.
@@ -234,15 +302,18 @@ final class RoamingAppUITests: XCTestCase {
       return app
     #else
       let terminal = app.descendants(matching: .any)["Terminal"].firstMatch
-      if terminal.exists, !terminal.hasFocusForTyping { terminal.tap() }
+      if terminal.exists, !terminal.hasFocusForTyping { press(terminal) }
       return terminal.exists ? terminal : app
     #endif
   }
 
   private func replaceText(in field: XCUIElement, with text: String) {
-    XCTAssertTrue(field.waitForExistence(timeout: 10))
-    field.tap()
-    #if os(macOS)
+    guard field.waitForExistence(timeout: 10) else {
+      XCTFail("missing \(field)\n\(app.debugDescription)")
+      return
+    }
+    press(field)
+    #if os(macOS) || targetEnvironment(macCatalyst)
       field.typeKey("a", modifierFlags: .command)
       field.typeText(text)
     #else

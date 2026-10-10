@@ -71,12 +71,14 @@ struct ConnectionPrompts: ViewModifier {
     content
       .sheet(item: enabled ? pendingPassword : .constant(nil)) { prompt in
         PasswordPromptView(prompt: prompt) { model.resolvePassword($0) }
+          .macSheetFrame(width: 420, height: 260)
       }
       .background {
         // A second presentation anchor: one sheet per view.
         Color.clear
           .sheet(item: enabled ? pendingTrust : .constant(nil)) { prompt in
             TrustPromptView(prompt: prompt) { model.resolveTrust($0) }
+              .macSheetFrame(width: 480, height: 320)
           }
       }
   }
