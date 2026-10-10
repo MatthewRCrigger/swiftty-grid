@@ -41,6 +41,7 @@ final class PhoneWatchBridge {
     guard self.model == nil, model.profile.companionBridge else { return }
     self.model = model
     _ = core.withLock { $0.update(model.companionSettings, now: .now) }
+    if !model.companionSettings.sharingEnabled { attention.clear() }
     model.onSessionObservation = { [weak self] observation in
       self?.observe(observation)
     }
@@ -49,6 +50,7 @@ final class PhoneWatchBridge {
     }
     model.onCompanionSettingsChange = { [weak self] settings in
       guard let self else { return }
+      if !settings.sharingEnabled { attention.clear() }
       if let context = core.withLock({ $0.update(settings, now: .now) }) {
         publish(context)
       }
@@ -99,13 +101,18 @@ final class PhoneWatchBridge {
         let dictionary = try? context.dictionary()
       else { return }
       // Latest-state only; status metadata, never preview text.
-      try? session.updateApplicationContext(attention.merged(into: dictionary))
+      try? session.updateApplicationContext(attention.merged(into: dictionary, for: context))
     #endif
   }
 
   /// Redacted attention summaries (no message text, no terminal output).
   /// Replaces the previous batch; the companion status is resent with it.
   private func publishAttention(_ summaries: [AttentionSummary]) {
+    // Nothing is cached or sent to the watch while sharing is off.
+    guard core.withLock({ $0.settings.sharingEnabled }) else {
+      attention.clear()
+      return
+    }
     guard let data = try? AttentionSummaryBatch(summaries: summaries).encoded()
     else { return }
     attention.set(data)
@@ -119,7 +126,18 @@ final class AttentionCache: Sendable {
 
   func set(_ value: Data) { data.withLock { $0 = value } }
 
-  func merged(into dictionary: [String: Data]) -> [String: Data] {
+  func clear() { data.withLock { $0 = nil } }
+
+  /// Adds the batch beside a status context. A `.cleared` context (sharing
+  /// off) never carries attention, and drops the cached batch.
+  func merged(
+    into dictionary: [String: Data],
+    for context: CompanionApplicationContext
+  ) -> [String: Data] {
+    guard case .status = context else {
+      clear()
+      return dictionary
+    }
     var dictionary = dictionary
     if let value = data.withLock({ $0 }) {
       dictionary[AttentionSummaryBatch.dictionaryKey] = value
@@ -158,10 +176,11 @@ final class SharedBridge: Sendable {
       activationDidCompleteWith activationState: WCSessionActivationState,
       error: (any Error)?
     ) {
+      let context = core.withLock { $0.applicationContext }
       guard activationState == .activated, session.isPaired,
-        let dictionary = try? core.withLock({ $0.applicationContext }).dictionary()
+        let dictionary = try? context.dictionary()
       else { return }
-      try? session.updateApplicationContext(attention.merged(into: dictionary))
+      try? session.updateApplicationContext(attention.merged(into: dictionary, for: context))
     }
 
     func sessionDidBecomeInactive(_ session: WCSession) {}
