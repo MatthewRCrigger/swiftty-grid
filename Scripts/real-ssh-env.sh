@@ -71,8 +71,17 @@ container build --progress plain -t swiftty-rst-ssh:test \
   || fail "swifttyd build failed; see $workspace/swift-build.log"
 host_bin="$(cd "$repository_root" && mise exec -- swift build --show-bin-path)/swifttyd"
 quic_port=$((51500 + $$ % 400))
-printf '{"bindAddress":"127.0.0.1","advertisedHost":"127.0.0.1","port":%s,"stateDirectory":"%s/state"}' \
-  "$quic_port" "$workspace" >"$workspace/config.json"
+# RST_PUBLIC_HOST=<this Mac's LAN address> serves physical devices: swifttyd
+# and the SSH relay listen on all interfaces and grants advertise that
+# address. Default: loopback only (simulators and local tests).
+public_host=${RST_PUBLIC_HOST:-}
+if [ -n "$public_host" ]; then
+  bind_address=0.0.0.0; advertised=$public_host; relay_bind=0.0.0.0
+else
+  bind_address=127.0.0.1; advertised=127.0.0.1; relay_bind=127.0.0.1
+fi
+printf '{"bindAddress":"%s","advertisedHost":"%s","port":%s,"stateDirectory":"%s/state"}' \
+  "$bind_address" "$advertised" "$quic_port" "$workspace" >"$workspace/config.json"
 "$host_bin" serve --config "$workspace/config.json" </dev/null >/dev/null 2>"$workspace/host.log" &
 echo $! >"$workspace/host.pid"
 
@@ -149,9 +158,9 @@ echo "$hostkey" >"$workspace/hostkey.pub"
 fingerprint=$(ssh-keygen -lf "$workspace/hostkey.pub" | awk '{print $2}')
 
 ssh_port=$((52000 + $$ % 400))
-python3 -I - "$ssh_port" "$name" >"$workspace/relay.log" 2>&1 <<'PY' &
+python3 -I - "$ssh_port" "$name" "$relay_bind" >"$workspace/relay.log" 2>&1 <<'PY' &
 import socket, subprocess, sys, threading
-port, name = int(sys.argv[1]), sys.argv[2]
+port, name, bind = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 def serve(client):
     # Reach sshd through the container daemon, not the VM network.
     proc = subprocess.Popen(
@@ -176,7 +185,7 @@ def serve(client):
     except OSError: pass
     t.join(); proc.wait(); client.close()
 listener = socket.socket(); listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-listener.bind(("127.0.0.1", port)); listener.listen(16)
+listener.bind((bind, port)); listener.listen(16)
 while True:
     c, _ = listener.accept()
     threading.Thread(target=serve, args=(c,), daemon=True).start()
@@ -186,10 +195,10 @@ i=0
 until nc -z 127.0.0.1 "$ssh_port" 2>/dev/null; do
   i=$((i + 1)); [ $i -lt 50 ] || fail "relay did not start"; sleep 0.1
 done
-echo "OpenSSH at $address:22 via 127.0.0.1:$ssh_port; bridge $gateway:$bridge_port; swifttyd QUIC 127.0.0.1:$quic_port" >&2
+echo "OpenSSH at $address:22 via 127.0.0.1:$ssh_port; bridge $gateway:$bridge_port; swifttyd QUIC $advertised:$quic_port" >&2
 
 cat >"$workspace/env" <<ENV
-export RST_REAL_SSH_HOST=127.0.0.1
+export RST_REAL_SSH_HOST=$advertised
 export RST_REAL_SSH_PORT=$ssh_port
 export RST_REAL_SSH_USER=rst
 export RST_REAL_SSH_PASSWORD=$password

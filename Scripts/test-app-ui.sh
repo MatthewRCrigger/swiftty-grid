@@ -8,7 +8,9 @@
 #   'platform=iOS Simulator,id=<udid>'       MobileClient
 #   'platform=macOS'                         MacClient
 #   'platform=macOS,variant=Mac Catalyst'    CatalystClient
-# Mac destinations sign with Apple Development for team $RST_UI_TEAM
+#   'platform=iOS,id=<device-udid>'          MobileClient on a physical device
+#                                            (set RST_PUBLIC_HOST)
+# Mac and device destinations sign with Apple Development for team $RST_UI_TEAM
 # (default 72KB9YQR7B) using locally installed profiles; nothing is
 # provisioned. Extra args go to xcodebuild, e.g.
 #   -only-testing:AppUITests/RoamingAppUITests/testRejectUnknownHostKey
@@ -26,9 +28,13 @@ apps="$repository_root/Apps"
 team=${RST_UI_TEAM:-72KB9YQR7B}
 
 catalyst=NO
+device=NO
 case $destination in
   *"Mac Catalyst"*) platform=iOS; app=CatalystClient; catalyst=YES ;;
   *"iOS Simulator"*) platform=iOS; app=MobileClient ;;
+  # A physical iPhone or iPad: needs RST_PUBLIC_HOST=<this Mac's LAN IP>
+  # so the device reaches swifttyd and the SSH relay over the network.
+  *"platform=iOS,"*) platform=iOS; app=MobileClient; device=YES ;;
   *macOS*) platform=macOS; app=MacClient ;;
   *) echo "unsupported destination: $destination" >&2; exit 2 ;;
 esac
@@ -41,7 +47,11 @@ trap '"$repository_root/Scripts/real-ssh-env.sh" stop "$workspace"' EXIT INT TER
 container exec "$(cat "$workspace/container.name")" \
   sh -c 'echo note > /home/rst/files/ui-note.txt && chown rst:rst /home/rst/files/ui-note.txt'
 
-if [ $platform = macOS ] || [ $catalyst = YES ]; then
+if [ $device = YES ] && [ -z "${RST_PUBLIC_HOST:-}" ]; then
+  echo "physical devices need RST_PUBLIC_HOST=<this Mac's LAN address>" >&2
+  exit 2
+fi
+if [ $platform = macOS ] || [ $catalyst = YES ] || [ $device = YES ]; then
   signing="CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: $team
         CODE_SIGN_IDENTITY: Apple Development"
@@ -55,6 +65,7 @@ case $app in
     deps="- { package: Swiftty, product: RoamingApp }
       - { package: Swiftty, product: CompanionModel }"
     app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mobile
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Roaming SSH connects to Macs on your local network.
         TARGETED_DEVICE_FAMILY: \"1,2\"
         SUPPORTS_MACCATALYST: NO
         INFOPLIST_KEY_UILaunchScreen_Generation: YES" ;;

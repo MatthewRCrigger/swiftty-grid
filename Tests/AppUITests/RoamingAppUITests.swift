@@ -155,6 +155,17 @@ final class RoamingAppUITests: XCTestCase {
     let row = hostRow(nickname)
     XCTAssertTrue(row.waitForExistence(timeout: 10))
     press(row)
+    allowLocalNetworkIfAsked()
+  }
+
+  /// A physical device asks once for Local Network access when the app
+  /// first reaches the Mac over the LAN.
+  private func allowLocalNetworkIfAsked() {
+    #if os(iOS) && !targetEnvironment(simulator) && !targetEnvironment(macCatalyst)
+      let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+      let allow = springboard.alerts.buttons["Allow"].firstMatch
+      if allow.waitForExistence(timeout: 8) { allow.tap() }
+    #endif
   }
 
   private func signIn() {
