@@ -4,9 +4,17 @@
 # logic lives in the `RoamingApp` and `CompanionModel` SwiftPM targets.
 # Generate with Scripts/build-platforms.sh (the .xcodeproj is not
 # committed). `swifttyd` is a SwiftPM executable and is not built here.
+#
+# Universal Links are configured at generation time: set
+# SWIFTTY_LINK_DOMAINS (comma-separated) before running xcodegen and the
+# preGenCommand writes Config/Generated/ (spec.inbox.md §4.4).
 name: RoamingClients
 
 options:
+  # Writes Config/Generated/AttentionLinks.plist and the per-target
+  # entitlements from SWIFTTY_LINK_DOMAINS (no associated domains when
+  # unset). Runs from this directory.
+  preGenCommand: ../Scripts/configure-links.sh
   bundleIdPrefix: dev.swiftty.roaming
   createIntermediateGroups: true
   deploymentTarget:
@@ -43,15 +51,15 @@ directClientSettings: &directClientSettings
   INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
   INFOPLIST_KEY_CFBundleDisplayName: Roaming SSH
   INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: YES
-  # Attention deep links (swiftty-unified-spec.md §9): registers the
-  # `swiftty` URL scheme and the configured Universal Link domain,
-  # merged into the generated Info.plist.
+  # Attention deep links (spec.inbox.md §4.4): registers the `swiftty`
+  # URL scheme, merged into the generated Info.plist, with no Universal
+  # Link domains. Targets that support Universal Links instead use
+  # Config/Generated/AttentionLinks.plist (the domain list for
+  # AttentionLink) and Config/Generated/<Target>.entitlements (the
+  # target's own Apps/<Target>/<Target>.entitlements keys plus, only when
+  # SWIFTTY_LINK_DOMAINS is set, com.apple.developer.associated-domains),
+  # both written by the preGenCommand.
   INFOPLIST_FILE: Config/AttentionLinks.plist
-  # Empty disables https Universal Links. Setting a real domain also
-  # needs Config/AssociatedDomains.entitlements.template merged into the
-  # target's entitlements under real signing; that template (with the
-  # links.example.invalid placeholder) is deliberately not enabled.
-  SWIFTTY_LINK_DOMAIN: ""
 
 targets:
   # iOS/iPadOS full client and iPhone side of the watch companion bridge.
@@ -75,7 +83,9 @@ targets:
     settings:
       base:
         <<: *directClientSettings
+        INFOPLIST_FILE: Config/Generated/AttentionLinks.plist
         PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mobile
+        CODE_SIGN_ENTITLEMENTS: Config/Generated/MobileClient.entitlements
         TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_MACCATALYST: NO
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
@@ -102,8 +112,9 @@ targets:
     settings:
       base:
         <<: *directClientSettings
+        INFOPLIST_FILE: Config/Generated/AttentionLinks.plist
         PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mac
-        CODE_SIGN_ENTITLEMENTS: MacClient/MacClient.entitlements
+        CODE_SIGN_ENTITLEMENTS: Config/Generated/MacClient.entitlements
         ENABLE_HARDENED_RUNTIME: YES
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
 
@@ -122,13 +133,14 @@ targets:
     settings:
       base:
         <<: *directClientSettings
+        INFOPLIST_FILE: Config/Generated/AttentionLinks.plist
         PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.catalyst
         SUPPORTS_MACCATALYST: YES
         DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
         SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
         TARGETED_DEVICE_FAMILY: "2,6"
-        CODE_SIGN_ENTITLEMENTS: CatalystClient/CatalystClient.entitlements
+        CODE_SIGN_ENTITLEMENTS: Config/Generated/CatalystClient.entitlements
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
 
@@ -144,10 +156,13 @@ targets:
     settings:
       base:
         <<: *directClientSettings
+        INFOPLIST_FILE: Config/Generated/AttentionLinks.plist
         PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.vision
+        CODE_SIGN_ENTITLEMENTS: Config/Generated/VisionClient.entitlements
         TARGETED_DEVICE_FAMILY: "7"
 
-  # Focus-first tvOS SSH/roaming client; no SFTP.
+  # Focus-first tvOS SSH/roaming client; no SFTP. swiftty:// links only:
+  # no associated domains (tvOS has no browser to hand https links over).
   TVClient:
     type: application
     platform: tvOS

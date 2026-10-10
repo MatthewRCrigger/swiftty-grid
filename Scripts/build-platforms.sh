@@ -9,6 +9,10 @@
 #   entitlements paths relative to the project directory, so it is written
 #   to Apps/RoamingClients.xcodeproj, which is gitignored (*.xcodeproj) and
 #   never committed. Derived data, logs and evidence go to a temp dir.
+# - XcodeGen's preGenCommand runs Scripts/configure-links.sh, which writes
+#   Apps/Config/Generated/ from SWIFTTY_LINK_DOMAINS (spec.inbox.md §4.4).
+#   The evidence records the associated domains each target was given:
+#   none when the variable is unset.
 # - Builds each app with CODE_SIGNING_ALLOWED=NO for: iOS Simulator,
 #   macOS, Mac Catalyst, visionOS Simulator, tvOS Simulator and watchOS
 #   Simulator.
@@ -80,6 +84,19 @@ PY
   else
     echo "Package.resolved not present"
   fi
+  echo
+  echo "## Universal Links (SWIFTTY_LINK_DOMAINS=${SWIFTTY_LINK_DOMAINS:-})"
+  for target in MobileClient MacClient CatalystClient VisionClient; do
+    entitlements="$repository_root/Apps/Config/Generated/$target.entitlements"
+    printf '%-16s %s\n' "$target" "$(/usr/bin/python3 -I - "$entitlements" <<'PY'
+import plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    domains = plistlib.load(f).get("com.apple.developer.associated-domains", [])
+print(" ".join(domains) or "no associated domains")
+PY
+)"
+  done
+  printf '%-16s %s\n' "TVClient" "no associated domains (swiftty:// only)"
   echo
   echo "## Builds (deployment target 27.0 everywhere; CODE_SIGNING_ALLOWED=NO)"
   echo

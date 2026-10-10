@@ -3,16 +3,17 @@
 <plist version="1.0">
 <dict>
 	<!--
-	TEMPLATE, NOT ENABLED. Universal Links for attention items
-	(swiftty-unified-spec.md §9). No target references this file.
+	REFERENCE ONLY: the entitlement Scripts/configure-links.sh adds to
+	Config/Generated/<Target>.entitlements (MobileClient, MacClient,
+	CatalystClient, VisionClient) when SWIFTTY_LINK_DOMAINS is set, one
+	applinks:<domain> entry per domain (spec.inbox.md §4.4). No target
+	references this file, and nothing is added when the variable is unset.
 
-	To enable for a real deployment:
-	  1. Own a domain and serve /.well-known/apple-app-site-association
-	     listing this app's team/bundle IDs and the path "/a/*".
-	  2. Set SWIFTTY_LINK_DOMAIN to that domain in Apps/project.yml.
-	  3. Merge the key below into the target's entitlements (or point
-	     CODE_SIGN_ENTITLEMENTS at a copy) and sign with a provisioning
-	     profile that has the Associated Domains capability.
+	A real deployment also needs:
+	  1. Each domain serving Scripts/make-aasa.sh output at
+	     https://<domain>/.well-known/apple-app-site-association.
+	  2. Signing with a provisioning profile that has the Associated
+	     Domains capability.
 
 	links.example.invalid is a reserved placeholder (RFC 2606/6761) and
 	must never be deployed. A locator is not a credential: following a

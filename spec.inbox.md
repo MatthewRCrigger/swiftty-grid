@@ -310,6 +310,30 @@ never keyed by program name or message.
   - If that workspace's lease is held elsewhere, it asks first and then uses
     `takeover`.
 - **Mark Reviewed:** offered for failures and results only.
+- **Snooze:** a waiting request has a Snooze menu: 15 minutes, 1 hour or
+  tomorrow at 9:00 (local time), sent as `snooze(ref, until:)`. A snoozed
+  row shows "Snoozed until …", sorts after unsnoozed items and offers
+  **Unsnooze** (`until: nil`). The badge already excludes snoozed requests
+  (§3.2).
+- **Paging:** the window reads the first page (100 rows) of `needsYou` and
+  `results`. **Load More** follows each section's `nextCursor`. A reload
+  (subscribe, `resync`, stale item) starts again from the first page.
+- **Failures are always shown.** `markSeen`, `snooze`, `markReviewed`,
+  `inbox` paging, `locateAttention`, `switchWorkspace` and `takeover`
+  report failures. A failure appears as a line in the popover while it is
+  open. Once it has closed, a user-initiated command shows an alert, and a
+  background one (subscribe, reload, mark seen on display) waits for the
+  next time the popover opens.
+  - A reply of `stale` or `missing` drops the item and rereads the inbox:
+    "The program has already moved on from this request." /
+    "This item is no longer available."
+  - `leaseHeld` from `switchWorkspace` means another frontend attached in
+    the meantime, so the takeover prompt is shown.
+  - `staleRevision` from `takeover` means the lease moved while the user
+    was deciding. Nothing is taken over, and the prompt is shown again for
+    the new generation ("Control of workspace … changed while you were
+    deciding").
+  - The pane is focused only after the switch or takeover succeeded.
 - **Never an approval channel.** Opening an item never types into the pane;
   OSC 7501 is status only.
 
@@ -390,9 +414,38 @@ commands.
 
 ### 4.4 Platform routing
 
+**Universal Link configuration.** Universal Links are off unless
+`SWIFTTY_LINK_DOMAINS` is set. Nothing is deployed from this repository, so
+every piece is generated from configuration and can be checked locally.
+
+- **Domains:** `SWIFTTY_LINK_DOMAINS` is a comma-separated (or
+  space-separated) list of hostnames. `Scripts/link-domains.sh` lowercases,
+  deduplicates and validates them; an invalid name fails packaging and
+  project generation. `SWIFTTY_LINK_MODE=developer` appends
+  `?mode=developer` to each `applinks:` entry for development builds.
+- **Unset means nothing.** With the variable unset or empty, no target has
+  `com.apple.developer.associated-domains`, `SwifttyAssociatedDomains` is
+  empty and only `swiftty://` links are accepted.
+- **Association file:** `Scripts/make-aasa.sh [-o path] <team-id>
+  <bundle-id>...` writes the `apple-app-site-association` JSON. Its one
+  `applinks.details` entry lists `<team>.<bundle>` app IDs. Its
+  `components` include only `/a/?*` and exclude `/a/*/*`, any query
+  (`"?": "?*"`) and any fragment (`"#": "?*"`). The script validates the
+  output with `python3 -m json.tool`, `plutil` and a structure check;
+  `--check <file> [team bundle...]` re-validates a served copy. Each domain
+  serves it at `/.well-known/apple-app-site-association`. The apps still
+  validate every link (§4.2); the file only decides which URLs the system
+  hands to the app.
+
 - **macOS (native Swiftty):**
-  - The package script registers the `swiftty` URL type. Universal Link
-    domains are added only when `SWIFTTY_LINK_DOMAINS` is set.
+  - The package script registers the `swiftty` URL type. With
+    `SWIFTTY_LINK_DOMAINS` set, it lists the domains in
+    `SwifttyAssociatedDomains` and signs the app with
+    `com.apple.developer.associated-domains` (`applinks:<domain>` each);
+    unset, the app is signed with no entitlements.
+    `SWIFTTY_PROVISIONING_PROFILE` is embedded as
+    `Contents/embedded.provisionprofile`. macOS honours the entitlement
+    only with such a profile, so the script warns without one.
   - `AppDelegate` handles `application(_:open:)` and web-activity
     continuation.
   - `AttentionLinkRouter` shows each state as an `NSAlert`.
@@ -403,9 +456,22 @@ commands.
   - `.onOpenURL`, web-activity and Handoff-activity routing live in
     `Apps/Shared/AttentionLinkViews.swift`.
   - A sheet shows the destination states.
-  - Associated domains exist only as a template
-    (`Apps/Config/AssociatedDomains.entitlements.template`); no target uses
-    it.
+  - **Associated domains:** `Apps/project.yml` runs
+    `Scripts/configure-links.sh` as its XcodeGen `preGenCommand`. The script
+    writes `Apps/Config/Generated/` (gitignored):
+    - `AttentionLinks.plist`, with `SwifttyAssociatedDomains` set to the
+      domains;
+    - `<Target>.entitlements` for MobileClient, MacClient, CatalystClient
+      and VisionClient. Each holds the target's own
+      `Apps/<Target>/<Target>.entitlements` keys (or an empty dictionary)
+      and, only when domains are set, the associated-domains key.
+
+    Those four targets point `INFOPLIST_FILE` and `CODE_SIGN_ENTITLEMENTS`
+    at the generated files. `Apps/Config/AssociatedDomains.entitlements.template`
+    documents the key and is referenced by no target.
+  - **tvOS** keeps the committed `AttentionLinks.plist` (no domains) and no
+    associated domains. tvOS has no browser to hand an https link to the
+    app, so only `swiftty://` and Handoff apply there.
 - **watchOS:**
   - `AttentionSummary` shows a category, an app name, counts and a relative
     time. Message text is hidden by default and program text is sanitized.
@@ -429,7 +495,14 @@ These suites all pass with `mise exec -- swift test`:
   - lease held elsewhere;
   - final drain;
   - slow-subscriber resync.
-- **`MuxInboxUITests`.**
+- **`MuxInboxUITests`:**
+  - badge, open marks seen, review clears results;
+  - snooze hides a request from the badge and unsnooze restores it;
+  - stale and missing items are reported and dropped;
+  - Load More reads past the first page;
+  - a takeover refused with `staleRevision` asks again, then focuses the
+    pane;
+  - snooze choices, error wording and paging cursors.
 - **`MuxNavigationTests` (34):**
   - locator round trips, corruption and canonical encoding;
   - malformed links, plus 3,000 random mutations;
@@ -448,5 +521,7 @@ These suites all pass with `mise exec -- swift test`:
 **Manual smoke test:** `swiftmux-agent --roaming-config` followed by
 `swifttyd status` succeeds through the control socket.
 
-`Scripts/build-platforms.sh` builds every app target. No simulator or device
-has run link routing yet.
+`Scripts/build-platforms.sh` builds every app target and records the
+associated domains each one was given. `Scripts/make-aasa.sh --check`
+validates an association file. No simulator or device has run link routing,
+and no real domain has served an association file, yet.

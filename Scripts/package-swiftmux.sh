@@ -9,12 +9,29 @@
 #   NOTARY_PROFILE    notarytool keychain profile (xcrun notarytool
 #                     store-credentials); when set with a Developer ID
 #                     identity, the app is notarized, stapled and assessed.
+#   SWIFTTY_LINK_DOMAINS  comma-separated Universal Link domains; see below.
+#   SWIFTTY_LINK_MODE     "developer" signs applinks:<domain>?mode=developer.
+#   SWIFTTY_PROVISIONING_PROFILE  provisioning profile embedded as
+#                     Contents/embedded.provisionprofile; macOS honours
+#                     the associated-domains entitlement only with one.
 set -eu
 
 identity=${1:--}
 out=${2:-.build/package}
 label=com.chr33s.swiftty.swiftmux
 bundle_id=com.chr33s.swiftty
+
+# Attention deep links (spec.inbox.md §4.4): the `swiftty` scheme is
+# always registered. SWIFTTY_LINK_DOMAINS (comma-separated hostnames,
+# validated by Scripts/link-domains.sh before anything is built) lists
+# the domains whose https://<domain>/a/<locator> Universal Links the app
+# accepts. When set, the app is signed with
+# com.apple.developer.associated-domains (applinks:<domain> each) and
+# lists the domains in SwifttyAssociatedDomains; when unset, there is no
+# entitlement and the list is empty. Each domain must serve the file from
+# Scripts/make-aasa.sh at /.well-known/apple-app-site-association.
+domains=$("$(dirname "$0")/link-domains.sh")
+applinks=$("$(dirname "$0")/link-domains.sh" --entitlements)
 
 swift build -c release
 bin=$(swift build -c release --show-bin-path)
@@ -29,18 +46,8 @@ for exe in swiftty swiftmux-agent swmux-launcher swmux; do
 done
 cp -R "$bin/swiftty_SwifttyCore.bundle" "$app/Contents/Resources/"
 
-# Attention deep links (swiftty-unified-spec.md §9): the `swiftty` scheme
-# is always registered. SWIFTTY_LINK_DOMAINS (space-separated hostnames)
-# lists the domains whose https://<domain>/a/<locator> Universal Links
-# the app accepts; empty by default. Serving those links also needs a
-# signed com.apple.developer.associated-domains entitlement and an
-# apple-app-site-association file on the domain, neither of which this
-# script provides. links.example.invalid is a documentation placeholder.
 link_domains=""
-for domain in ${SWIFTTY_LINK_DOMAINS:-}; do
-  case "$domain" in
-    *[!A-Za-z0-9.-]*) echo "invalid link domain: $domain" >&2; exit 64 ;;
-  esac
+for domain in $domains; do
   link_domains="$link_domains<string>$domain</string>"
 done
 
@@ -94,7 +101,33 @@ for exe in swiftmux-agent swmux-launcher swmux; do
   codesign --force --options runtime "$timestamp" --sign "$identity" \
     --identifier "$bundle_id.$exe" "$app/Contents/MacOS/$exe"
 done
-codesign --force --options runtime "$timestamp" --sign "$identity" "$app"
+# Associated domains is the only entitlement, and only when configured.
+entitlements=""
+if [ -n "$applinks" ]; then
+  entitlements="$out/Swiftty.entitlements"
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    echo '<plist version="1.0">'
+    echo '<dict>'
+    echo '  <key>com.apple.developer.associated-domains</key>'
+    echo '  <array>'
+    for entry in $applinks; do echo "    <string>$entry</string>"; done
+    echo '  </array>'
+    echo '</dict>'
+    echo '</plist>'
+  } >"$entitlements"
+  plutil -lint "$entitlements" >/dev/null
+  if [ -n "${SWIFTTY_PROVISIONING_PROFILE:-}" ]; then
+    cp "$SWIFTTY_PROVISIONING_PROFILE" "$app/Contents/embedded.provisionprofile"
+  else
+    echo "warning: associated domains need SWIFTTY_PROVISIONING_PROFILE (a profile" \
+      "with the Associated Domains capability); without one macOS will not" \
+      "honour, and may refuse to launch, the signed entitlement" >&2
+  fi
+fi
+codesign --force --options runtime "$timestamp" --sign "$identity" \
+  ${entitlements:+--entitlements "$entitlements"} "$app"
 codesign --verify --strict --verbose=1 "$app"
 
 if [ -n "${NOTARY_PROFILE:-}" ] && [ "$identity" != "-" ]; then
