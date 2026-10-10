@@ -44,6 +44,11 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   var onClose: (() -> Void)?
   private(set) var searchBar: SearchBar?
   private var appearanceObservation: NSKeyValueObservation?
+  /// Attention inbox mirror, fed by its own subscription (not frames).
+  private(set) var inbox = MuxInboxModel()
+  let inboxToolbar = MuxInboxToolbar()
+  private var inboxPopover: NSPopover?
+  private var inboxView: MuxInboxViewController?
 
   private init(
     connection: MuxConnection,
@@ -85,6 +90,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       layoutView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
     ])
     window.contentView = content
+    inboxToolbar.onClick = { [weak self] in self?.toggleInbox() }
+    window.toolbar = inboxToolbar.toolbar
     startPipelines()
   }
 
@@ -215,6 +222,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     )
     controller.apply(ws)
     controller.startEvents()
+    controller.startInbox()
     controller.sendTheme()
     controller.observeAppearance()
     return controller
@@ -309,7 +317,12 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
         workspace?.panes[i].exitStatus = status
       }
       refreshChrome()
-    case .paste, .frameUnavailable, .frame, .workspaces, .inbox: break
+    case let .inbox(update):
+      if inbox.apply(update) {
+        Task { await reloadInbox() }
+      }
+      refreshInbox()
+    case .paste, .frameUnavailable, .frame, .workspaces: break
     }
   }
 
@@ -328,8 +341,16 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   var activePane: PaneID? { activeTab?.activePane }
 
   private func apply(_ ws: WorkspaceSnapshot) {
-    guard workspace == nil || ws.layoutRevision >= workspace!.layoutRevision
+    guard workspace == nil || ws.id != workspace!.id
+      || ws.layoutRevision >= workspace!.layoutRevision
     else { return }
+    if let current = workspace, current.id != ws.id {
+      // Switched workspaces (inbox navigation): the service dropped the
+      // old subscriptions and geometry.
+      subscribed = []
+      sentGeometry = nil
+      activity = []
+    }
     workspace = ws
     for pane in ws.panes where titles[pane.id] == nil || !pane.title.isEmpty {
       titles[pane.id] = DisplayText.sanitize(pane.title)
@@ -616,8 +637,10 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       .yield {
         do {
           let reply = try await connection.execute(command)
-          if case let .layout(ws) = reply {
+          switch reply {
+          case let .layout(ws), let .attached(_, ws):
             await MainActor.run { [weak self] in self?.apply(ws) }
+          default: break
           }
         } catch {
           await MainActor.run {
@@ -768,6 +791,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     _ ask: Bool,
     _ message: String,
     _ detail: String,
+    button: String = "End",
     _ action: @escaping @MainActor () -> Void
   ) {
     guard ask else { return action() }
@@ -781,7 +805,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
         alert.messageText = message
         alert.informativeText = detail
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "End")
+        alert.addButton(withTitle: button)
         alert.addButton(withTitle: "Cancel")
         if let window {
           ok =
@@ -907,6 +931,165 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       if let view = views[pane] { window?.makeFirstResponder(view) }
     }
   }
+
+  // MARK: Attention inbox
+
+  /// Subscribes to inbox metadata: no lease, frames or resize involved.
+  func startInbox() {
+    let connection = connection
+    Task { [weak self] in
+      guard case .inbox? = try? await connection.execute(.subscribeInbox(true))
+      else { return }
+      await self?.reloadInbox()
+    }
+  }
+
+  /// Rereads the first page of each section (after subscribing or a
+  /// `resync`).
+  func reloadInbox() async {
+    var pages: [InboxPage] = []
+    for section in [InboxQuery.Section.needsYou, .results] {
+      if case let .inbox(page)? = try? await connection.execute(
+        .inbox(InboxQuery(section: section))
+      ) {
+        pages.append(page)
+      }
+    }
+    inbox.reset(pages)
+    refreshInbox()
+  }
+
+  private func refreshInbox() {
+    inboxToolbar.update(inbox.counts)
+    if inboxPopover?.isShown == true { inboxView?.update(inbox) }
+  }
+
+  func toggleInbox() {
+    if let popover = inboxPopover, popover.isShown {
+      popover.performClose(nil)
+      return
+    }
+    let view = inboxView ?? MuxInboxViewController()
+    view.onOpen = { [weak self] item in self?.openAttention(item) }
+    view.onReview = { [weak self] item in self?.markReviewed(item) }
+    // Showing an item marks it seen; it never resolves it.
+    view.onShown = { [weak self] items in
+      for item in items where !item.seen { self?.markSeen(item) }
+    }
+    inboxView = view
+    let popover = inboxPopover ?? NSPopover()
+    popover.behavior = .transient
+    popover.contentViewController = view
+    inboxPopover = popover
+    view.update(inbox)
+    guard let content = window?.contentView else { return }
+    popover.show(
+      relativeTo: NSRect(
+        x: content.bounds.maxX - 40,
+        y: content.bounds.maxY - 2,
+        width: 1,
+        height: 1
+      ),
+      of: content,
+      preferredEdge: .minY
+    )
+  }
+
+  private func reference(_ item: AttentionItem) -> AttentionReference {
+    AttentionReference(source: item.source, occurrence: item.occurrence)
+  }
+
+  private func markSeen(_ item: AttentionItem) {
+    let connection = connection
+    let ref = reference(item)
+    Task { _ = try? await connection.execute(.markSeen(ref)) }
+  }
+
+  func markReviewed(_ item: AttentionItem) {
+    guard item.category != .needsYou else { return }
+    let connection = connection
+    let ref = reference(item)
+    Task { _ = try? await connection.execute(.markReviewed(ref)) }
+  }
+
+  /// Opens the item's pane: marks it seen, then reveals the pane in this
+  /// workspace. Another workspace is switched to, and one controlled
+  /// elsewhere is taken over only after explicit confirmation.
+  func openAttention(_ item: AttentionItem) {
+    let connection = connection
+    let ref = reference(item)
+    Task { [weak self] in
+      guard
+        case let .attention(location)? = try? await connection.execute(
+          .markSeen(ref)
+        )
+      else { return }
+      self?.reveal(location)
+    }
+  }
+
+  private func reveal(_ location: AttentionLocation) {
+    switch location.availability {
+    case .missing:
+      notice("This item is no longer available.")
+      return
+    case .stale:
+      notice("The program has already moved on from this request.")
+      return
+    case .available, .paneExited: break
+    }
+    guard let wsID = location.workspace, let pane = location.pane else {
+      return
+    }
+    inboxPopover?.performClose(nil)
+    if wsID == workspace?.id {
+      if workspace?.pane(pane) != nil { command(.focusPane(pane)) }
+      return
+    }
+    guard location.leaseHeldElsewhere else {
+      command(.switchWorkspace(.id(wsID)))
+      command(.focusPane(pane))
+      return
+    }
+    let connection = connection
+    Task { [weak self] in
+      guard
+        case let .workspaces(list)? = try? await connection.execute(
+          .listWorkspaces
+        ),
+        let summary = list.first(where: { $0.id == wsID })
+      else { return }
+      let name = DisplayText.sanitize(summary.name)
+      self?
+        .confirmThen(
+          true,
+          "Take control of workspace “\(name)”?",
+          "Another window or device controls it. Taking over disconnects it there; its programs keep running.",
+          button: "Take Over"
+        ) { [weak self] in
+          self?
+            .command(
+              .takeover(.id(wsID), expectedLease: summary.leaseGeneration)
+            )
+          self?.command(.focusPane(pane))
+        }
+    }
+  }
+
+  private func notice(_ message: String) {
+    if let hook = confirmDestructive {
+      Task { _ = await hook(message) }
+      return
+    }
+    let alert = NSAlert()
+    alert.messageText = message
+    if let window {
+      alert.beginSheetModal(for: window)
+    } else {
+      alert.runModal()
+    }
+  }
+
 
   func windowWillClose(_ notification: Notification) {
     Task { await detach() }

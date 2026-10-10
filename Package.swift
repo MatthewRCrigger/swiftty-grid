@@ -73,6 +73,8 @@ let package = Package(
     // SwiftMux (spec.multiplexer.md): shared messages, engine bridge,
     // service, PTY launcher, client connection and frontends.
     .target(name: "SwiftMuxProtocol"),
+    // OSC 7501 attention reducer (unified spec §8): pure, no I/O.
+    .target(name: "MuxAttention", dependencies: ["SwiftMuxProtocol"]),
     // Frame export needs only the engine; import needs the renderer.
     .target(
       name: "SwiftMuxExport",
@@ -85,7 +87,9 @@ let package = Package(
     // Headless: links the engine, never the Metal renderer or fonts.
     .target(
       name: "SwiftMuxService",
-      dependencies: ["SwifttyEngine", "SwiftMuxProtocol", "SwiftMuxExport"]
+      dependencies: [
+        "SwifttyEngine", "SwiftMuxProtocol", "SwiftMuxExport", "MuxAttention",
+      ]
     ),
     // The one PTY owner: local XPC and, when configured, roaming RST/1.
     .executableTarget(
@@ -228,7 +232,7 @@ let package = Package(
       name: "SwiftMuxTests",
       dependencies: [
         "SwiftMuxProtocol", "SwiftMuxBridge", "SwiftMuxService",
-        "SwiftMuxClient", "SwiftMuxTerminal", "SwifttyCore",
+        "SwiftMuxClient", "SwiftMuxTerminal", "SwifttyCore", "MuxAttention",
       ]
     ),
     .testTarget(
@@ -237,6 +241,10 @@ let package = Package(
         "MuxNavigation", "MuxNavigationSMX", "SwiftMuxProtocol",
         "SwiftMuxClient", "SwiftMuxService",
       ]
+    ),
+    .testTarget(
+      name: "MuxAttentionTests",
+      dependencies: ["MuxAttention", "SwiftMuxProtocol"]
     ),
     .testTarget(
       name: "SwifttyAppTests",

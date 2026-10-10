@@ -1,6 +1,7 @@
 import Darwin
 import Dispatch
 import Foundation
+import MuxAttention
 import SwiftMuxExport
 import SwiftMuxProtocol
 import SwifttyEngine
@@ -11,6 +12,9 @@ enum PaneEvent: Sendable {
   case title(String)
   case bell
   case workingDirectory(String)
+  /// OSC 7501 changes in stream order, under the terminal epoch they
+  /// happened in. Always delivered before `finished`.
+  case status(TerminalEpochID, [StatusChange])
   /// Process exited and output drained (or the drain bound elapsed).
   case finished(status: Int32, forced: Bool)
 }
@@ -59,6 +63,11 @@ final class PaneRuntime: @unchecked Sendable {
   private(set) var geometryGeneration: UInt64 = 0
   private(set) var viewportRevision: UInt64 = 0
   private var title = ""
+  /// New on creation and on every full reset (RIS).
+  private var terminalEpoch = TerminalEpochID()
+  /// Status changes journaled per publish; past it the inbox resyncs
+  /// from the records (intermediate transitions are then lost).
+  static let statusJournalLimit = 4096
 
   static let drainBound: DispatchTimeInterval = .seconds(1)
   static let terminateGrace: DispatchTimeInterval = .seconds(2)
@@ -93,6 +102,10 @@ final class PaneRuntime: @unchecked Sendable {
     state.terminfoName = innerTerm
     state.keyboardProtocolEnabled = false
     state.clipboardWritesAdvertised = false
+    // OSC 7501 feeds the attention inbox, hidden or not.
+    state.programStatusEnabled = true
+    state.programStatusCapacity = limits.statusRecordsPerPane
+    state.programStatusJournalLimit = Self.statusJournalLimit
     writer = PaneWriter(replyReserve: limits.replyReserveBytes)
     readBuffer = .allocate(byteCount: limits.readTurnBytes, alignment: 16)
   }
@@ -194,7 +207,7 @@ final class PaneRuntime: @unchecked Sendable {
       state.output.removeAll(keepingCapacity: true)
       flush()
     }
-    _ = state.takeProgramStatusChange()
+    publishStatus()
     for event in state.takeEvents() {
       switch event {
       case let .title(t):
@@ -207,6 +220,58 @@ final class PaneRuntime: @unchecked Sendable {
     }
     _ = state.takeDamage()
     noteChange()
+  }
+
+  /// Converts the status journal into owned changes, splitting it at
+  /// each reset into a new terminal epoch.
+  private func publishStatus() {
+    guard let journal = state.takeProgramStatusJournal() else { return }
+    var batch: [StatusChange] = []
+    var epochChanged = false
+    for change in journal.changes {
+      switch change {
+      case let .report(record): batch.append(.report(Self.status(record)))
+      case let .removed(ids): batch.append(.removed(ids))
+      case .reset:
+        if !batch.isEmpty { onEvent?(.status(terminalEpoch, batch)) }
+        batch = []
+        terminalEpoch = TerminalEpochID()
+        epochChanged = true
+      }
+    }
+    if journal.truncated {
+      batch.append(.sync(journal.snapshot.records.map(Self.status)))
+    }
+    if !batch.isEmpty || epochChanged {
+      onEvent?(.status(terminalEpoch, batch))
+    }
+  }
+
+  static func status(_ r: ProgramStatusRecord) -> StatusRecord {
+    let state: AttentionState =
+      switch r.state {
+      case .idle: .idle
+      case .working: .working
+      case .done: .done
+      case .blocked: .blocked
+      case .error: .error
+      }
+    let kind: AttentionBlockedKind? =
+      switch r.kind {
+      case .permission?: .permission
+      case .question?: .question
+      case .auth?: .auth
+      case nil: nil
+      }
+    return StatusRecord(
+      path: r.id,
+      state: state,
+      kind: kind,
+      progress: r.progress,
+      app: r.app,
+      title: r.title,
+      message: r.message
+    )
   }
 
   private func noteChange() {
@@ -575,6 +640,8 @@ final class PaneRuntime: @unchecked Sendable {
     }
     parser = Parser()
     state.programExited()
+    // The final status reaches the inbox before `finished`.
+    publishStatus()
     noteChange()
     onEvent?(.finished(status: exitStatus ?? -1, forced: forcedTermination))
   }

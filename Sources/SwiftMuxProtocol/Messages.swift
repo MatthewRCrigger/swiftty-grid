@@ -565,6 +565,8 @@ public enum ClientMessage: Codable, Sendable {
   case input(InputRecord)
   /// Releases transport credit for the pane's in-flight frame.
   case frameAck(pane: PaneID, revision: UInt64)
+  /// The consumer took one `inbox` event (inbox flow control).
+  case inboxAck(revision: UInt64)
 }
 
 public enum MuxEvent: Codable, Sendable {

@@ -187,12 +187,15 @@ public actor MuxConnection {
     events.append(event)
   }
 
-  /// Acknowledges a frame once the consumer has it.
+  /// Acknowledges a frame or inbox update once the consumer has it.
   private func take(_ event: MuxEvent) {
-    if case let .frame(frame) = event {
+    switch event {
+    case let .frame(frame):
       transmit(
         .frameAck(pane: frame.identity.pane, revision: frame.identity.revision)
       )
+    case let .inbox(update): transmit(.inboxAck(revision: update.revision))
+    default: break
     }
   }
 

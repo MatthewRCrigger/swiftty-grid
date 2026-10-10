@@ -1,6 +1,7 @@
 import Darwin
 import Dispatch
 import Foundation
+import MuxAttention
 import SwiftMuxProtocol
 import os
 
@@ -59,12 +60,15 @@ public actor MuxService {
   private var listeners: [SMXListener] = []
   /// Called once the empty-state barrier holds for `idleExitDelay`.
   private var onIdle: (@Sendable () -> Void)?
+  /// OSC 7501 attention inbox (unified spec §8).
+  private var attention: InboxHub
 
   var limits: MuxLimits { configuration.limits }
 
   public init(configuration: MuxServiceConfiguration) {
     self.configuration = configuration
     queue = DispatchSerialQueue(label: "swiftmux.service", qos: .userInitiated)
+    attention = InboxHub(serviceEpoch: instance, limits: configuration.limits)
     launcher = PaneLauncher(
       launcherPath: configuration.launcherPath,
       innerTerm: configuration.innerTerm,
@@ -146,6 +150,7 @@ public actor MuxService {
 
   func disconnected(_ id: UUID, reason: String) {
     guard clients.removeValue(forKey: id) != nil else { return }
+    _ = attention.subscribe(id, false)
     if let ws = clientLeases[id] {
       // Connection loss: cancel remaining input, release the lease.
       releaseLease(ws, notify: false, reason: "connection lost: \(reason)")
@@ -205,6 +210,7 @@ public actor MuxService {
       }
     case let .input(record): input(record, from: id)
     case let .frameAck(pane, revision): frameAck(pane, revision, from: id)
+    case .inboxAck: inboxAcknowledged(by: id)
     }
   }
 
@@ -429,13 +435,106 @@ public actor MuxService {
     return .attached(attachment: lease.attachment, workspace: snapshot(ws))
   }
 
-  /// OSC 7501 inbox commands: metadata only, never a lease.
+  /// OSC 7501 inbox commands: metadata only. They never take a lease,
+  /// resize a pane or subscribe frames.
   private func handleAttention(
     _ command: MuxCommand,
     client: Client,
     reply: @escaping Reply
   ) {
-    reply(.failure(MuxError(.invalidRequest, "inbox unavailable")))
+    do throws(MuxError) {
+      switch command {
+      case let .subscribeInbox(on):
+        guard attention.subscribe(client.id, on) else {
+          throw MuxError(
+            .resourceLimit,
+            "inbox subscriber limit \(limits.inboxSubscribers) reached"
+          )
+        }
+        client.subscribesInbox = on
+        reply(.success(.inbox(try attention.page(InboxQuery()))))
+      case let .inbox(query): reply(.success(.inbox(try attention.page(query))))
+      case let .locateAttention(ref):
+        reply(
+          .success(
+            .attention(location(attention.inbox.lookup(ref), for: client))
+          )
+        )
+      case let .markSeen(ref):
+        let lookup = attention.markSeen(ref)
+        reply(.success(.attention(location(lookup, for: client))))
+      case let .snooze(ref, until):
+        let lookup = attention.snooze(ref, until: until)
+        reply(.success(.attention(location(lookup, for: client))))
+      case let .markReviewed(ref):
+        let lookup = try attention.markReviewed(ref)
+        reply(.success(.attention(location(lookup, for: client))))
+      default: throw MuxError(.invalidRequest, "not an inbox command")
+      }
+    } catch { reply(.failure(error)) }
+    attentionChanged()
+  }
+
+  /// Where an occurrence lives now. The lease is reported, never taken.
+  private func location(
+    _ lookup: AttentionLookup,
+    for client: Client
+  ) -> AttentionLocation {
+    guard let item = lookup.item else {
+      return AttentionLocation(availability: .missing)
+    }
+    let pane = item.source.pane
+    var availability = lookup.availability
+    if availability == .available, panes[pane]?.exitStatus != nil {
+      availability = .paneExited
+    }
+    let placed = locate(pane: pane)
+    let workspace = placed.map { workspaces[$0.0].id } ?? item.workspace
+    let holder = leases[workspace]?.client
+    return AttentionLocation(
+      availability: availability,
+      item: item,
+      workspace: workspace,
+      tab: placed.map { workspaces[$0.0].tabs[$0.1].id } ?? item.tab,
+      pane: pane,
+      leaseHeldElsewhere: holder != nil && holder != client.id
+    )
+  }
+
+  /// After any reduction or acknowledgement: schedule the coalesced
+  /// flush and the next snooze expiry.
+  private func attentionChanged() {
+    if attention.inbox.hasPendingUpdate, !attention.flushScheduled {
+      attention.flushScheduled = true
+      queue.asyncAfter(deadline: .now() + InboxHub.flushDelay) { [weak self] in
+        self?.assumeIsolated { $0.flushInbox() }
+      }
+    }
+    let expiry = attention.inbox.nextSnoozeExpiry
+    guard let expiry, expiry != attention.snoozeDeadline else { return }
+    attention.snoozeDeadline = expiry
+    let delay = max(0, expiry.timeIntervalSinceNow)
+    queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+      self?
+        .assumeIsolated { service in
+          guard service.attention.snoozeDeadline == expiry else { return }
+          service.attention.snoozeDeadline = nil
+          service.attention.expireSnoozes()
+          service.attentionChanged()
+        }
+    }
+  }
+
+  private func flushInbox() {
+    for (client, update) in attention.flush() {
+      send(.event(.inbox(update)), to: client)
+    }
+  }
+
+  private func inboxAcknowledged(by client: UUID) {
+    if let resync = attention.acknowledge(client) {
+      send(.event(.inbox(resync)), to: client)
+    }
   }
 
   /// Sends the workspace list to metadata observers.
@@ -1047,7 +1146,19 @@ public actor MuxService {
       if let client { send(.event(.title(id, title)), to: client) }
     case .bell: if let client { send(.event(.bell(id)), to: client) }
     case let .workingDirectory(dir): panes[id]?.workingDirectory = dir
+    case let .status(epoch, changes):
+      let tab = locate(pane: id).map { workspaces[$0.0].tabs[$0.1].id }
+      attention.apply(
+        changes,
+        pane: id,
+        epoch: epoch,
+        context: AttentionContext(workspace: wsID, tab: tab)
+      )
+      attentionChanged()
     case let .finished(status, forced):
+      // The final status was drained ahead of this event.
+      attention.paneExited(id)
+      attentionChanged()
       if forced {
         log.notice(
           "pane \(id.short) terminated forcibly; output may be truncated"

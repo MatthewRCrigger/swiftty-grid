@@ -88,11 +88,13 @@ public enum AttentionLink {
     let host = components.percentEncodedHost?.lowercased() ?? ""
     // The authority must be the bare host: URLComponents reports an empty
     // port (`host:`) as no port at all.
-    guard let separator = text.range(of: "://"),
-      text[separator.upperBound...]
+    if let separator = text.range(of: "://") {
+      let authority = text[separator.upperBound...]
         .prefix(while: { $0 != "/" && $0 != "?" && $0 != "#" })
-        .lowercased() == host
-    else { throw .unexpectedComponent }
+      guard authority.lowercased() == host else {
+        throw .unexpectedComponent
+      }
+    }
     let locator: String
     switch scheme {
     case AttentionLinkConfiguration.scheme:
