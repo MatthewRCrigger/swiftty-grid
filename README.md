@@ -147,7 +147,7 @@ Roaming verification record (2026-10-10, Xcode 27.0, OS 27 SDKs):
 
 | Destination | Evidence |
 |---|---|
-| iPhone 16, iOS 27.0.1 (physical) | App UI flow over LAN to real `swifttyd` + OpenSSH; signed Keychain |
+| iPhone 16, iOS 27.0.1 (physical) | App UI flow over LAN to real `swifttyd` + OpenSSH; signed Keychain; A2: 50 Wi-Fi↔5G switches over Tailscale, one retained shell, no duplicated input (`Tests/DeviceHandover/Evidence`) |
 | iPad Pro 12.9" (5th gen), iPadOS 27.0.1 (physical) | App UI flow over LAN; signed Keychain |
 | macOS 27 native, Mac Catalyst | App UI flow; signed Keychain (Apple Development) |
 | iOS, iPadOS, tvOS, visionOS simulators | Roaming runtime test vs real `swifttyd`; Keychain |
@@ -155,8 +155,12 @@ Roaming verification record (2026-10-10, Xcode 27.0, OS 27 SDKs):
 | macOS host | Unit, integration, end-to-end QUIC and real OpenSSH suites |
 
 Still open (spec §2.4, §13): physical Apple TV, Vision Pro and paired
-Apple Watch runs, cellular handover (A2) and QUIC migration on a real path
-change.
+Apple Watch runs, and QUIC connection migration on a real path change (the A2
+run went through Tailscale, which hides the path change from QUIC).
+
+`Scripts/test-handover.sh <iphone-udid> [switches]` runs A2: a standalone app
+on the phone keeps one roaming session open while you toggle Wi-Fi, and the
+retained shell on the Mac logs one line per switch.
 
 ## API and storage contracts
 
