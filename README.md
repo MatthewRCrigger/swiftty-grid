@@ -143,8 +143,20 @@ VM's `/usr/local/libexec/swifttyd` relays `bootstrap --stdio` to an agent on
 this Mac. macOS Local Network privacy can deny test runners a route to the VM
 subnet, so the script reaches sshd through `container exec`.
 
-Device, cellular-handover, Apple TV, Vision Pro and paired-watch gates
-(spec §2.4, §13) need physical hardware and are not covered by these tests.
+Roaming verification record (2026-10-10, Xcode 27.0, OS 27 SDKs):
+
+| Destination | Evidence |
+|---|---|
+| iPhone 16, iOS 27.0.1 (physical) | App UI flow over LAN to real `swifttyd` + OpenSSH; signed Keychain |
+| iPad Pro 12.9" (5th gen), iPadOS 27.0.1 (physical) | App UI flow over LAN; signed Keychain |
+| macOS 27 native, Mac Catalyst | App UI flow; signed Keychain (Apple Development) |
+| iOS, iPadOS, tvOS, visionOS simulators | Roaming runtime test vs real `swifttyd`; Keychain |
+| watchOS simulator | Companion tests hosted by the watch app |
+| macOS host | Unit, integration, end-to-end QUIC and real OpenSSH suites |
+
+Still open (spec §2.4, §13): physical Apple TV, Vision Pro and paired
+Apple Watch runs, cellular handover (A2) and QUIC migration on a real path
+change.
 
 ## API and storage contracts
 
