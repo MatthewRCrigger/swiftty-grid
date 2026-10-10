@@ -6,6 +6,9 @@
 # usage: Scripts/package-swiftmux.sh [signing-identity] [output-dir]
 #   signing-identity  Developer ID identity, or "-" for ad-hoc (default).
 #                     Ad-hoc builds only get the same-user peer check.
+#   NOTARY_PROFILE    notarytool keychain profile (xcrun notarytool
+#                     store-credentials); when set with a Developer ID
+#                     identity, the app is notarized, stapled and assessed.
 set -eu
 
 identity=${1:--}
@@ -59,11 +62,22 @@ cat > "$app/Contents/Library/LaunchAgents/$label.plist" <<EOF
 </plist>
 EOF
 
+# Notarization needs a secure timestamp; ad-hoc signatures cannot have one.
+if [ "$identity" = "-" ]; then timestamp=--timestamp=none; else timestamp=--timestamp; fi
+
 # Sign nested code first, then the app (no --deep).
 for exe in swiftmux-agent swmux-launcher swmux; do
-  codesign --force --options runtime --timestamp=none --sign "$identity" \
+  codesign --force --options runtime "$timestamp" --sign "$identity" \
     --identifier "$bundle_id.$exe" "$app/Contents/MacOS/$exe"
 done
-codesign --force --options runtime --timestamp=none --sign "$identity" "$app"
+codesign --force --options runtime "$timestamp" --sign "$identity" "$app"
 codesign --verify --strict --verbose=1 "$app"
+
+if [ -n "${NOTARY_PROFILE:-}" ] && [ "$identity" != "-" ]; then
+  zip="$out/Swiftty-notarize.zip"
+  ditto -c -k --keepParent "$app" "$zip"
+  xcrun notarytool submit "$zip" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$app"
+  spctl --assess --type execute --verbose=2 "$app"
+fi
 echo "$app"

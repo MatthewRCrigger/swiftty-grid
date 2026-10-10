@@ -5,6 +5,13 @@ import Testing
 import TestSupport
 
 struct SnapshotTests {
+  /// Frame budgets apply to optimized code: `swift test -c release`.
+  #if DEBUG
+  static let measurable = false
+  #else
+  static let measurable = true
+  #endif
+
   @Test
   func
     `concurrent readers retain immutable snapshots while updates resize the pool`()
@@ -33,7 +40,7 @@ struct SnapshotTests {
     #expect(TestFixture(original.text) == TestFixture(originalText))
   }
 
-  @Test
+  @Test(.enabled(if: measurable))
   func `search snapshots with dense history fit a frame budget`() {
     var state = TerminalState(
       columns: 120,

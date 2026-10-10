@@ -39,8 +39,21 @@ From `swift run -c release swiftmux-bench` (`mise run bench-swiftmux`): an in-pr
 | 32 visible noisy panes in one 512×255 tab | service+client CPU 422 %; footprint 624 MiB; 1,836 frames/s (about 57 per pane, at the 60 Hz cap) |
 | Idle footprint | 39 MiB |
 
+Contended run (another toolchain build on the same machine, load average 15–20):
+
+| Measure | Result |
+|---|---|
+| Parser throughput, detached / attached | 99 / 97 MiB/s |
+| Input → frame latency | p50 0.56 ms, p95 0.63 ms, p99 1.36 ms |
+| 512×256 frame | export+encode p95 12.2 ms; import p95 14.6 ms; GPU p95 14.6 ms |
+| 200×50 GPU render, quiet → beside a renderer saturating the GPU with 512×256 frames | p95 2.96 ms → 5.03 ms (still within a 60 Hz frame) |
+| 32 visible noisy panes | 1,749 frames/s; footprint 720 MiB |
+| Search over 10,000 history rows | 2.79 ms |
+
 History budget: each pane gets up to 16 MiB and 10,000 rows from the shared 128 MiB pool. A 1 MiB minimum is held back for each pane that could still be created, so the total of all pane limits never exceeds 128 MiB (`HistoryBudgetTests`).
 
 The footprint covers the whole bench process, so the client that decodes every frame is included. The JSON codec takes roughly 10 ms per frame at the 512×256 limit, which makes it the first candidate for a compact codec or deltas (spec §4).
 
-`FrameTimeTests` measures optimized code. It is now enabled only in optimized builds (`swift test -c release`), where it passes with p95 0.68 ms and 1.77 ms. Debug builds skip it rather than failing.
+Notarization: the package script signs Developer ID builds with a secure timestamp. When `NOTARY_PROFILE` names a `notarytool` keychain profile, it also submits the app, staples the ticket and runs `spctl --assess`. No notary credentials are stored on this machine, so that step has not run. Without it, Gatekeeper rejects the Developer ID build as `Unnotarized Developer ID`, as expected.
+
+`FrameTimeTests` measures optimized code. It is now enabled only in optimized builds (`swift test -c release`), where it passes with p95 0.68 ms and 1.77 ms. Debug builds skip it rather than failing. The `SnapshotTests` search budget is gated the same way (release p95 0.009 ms). The PTY slave-leak test waited only 1 s for an asynchronous hang-up and failed under full-suite load (also on `main`); it now waits up to 10 s and returns as soon as EOF arrives. Three consecutive full `swift test` runs then passed (1,202 tests each).

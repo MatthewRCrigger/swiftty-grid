@@ -6,12 +6,13 @@
 // at the pane limit, and GPU time for imported frames.
 import Darwin
 import Foundation
-import Metal
+@preconcurrency import Metal
 import SwiftMuxBridge
 import SwiftMuxClient
 import SwiftMuxProtocol
 import SwiftMuxService
 import SwifttyCore
+import Synchronization
 
 func percentile(_ values: [Double], _ p: Double) -> Double {
   let sorted = values.sorted()
@@ -468,6 +469,77 @@ func visibleLimit(
   return result
 }
 
+// MARK: Noisy GPU
+
+/// 200x50 pane render time while another renderer saturates the GPU with
+/// back-to-back 512x256 frames (a busy neighbouring pane or app).
+func noisyGPU() throws -> (quiet: [Double], noisy: [Double])? {
+  guard let device = MTLCreateSystemDefaultDevice() else { return nil }
+  func target(_ r: MetalRenderer, _ columns: Int, _ rows: Int) -> MTLTexture {
+    let d = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: .bgra8Unorm,
+      width: Int(r.cellSize.width) * columns + 16,
+      height: Int(r.cellSize.height) * rows + 16,
+      mipmapped: false
+    )
+    d.usage = [.renderTarget, .shaderRead]
+    d.storageMode = .private
+    return device.makeTexture(descriptor: d)!
+  }
+  func snapshot(_ columns: Int, _ rows: Int) throws -> RenderSnapshot {
+    let session = filledState(columns: columns, rows: rows)
+    let identity = FrameIdentity(
+      server: ServerInstanceID(),
+      attachment: AttachmentID(),
+      pane: PaneID(),
+      revision: 1,
+      layoutRevision: 1,
+      geometryGeneration: 1,
+      viewportRevision: 0
+    )
+    let frame = try session.withState {
+      try FrameExporter.frame(from: $0.captureOwnedScreen(), identity: identity)
+    }
+    return try FrameImporter.snapshot(from: frame, sequence: 1)
+  }
+  let pane = try MetalRenderer(
+    device: device,
+    fontManager: CoreTextFontManager(),
+    font: FontDescriptor()
+  )
+  let noise = try MetalRenderer(
+    device: device,
+    fontManager: CoreTextFontManager(),
+    font: FontDescriptor()
+  )
+  let small = try snapshot(200, 50)
+  let large = try snapshot(512, 256)
+  let paneTexture = target(pane, 200, 50)
+  let noiseTexture = target(noise, 512, 256)
+  func measure() -> [Double] {
+    var times: [Double] = []
+    for i in 0 ..< 65 {
+      let t0 = now()
+      pane.render(small, to: paneTexture).waitUntilCompleted()
+      if i >= 5 { times.append((now() - t0) * 1000) }
+    }
+    return times
+  }
+  let quiet = measure()
+  let stop = Atomic(false)
+  let noiseThread = Thread {
+    while !stop.load(ordering: .relaxed) {
+      noise.render(large, to: noiseTexture).waitUntilCompleted()
+    }
+  }
+  noiseThread.start()
+  Thread.sleep(forTimeInterval: 0.2)
+  let noisy = measure()
+  stop.store(true, ordering: .relaxed)
+  Thread.sleep(forTimeInterval: 0.1)
+  return (quiet, noisy)
+}
+
 // MARK: Run
 
 signal(SIGPIPE, SIG_IGN)
@@ -532,6 +604,12 @@ print(
     withClient.framesPerSecond
   )
 )
+if let gpu = try noisyGPU() {
+  print(
+    "200x50 GPU render, quiet p50 \(ms(percentile(gpu.quiet, 0.5))) p95 \(ms(percentile(gpu.quiet, 0.95))); "
+      + "with a saturating 512x256 renderer p50 \(ms(percentile(gpu.noisy, 0.5))) p95 \(ms(percentile(gpu.noisy, 0.95)))"
+  )
+}
 let pasteMs = try await pasteLimit()
 print(
   String(format: "1 MiB paste (32 KiB chunks, acknowledged): %.1f ms", pasteMs)

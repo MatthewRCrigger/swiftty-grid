@@ -88,7 +88,9 @@ struct PTYProcessTests {
     var byte: UInt8 = 0
     var count = -1
     var readError: Int32 = 0
-    let deadline = ContinuousClock.now + .seconds(1)
+    // Teardown hangs up asynchronously; under a loaded parallel test run it
+    // can take longer than a second. Success ends the wait immediately.
+    let deadline = ContinuousClock.now + .seconds(10)
     repeat {
       count = withUnsafeMutableBytes(of: &byte) { master.read(into: $0) }
       readError = errno
