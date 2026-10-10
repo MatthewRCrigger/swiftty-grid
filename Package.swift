@@ -26,6 +26,7 @@ let package = Package(
     .library(name: "TerminalSurface", targets: ["TerminalSurface"]),
     .library(name: "CompanionModel", targets: ["CompanionModel"]),
     .library(name: "RoamingApp", targets: ["RoamingApp"]),
+    .library(name: "MuxNavigation", targets: ["MuxNavigation"]),
     .executable(name: "swiftty", targets: ["Swiftty"]),
     .executable(name: "swiftty-bench", targets: ["SwifttyBench"]),
     .executable(name: "swmux", targets: ["SwiftMuxCLI"]),
@@ -66,6 +67,7 @@ let package = Package(
       name: "Swiftty",
       dependencies: [
         "SwifttyCore", "SwifttyMac", "SwiftMuxClient", "SwiftMuxBridge",
+        "MuxNavigation", "MuxNavigationSMX",
       ]
     ),
     // SwiftMux (spec.multiplexer.md): shared messages, engine bridge,
@@ -93,6 +95,15 @@ let package = Package(
     // Fresh-process terminal setup: login_tty, then exec the shell in place.
     .executableTarget(name: "SwiftMuxLauncher"),
     .target(name: "SwiftMuxClient", dependencies: ["SwiftMuxProtocol"]),
+    // Deep links (swiftty-unified-spec.md §9): typed destinations, the
+    // opaque locator, URL validation and the navigation state machine.
+    // Foundation only, so the watch companion can link it.
+    .target(name: "MuxNavigation", dependencies: ["SwiftMuxProtocol"]),
+    // The navigator's local SwiftMux (XPC) service adapter; macOS only.
+    .target(
+      name: "MuxNavigationSMX",
+      dependencies: ["MuxNavigation", "SwiftMuxClient", "SwiftMuxProtocol"]
+    ),
     // §10 measurements: throughput, latency, CPU, memory, export and GPU.
     .executableTarget(
       name: "SwiftMuxBench",
@@ -184,7 +195,7 @@ let package = Package(
       name: "RoamingApp",
       dependencies: [
         "SessionCore", "ScreenProtocol", "SSHClient", "TerminalSurface",
-        "CompanionModel", "SwifttyCore", "SwifttyMobile",
+        "CompanionModel", "SwifttyCore", "SwifttyMobile", "MuxNavigation",
         // AppKit surface for the native Mac client only; never Catalyst.
         .target(name: "SwifttyMac", condition: .when(platforms: [.macOS])),
         .product(name: "Crypto", package: "swift-crypto"),
@@ -218,6 +229,13 @@ let package = Package(
       dependencies: [
         "SwiftMuxProtocol", "SwiftMuxBridge", "SwiftMuxService",
         "SwiftMuxClient", "SwiftMuxTerminal", "SwifttyCore",
+      ]
+    ),
+    .testTarget(
+      name: "MuxNavigationTests",
+      dependencies: [
+        "MuxNavigation", "MuxNavigationSMX", "SwiftMuxProtocol",
+        "SwiftMuxClient", "SwiftMuxService",
       ]
     ),
     .testTarget(

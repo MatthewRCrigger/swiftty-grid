@@ -32,6 +32,8 @@ public struct RoamingRootView: View {
     // While a child sheet (SFTP) is up it presents the prompts itself.
     .connectionPrompts(model, enabled: model.modalDepth == 0)
     .privacyShield(when: hidesContent)
+    // Attention deep links resolve only through this device's hosts.
+    .attentionLinks(model)
     .task { model.load() }
     .onChange(of: scenePhase, initial: true) { _, phase in
       // Suspension pauses bulk SFTP work; a Mac window losing focus does

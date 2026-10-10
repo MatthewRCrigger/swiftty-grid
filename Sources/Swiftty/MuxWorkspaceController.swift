@@ -168,11 +168,14 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   }
 
   /// Attaches over an existing connection (also used by tests with an
-  /// in-process service).
+  /// in-process service). With `expectedLease`, explicitly takes over the
+  /// workspace from whoever holds that lease generation; callers pass it
+  /// only after the user confirmed a takeover prompt.
   static func open(
     _ selector: WorkspaceSelector?,
     configuration: Configuration,
-    connection: MuxConnection
+    connection: MuxConnection,
+    takeover expectedLease: UInt64? = nil
   ) async throws -> MuxWorkspaceController {
     guard let welcome = await connection.welcome else {
       throw MuxError(.connectionLost)
@@ -199,8 +202,11 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       else { throw MuxError(.invalidRequest, "unexpected reply") }
       target = .id(ws.id)
     }
+    let attach: MuxCommand =
+      expectedLease.map { .takeover(target, expectedLease: $0) }
+      ?? .attach(target)
     guard
-      case let .attached(_, ws) = try await connection.execute(.attach(target))
+      case let .attached(_, ws) = try await connection.execute(attach)
     else { throw MuxError(.invalidRequest, "unexpected attach reply") }
     let controller = MuxWorkspaceController(
       connection: connection,
@@ -676,6 +682,17 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     else { return }
     let grow = direction == .right || direction == .down
     setRatio(current + (grow ? step : -step), path: split.path)
+  }
+
+  /// Brings the window forward and activates `pane` (selecting `tab`
+  /// first when it is not the active one), for attention links. The
+  /// layout reply makes the pane's view first responder.
+  func reveal(pane: PaneID, tab: TabID?) {
+    if let tab = tab ?? workspace?.tab(containing: pane)?.id { selectTab(tab) }
+    if pane != activePane { command(.focusPane(pane)) }
+    showWindow(nil)
+    window?.makeKeyAndOrderFront(nil)
+    if let view = views[pane] { window?.makeFirstResponder(view) }
   }
 
   func selectTab(_ tab: TabID) {

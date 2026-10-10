@@ -1,3 +1,6 @@
+// Local XPC transport: macOS only. The message types in this module are
+// Foundation-only, so attention links (MuxNavigation) build everywhere.
+#if os(macOS)
 import Darwin
 import Dispatch
 import Foundation
@@ -136,3 +139,4 @@ public final class SMXListener: @unchecked Sendable {
 
   public func cancel() { xpc_connection_cancel(listener) }
 }
+#endif
