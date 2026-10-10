@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	Attention deep links (swiftty-unified-spec.md §9), merged into each
+	direct client's generated Info.plist.
+
+	- swiftty://attention/open?ref=<locator> is always registered.
+	- SwifttyAssociatedDomains lists the hosts whose
+	  https://<domain>/a/<locator> Universal Links the app accepts. It
+	  comes from the SWIFTTY_LINK_DOMAIN build setting, empty by default,
+	  which disables the Universal Link form. Accepting such links also
+	  needs AssociatedDomains.entitlements.template enabled under real
+	  signing and an apple-app-site-association file on the domain.
+	-->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER).attention</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>swiftty</string>
+			</array>
+		</dict>
+	</array>
+	<key>SwifttyAssociatedDomains</key>
+	<array>
+		<string>$(SWIFTTY_LINK_DOMAIN)</string>
+	</array>
+</dict>
+</plist>

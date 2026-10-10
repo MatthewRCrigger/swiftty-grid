@@ -43,6 +43,15 @@ directClientSettings: &directClientSettings
   INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
   INFOPLIST_KEY_CFBundleDisplayName: Roaming SSH
   INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: YES
+  # Attention deep links (swiftty-unified-spec.md §9): registers the
+  # `swiftty` URL scheme and the configured Universal Link domain,
+  # merged into the generated Info.plist.
+  INFOPLIST_FILE: Config/AttentionLinks.plist
+  # Empty disables https Universal Links. Setting a real domain also
+  # needs Config/AssociatedDomains.entitlements.template merged into the
+  # target's entitlements under real signing; that template (with the
+  # links.example.invalid placeholder) is deliberately not enabled.
+  SWIFTTY_LINK_DOMAIN: ""
 
 targets:
   # iOS/iPadOS full client and iPhone side of the watch companion bridge.
@@ -154,8 +163,11 @@ targets:
         TARGETED_DEVICE_FAMILY: "3"
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
 
-  # Read-only watch companion. Links ONLY CompanionModel: no Swiftty,
-  # NIO/SSH, QUIC, SFTP or PTY code may reach the watch (spec §2.2).
+  # Read-only watch companion. Links ONLY CompanionModel and the
+  # Foundation-only MuxNavigation (redacted attention summaries and
+  # handoff requests; its XPC transport compiles only on macOS): no
+  # Swiftty, NIO/SSH, QUIC, SFTP or PTY code may reach the watch
+  # (spec §2.2). No URL scheme: the watch never opens panes itself.
   WatchCompanion:
     type: application
     platform: watchOS
@@ -164,6 +176,8 @@ targets:
     dependencies:
       - package: Swiftty
         product: CompanionModel
+      - package: Swiftty
+        product: MuxNavigation
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mobile.watchkitapp

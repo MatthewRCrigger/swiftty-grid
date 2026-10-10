@@ -1,4 +1,5 @@
 import AppKit
+import MuxNavigation
 import SwiftMuxProtocol
 import SwifttyMac
 import SwifttyCore
@@ -10,6 +11,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   /// The one native SwiftMux workspace window (one lease at a time).
   private var mux: MuxWorkspaceController?
   private let muxUpdate = MuxUpdateController()
+  private lazy var attentionLinks = AttentionLinkRouter(
+    ownsWorkspace: { [weak self] id in self?.mux?.workspace?.id == id },
+    reveal: { [weak self] target, lease in
+      try await self?.revealAttention(target, takeover: lease)
+    }
+  )
+
+  /// `swiftty://attention/open?ref=…` and configured Universal Links
+  /// (swiftty-unified-spec.md §9). Other URLs are rejected without
+  /// contacting anything.
+  func application(_ application: NSApplication, open urls: [URL]) {
+    // A burst of links: only the newest navigates.
+    guard let url = urls.last else { return }
+    attentionLinks.handle(url)
+  }
+
+  func application(
+    _ application: NSApplication,
+    continue userActivity: NSUserActivity,
+    restorationHandler: @escaping ([any NSUserActivityRestoring]) -> Void
+  ) -> Bool {
+    guard userActivity.activityType == NSUserActivityTypeBrowsingWeb,
+      let url = userActivity.webpageURL
+    else { return false }
+    attentionLinks.handle(url)
+    return true
+  }
+
+  /// Opens (or reuses) the SwiftMux window on `target`'s workspace and
+  /// activates the pane. `lease` is set only after the user confirmed a
+  /// takeover; without it a held workspace fails with `leaseHeld`.
+  private func revealAttention(
+    _ target: PaneTarget,
+    takeover lease: UInt64?
+  ) async throws {
+    NSApp.activate()
+    if let mux, mux.workspace?.id == target.workspace {
+      mux.reveal(pane: target.pane, tab: target.tab)
+      return
+    }
+    // One SwiftMux window and lease at a time: leave the current one.
+    if let mux {
+      self.mux = nil
+      await mux.detach()
+      mux.close()
+    }
+    let controller = try await MuxWorkspaceController.open(
+      .id(target.workspace),
+      configuration: config,
+      connection: MuxWorkspaceController.connect(),
+      takeover: lease
+    )
+    controller.onClose = { [weak controller] in
+      if self.mux === controller { self.mux = nil }
+    }
+    mux = controller
+    controller.reveal(pane: target.pane, tab: target.tab)
+  }
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.mainMenu = makeMenu()

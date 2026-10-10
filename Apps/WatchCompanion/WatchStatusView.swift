@@ -21,6 +21,7 @@ struct WatchStatusView: View {
               .foregroundStyle(.orange)
           }
           actions(p)
+          WatchAttentionSection(summaries: model.attention, now: context.date)
           if let preview = p.preview {
             previewSection(preview, now: context.date)
           }

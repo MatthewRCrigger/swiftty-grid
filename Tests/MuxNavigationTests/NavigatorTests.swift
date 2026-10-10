@@ -254,20 +254,28 @@ struct NavigatorTests {
     let holder = LeaseHolder(transport: .remote, frontend: .native, since: Date(timeIntervalSince1970: 5))
     await h.service.set(h.location(.available, leaseHeldElsewhere: true), for: h.destination.occurrenceID)
     await h.service.setLease(LeaseState(generation: 7, holder: holder))
+    // A plain attach is refused while the other device holds the lease.
+    await h.service.setOpenResults([.leaseHeld, .leaseHeld])
     await h.navigator.open(h.url)
     // Metadata stays viewable while another device controls the pane.
     #expect(h.navigator.state == .ready(h.preview(lease: true)))
     await h.navigator.openInPane()
     let offer = TakeoverOffer(preview: h.preview(lease: true), expectedLease: 7, holder: holder)
     #expect(h.navigator.state == .confirmTakeover(offer))
-    #expect(await h.opens().isEmpty)
+    #expect(await h.opens() == [.open(h.target, takeover: nil)])
     h.navigator.declineTakeover()
     #expect(h.navigator.state == .ready(h.preview(lease: true)))
-    #expect(await h.opens().isEmpty)
     await h.navigator.openInPane()
+    #expect(h.navigator.state == .confirmTakeover(offer))
     await h.navigator.confirmTakeover()
     #expect(h.navigator.state == .opened(h.target))
-    #expect(await h.opens() == [.open(h.target, takeover: 7)])
+    // Only the confirmed call carried a takeover generation.
+    #expect(
+      await h.opens() == [
+        .open(h.target, takeover: nil), .open(h.target, takeover: nil),
+        .open(h.target, takeover: 7),
+      ]
+    )
   }
 
   @Test func leaseTakenWhileOpeningOffersTakeover() async {

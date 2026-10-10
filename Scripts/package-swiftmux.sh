@@ -29,6 +29,21 @@ for exe in swiftty swiftmux-agent swmux-launcher swmux; do
 done
 cp -R "$bin/swiftty_SwifttyCore.bundle" "$app/Contents/Resources/"
 
+# Attention deep links (swiftty-unified-spec.md §9): the `swiftty` scheme
+# is always registered. SWIFTTY_LINK_DOMAINS (space-separated hostnames)
+# lists the domains whose https://<domain>/a/<locator> Universal Links
+# the app accepts; empty by default. Serving those links also needs a
+# signed com.apple.developer.associated-domains entitlement and an
+# apple-app-site-association file on the domain, neither of which this
+# script provides. links.example.invalid is a documentation placeholder.
+link_domains=""
+for domain in ${SWIFTTY_LINK_DOMAINS:-}; do
+  case "$domain" in
+    *[!A-Za-z0-9.-]*) echo "invalid link domain: $domain" >&2; exit 64 ;;
+  esac
+  link_domains="$link_domains<string>$domain</string>"
+done
+
 cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -42,6 +57,15 @@ cat > "$app/Contents/Info.plist" <<EOF
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>27.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>$bundle_id.attention</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>CFBundleURLSchemes</key><array><string>swiftty</string></array>
+    </dict>
+  </array>
+  <key>SwifttyAssociatedDomains</key><array>$link_domains</array>
 </dict>
 </plist>
 EOF

@@ -133,6 +133,55 @@ in section 11 of [spec.multiplexer.md](spec.multiplexer.md).
 The service enforces the limits in `MuxLimits`: 32 panes, a 256 KiB input
 buffer per pane, 16 MiB frames, 1 MiB pastes and a bounded history per pane.
 
+### Deep links
+
+Attention items (OSC 7501) can be opened from a link, as described in section 9
+of `swiftty-unified-spec.md`:
+
+```text
+swiftty://attention/open?ref=<locator>
+https://<configured domain>/a/<locator>
+```
+
+- `MuxNavigation` holds the typed `AttentionDestination`: the recipient's host
+  profile ID, service epoch, workspace, tab, pane, terminal epoch, record path
+  and incarnation, occurrence and intent (`review`, `result` or `reveal`). It
+  also has the locator codec, link validation and `AttentionNavigator`, a
+  state machine for the navigation steps. It needs only Foundation and builds
+  for every platform, watchOS included. `MuxNavigationSMX` adapts the navigator
+  to a local SwiftMux connection.
+- The locator is a versioned binary record of IDs, encoded as base64url. It
+  holds no endpoints, hostnames, usernames, credentials, message text or
+  commands. **It is not an authentication credential.** The app resolves a
+  link only against hosts the recipient has configured. If the host is
+  unknown, the app asks the user to pick one. It never connects to anything
+  named in the link.
+- The app checks a link before it contacts anything. The scheme or configured
+  domain must match, the link must be at most 2 KiB, the path must match, and
+  the URL must have exactly one `ref` and no other parameters. The locator must
+  decode strictly. The app then checks the service epoch and the exact
+  occurrence before it shows any metadata. If the item is stale, superseded,
+  missing or from before a service restart, the app says so and never shows a
+  different request in its place. "Open in pane" attaches without taking over.
+  If another client holds the workspace, the app asks for an explicit takeover
+  tied to the lease generation the user saw. The app marks only the linked
+  occurrence seen.
+- On macOS, Swiftty handles the `swiftty` scheme (`CFBundleURLTypes`, written
+  by `Scripts/package-swiftmux.sh`). It opens or activates the SwiftMux window
+  and focuses the pane. Prompts appear as alerts. Universal Links stay off
+  until `SWIFTTY_LINK_DOMAINS` is set when packaging.
+- The roaming clients (iOS/iPadOS, Catalyst, visionOS, tvOS and the Mac
+  client) register the scheme through `Apps/Config/AttentionLinks.plist`. They
+  route `onOpenURL`, web-browsing activities and attention Handoff into a
+  destination sheet. RST/1 does not carry attention data yet, so roaming hosts
+  report "attention not yet available over roaming". Universal Links need
+  `SWIFTTY_LINK_DOMAIN` and `Apps/Config/AssociatedDomains.entitlements.template`,
+  which is not enabled. `links.example.invalid` is a placeholder only.
+- The watch shows redacted `AttentionSummary` values: category, app name,
+  counts and time. Message text is hidden by default. The watch can offer a
+  Handoff (`AttentionHandoffRequest`) to a paired device, but it never takes a
+  lease or sends input.
+
 ## Roaming SSH (RST/1)
 
 [spec.roaming.md](spec.roaming.md) (with its Swiftty integration in Appendix A) defines SSH clients for Apple

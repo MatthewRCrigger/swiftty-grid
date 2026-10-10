@@ -171,11 +171,10 @@ public final class AttentionNavigator {
     case let .ready(p), let .paneExited(p): preview = p
     default: return
     }
-    if preview.leaseHeldElsewhere {
-      await offerTakeover(preview, changed: false, generation: generation)
-    } else {
-      await activate(preview, takeover: nil, generation: generation)
-    }
+    // Always a plain attach first: the opener may already hold the lease
+    // (its own window), and otherwise the service refuses with
+    // `leaseHeld`, which becomes an explicit offer.
+    await activate(preview, takeover: nil, generation: generation)
   }
 
   /// The user confirmed the takeover offer.

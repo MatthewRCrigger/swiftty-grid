@@ -1,5 +1,6 @@
 import CompanionModel
 import Foundation
+import MuxNavigation
 import Observation
 
 #if canImport(WatchConnectivity)
@@ -12,6 +13,10 @@ import Observation
 @Observable
 final class WatchCompanionModel {
   private(set) var store = WatchCompanionStore()
+  /// Redacted attention summaries. Empty until a paired device can
+  /// deliver them: the roaming transport has no attention data yet, and
+  /// no new watch messages are defined for it.
+  private(set) var attention: [AttentionSummary] = []
   #if canImport(WatchConnectivity)
     @ObservationIgnored private var delegate: WatchSessionDelegate?
   #endif
