@@ -2,6 +2,13 @@ import Dispatch
 import Foundation
 import SwiftMuxProtocol
 
+extension Duration {
+  fileprivate var timeInterval: TimeInterval {
+    let (seconds, attoseconds) = components
+    return TimeInterval(seconds) + TimeInterval(attoseconds) / 1e18
+  }
+}
+
 /// The single concrete connection to the SwiftMux service.
 ///
 /// Exactly one bounded event consumer (`nextEvent`). Frames are delivered
@@ -30,6 +37,18 @@ public actor MuxConnection {
   private var closedError: MuxError?
   private var isClosed = false
   private var closedDeliberately = false
+  private var channelCancelled = false
+  /// Panes with a paste envelope open, each with the pastes (and the
+  /// input enqueued after them) waiting for it to close: one paste per
+  /// pane at a time, in call order.
+  private var pasting: [PaneID: [PaneJob]] = [:]
+  /// The service's refusal of a paste's begin record, by paste id.
+  private var pasteRefusals: [UInt64: MuxError] = [:]
+
+  private enum PaneJob {
+    case input(MuxInput, rejected: (@Sendable (MuxError) -> Void)?)
+    case paste(String, completion: (Result<PasteState, MuxError>) -> Void)
+  }
 
   /// Non-frame events held for the consumer before the connection fails.
   public static let maxBufferedEvents = 4096
@@ -100,7 +119,6 @@ public actor MuxConnection {
               "the service did not answer; it may be signed by a different team or not running"
             )
           )
-          connection.channel.cancel()
         }
     }
     let welcome = try await withCheckedThrowingContinuation { continuation in
@@ -127,7 +145,6 @@ public actor MuxConnection {
         )
       } catch {
         fail(error)
-        channel.cancel()
         return
       }
       dispatch(message)
@@ -181,7 +198,6 @@ public actor MuxConnection {
     }
     guard events.count - eventHead < Self.maxBufferedEvents else {
       fail(MuxError(.resourceLimit, "event consumer is not keeping up"))
-      channel.cancel()
       return
     }
     events.append(event)
@@ -199,7 +215,10 @@ public actor MuxConnection {
     }
   }
 
+  /// Ends the connection with `error` and cancels the channel, so the
+  /// service releases any lease it holds.
   private func fail(_ error: MuxError) {
+    cancelChannel()
     guard !isClosed else { return }
     isClosed = true
     closedError = error
@@ -220,6 +239,21 @@ public actor MuxConnection {
     callbacks = [:]
     for c in inputs.values { c(error) }
     inputs = [:]
+    let queued = pasting.values.flatMap { $0 }
+    pasting = [:]
+    pasteRefusals = [:]
+    for job in queued {
+      switch job {
+      case let .input(_, rejected): rejected?(error)
+      case let .paste(_, completion): completion(.failure(error))
+      }
+    }
+  }
+
+  private func cancelChannel() {
+    guard !channelCancelled else { return }
+    channelCancelled = true
+    channel.cancel()
   }
 
   // MARK: Public API
@@ -241,19 +275,71 @@ public actor MuxConnection {
       throw closedError ?? MuxError(.connectionLost)
     }
     precondition(waiter == nil, "MuxConnection supports one event consumer")
-    return try await withCheckedThrowingContinuation { waiter = $0 }
+    let queue = queue
+    return try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { waiter = $0 }
+    } onCancel: {
+      // Stops waiting; a later event stays buffered for the next call.
+      queue.async { [weak self] in
+        self?
+          .assumeIsolated { connection in
+            guard let waiter = connection.waiter else { return }
+            connection.waiter = nil
+            waiter.resume(throwing: CancellationError())
+          }
+      }
+    }
   }
 
   /// Executes a command. Acknowledgement means the operation committed.
+  /// Cancelling the calling task, or `timeout` passing, stops waiting
+  /// (a late reply is dropped); the command may still commit.
   @discardableResult
-  public func execute(_ command: MuxCommand) async throws -> MuxReply {
+  public func execute(
+    _ command: MuxCommand,
+    timeout: Duration? = nil
+  ) async throws -> MuxReply {
     if let closedError { throw closedError }
     let id = nextRequest
     nextRequest += 1
-    return try await withCheckedThrowingContinuation { continuation in
-      requests[id] = continuation
-      transmit(.request(id: id, command: command))
+    if let timeout {
+      queue.asyncAfter(deadline: .now() + timeout.timeInterval) {
+        [weak self] in
+        self?
+          .assumeIsolated {
+            $0.abandon(id, MuxError(.connectionLost, "no reply in time"))
+          }
+      }
     }
+    let queue = queue
+    return try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        requests[id] = continuation
+        if let error = request(id, command) {
+          abandon(id, error)
+        }
+      }
+    } onCancel: {
+      // Runs after the continuation is registered: the actor's executor
+      // is this queue.
+      queue.async { [weak self] in
+        self?.assumeIsolated { $0.abandon(id, CancellationError()) }
+      }
+    }
+  }
+
+  /// Resumes a pending request with `error`, at most once.
+  private func abandon(_ id: UInt64, _ error: any Error) {
+    requests.removeValue(forKey: id)?.resume(throwing: error)
+  }
+
+  /// Sends one request. A request too large to encode is refused alone;
+  /// the connection stays up.
+  private func request(_ id: UInt64, _ command: MuxCommand) -> MuxError? {
+    do {
+      channel.send(try encode(.request(id: id, command: command)))
+      return nil
+    } catch { return error }
   }
 
   /// Sends semantic input; returns once admitted to the pane's writer.
@@ -264,19 +350,49 @@ public actor MuxConnection {
   /// Sends input without waiting for admission. Errors are dropped; the
   /// caller keeps order because records are sent in call order.
   public func post(_ input: MuxInput, to pane: PaneID) {
-    guard let attachment, closedError == nil else { return }
-    let sequence = nextInput
-    nextInput += 1
-    transmit(
-      .input(
-        InputRecord(
-          sequence: sequence,
-          attachment: attachment,
-          pane: pane,
-          payload: .input(input)
+    guard attachment != nil, closedError == nil else { return }
+    if let queued = pasting[pane], !queued.isEmpty {
+      pasting[pane]?.append(.input(input, rejected: nil))
+      return
+    }
+    transmitInput(input, to: pane, rejected: nil)
+  }
+
+  /// Sends input records; text longer than a paste chunk is split on
+  /// scalar boundaries so each record stays within the record limit.
+  private func transmitInput(
+    _ input: MuxInput,
+    to pane: PaneID,
+    rejected: (@Sendable (MuxError) -> Void)?
+  ) {
+    guard let attachment, closedError == nil else {
+      rejected?(closedError ?? MuxError(.notAttached))
+      return
+    }
+    let parts: [MuxInput]
+    let maxBytes = (welcome?.limits ?? .standard).maxPasteChunkBytes
+    if case let .text(text) = input, text.utf8.count > maxBytes {
+      parts = Self.chunks(text, maxBytes: maxBytes).map { .text($0) }
+    } else {
+      parts = [input]
+    }
+    for part in parts {
+      let sequence = nextInput
+      nextInput += 1
+      if let rejected {
+        inputs[sequence] = { if let e = $0 { rejected(e) } }
+      }
+      transmit(
+        .input(
+          InputRecord(
+            sequence: sequence,
+            attachment: attachment,
+            pane: pane,
+            payload: .input(part)
+          )
         )
       )
-    )
+    }
   }
 
   /// Sends one record with a caller-chosen sequence and waits for its
@@ -329,27 +445,14 @@ public actor MuxConnection {
   ) {
     queue.async {
       self.assumeIsolated { connection in
-        guard let attachment = connection.attachment,
-          connection.closedError == nil
-        else {
-          rejected?(connection.closedError ?? MuxError(.notAttached))
+        if connection.closedError == nil,
+          let queued = connection.pasting[pane], !queued.isEmpty
+        {
+          // After a paste still waiting for its turn.
+          connection.pasting[pane]?.append(.input(input, rejected: rejected))
           return
         }
-        let sequence = connection.nextInput
-        connection.nextInput += 1
-        if let rejected {
-          connection.inputs[sequence] = { if let e = $0 { rejected(e) } }
-        }
-        connection.transmit(
-          .input(
-            InputRecord(
-              sequence: sequence,
-              attachment: attachment,
-              pane: pane,
-              payload: .input(input)
-            )
-          )
-        )
+        connection.transmitInput(input, to: pane, rejected: rejected)
       }
     }
   }
@@ -369,13 +472,17 @@ public actor MuxConnection {
         let id = connection.nextRequest
         connection.nextRequest += 1
         connection.callbacks[id] = { completion?($0) }
-        connection.transmit(.request(id: id, command: command))
+        if let error = connection.request(id, command) {
+          connection.callbacks.removeValue(forKey: id)?(.failure(error))
+        }
       }
     }
   }
 
   /// Starts a paste in call order: its begin record precedes any later
   /// enqueued input, which the service defers until the envelope closes.
+  /// A paste to a pane with one still open waits for it to close (and
+  /// input enqueued after the waiting paste waits too).
   public nonisolated func enqueuePaste(
     _ text: String,
     to pane: PaneID,
@@ -383,48 +490,83 @@ public actor MuxConnection {
   ) {
     queue.async {
       self.assumeIsolated { connection in
-        let limits = connection.welcome?.limits ?? .standard
-        guard let attachment = connection.attachment,
-          connection.closedError == nil
-        else {
-          completion?(
-            .failure(connection.closedError ?? MuxError(.notAttached))
-          )
-          return
-        }
-        guard text.utf8.count <= limits.maxPasteBytes else {
-          completion?(
-            .failure(
-              MuxError(
-                .resourceLimit,
-                "paste exceeds \(limits.maxPasteBytes) bytes"
-              )
-            )
-          )
-          return
-        }
-        let id = connection.nextPaste
-        connection.nextPaste += 1
-        let sequence = connection.nextInput
-        connection.nextInput += 1
-        connection.transmit(
-          .input(
-            InputRecord(
-              sequence: sequence,
-              attachment: attachment,
-              pane: pane,
-              payload: .pasteBegin(id: id)
-            )
-          )
+        connection.schedulePaste(text, to: pane) { completion?($0) }
+      }
+    }
+  }
+
+  private func schedulePaste(
+    _ text: String,
+    to pane: PaneID,
+    completion: @escaping (Result<PasteState, MuxError>) -> Void
+  ) {
+    let limits = welcome?.limits ?? .standard
+    guard attachment != nil, closedError == nil else {
+      completion(.failure(closedError ?? MuxError(.notAttached)))
+      return
+    }
+    guard text.utf8.count <= limits.maxPasteBytes else {
+      completion(
+        .failure(
+          MuxError(.resourceLimit, "paste exceeds \(limits.maxPasteBytes) bytes")
         )
-        Task {
-          let result = await connection.pasteBody(
-            id: id,
-            text: text,
-            pane: pane
-          )
-          completion?(result)
-        }
+      )
+      return
+    }
+    if pasting[pane] != nil {
+      pasting[pane]?.append(.paste(text, completion: completion))
+      return
+    }
+    beginPaste(text, to: pane, completion: completion)
+  }
+
+  /// Sends the begin record and the body; the pane's next queued paste
+  /// starts once this one's envelope is closed.
+  private func beginPaste(
+    _ text: String,
+    to pane: PaneID,
+    completion: @escaping (Result<PasteState, MuxError>) -> Void
+  ) {
+    guard let attachment, closedError == nil else {
+      completion(.failure(closedError ?? MuxError(.notAttached)))
+      return
+    }
+    pasting[pane] = []
+    let id = nextPaste
+    nextPaste += 1
+    let sequence = nextInput
+    nextInput += 1
+    inputs[sequence] = { [weak self] error in
+      if let error { self?.assumeIsolated { $0.pasteRefusals[id] = error } }
+    }
+    transmit(
+      .input(
+        InputRecord(
+          sequence: sequence,
+          attachment: attachment,
+          pane: pane,
+          payload: .pasteBegin(id: id)
+        )
+      )
+    )
+    Task {
+      let result = await self.pasteBody(id: id, text: text, pane: pane)
+      self.pasteFinished(pane)
+      completion(result)
+    }
+  }
+
+  /// Sends what waited behind the pane's paste, up to its next paste.
+  private func pasteFinished(_ pane: PaneID) {
+    var queued = pasting.removeValue(forKey: pane) ?? []
+    while !queued.isEmpty {
+      switch queued.removeFirst() {
+      case let .input(input, rejected):
+        transmitInput(input, to: pane, rejected: rejected)
+      case let .paste(text, completion):
+        beginPaste(text, to: pane, completion: completion)
+        if pasting[pane] != nil { pasting[pane] = queued }
+        return
       }
     }
   }
@@ -450,6 +592,10 @@ public actor MuxConnection {
           attempts += 1
           try? await Task.sleep(for: pasteRetry.delay)
         } catch {
+          if let refused = pasteRefusals.removeValue(forKey: id) {
+            // The service never opened this envelope.
+            return .failure(refused)
+          }
           // Close the envelope on the service: an open paste would keep
           // deferring this pane's later input and refuse a new paste.
           try? await submit(pane, .pasteCancel(id: id))
@@ -459,7 +605,10 @@ public actor MuxConnection {
       sent += chunk.utf8.count
     }
     do { try await submit(pane, .pasteEnd(id: id)) } catch {
-      return .failure(error as? MuxError ?? MuxError(.connectionLost))
+      return .failure(
+        pasteRefusals.removeValue(forKey: id) ?? error as? MuxError
+          ?? MuxError(.connectionLost)
+      )
     }
     return .success(.completed)
   }
@@ -485,10 +634,11 @@ public actor MuxConnection {
         "paste exceeds \(limits.maxPasteBytes) bytes"
       )
     }
-    let id = nextPaste
-    nextPaste += 1
-    try await submit(pane, .pasteBegin(id: id))
-    return try await pasteBody(id: id, text: text, pane: pane).get()
+    if let closedError { throw closedError }
+    guard attachment != nil else { throw MuxError(.notAttached) }
+    return try await withCheckedThrowingContinuation { continuation in
+      schedulePaste(text, to: pane) { continuation.resume(with: $0) }
+    }
   }
 
   /// Splits on scalar boundaries so each chunk is valid UTF-8.
@@ -510,23 +660,30 @@ public actor MuxConnection {
     return out
   }
 
-  /// Releases the attachment, bounded in time; panes keep running.
+  /// Releases the attachment, bounded in time; panes keep running. A
+  /// service that does not answer in time gets the connection closed,
+  /// which releases the lease too.
   public func detach() async {
     guard attachment != nil, closedError == nil else { return }
-    let task = Task { try? await self.execute(.detach) }
-    let timeout = Task {
-      try? await Task.sleep(for: .seconds(2))
-      task.cancel()
+    do { try await execute(.detach, timeout: detachTimeout) } catch {
+      close()
     }
-    _ = await task.value
-    timeout.cancel()
     attachment = nil
   }
 
+  /// How long `detach` waits for the service.
+  private var detachTimeout: Duration = .seconds(2)
+
+  /// Shortens the detach bound (tests).
+  package func setDetachTimeout(_ timeout: Duration) {
+    detachTimeout = timeout
+  }
+
   /// Closes the connection. An attached lease is released by the service.
+  /// Also cancels the channel of a connection that already failed.
   public func close() {
+    cancelChannel()
     guard !isClosed else { return }
-    channel.cancel()
     isClosed = true
     closedDeliberately = true
     let error = MuxError(.connectionLost, "closed")
@@ -537,14 +694,17 @@ public actor MuxConnection {
     }
   }
 
+  /// Sends one record. One that cannot be encoded would leave a gap in
+  /// the input sequence, so it fails the connection (cancelling the
+  /// channel, which releases its lease).
   private func transmit(_ message: ClientMessage) {
-    do {
-      channel.send(
-        try SMXCodec.encode(
-          message,
-          limit: SMXCodec.clientRecordLimit(welcome?.limits ?? .standard)
-        )
-      )
-    } catch { fail(error) }
+    do { channel.send(try encode(message)) } catch { fail(error) }
+  }
+
+  private func encode(_ message: ClientMessage) throws(MuxError) -> Data {
+    try SMXCodec.encode(
+      message,
+      limit: SMXCodec.clientRecordLimit(welcome?.limits ?? .standard)
+    )
   }
 }
