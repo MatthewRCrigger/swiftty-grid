@@ -16,7 +16,8 @@ a small C helper is acceptable when justified.
 Scope includes session lifecycle, parsing, terminal state/history, input encoding,
 resize, Unicode/graphemes, snapshots, fonts, rendering and frontend features.
 The embedder owns external transports, connections, authentication and window/tab/
-split management. Linux, Windows, GTK, OpenGL, WebAssembly, plugin APIs and a
+split management; the Swiftty app's own SwiftMux workspace window is specified
+below. Linux, Windows, GTK, OpenGL, WebAssembly, plugin APIs and a
 stable core C ABI are excluded; Shell supplies its own libghostty embedder API.
 Sixel is excluded. Kitty graphics is future work; until separately specified,
 ignore APC strings safely. Future graphics support should use bounded image
@@ -228,6 +229,168 @@ prefix collisions, ordering, capacity/eviction and revisions. Exercise prompt/
 reset/exit/reconstruction in stream order, surface-independent publication and
 BEL/ST reply provenance. Existing OSC 9;4, OSC 133, reset and response tests
 must continue passing. The embedder must consume status without parsing OSC itself.
+
+## SwiftMux native workspace
+
+The Swiftty app is also the native frontend for SwiftMux, the persistent
+per-user session service. The service, its wire protocol and its acceptance
+record are in [spec.multiplexer.md](spec.multiplexer.md). Remote attachment,
+leases, the attention inbox and deep links are in
+[spec.inbox.md](spec.inbox.md). This section covers the native workspace
+window.
+
+**Not a character compositor.** AppKit draws the window chrome: tab strip,
+dividers, pane headers, focus and geometry. Swiftty's Metal renderer draws
+each pane's cells. The service owns sessions, pane identities, PTYs, parsers,
+history and the canonical layout. The `swmux` terminal client remains a
+secondary frontend.
+
+### Layout model
+
+A workspace holds tabs, and each tab holds a typed split tree. Layouts are
+never stored as absolute pixel coordinates.
+
+```swift
+indirect enum LayoutNode { case pane(PaneID); case split(axis:ratio:first:second:) }
+enum SplitAxis { case leftRight, topBottom }
+```
+
+- **Splits:** `leftRight` has left/right children and `topBottom` has
+  top/bottom children. `ratio` is the share given to `first`, in (0, 1).
+  It is derived from the available geometry and changed by dragging a
+  divider.
+- **Panes:** each pane has a stable ID, one PTY and one authoritative
+  emulator.
+- **Titles:** a tab or pane title is either a user label or a bounded,
+  sanitized title reported by the program. Tab icons are local UI metadata,
+  never remote content.
+- **Tabs:** switching tabs hides views without suspending server-side
+  processes or parsers.
+- **Close actions:** hiding, detaching and terminating are distinct.
+  Terminating a running pane or tab asks for confirmation first.
+
+### Ownership
+
+| Service owns | Native app owns |
+|---|---|
+| Workspace, tab and pane IDs; split tree; pane lifecycle | Window, tab strip, focus, pane headers, dividers, hover, selection |
+| PTY, child process, exit status, terminal state, bounded history | One `MTKView` and Metal renderer per visible pane; fonts, atlases, GPU resources |
+| Canonical grid sizes and accepted geometry generations | Pixel rectangles and proposed grids from font metrics, scale and padding |
+| Input sequencing, mode-aware encoding, terminal query replies | AppKit key events, IME composition, paste, native shortcuts |
+| Bounded owned frame export and pane events | Frame validation and import, display coalescing, presentation baseline |
+
+One XPC connection holds the interactive lease for the attached workspace.
+Each `MuxPaneView` subscribes to its pane through that connection. Destroying
+a view never ends the lease or a PTY. On reconnect the app requests the
+workspace tree and a complete frame for every visible pane.
+
+### Pane presenter and frame bridge
+
+`MuxPaneView` keeps a client-side frame store. It never runs another shell,
+PTY or parser. The service exports **owned semantic frames** (`PaneFrame`):
+- graphemes, cell widths and continuations;
+- attributes and palette;
+- wrap flags, cursor, active screen and dimensions;
+- revision and geometry identity.
+
+The bridge (`SwiftMuxBridge`) validates counts and sizes before allocating,
+then imports the frame into snapshot storage for the renderer. It never sends
+raw `RenderSnapshot` pointers, pooled storage, cell ABI dumps, GPU buffers or
+Swift object serialization. It never turns frames back into ANSI for a second
+parser.
+
+The pipeline:
+1. **Parse.** The service parses every PTY byte in order, including for
+   hidden panes.
+2. **Publish.** It publishes a full owned frame tagged with pane, attachment,
+   revision, layout revision and geometry generation.
+3. **Check.** The app accepts the frame only for the current attachment and
+   accepted geometry.
+4. **Bound.** Each presenter keeps the displayed frame, one frame in
+   preparation and the newest pending replacement, never a backlog.
+5. **Draw.** On the main actor it imports the frame, schedules the `MTKView`
+   and draws.
+6. **Advance the baseline.** Only a frame actually accepted for presentation
+   replaces the interaction baseline used for hit testing, IME placement,
+   selection and accessibility. A skipped drawable does not advance it. GPU
+   resources live until their command buffers complete.
+
+### Interaction
+
+- **Tab strip:** editable labels, local icons, activity dots, new tab, and
+  separate close and detach actions. It is a view of the service's workspace
+  state.
+- **Pane headers:** the program or title label, an active-pane indicator,
+  and split, zoom and close actions. Title text is sanitized before display.
+- **Dividers:** adjustable ratios with minimum pane sizes, keyboard- and
+  VoiceOver-adjustable. A drag updates the proposed layout locally and sends
+  coalesced geometry, never one request per pixel.
+- **Focus and keys:**
+  - Clicking a pane focuses it by ID, and semantic input goes to the focused
+    pane.
+  - Window and tab focus changes never end processes.
+  - App shortcuts (new tab, split, focus, zoom, resize, end pane or tab,
+    find) are never forwarded as terminal input.
+  - Ctrl-C, arrows, paste and IME commits go to the pane.
+- **Selection and search:** selection freezes the displayed viewport for
+  copy. Find runs the service's bounded history search. Selection across
+  fetched pages is deferred.
+- **Accessibility:** pane names, status, dividers, tab titles and displayed
+  text are exposed through AppKit accessibility. Mutable server state is
+  never read synchronously on the main actor.
+- **Attention inbox:** the toolbar badge and popover are specified in
+  spec.inbox.md §3.5.
+
+### Resize and full-screen programs
+
+- **Geometry batch:** for each visible pane the app computes columns and rows
+  from the real font metrics, backing scale and content rectangle, excluding
+  the header, padding and divider. It submits one batch tagged with the layout
+  revision and a client geometry generation. The service accepts a valid
+  batch atomically, resizes emulators and PTYs, then publishes frames carrying
+  the matching generation. Stale frames and stale batches are ignored.
+- **Full-screen programs:** alternate screen, raw keys, cursor visibility,
+  terminal queries, bracketed paste and resize notifications behave as in a
+  plain Swiftty window.
+- **Hidden and small panes:** a hidden pane keeps parsing and keeps its last
+  accepted size until it is visible again. A pane too small for its program
+  keeps a valid PTY size and clips; it is never zero-sized.
+
+### Lifetime
+
+A window, tab, pane view or app process never owns the last reference to a
+shell.
+- Closing a view ends its subscription.
+- Quitting the app detaches its lease.
+- Only an explicit end of a pane, tab or workspace kills shells.
+- Reopening the app lists workspaces and requests fresh full frames.
+
+A service crash, logout or reboot is not restored transparently, and no
+submitted command is ever replayed to recreate a process. The endpoint checks
+that the peer is the same user, and every lease, input and resize is fenced
+by attachment generation. Queues for PTY writes, parsing and frame delivery
+are bounded.
+
+### Required coverage
+
+- Three independent PTYs in a left-stacked, right-tall layout, with distinct
+  input routing and process IDs.
+- Switching tabs and quitting and reopening the app while a full-screen
+  program runs; its screen converges after reattach.
+- Rapid resize, zoom and moving between displays; stale frames never restore
+  old dimensions.
+- One pane flooding output while typing in another; the UI stays responsive
+  and queue memory stays bounded.
+- Pasting text that contains shortcut characters never triggers a split, tab
+  switch or prefix command.
+- IME composition, grapheme widths, selection of changing output and cursor
+  placement.
+- Renderer failure, missing drawables and a client crash never end a PTY or
+  advance the presentation baseline early.
+- An explicit destructive action ends only the intended pane; disposing a
+  view never does.
+
+Status and measurements for these are recorded in spec.multiplexer.md §11.
 
 ## Performance and acceptance
 
