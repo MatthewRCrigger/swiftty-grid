@@ -428,9 +428,14 @@ public final class SessionRegistry: @unchecked Sendable {
 
   /// The service's workspaces, as the control client sees them.
   package func workspaces() async -> [WorkspaceSummary] {
+    await listWorkspaces() ?? []
+  }
+
+  /// Nil when the service did not answer.
+  private func listWorkspaces() async -> [WorkspaceSummary]? {
     guard case let .success(.workspaces(list)) = await control.request(
       .listWorkspaces
-    ) else { return [] }
+    ) else { return nil }
     return list
   }
 
@@ -521,8 +526,12 @@ public final class SessionRegistry: @unchecked Sendable {
   public func sweep(now: ContinuousClock.Instant = .now) async -> [SessionID] {
     // A detached session sees no layout events, so a shell that exits
     // while no remote client is attached is learned from the service.
+    // Entries created after the list was requested may not be in it, and
+    // a failed list says nothing: neither is ever taken as "ended".
+    let listedAt = ContinuousClock.now
+    let listed = await listWorkspaces()
     let workspaces = Dictionary(
-      await workspaces().map { ($0.id, $0) },
+      (listed ?? []).map { ($0.id, $0) },
       uniquingKeysWith: { first, _ in first }
     )
     let (removed, end) = state.withLock { s -> ([SessionID], [SessionID]) in
@@ -533,7 +542,7 @@ public final class SessionRegistry: @unchecked Sendable {
         // An attached entry is never dropped: its session holds the lease.
         if status.isAttached, status.state != .terminated { continue }
         let summary = workspaces[id.workspace]
-        let gone = summary == nil
+        let gone = listed != nil && summary == nil && entry.createdAt < listedAt
         let allExited =
           status.allPanesExited
           || (summary.map { $0.paneCount > 0 && $0.livePaneCount == 0 } ?? false)

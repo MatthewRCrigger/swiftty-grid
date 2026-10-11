@@ -705,21 +705,29 @@ public final class RoamingSession: @unchecked Sendable {
         }
       }
     }
-    if closing {
-      closeMux {}
-      return
+    var pumpAfterAnswer = false
+    // The answer is recorded first, even when the lease is about to be
+    // released: an operation the pane took must complete in the ledger,
+    // or the next attachment would send it again.
+    defer {
+      if closing {
+        closeMux {}
+      } else if pumpAfterAnswer {
+        // Next operation on a later turn: a synchronous answer never
+        // recurses through `pumpInput`.
+        queue.async { [weak self] in self?.pumpInput() }
+      }
     }
     guard let error else {
       if let done = ledger.completeHead() { acknowledge(done) }
-      // Next operation on a later turn: a synchronous answer never
-      // recurses through `pumpInput`.
-      queue.async { [weak self] in self?.pumpInput() }
+      pumpAfterAnswer = true
       return
     }
     switch error.code {
     case .resourceLimit, .staleGeometry, .staleRevision:
       // Nothing was written; retry after the pane drains or the layout
       // settles, never in a tight loop.
+      guard !closing else { break }
       retryScheduled = true
       queue.asyncAfter(deadline: .now() + .milliseconds(20)) { [weak self] in
         self?.retryScheduled = false
@@ -739,7 +747,7 @@ public final class RoamingSession: @unchecked Sendable {
       // A refusal of this one operation (e.g. malformed for the pane):
       // retire it and continue; the writer stays usable.
       for done in ledger.discard(through: sequence) { acknowledge(done) }
-      queue.async { [weak self] in self?.pumpInput() }
+      pumpAfterAnswer = true
     }
   }
 

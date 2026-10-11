@@ -355,5 +355,43 @@ struct RemoteAttentionTests {
       }
     }
   }
+
+  @Test
+  func `reattaching mid-input never delivers an operation twice`() async throws {
+    let directory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let output = directory.appendingPathComponent("lines")
+    try await withRegistry(
+      launch: { shellLaunch("stty -echo; exec cat > \"$HOME/lines\"", in: directory) }
+    ) { registry in
+      let grant = try await registry.create(grid: GridSize(columns: 80, rows: 24))
+      let total: UInt64 = 120
+      var client = TestClient(registry)
+      var epoch = try await client.attached(grant).attachmentEpoch
+      var next: UInt64 = 1
+      while next <= total {
+        // Send a burst without waiting, then drop the connection while
+        // answers are in flight and resend from the host's watermark.
+        for n in next ... min(total, next + 7) {
+          try? await client.send(
+            .input(.init(attachmentEpoch: epoch, sequence: n, operation: .committedText("L\(n)\n")))
+          )
+        }
+        client.connection.sever()
+        client = TestClient(registry)
+        let attached = try await client.attached(grant)
+        epoch = attached.attachmentEpoch
+        next = attached.lastFullyAppliedInputSequence + 1
+      }
+      try await hostEventually("all lines", timeout: .seconds(20)) {
+        let text = (try? String(contentsOf: output, encoding: .utf8)) ?? ""
+        return text.split(separator: "\n").count >= Int(total) ? true : nil
+      }
+      try await Task.sleep(for: .milliseconds(300))
+      let lines = try String(contentsOf: output, encoding: .utf8)
+        .split(separator: "\n").map(String.init)
+      #expect(lines == (1 ... total).map { "L\($0)" })
+    }
+  }
 }
 #endif
