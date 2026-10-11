@@ -98,13 +98,10 @@ open class TerminalViewController: UIViewController {
   override open func viewDidLoad() {
     super.viewDidLoad()
     view.backgroundColor = .black
-    // Translucent backgrounds blur what is behind the window.
     if configuration.backgroundOpacity < 1 {
       view.backgroundColor = .clear
       if configuration.backgroundBlur > 0 {
-        let blur = UIVisualEffectView(
-          effect: UIBlurEffect(style: Self.backgroundMaterial)
-        )
+        let blur = Self.backgroundView()
         blur.frame = view.bounds
         blur.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(blur)
@@ -118,7 +115,8 @@ open class TerminalViewController: UIViewController {
       terminal.translatesAutoresizingMaskIntoConstraints = false
       terminal.onTitle = { [weak self] title in self?.title = title }
       terminal.onBackgroundColor = { [weak self] color in
-        self?.view.backgroundColor = color
+        guard let self, configuration.backgroundOpacity >= 1 else { return }
+        view.backgroundColor = color
       }
       view.addSubview(terminal)
       let safe = view.safeAreaLayoutGuide
@@ -134,7 +132,7 @@ open class TerminalViewController: UIViewController {
     } catch {
       let label = UILabel()
       label.text = "Metal unavailable: \(error)"
-      label.textColor = .white
+      label.textColor = .label
       label.frame = view.bounds
       view.addSubview(label)
     }
@@ -146,12 +144,13 @@ open class TerminalViewController: UIViewController {
     terminal?.becomeFirstResponder()
   }
 
-  #if os(tvOS)
-  private static let backgroundMaterial = UIBlurEffect.Style.dark
-  #else
-  private static let backgroundMaterial = UIBlurEffect.Style
-    .systemUltraThinMaterialDark
-  #endif
+  private static func backgroundView() -> UIView {
+    #if os(visionOS)
+    VisionGlassBackground()
+    #else
+    UIVisualEffectView(effect: UIGlassEffect(style: .regular))
+    #endif
+  }
 
   #if !os(tvOS)
   override open var preferredStatusBarStyle: UIStatusBarStyle { .default }

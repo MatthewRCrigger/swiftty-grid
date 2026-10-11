@@ -189,9 +189,9 @@ public struct Configuration: Sendable, Equatable {
 
   public var theme: ThemeSelection?
   public var colors = ColorSet()
-  public var backgroundOpacity = 1.0
-  /// Blur radius behind a translucent background; 0 for none.
-  public var backgroundBlur = 0
+  public var backgroundOpacity = 0.8
+  /// Glass behind a translucent background; zero disables it.
+  public var backgroundBlur = 20
   public var minimumContrast = 1.0
   /// Metal post-processing shader file (see `MetalRenderer.setPostProcessShader`).
   public var customShader: String?

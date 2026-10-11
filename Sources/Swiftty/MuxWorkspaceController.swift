@@ -21,6 +21,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private let server: ServerInstanceID
   private let limits: MuxLimits
   private var config: Configuration
+  private let workspaceContent = NSView()
   private(set) var workspace: WorkspaceSnapshot?
   /// Orders snapshots against the attach, switch and takeover replies.
   private var sequencer = LayoutSequencer()
@@ -89,7 +90,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     window.center()
     super.init(window: window)
     window.delegate = self
-    let content = NSView()
+    let content = workspaceContent
     tabStrip.translatesAutoresizingMaskIntoConstraints = false
     tabStrip.onSelect = { [weak self] tab in self?.selectTab(tab) }
     tabStrip.onClose = { [weak self] tab in self?.closeTab(tab) }
@@ -108,7 +109,11 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       layoutView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
       layoutView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
     ])
-    window.contentView = content
+    TerminalWindowBackground.apply(
+      to: window,
+      content: content,
+      configuration: configuration
+    )
     inboxToolbar.onClick = { [weak self] in self?.toggleInbox() }
     window.toolbar = inboxToolbar.toolbar
     startPipelines()
@@ -231,8 +236,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     let attach: MuxCommand =
       expectedLease.map { .takeover(target, expectedLease: $0) }
       ?? .attach(target)
-    guard
-      case let .attached(_, ws) = try await connection.execute(attach)
+    guard case let .attached(_, ws) = try await connection.execute(attach)
     else { throw MuxError(.invalidRequest, "unexpected attach reply") }
     let controller = MuxWorkspaceController(
       connection: connection,
@@ -405,9 +409,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       }
       refreshChrome()
     case let .inbox(update):
-      if inbox.apply(update) {
-        Task { await reloadInbox() }
-      }
+      if inbox.apply(update) { Task { await reloadInbox() } }
       refreshInbox()
     case .paste, .frameUnavailable, .frame, .workspaces: break
     }
@@ -749,8 +751,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
           let reply = try await connection.execute(command)
           switch reply {
           case let .attached(_, ws):
-            await MainActor.run { [weak self] in
-              self?.apply(ws, attached: true)
+            await MainActor.run { [weak self] in self?.apply(ws, attached: true)
             }
           case let .layout(ws):
             // A switch reply names the workspace now held.
@@ -1046,6 +1047,23 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// A configuration reload: new colours reach the engines.
   func apply(_ configuration: Configuration) {
     config = configuration
+    for view in views.values { view.apply(configuration) }
+    if let window {
+      let focused =
+        searchBar?.field.currentEditor() === window.firstResponder
+        ? searchBar?.field : window.firstResponder as? NSView
+      let selection = (focused as? NSControl)?.currentEditor()?.selectedRange
+      if TerminalWindowBackground.apply(
+        to: window,
+        content: workspaceContent,
+        configuration: configuration
+      ), let focused {
+        window.makeFirstResponder(focused)
+        if let selection, let control = focused as? NSControl {
+          control.currentEditor()?.selectedRange = selection
+        }
+      }
+    }
     sendTheme()
   }
 
@@ -1063,7 +1081,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   }
 
   func showSearch() {
-    guard let content = window?.contentView else { return }
+    let content = workspaceContent
     if searchBar == nil {
       let bar = SearchBar()
       bar.onChange = { [weak self] query in self?.search(query) }
@@ -1169,9 +1187,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
 
   private func refreshInbox() {
     inboxToolbar.update(inbox.counts)
-    if inboxPopover?.isShown == true {
-      inboxView?.update(inbox)
-    }
+    if inboxPopover?.isShown == true { inboxView?.update(inbox) }
   }
 
   /// Reports a failed inbox command: inline while the popover is open,
@@ -1234,7 +1250,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     popover.contentViewController = view
     inboxPopover = popover
     view.update(inbox)
-    guard let content = window?.contentView else { return }
+    let content = workspaceContent
     popover.show(
       relativeTo: NSRect(
         x: content.bounds.maxX - 40,
@@ -1381,9 +1397,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
         confirmTakeover(target.workspace, moved: lease != nil) {
           [weak self] lease in self?.reattach(target, takeover: lease)
         }
-      } catch {
-        (replacement ?? self).inboxFailed(error, alert: true)
-      }
+      } catch { (replacement ?? self).inboxFailed(error, alert: true) }
     }
   }
 

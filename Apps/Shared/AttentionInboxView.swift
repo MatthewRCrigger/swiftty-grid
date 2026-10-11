@@ -17,11 +17,13 @@ struct AttentionInboxView: View {
     List {
       if inbox.entries.isEmpty {
         Text(emptyText).foregroundStyle(.secondary)
+          .listRowBackground(Color.clear)
       }
       section("Needs you", inbox.entries.filter { $0.item.category != .result })
       section("Results", inbox.entries.filter { $0.item.category == .result })
       hostProblems
     }
+    .glassListBackground()
     .navigationTitle("Inbox")
     #if !os(tvOS)
       .refreshable { inbox.refresh() }
@@ -44,6 +46,7 @@ struct AttentionInboxView: View {
       Section(title) {
         ForEach(entries) { entry in row(entry) }
       }
+      .listRowBackground(Color.clear)
     }
   }
 
@@ -102,6 +105,7 @@ struct AttentionInboxView: View {
           Text(verbatim: "\(name): \(reason)").font(.caption)
         }
       }
+      .listRowBackground(Color.clear)
     }
   }
 

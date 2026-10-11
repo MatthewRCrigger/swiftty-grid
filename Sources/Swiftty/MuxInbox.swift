@@ -390,6 +390,7 @@ final class MuxInboxViewController: NSViewController {
   ) -> NSPopUpButton {
     let button = NSPopUpButton(frame: .zero, pullsDown: true)
     button.controlSize = .small
+    button.bezelStyle = .glass
     button.addItem(withTitle: snoozed ? "Snoozed" : "Snooze")
     for choice in MuxInboxModel.snoozeChoices(at: now) {
       button.menu?
@@ -423,7 +424,7 @@ final class MuxInboxViewController: NSViewController {
     convenience init(title: String, _ handler: @escaping () -> Void) {
       self.init(frame: .zero)
       self.title = title
-      bezelStyle = .push
+      bezelStyle = .glass
       controlSize = .small
       self.handler = handler
       target = self

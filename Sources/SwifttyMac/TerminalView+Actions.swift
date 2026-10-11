@@ -111,7 +111,9 @@ extension TerminalView {
   }
 
   @objc
-  public func jumpToPreviousPrompt(_ sender: Any?) { perform(.jumpToPrompt(-1)) }
+  public func jumpToPreviousPrompt(_ sender: Any?) {
+    perform(.jumpToPrompt(-1))
+  }
 
   @objc
   public func jumpToNextPrompt(_ sender: Any?) { perform(.jumpToPrompt(1)) }
@@ -221,7 +223,7 @@ package final class SearchFieldEditor: NSTextView {
 
 /// Find controls pinned to the terminal's top-right corner.
 @MainActor
-package final class SearchBar: NSView, NSSearchFieldDelegate {
+package final class SearchBar: NSGlassEffectView, NSSearchFieldDelegate {
   package let field = NSSearchField()
   private let navigationButtons: [NSButton]
   package var onChange: ((String) -> Void)?
@@ -239,19 +241,23 @@ package final class SearchBar: NSView, NSSearchFieldDelegate {
       NSButton(title: "▼", target: nil, action: nil),
     ]
     super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 32))
-    wantsLayer = true
-    layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-    layer?.cornerRadius = 6
+    style = .regular
+    cornerRadius = 8
+    effectIsInteractive = true
+    let content = NSView(frame: bounds)
+    content.autoresizingMask = [.width, .height]
+    contentView = content
     field.frame = NSRect(x: 6, y: 5, width: 220, height: 22)
     field.delegate = self
     field.sendsSearchStringImmediately = true
-    addSubview(field)
+    content.addSubview(field)
     for (i, button) in navigationButtons.enumerated() {
       button.target = self
       button.action = i == 0 ? #selector(previous) : #selector(next)
-      button.bezelStyle = .smallSquare
+      button.bezelStyle = .accessoryBarAction
+      button.isBordered = false
       button.frame = NSRect(x: 232 + i * 32, y: 5, width: 28, height: 22)
-      addSubview(button)
+      content.addSubview(button)
     }
   }
 
@@ -289,6 +295,7 @@ package final class SearchBar: NSView, NSSearchFieldDelegate {
         height: controlHeight
       )
     }
+    layoutSubtreeIfNeeded()
   }
 
   package func controlTextDidChange(_ notification: Notification) {

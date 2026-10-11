@@ -381,6 +381,10 @@ and ignored. macOS reads `$XDG_CONFIG_HOME/swiftty/config` (default
 `~/.config/swiftty/config`); Settings opens it and Shift-Cmd-, reloads it.
 iOS reads `Documents/config`.
 
+Terminal windows use Liquid Glass by default, with `background-opacity = 0.8`
+and `background-blur = true`. Set `background-opacity = 1` for an opaque
+terminal or `background-blur = false` for translucency without glass.
+
 ```text
 font-family = JetBrains Mono
 font-size = 14

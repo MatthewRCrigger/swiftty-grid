@@ -42,6 +42,7 @@ public struct RoamingRootView: View {
           TerminalScreen(model: session) { model.close() }
         }
     }
+    .glassWindowBackground()
     // While a child sheet (SFTP) is up it presents the prompts itself.
     .connectionPrompts(model, enabled: model.modalDepth == 0)
     .privacyShield(when: hidesContent)
@@ -96,6 +97,7 @@ struct ConnectionPrompts: ViewModifier {
       .sheet(item: enabled ? pendingPassword : .constant(nil)) { prompt in
         PasswordPromptView(prompt: prompt) { model.resolvePassword($0) }
           .macSheetFrame(width: 420, height: 260)
+          .presentationBackground(.clear)
       }
       .background {
         // A second presentation anchor: one sheet per view.
@@ -103,6 +105,7 @@ struct ConnectionPrompts: ViewModifier {
           .sheet(item: enabled ? pendingTrust : .constant(nil)) { prompt in
             TrustPromptView(prompt: prompt) { model.resolveTrust($0) }
               .macSheetFrame(width: 480, height: 320)
+              .presentationBackground(.clear)
           }
       }
   }
@@ -178,6 +181,7 @@ public struct CompanionSettingsView: View {
             + "this iPhone last observed it. Turning this off clears the watch."
         )
       }
+      .listRowBackground(Color.clear)
       Section {
         Toggle("Allow text preview", isOn: $model.companionSettings.previewEnabled)
           .disabled(!model.companionSettings.sharingEnabled)
@@ -188,7 +192,9 @@ public struct CompanionSettingsView: View {
             + "complications or notifications."
         )
       }
+      .listRowBackground(Color.clear)
     }
+    .glassListBackground()
     .navigationTitle("Apple Watch")
   }
 }

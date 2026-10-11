@@ -98,8 +98,8 @@ struct ViewBehaviorTests {
     view.showSearch(text: "x")
     let bar = try #require(view.searchBar)
     let covered = view.convert(
-      NSPoint(x: bar.field.frame.midX, y: bar.field.frame.midY),
-      from: bar
+      NSPoint(x: bar.field.bounds.midX, y: bar.field.bounds.midY),
+      from: bar.field
     )
     func screen(_ point: NSPoint) -> NSPoint {
       window.convertPoint(toScreen: view.convert(point, to: nil))
@@ -218,8 +218,8 @@ struct ViewBehaviorTests {
     view.showSearch(text: "x")
     let bar = try #require(view.searchBar)
     let location = view.convert(
-      NSPoint(x: bar.field.frame.midX, y: bar.field.frame.midY),
-      from: bar
+      NSPoint(x: bar.field.bounds.midX, y: bar.field.bounds.midY),
+      from: bar.field
     )
     let hit = try #require(view.hitTest(location))
     #expect(hit === bar.field || hit.isDescendant(of: bar.field))
@@ -276,7 +276,7 @@ struct ViewBehaviorTests {
     let controller = try TerminalWindowController(configuration: config)
     let window = try #require(controller.window)
     defer { window.close() }
-    let view = try #require(window.contentView as? TerminalView)
+    let view = controller.terminal
     if searching { view.showSearch(text: "link") }
     let responder = try #require(window.firstResponder)
     view.session.feed(Array("https://a.test".utf8))
@@ -636,7 +636,7 @@ struct ViewBehaviorTests {
       configuration: Configuration.parse("command=/bin/sleep 30")
     )
     let window = try #require(controller.window)
-    let view = try #require(window.contentView as? TerminalView)
+    let view = controller.terminal
     defer { window.close() }
     view.session.feed(Array("needle0\r\nneedle1\r\nneedle2".utf8))
     view.showSearch(text: "needle")
@@ -663,6 +663,40 @@ struct ViewBehaviorTests {
   }
 
   @Test(.enabled(if: hasMetal))
+  func `default glass windows keep terminal content below the title bar`()
+    throws
+  {
+    _ = NSApplication.shared
+    let config = Configuration.parse("command=/bin/sleep 30")
+    let controller = try TerminalWindowController(configuration: config)
+    let window = try #require(controller.window)
+    defer { window.close() }
+    let view = controller.terminal
+    #expect(window.contentView is NSGlassEffectView)
+    #expect(!window.isOpaque && view.layer?.isOpaque == false)
+    #expect(view.renderer.options.backgroundOpacity > 0)
+    #expect(view.renderer.options.backgroundOpacity < 1)
+    for size in [
+      NSSize(width: 320, height: 160), NSSize(width: 800, height: 240),
+    ] {
+      window.setContentSize(size)
+      window.contentView?.layoutSubtreeIfNeeded()
+      let frame = view.convert(view.bounds, to: window.contentView)
+      #expect(frame.width > 0 && frame.height > 0)
+      #expect(window.contentLayoutRect.contains(frame))
+      view.showSearch(text: "retained query")
+      let field = try #require(view.searchBar?.field)
+      let location = view.convert(
+        NSPoint(x: field.bounds.midX, y: field.bounds.midY),
+        from: field
+      )
+      let hit = try #require(view.hitTest(location))
+      #expect(hit === field || hit.isDescendant(of: field))
+      #expect(field.currentEditor() != nil)
+    }
+  }
+
+  @Test(.enabled(if: hasMetal))
   func `configuration reload preserves search focus across background layouts`()
     throws
   {
@@ -672,7 +706,7 @@ struct ViewBehaviorTests {
     let controller = try TerminalWindowController(configuration: config)
     let window = try #require(controller.window)
     defer { window.close() }
-    let view = try #require(window.contentView as? TerminalView)
+    let view = controller.terminal
     view.showSearch(text: "needle")
     let field = try #require(view.searchBar?.field)
     let editor = try #require(field.currentEditor())
@@ -687,10 +721,15 @@ struct ViewBehaviorTests {
         && window.firstResponder === field.currentEditor()
     )
     #expect(field.currentEditor()?.selectedRange == selection)
+    config.backgroundBlur = 0
+    controller.apply(config)
+    #expect(window.contentView === view && !window.isOpaque)
+    #expect(window.firstResponder === field.currentEditor())
+    #expect(field.currentEditor()?.selectedRange == selection)
     config.backgroundOpacity = 0.5
     config.backgroundBlur = 20
     controller.apply(config)
-    #expect(window.contentView is NSVisualEffectView)
+    #expect(window.contentView is NSGlassEffectView)
     #expect(
       field.currentEditor() != nil
         && window.firstResponder === field.currentEditor()

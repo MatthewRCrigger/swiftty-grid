@@ -84,6 +84,7 @@ struct AttentionLinkRouting: ViewModifier {
       .sheet(item: $session) { session in
         AttentionDestinationView(navigator: session.navigator) { self.session = nil }
           .macSheetFrame(width: 440, height: 320)
+          .presentationBackground(.clear)
       }
   }
 
@@ -108,6 +109,8 @@ struct AttentionDestinationView: View {
       content
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .glassSurface()
+        .glassButtonStyle()
         .navigationTitle("Attention")
         .toolbar {
           ToolbarItem(placement: .cancellationAction) {
@@ -155,7 +158,7 @@ struct AttentionDestinationView: View {
       VStack(alignment: .leading, spacing: 12) {
         item(preview)
         Button("Open in Pane") { Task { await navigator.openInPane() } }
-          .buttonStyle(.borderedProminent)
+          .glassButtonStyle(prominent: true)
       }
       .task { await navigator.didView() }
     case let .stale(preview):

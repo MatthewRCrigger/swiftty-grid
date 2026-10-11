@@ -54,6 +54,7 @@ struct WatchAttentionSection: View {
         } label: {
           Label("Open on iPhone", systemImage: "arrow.up.forward.app")
         }
+        .buttonStyle(.glass)
       }
     }
     .accessibilityElement(children: .combine)

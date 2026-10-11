@@ -141,6 +141,7 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
     autoResizeDrawable = true
     delegate = self
     renderer.options = configuration.renderOptions(scale: 2)
+    layer?.isOpaque = configuration.backgroundOpacity >= 1
     setAccessibilityRole(.textArea)
     setAccessibilityLabel("Terminal pane")
   }
@@ -162,13 +163,20 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
 
   private func applyScale() {
     let scale = window?.backingScaleFactor ?? 2
-    guard renderer.font.descriptor.scale != scale else { return }
-    renderer.setFont(config.fontDescriptor(scale: scale))
+    let font = config.fontDescriptor(scale: scale)
+    if renderer.font.descriptor != font { renderer.setFont(font) }
     var options = config.renderOptions(scale: scale)
     options.preedit = renderer.options.preedit
     options.preeditSelection = renderer.options.preeditSelection
     renderer.options = options
+    layer?.isOpaque = config.backgroundOpacity >= 1
     controller?.geometryChanged()
+  }
+
+  func apply(_ configuration: Configuration) {
+    config = configuration
+    applyScale()
+    needsDisplay = true
   }
 
   override func setFrameSize(_ newSize: NSSize) {

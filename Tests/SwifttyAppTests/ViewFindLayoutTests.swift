@@ -9,7 +9,9 @@ extension ViewBehaviorTests {
     NSSize(width: 280, height: 40), NSSize(width: 320, height: 160),
     NSSize(width: 800, height: 240),
   ])
-  func `find controls stay inside the terminal after resizing`(_ size: NSSize) {
+  func `find controls stay inside the terminal after resizing`(
+    _ size: NSSize
+  ) throws {
     _ = NSApplication.shared
     let bar = SearchBar()
     bar.text = "retained query"
@@ -20,8 +22,9 @@ extension ViewBehaviorTests {
       bar.position(in: bounds)
       #expect(bounds.contains(bar.frame))
       #expect(bar.field.frame.width >= 40)
-      for control in bar.subviews where !control.isHidden {
-        #expect(bar.bounds.contains(control.frame))
+      let content = try #require(bar.contentView)
+      for control in content.subviews where !control.isHidden {
+        #expect(content.bounds.contains(control.frame))
       }
       #expect(bar.text == "retained query")
     }

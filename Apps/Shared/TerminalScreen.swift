@@ -71,6 +71,7 @@ public struct TerminalScreen: View {
     .font(.footnote)
     .padding(.horizontal)
     .padding(.vertical, 8)
+    .glassPanel(cornerRadius: 0)
     .accessibilityElement(children: .combine)
     .accessibilityIdentifier("terminal.status")
   }
@@ -107,7 +108,7 @@ struct TerminalSurfacePlaceholder: View {
     }
     .padding()
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(.background.secondary)
+    .glassSurface()
     .accessibilityElement(children: .contain)
     .accessibilityLabel("Terminal unavailable")
   }

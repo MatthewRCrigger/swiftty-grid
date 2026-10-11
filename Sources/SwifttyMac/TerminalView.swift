@@ -213,6 +213,7 @@ public final class TerminalView: MTKView, MTKViewDelegate {
   /// Replaces the configured options, keeping the ones the view drives
   /// (composition, link hover, blink phase, focus).
   private func applyRenderOptions(scale: CGFloat) {
+    layer?.isOpaque = config.backgroundOpacity >= 1
     renderer.options = Self.merge(
       configured: config.renderOptions(scale: scale),
       current: renderer.options

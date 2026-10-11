@@ -64,8 +64,9 @@ struct RoamingSurfaceView: View {
   @State private var showsFiles = false
 
   var body: some View {
-    TerminalDisplayView(session: controller.display, capabilities: controller.model.capabilities)
-      .uiTestingScreenProbe(controller.model)
+      TerminalDisplayView(session: controller.display, capabilities: controller.model.capabilities)
+        .uiTestingScreenProbe(controller.model)
+        .glassSurface()
       .overlay { overlay }
       .safeAreaInset(edge: .bottom) {
         if controller.offersOrdinarySSH {
@@ -154,7 +155,8 @@ struct FallbackBanner: View {
     }
     .padding()
     .frame(maxWidth: .infinity, alignment: .leading)
-    .background(.regularMaterial)
+    .glassPanel(cornerRadius: 0)
+    .glassButtonStyle()
   }
 }
 
@@ -176,9 +178,10 @@ struct SSHSurfaceView: View {
       .padding(.horizontal)
       .padding(.vertical, 6)
       .frame(maxWidth: .infinity, alignment: .leading)
-      .background(.yellow.opacity(0.2))
+      .glassPanel(cornerRadius: 0, tint: .yellow.opacity(0.2))
       TerminalDisplayView(session: controller.session, capabilities: controller.model.capabilities)
         .uiTestingScreenProbe(controller.model)
+        .glassSurface()
         .overlay { overlay }
     }
     .task { controller.start() }
@@ -226,6 +229,7 @@ struct SSHSurfaceView: View {
         capabilities: controller.model.capabilities,
         prepare: { controller.attach($0) }
       )
+      .glassSurface()
       .overlay {
         if case .failed(let problem) = controller.phase {
           ProblemCard(problem: problem) { _ in }
@@ -246,7 +250,7 @@ struct ProgressCard: View {
       Text(message).font(.headline)
     }
     .padding(24)
-    .background(.regularMaterial, in: .rect(cornerRadius: 12))
+    .glassPanel()
     .accessibilityElement(children: .combine)
   }
 }
@@ -268,10 +272,10 @@ struct ProblemCard: View {
         switch action {
         case .retry:
           Button(retryTitle) { perform(.retry) }
-            .buttonStyle(.borderedProminent)
+            .glassButtonStyle(prominent: true)
         case .startNewSession:
           Button("Start New Session") { perform(.startNewSession) }
-            .buttonStyle(.borderedProminent)
+            .glassButtonStyle(prominent: true)
         case .openOrdinarySSH:
           VStack(alignment: .leading, spacing: 4) {
             Button("Open Ordinary SSH Shell") { perform(.openOrdinarySSH) }
@@ -284,7 +288,8 @@ struct ProblemCard: View {
     }
     .padding(24)
     .frame(maxWidth: 480)
-    .background(.regularMaterial, in: .rect(cornerRadius: 12))
+    .glassPanel()
+    .glassButtonStyle()
     .padding()
   }
 }

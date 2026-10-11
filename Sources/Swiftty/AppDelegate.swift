@@ -62,9 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       configuration: config,
       connect: { try await MuxWorkspaceController.connect() },
       takeover: lease
-    ) { controller in
-      self.install(controller, replacing: previous)
-    }
+    ) { controller in self.install(controller, replacing: previous) }
   }
 
   /// Makes `controller` the SwiftMux window after it replaced `previous`.
@@ -588,7 +586,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 final class TerminalWindowController: NSWindowController, NSWindowDelegate {
   var onClose: (() -> Void)?
-  private let terminal: TerminalView
+  let terminal: TerminalView
   private lazy var searchFieldEditor: SearchFieldEditor = {
     let editor = SearchFieldEditor(frame: .zero)
     editor.isFieldEditor = true
@@ -636,8 +634,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     return searchFieldEditor
   }
 
-  /// A translucent background (`background-opacity`) shows the desktop,
-  /// blurred behind a visual-effect view when `background-blur` is set.
+  /// Restores editing focus when changing the window's glass background.
   private func applyBackground(_ configuration: Configuration) {
     guard let window else { return }
     let focusedView: NSView? =
@@ -649,29 +646,11 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         view === terminal || view.isDescendant(of: terminal)
       { view } else { nil }
     let selection = (focusedView as? NSControl)?.currentEditor()?.selectedRange
-    var reparented = false
-    let translucent = configuration.backgroundOpacity < 1
-    window.isOpaque = !translucent
-    window.backgroundColor = translucent ? .clear : .windowBackgroundColor
-    terminal.layer?.isOpaque = !translucent
-    let frame = window.contentLayoutRect
-    if translucent, configuration.backgroundBlur > 0 {
-      guard !(window.contentView is NSVisualEffectView) else { return }
-      let effect = NSVisualEffectView(frame: frame)
-      effect.blendingMode = .behindWindow
-      effect.material = .underWindowBackground
-      effect.state = .active
-      terminal.removeFromSuperview()
-      terminal.frame = effect.bounds
-      terminal.autoresizingMask = [.width, .height]
-      effect.addSubview(terminal)
-      window.contentView = effect
-      reparented = true
-    } else if window.contentView !== terminal {
-      terminal.removeFromSuperview()
-      window.contentView = terminal
-      reparented = true
-    }
+    let reparented = TerminalWindowBackground.apply(
+      to: window,
+      content: terminal,
+      configuration: configuration
+    )
     if reparented, let focusedView {
       window.makeFirstResponder(focusedView)
       if let selection, let control = focusedView as? NSControl {

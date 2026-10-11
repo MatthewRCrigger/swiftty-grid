@@ -450,20 +450,25 @@
           if let message = model.message {
             Label(message, systemImage: "exclamationmark.triangle")
               .foregroundStyle(.orange)
+              .listRowBackground(Color.clear)
           }
           switch model.status {
           case .connecting:
             ProgressView("Connecting")
+              .listRowBackground(Color.clear)
           case .failed(let reason):
             VStack(alignment: .leading) {
               Text(reason)
               Button("Try Again") { Task { await model.connect() } }
             }
+            .listRowBackground(Color.clear)
+            .glassButtonStyle()
           case .ready:
             directorySection
           }
           if !model.transfers.isEmpty { transferSection }
         }
+        .glassListBackground()
         .navigationTitle(model.host.nickname)
         .toolbar {
           ToolbarItem(placement: .cancellationAction) {
@@ -560,6 +565,7 @@
         Text(model.path).font(.caption.monospaced())
           .accessibilityIdentifier("sftp.path")
       }
+      .listRowBackground(Color.clear)
     }
 
     private var transferSection: some View {
@@ -588,6 +594,7 @@
       } header: {
         Text("Transfers")
       }
+      .listRowBackground(Color.clear)
     }
 
     @ViewBuilder private func actions(for item: TransferItem) -> some View {

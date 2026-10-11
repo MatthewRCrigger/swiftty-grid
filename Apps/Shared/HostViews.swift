@@ -17,6 +17,7 @@ public struct HostListView: View {
       if let error = model.lastError {
         Label(error, systemImage: "exclamationmark.triangle")
           .foregroundStyle(.orange)
+          .listRowBackground(Color.clear)
       }
       if model.hosts.isEmpty {
         ContentUnavailableView(
@@ -24,6 +25,7 @@ public struct HostListView: View {
           systemImage: "server.rack",
           description: Text("Add a Mac with Remote Login enabled.")
         )
+        .listRowBackground(Color.clear)
       }
       ForEach(model.hosts) { host in
         Button {
@@ -58,7 +60,9 @@ public struct HostListView: View {
           Button("Delete", role: .destructive) { model.delete(host) }
         }
       }
+      .listRowBackground(Color.clear)
     }
+    .glassListBackground()
     .navigationTitle("Hosts")
     .toolbar {
       ToolbarItem(placement: .primaryAction) {
@@ -103,7 +107,9 @@ extension View {
     #if targetEnvironment(macCatalyst)
       navigationDestination(isPresented: isPresented, destination: content)
     #else
-      sheet(isPresented: isPresented, content: content)
+      sheet(isPresented: isPresented) {
+        content().presentationBackground(.clear)
+      }
     #endif
   }
 
@@ -115,7 +121,9 @@ extension View {
     #if targetEnvironment(macCatalyst)
       navigationDestination(item: item, destination: content)
     #else
-      sheet(item: item, content: content)
+      sheet(item: item) { item in
+        content(item).presentationBackground(.clear)
+      }
     #endif
   }
 
@@ -188,6 +196,7 @@ public struct HostEditorView: View {
             .plainEntry()
             .accessibilityIdentifier("host.username")
         }
+        .listRowBackground(Color.clear)
         Section("Authentication") {
           Toggle("Use Keychain key", isOn: $usesKey)
           if usesKey {
@@ -199,10 +208,13 @@ public struct HostEditorView: View {
               .foregroundStyle(.secondary)
           }
         }
+        .listRowBackground(Color.clear)
         if let error {
           Text(error.message).foregroundStyle(.red)
+            .listRowBackground(Color.clear)
         }
       }
+      .glassListBackground()
       .navigationTitle(original == nil ? "Add Host" : "Edit Host")
       .toolbar {
         ToolbarItem(placement: .cancellationAction) {
@@ -335,12 +347,15 @@ public struct TrustPromptView: View {
         .accessibilityIdentifier("trust.reject")
         if prompt.kind == .unknownKey {
           Button("Trust") { decide(.trust) }
-            .buttonStyle(.borderedProminent)
+            .glassButtonStyle(prominent: true)
             .accessibilityIdentifier("trust.accept")
         }
       }
     }
     .padding()
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    .glassSurface()
+    .glassButtonStyle()
   }
 }
 
@@ -373,7 +388,9 @@ public struct PasswordPromptView: View {
             Text("Kept in memory until the app quits; never saved.")
           }
         }
+        .listRowBackground(Color.clear)
       }
+      .glassListBackground()
       .navigationTitle("Sign In")
       .toolbar {
         ToolbarItem(placement: .cancellationAction) {

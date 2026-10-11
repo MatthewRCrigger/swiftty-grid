@@ -19,6 +19,16 @@ final class TerminalAccessoryBar: UIInputView, UIInputViewAudioFeedback {
     allowsSelfSizing = true
     translatesAutoresizingMaskIntoConstraints = false
 
+    #if os(visionOS)
+    let content = self
+    #else
+    let container = UIVisualEffectView(effect: UIGlassContainerEffect())
+    container.frame = bounds
+    container.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    addSubview(container)
+    let content = container.contentView
+    #endif
+
     let stack = UIStackView()
     stack.axis = .horizontal
     stack.spacing = 6
@@ -48,7 +58,11 @@ final class TerminalAccessoryBar: UIInputView, UIInputViewAudioFeedback {
     scroll.translatesAutoresizingMaskIntoConstraints = false
     scroll.addSubview(stack)
 
+    #if os(visionOS)
     var dismiss = UIButton.Configuration.plain()
+    #else
+    var dismiss = UIButton.Configuration.glass()
+    #endif
     dismiss.image = UIImage(systemName: "keyboard.chevron.compact.down")
     let dismissButton = UIButton(
       configuration: dismiss,
@@ -57,8 +71,8 @@ final class TerminalAccessoryBar: UIInputView, UIInputViewAudioFeedback {
     dismissButton.accessibilityLabel = "Hide keyboard"
     dismissButton.translatesAutoresizingMaskIntoConstraints = false
 
-    addSubview(scroll)
-    addSubview(dismissButton)
+    content.addSubview(scroll)
+    content.addSubview(dismissButton)
     NSLayoutConstraint.activate([
       heightAnchor.constraint(equalToConstant: 44),
       scroll.leadingAnchor.constraint(
@@ -111,7 +125,7 @@ final class TerminalAccessoryBar: UIInputView, UIInputViewAudioFeedback {
       guard let button = buttons[key], let modifier = key.modifier else {
         continue
       }
-      var config = button.configuration ?? .gray()
+      var config = button.configuration ?? Self.keyConfiguration
       switch sticky.state(of: modifier) {
       case .off:
         config.baseBackgroundColor = nil
@@ -130,7 +144,7 @@ final class TerminalAccessoryBar: UIInputView, UIInputViewAudioFeedback {
   }
 
   private func makeButton(_ title: String) -> UIButton {
-    var config = UIButton.Configuration.gray()
+    var config = Self.keyConfiguration
     config.title = title
     config.baseForegroundColor = .label
     config.contentInsets = NSDirectionalEdgeInsets(
@@ -150,6 +164,14 @@ final class TerminalAccessoryBar: UIInputView, UIInputViewAudioFeedback {
     button.widthAnchor.constraint(greaterThanOrEqualToConstant: 36).isActive =
       true
     return button
+  }
+
+  private static var keyConfiguration: UIButton.Configuration {
+    #if os(visionOS)
+    .gray()
+    #else
+    .glass()
+    #endif
   }
 
   // MARK: Key repeat

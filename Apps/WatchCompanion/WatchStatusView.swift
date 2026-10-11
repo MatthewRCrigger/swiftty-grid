@@ -27,6 +27,8 @@ struct WatchStatusView: View {
           }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .glassEffect(.regular, in: .rect(cornerRadius: 12))
       }
       .onChange(of: context.date) { _, now in model.tick(now: now) }
     }
@@ -81,6 +83,7 @@ struct WatchStatusView: View {
         .disabled(p.refreshing || !p.phoneReachable)
       }
     }
+    .buttonStyle(.glass)
   }
 
   private func previewSection(_ preview: CompanionPreview, now: Date) -> some View {
@@ -113,6 +116,6 @@ struct FreshnessBadge: View {
       .font(.caption2.bold())
       .padding(.horizontal, 6)
       .padding(.vertical, 2)
-      .background(color.opacity(0.25), in: Capsule())
+      .glassEffect(.regular.tint(color.opacity(0.25)), in: .capsule)
   }
 }

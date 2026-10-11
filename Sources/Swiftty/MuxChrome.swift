@@ -65,7 +65,7 @@ final class MuxActivityDot: NSView {
 /// The window-level tab strip: icon, title, activity marker and close
 /// button per tab, plus a new-tab button. Double-click renames.
 @MainActor
-final class MuxTabStrip: NSView {
+final class MuxTabStrip: NSGlassEffectContainerView {
   var onSelect: ((TabID) -> Void)?
   var onClose: ((TabID) -> Void)?
   var onRename: ((TabID, String) -> Void)?
@@ -77,20 +77,22 @@ final class MuxTabStrip: NSView {
 
   override init(frame: NSRect) {
     super.init(frame: frame)
+    let content = NSView(frame: bounds)
+    content.autoresizingMask = [.width, .height]
+    contentView = content
     stack.orientation = .horizontal
     stack.spacing = 2
     stack.alignment = .centerY
     stack.translatesAutoresizingMaskIntoConstraints = false
     newButton.image = MuxIcons.image("plus", "New Tab")
-    newButton.bezelStyle = .accessoryBarAction
-    newButton.isBordered = false
+    newButton.bezelStyle = .glass
     newButton.target = self
     newButton.action = #selector(newClicked)
     newButton.toolTip = "New Tab"
     newButton.setAccessibilityLabel("New Tab")
     newButton.translatesAutoresizingMaskIntoConstraints = false
-    addSubview(stack)
-    addSubview(newButton)
+    content.addSubview(stack)
+    content.addSubview(newButton)
     NSLayoutConstraint.activate([
       stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
       stack.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -128,17 +130,10 @@ final class MuxTabStrip: NSView {
     }
     for (b, item) in zip(buttons, items) { b.item = item }
   }
-
-  override func draw(_ dirtyRect: NSRect) {
-    NSColor.windowBackgroundColor.setFill()
-    bounds.fill()
-    NSColor.separatorColor.setFill()
-    NSRect(x: 0, y: 0, width: bounds.width, height: 1).fill()
-  }
 }
 
 @MainActor
-final class MuxTabButton: NSView, NSTextFieldDelegate {
+final class MuxTabButton: NSGlassEffectView, NSTextFieldDelegate {
   weak var strip: MuxTabStrip?
   private let icon = NSImageView()
   let label = NSTextField(labelWithString: "")
@@ -154,6 +149,9 @@ final class MuxTabButton: NSView, NSTextFieldDelegate {
       label.font =
         item.isActive
         ? .systemFont(ofSize: 12, weight: .semibold) : .systemFont(ofSize: 12)
+      tintColor =
+        item.isActive
+        ? .selectedContentBackgroundColor.withAlphaComponent(0.18) : nil
       dot.isHidden = !item.hasActivity
       closeButton.setAccessibilityLabel("Close tab \(item.title)")
       setAccessibilityLabel(
@@ -166,6 +164,12 @@ final class MuxTabButton: NSView, NSTextFieldDelegate {
   init() {
     super.init(frame: .zero)
     translatesAutoresizingMaskIntoConstraints = false
+    style = .regular
+    cornerRadius = 6
+    effectIsInteractive = true
+    let content = NSView(frame: bounds)
+    content.autoresizingMask = [.width, .height]
+    contentView = content
     icon.translatesAutoresizingMaskIntoConstraints = false
     icon.symbolConfiguration = .init(pointSize: 11, weight: .regular)
     icon.setAccessibilityElement(false)
@@ -179,7 +183,9 @@ final class MuxTabButton: NSView, NSTextFieldDelegate {
     closeButton.target = self
     closeButton.action = #selector(closeClicked)
     closeButton.translatesAutoresizingMaskIntoConstraints = false
-    for v in [icon, label, dot, closeButton] as [NSView] { addSubview(v) }
+    for v in [icon, label, dot, closeButton] as [NSView] {
+      content.addSubview(v)
+    }
     NSLayoutConstraint.activate([
       heightAnchor.constraint(equalToConstant: 24),
       widthAnchor.constraint(lessThanOrEqualToConstant: 220),
@@ -206,12 +212,6 @@ final class MuxTabButton: NSView, NSTextFieldDelegate {
 
   @available(*, unavailable)
   required init?(coder: NSCoder) { fatalError() }
-
-  override func draw(_ dirtyRect: NSRect) {
-    guard item?.isActive == true else { return }
-    NSColor.selectedContentBackgroundColor.withAlphaComponent(0.18).setFill()
-    NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
-  }
 
   override func mouseDown(with event: NSEvent) {
     guard let item else { return }
@@ -327,7 +327,7 @@ final class MuxPaneContainer: NSView {
 }
 
 @MainActor
-final class MuxPaneHeader: NSView {
+final class MuxPaneHeader: NSGlassEffectView {
   enum Action { case splitRight, splitDown, zoom, close }
   var onAction: ((Action) -> Void)?
   private let marker = NSView()
@@ -362,6 +362,12 @@ final class MuxPaneHeader: NSView {
 
   override init(frame: NSRect) {
     super.init(frame: frame)
+    style = .regular
+    cornerRadius = 6
+    effectIsInteractive = true
+    let content = NSView(frame: bounds)
+    content.autoresizingMask = [.width, .height]
+    contentView = content
     marker.wantsLayer = true
     marker.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
     marker.translatesAutoresizingMaskIntoConstraints = false
@@ -391,7 +397,7 @@ final class MuxPaneHeader: NSView {
       actionButtons[action] = b
       buttons.addArrangedSubview(b)
     }
-    for v in [marker, label, dot, buttons] as [NSView] { addSubview(v) }
+    for v in [marker, label, dot, buttons] as [NSView] { content.addSubview(v) }
     NSLayoutConstraint.activate([
       marker.leadingAnchor.constraint(equalTo: leadingAnchor),
       marker.topAnchor.constraint(equalTo: topAnchor),
@@ -420,10 +426,5 @@ final class MuxPaneHeader: NSView {
   private func clicked(_ sender: NSButton) {
     let actions: [Action] = [.splitRight, .splitDown, .zoom, .close]
     onAction?(actions[sender.tag])
-  }
-
-  override func draw(_ dirtyRect: NSRect) {
-    NSColor.windowBackgroundColor.setFill()
-    bounds.fill()
   }
 }
