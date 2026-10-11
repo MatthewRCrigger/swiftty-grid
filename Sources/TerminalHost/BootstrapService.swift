@@ -47,10 +47,12 @@ public struct BootstrapService: Sendable {
   }
 
   static func envelope(_ response: BootstrapResponse) -> [UInt8] {
-    (try? BootstrapEnvelope.encode(response))
-      ?? (try! BootstrapEnvelope.encode(
-        BootstrapResponse.failure(.internalError)
-      ))
+    if let bytes = try? BootstrapEnvelope.encode(response) { return bytes }
+    do {
+      return try BootstrapEnvelope.encode(BootstrapResponse.failure(.internalError))
+    } catch {
+      preconditionFailure("Cannot encode bootstrap failure: \(error)")
+    }
   }
 
   /// `bootstrap --stdio` core: validates one request envelope, forwards

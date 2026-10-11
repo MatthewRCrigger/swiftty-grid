@@ -4,6 +4,7 @@ import SessionCore
 import Synchronization
 import SwifttyCore
 import TerminalSurface
+import Testing
 
 // MARK: Timing
 
@@ -118,8 +119,8 @@ actor FakeHost {
   var sendSnapshotOnAttach = true
   var sessionGone = false
 
-  init() {
-    try! ledger.authorize(writer)
+  init() throws {
+    try ledger.authorize(writer)
   }
 
   func set(
@@ -355,7 +356,13 @@ actor FakeHost {
 
   private func send(_ message: ControlMessage, to id: ObjectIdentifier) async {
     guard let link = links[id], !link.blackHole else { return }
-    let record = try! ControlRecord.encode(message)
+    let record: [UInt8]
+    do {
+      record = try ControlRecord.encode(message)
+    } catch {
+      Issue.record(error)
+      return
+    }
     try? await link.connection.sendControl(record)
   }
 
@@ -366,7 +373,13 @@ actor FakeHost {
     guard let link = links[id], !link.blackHole else { return }
     nextStream += 1
     let stream = nextStream
-    let payload = try! SnapshotFrame.encode(snapshot)
+    let payload: [UInt8]
+    do {
+      payload = try SnapshotFrame.encode(snapshot)
+    } catch {
+      Issue.record(error)
+      return
+    }
     try? await link.connection.sendSnapshot(payload, stream: stream)
   }
 
@@ -489,13 +502,14 @@ extension PresentationFrame {
 
 struct RoamingFixture {
   let clock = TestClock()
-  let host = FakeHost()
+  let host: FakeHost
   let bootstrapper: FakeBootstrapper
   let connector: FakeConnector
   let sink = RecordingSink()
   let client: RoamingClient
 
-  init(jitter: Double = 0, initialGrid: GridSize? = nil) {
+  init(jitter: Double = 0, initialGrid: GridSize? = nil) throws {
+    host = try FakeHost()
     bootstrapper = FakeBootstrapper(host: host)
     connector = FakeConnector(host: host)
     var configuration = testConfiguration(jitter: jitter)

@@ -462,27 +462,7 @@ public struct Parser: ~Copyable {
     switch state {
     case .ground: ground(byte, &t)
 
-    case .escape:
-      guard byte < 0xA0 else { return }
-      switch byte {
-      case 0x00 ... 0x1F: t.execute(byte)
-      case 0x20 ... 0x2F:
-        escIntermediate = byte;
-        state = .escapeIntermediate
-      case 0x5B: enterCSI()  // [
-      case 0x5D:
-        oscCount = 0;
-        oscOverflow = false;
-        state = .oscString  // ]
-      case 0x50:
-        enterCSI();
-        state = .dcsEntry  // P
-      case 0x58, 0x5E, 0x5F: state = .stringIgnore  // X ^ _
-      case 0x7F: break
-      default:
-        t.escDispatch(intermediate: 0, final: byte);
-        state = .ground
-      }
+    case .escape: escapeStep(byte, &t)
 
     case .escapeIntermediate:
       guard byte < 0xA0 else { return }
@@ -567,6 +547,30 @@ public struct Parser: ~Copyable {
 
     // handled before the anywhere transitions
     case .dcsEscape, .controlMode, .controlModeEscape: break
+    }
+  }
+
+  @inline(__always)
+  private mutating func escapeStep(_ byte: UInt8, _ t: inout TerminalState) {
+    guard byte < 0xA0 else { return }
+    switch byte {
+    case 0x00 ... 0x1F: t.execute(byte)
+    case 0x20 ... 0x2F:
+      escIntermediate = byte;
+      state = .escapeIntermediate
+    case 0x5B: enterCSI()  // [
+    case 0x5D:
+      oscCount = 0;
+      oscOverflow = false;
+      state = .oscString  // ]
+    case 0x50:
+      enterCSI();
+      state = .dcsEntry  // P
+    case 0x58, 0x5E, 0x5F: state = .stringIgnore  // X ^ _
+    case 0x7F: break
+    default:
+      t.escDispatch(intermediate: 0, final: byte);
+      state = .ground
     }
   }
 

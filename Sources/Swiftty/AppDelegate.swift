@@ -61,8 +61,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       in: previous,
       configuration: config,
       connect: { try await MuxWorkspaceController.connect() },
-      takeover: lease
-    ) { controller in self.install(controller, replacing: previous) }
+      takeover: lease,
+      attached: { controller in self.install(controller, replacing: previous) }
+    )
   }
 
   /// Makes `controller` the SwiftMux window after it replaced `previous`.

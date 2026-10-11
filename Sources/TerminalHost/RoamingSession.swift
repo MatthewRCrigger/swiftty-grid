@@ -198,9 +198,9 @@ public final class RoamingSession: @unchecked Sendable {
     let (pane, stamp) = queue.sync { (activePane, stamp(epoch: epoch)) }
     guard let pane else { return nil }
     return await withCheckedContinuation { continuation in
-      service.inspect(pane: pane, { ScreenExporter.export($0, stamp: stamp) }) {
+      service.inspect(pane: pane, { ScreenExporter.export($0, stamp: stamp) }, completion: {
         continuation.resume(returning: $0)
-      }
+      })
     }
   }
 
@@ -820,12 +820,12 @@ public final class RoamingSession: @unchecked Sendable {
       let exit = exitStatus
       // Exported in the pane's order, so every byte parsed before this
       // point (including final output after exit) is included.
-      service.inspect(pane: pane, { ScreenExporter.export($0, stamp: stamp) }) {
+      service.inspect(pane: pane, { ScreenExporter.export($0, stamp: stamp) }, completion: {
         [weak self] snapshot in
         self?.queue.async {
           self?.captured(snapshot, stream: stream, exit: exit, to: a)
         }
-      }
+      })
     }
   }
 

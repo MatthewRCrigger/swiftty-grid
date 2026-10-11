@@ -100,80 +100,17 @@ public final class ResolvedFont: @unchecked Sendable {
     let descriptor = descriptor.normalized
     self.descriptor = descriptor
     let pixelSize = descriptor.size * descriptor.scale
-    func named(_ family: String) -> CTFont? {
-      let font = CTFontCreateWithName(family as CFString, pixelSize, nil)
-      // CoreText also accepts PostScript and full face names. Check
-      // those names to distinguish a match from its default font.
-      let names = [
-        CTFontCopyFamilyName(font), CTFontCopyPostScriptName(font),
-        CTFontCopyFullName(font), CTFontCopyDisplayName(font),
-      ]
-      return names.contains {
-        ($0 as String).caseInsensitiveCompare(family) == .orderedSame
-      } ? font : nil
-    }
+    let resolver = FontFaceResolver(descriptor: descriptor)
+
     let regular =
-      named(descriptor.family) ?? CTFontCreateUIFontForLanguage(
+      resolver.named(descriptor.family) ?? CTFontCreateUIFontForLanguage(
         .userFixedPitch,
         pixelSize,
         nil
       ) ?? CTFontCreateWithName(descriptor.family as CFString, pixelSize, nil)
-    func styled(
-      _ regular: CTFont,
-      _ traits: CTFontSymbolicTraits,
-      family: String? = nil
-    ) -> (CTFont, Bool) {
-      if let family, let font = named(family) { return (font, false) }
-      if let font = CTFontCreateCopyWithSymbolicTraits(
-        regular,
-        pixelSize,
-        nil,
-        traits,
-        traits
-      ) {
-        return (font, false)
-      }
-      // No such face: synthesize from the closest one.
-      let bold = traits.contains(.traitBold)
-      let italic = traits.contains(.traitItalic)
-      let synthesize =
-        bold && italic
-        ? descriptor.synthesizeBoldItalic
-        : bold ? descriptor.synthesizeBold : descriptor.synthesizeItalic
-      guard synthesize else { return (regular, false) }
-      let boldFace =
-        bold
-        ? CTFontCreateCopyWithSymbolicTraits(
-          regular,
-          pixelSize,
-          nil,
-          .traitBold,
-          .traitBold
-        ) : nil
-      let embolden = bold && boldFace == nil
-      let base = boldFace ?? regular
-      guard italic else { return (base, embolden) }
-      var skew = CGAffineTransform(a: 1, b: 0, c: 0.2, d: 1, tx: 0, ty: 0)
-      return (
-        CTFontCreateWithFontDescriptor(
-          CTFontCopyFontDescriptor(base),
-          pixelSize,
-          &skew
-        ), embolden
-      )
-    }
-    let fallbackFonts = descriptor.fallbackFamilies.compactMap(named)
-    var features: [FontFeature] = []
-    var featureIndices: [String: Int] = [:]
-    for raw in descriptor.features {
-      guard let feature = FontFeature(raw) else { continue }
-      if let index = featureIndices[feature.tag] {
-        features[index] = feature
-      } else {
-        featureIndices[feature.tag] = features.count
-        features.append(feature)
-      }
-    }
+
+    let fallbackFonts = descriptor.fallbackFamilies.compactMap(resolver.named)
+    let features = Self.resolvedFeatures(descriptor.features)
     let settings: [[CFString: Any]] = features.map {
       [
         kCTFontOpenTypeFeatureTag: $0.tag,
@@ -181,17 +118,7 @@ public final class ResolvedFont: @unchecked Sendable {
       ]
     }
     let shapes = features.contains { $0.value != 0 }
-    let variations = descriptor.variations.reduce(into: [NSNumber: Double]()) {
-      out,
-      axis in
-      // Axis identifiers are the tag's four bytes as a big-endian integer.
-      guard axis.key.utf8.count == 4 else { return }
-      out[
-        NSNumber(
-          value: axis.key.utf8.reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
-        )
-      ] = axis.value
-    }
+    let variations = Self.variationSettings(descriptor.variations)
     func featured(_ font: CTFont, cascade: [CTFontDescriptor] = []) -> CTFont {
       guard !settings.isEmpty || !cascade.isEmpty || !variations.isEmpty else {
         return font
@@ -213,9 +140,9 @@ public final class ResolvedFont: @unchecked Sendable {
     }
     let fallbackStyles = fallbackFonts.map { regular in
       [
-        (regular, false), styled(regular, .traitBold),
-        styled(regular, .traitItalic),
-        styled(regular, [.traitBold, .traitItalic]),
+        (regular, false), resolver.styled(regular, .traitBold),
+        resolver.styled(regular, .traitItalic),
+        resolver.styled(regular, [.traitBold, .traitItalic]),
       ]
     }
     let styledFallbacks = (0 ..< 4)
@@ -226,9 +153,9 @@ public final class ResolvedFont: @unchecked Sendable {
     fallbacks = fallbackFaces[0]
     let primaryStyles = [
       (regular, false),
-      styled(regular, .traitBold, family: descriptor.boldFamily),
-      styled(regular, .traitItalic, family: descriptor.italicFamily),
-      styled(
+      resolver.styled(regular, .traitBold, family: descriptor.boldFamily),
+      resolver.styled(regular, .traitItalic, family: descriptor.italicFamily),
+      resolver.styled(
         regular,
         [.traitBold, .traitItalic],
         family: descriptor.boldItalicFamily
@@ -298,6 +225,35 @@ public final class ResolvedFont: @unchecked Sendable {
       max(-.greatestFiniteMagnitude, underline)
     )
     underlineThickness = max(1, round(CTFontGetUnderlineThickness(metrics)))
+  }
+
+  private static func variationSettings(
+    _ values: [String: Double]
+  ) -> [NSNumber: Double] {
+    values.reduce(into: [NSNumber: Double]()) { out, axis in
+      // Axis identifiers are the tag's four bytes as a big-endian integer.
+      guard axis.key.utf8.count == 4 else { return }
+      out[
+        NSNumber(
+          value: axis.key.utf8.reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
+        )
+      ] = axis.value
+    }
+  }
+
+  private static func resolvedFeatures(_ rawValues: [String]) -> [FontFeature] {
+    var features: [FontFeature] = []
+    var featureIndices: [String: Int] = [:]
+    for raw in rawValues {
+      guard let feature = FontFeature(raw) else { continue }
+      if let index = featureIndices[feature.tag] {
+        features[index] = feature
+      } else {
+        featureIndices[feature.tag] = features.count
+        features.append(feature)
+      }
+    }
+    return features
   }
 
   public func face(_ style: FontStyle) -> CTFont {

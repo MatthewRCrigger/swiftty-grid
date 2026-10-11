@@ -206,19 +206,7 @@ struct UnicodeGeneratorTests {
       withIntermediateDirectories: true
     )
     defer { try? FileManager.default.removeItem(at: directory) }
-    let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-      .deletingLastPathComponent().deletingLastPathComponent()
-    let binary = directory.appendingPathComponent("generator")
-    let compilation = try run(
-      URL(fileURLWithPath: "/usr/bin/env"),
-      arguments: [
-        "swiftc",
-        root.appendingPathComponent("Scripts/gen-grapheme-tables.swift").path,
-        "-o", binary.path,
-      ],
-      directory: directory,
-    )
-    try #require(compilation.status == 0, Comment(rawValue: compilation.error))
+    let binary = try compileGraphemeGenerator(in: directory)
     let inputs = [
       "auxiliary/GraphemeBreakProperty.txt": "0041 ; Other\n",
       "auxiliary/GraphemeBreakTest.txt": "÷ 0041 ÷\n",
@@ -330,6 +318,23 @@ struct UnicodeGeneratorTests {
       }
       try original.write(to: url, atomically: true, encoding: .utf8)
     }
+  }
+
+  private func compileGraphemeGenerator(in directory: URL) throws -> URL {
+    let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+      .deletingLastPathComponent().deletingLastPathComponent()
+    let binary = directory.appendingPathComponent("generator")
+    let compilation = try run(
+      URL(fileURLWithPath: "/usr/bin/env"),
+      arguments: [
+        "swiftc",
+        root.appendingPathComponent("Scripts/gen-grapheme-tables.swift").path,
+        "-o", binary.path,
+      ],
+      directory: directory,
+    )
+    try #require(compilation.status == 0, Comment(rawValue: compilation.error))
+    return binary
   }
 
   private func run(

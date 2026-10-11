@@ -138,7 +138,7 @@ struct LocatorTests {
     #expect(AttentionHandoffRequest(userInfo: ["ref": locator, "cmd": "x"]) == nil)
   }
 
-  @Test func summaryIsRedactedByDefault() {
+  @Test func summaryIsRedactedByDefault() throws {
     let item = sampleItem(for: sampleDestination(), message: "secret token abc")
     let summary = AttentionSummary(item: item, counts: InboxCounts(needsYou: 2, results: 1))
     #expect(summary.message == nil)
@@ -152,7 +152,7 @@ struct LocatorTests {
       policy: AttentionSummaryPolicy(showsMessage: true)
     )
     #expect(opted.message == "secret token abc")
-    let encoded = String(decoding: try! JSONEncoder().encode(summary), as: UTF8.self)
+    let encoded = String(decoding: try JSONEncoder().encode(summary), as: UTF8.self)
     #expect(!encoded.contains("secret"))
     #expect(!encoded.contains("Build"))
   }

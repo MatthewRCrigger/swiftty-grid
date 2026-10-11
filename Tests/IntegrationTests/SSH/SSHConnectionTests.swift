@@ -507,4 +507,3 @@ struct SSHConnectionTests {
     await shell.close()
   }
 }
-

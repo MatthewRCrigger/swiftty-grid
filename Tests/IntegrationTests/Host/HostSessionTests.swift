@@ -239,7 +239,7 @@ struct HostSessionTests {
       "stty -echo -icanon min 1; printf 'Q\\033[6n'; "
       + "r=$(dd bs=1 count=6 2>/dev/null | od -An -c | tr -d ' \\n'); "
       + "echo; echo \"GOT:$r\"; sleep 30"
-    try await withRegistry(launch: { shellLaunch(script) }) { registry in
+    try await withRegistry(launch: { shellLaunch(script) }, { registry in
       let grant = try await registry.create(grid: GridSize(columns: 40, rows: 10))
       let client = TestClient(registry)
       _ = try await client.attached(grant)
@@ -253,14 +253,14 @@ struct HostSessionTests {
         if case .attached = message { continue }
         Issue.record("unexpected message \(message.typeName)")
       }
-    }
+    })
   }
 
   @Test
   func `shell exit retains the final screen and status`() async throws {
     try await withRegistry(
       launch: { shellLaunch("echo FINAL-OUTPUT; exit 3") }
-    ) { registry in
+    , { registry in
       let grant = try await registry.create(grid: GridSize(columns: 40, rows: 10))
       let session = try #require(registry.session(grant.sessionID))
       let client = TestClient(registry)
@@ -306,7 +306,7 @@ struct HostSessionTests {
       )
       // This host created the workspace and its shell exited: it ends.
       #expect(await registry.list().isEmpty)
-    }
+    })
   }
 
   @Test
@@ -315,7 +315,7 @@ struct HostSessionTests {
     defer { try? FileManager.default.removeItem(at: directory) }
     let script =
       "trap '' HUP TERM; sleep 300 & echo $! > \"$HOME/bg\"; echo READY; wait"
-    try await withRegistry(launch: { shellLaunch(script, in: directory) }) {
+    try await withRegistry(launch: { shellLaunch(script, in: directory) }, {
       registry in
       let grant = try await registry.create(grid: GridSize(columns: 40, rows: 10))
       let session = try #require(registry.session(grant.sessionID))
@@ -349,7 +349,7 @@ struct HostSessionTests {
       let late = TestClient(registry)
       try await late.attach(grant)
       #expect(try await late.errorCode() == .unknownSession)
-    }
+    })
   }
 }
 #endif

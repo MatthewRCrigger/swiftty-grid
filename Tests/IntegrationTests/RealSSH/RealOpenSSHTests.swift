@@ -51,7 +51,9 @@ struct RealOpenSSHTests {
     var identity: SSHClient.HostIdentity { SSHClient.HostIdentity(host: host, port: port)! }
 
     var key: Curve25519.Signing.PrivateKey {
-      try! Curve25519.Signing.PrivateKey(rawRepresentation: keySeed)
+      get throws {
+        try Curve25519.Signing.PrivateKey(rawRepresentation: keySeed)
+      }
     }
   }
 
@@ -122,7 +124,7 @@ struct RealOpenSSHTests {
     let bootstrapper = SSHBootstrapper(
       endpoint: SSHEndpoint(
         configuration: env.configuration,
-        credential: .ed25519(env.key),
+        credential: .ed25519(try env.key),
         trustStore: trusted
       ),
       eventLoopGroup: env.group

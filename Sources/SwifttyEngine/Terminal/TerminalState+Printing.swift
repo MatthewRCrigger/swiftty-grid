@@ -290,22 +290,10 @@ extension TerminalState {
           canBatchWide = false
         }
         previousClass = cls
-        if x < clean {
-          if row[x].width != 1 { splitWide(row, x, replacingWidth: w) }
-          if w == 2, row[x + 1].width != 1 {
-            splitWide(row, x + 1, replacingWidth: 0)
-          }
-        }
-        var cell = w == 1 ? narrow : wide
-        cell[0] = c
-        raw.storeBytes(of: cell, toByteOffset: x &* 16, as: SIMD4<UInt32>.self)
-        if w == 2 {
-          raw.storeBytes(
-            of: tail,
-            toByteOffset: (x &+ 1) &* 16,
-            as: SIMD4<UInt32>.self
-          )
-        }
+        storeScalar(
+          c, width: w, column: x, row: row, clean: clean,
+          templates: (narrow, wide, tail)
+        )
         x += w
         i += 1
       }
@@ -323,6 +311,36 @@ extension TerminalState {
         continue
       }
       finishPrintRun(at: x)
+    }
+  }
+
+  @inline(__always)
+  private mutating func storeScalar(
+    _ scalar: UInt32,
+    width: Int,
+    column: Int,
+    row: UnsafeMutablePointer<Cell>,
+    clean: Int,
+    templates: (SIMD4<UInt32>, SIMD4<UInt32>, SIMD4<UInt32>)
+  ) {
+    let (narrow, wide, tail) = templates
+    let (c, w, x) = (scalar, width, column)
+    let raw = UnsafeMutableRawPointer(row)
+    if x < clean {
+      if row[x].width != 1 { splitWide(row, x, replacingWidth: w) }
+      if w == 2, row[x + 1].width != 1 {
+        splitWide(row, x + 1, replacingWidth: 0)
+      }
+    }
+    var cell = w == 1 ? narrow : wide
+    cell[0] = c
+    raw.storeBytes(of: cell, toByteOffset: x &* 16, as: SIMD4<UInt32>.self)
+    if w == 2 {
+      raw.storeBytes(
+        of: tail,
+        toByteOffset: (x &+ 1) &* 16,
+        as: SIMD4<UInt32>.self
+      )
     }
   }
 

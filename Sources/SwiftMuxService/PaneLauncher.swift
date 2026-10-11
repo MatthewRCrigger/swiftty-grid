@@ -200,18 +200,7 @@ struct PaneLauncher: Sendable {
 
     // The launcher either reports and execs (closing the pipe on exec)
     // or reports a failure and exits. EOF alone is not success.
-    var report = Data()
-    var buffer = [UInt8](repeating: 0, count: 256)
-    while true {
-      let n = read(pipeFDs[0], &buffer, buffer.count)
-      if n > 0 {
-        report.append(contentsOf: buffer[0 ..< n])
-        if report.count > 4096 { break }
-        continue
-      }
-      if n < 0, errno == EINTR { continue }
-      break
-    }
+    let report = Self.readLaunchReport(from: pipeFDs[0])
     close(pipeFDs[0])
     let lines = String(decoding: report, as: UTF8.self).split(separator: "\n")
     let failure = lines.first { $0.hasPrefix("E ") }
@@ -235,6 +224,22 @@ struct PaneLauncher: Sendable {
       pid: pid,
       warnings: warnings
     )
+  }
+
+  private static func readLaunchReport(from fd: Int32) -> Data {
+    var report = Data()
+    var buffer = [UInt8](repeating: 0, count: 256)
+    while true {
+      let n = read(fd, &buffer, buffer.count)
+      if n > 0 {
+        report.append(contentsOf: buffer[0 ..< n])
+        if report.count > 4096 { break }
+        continue
+      }
+      if n < 0, errno == EINTR { continue }
+      break
+    }
+    return report
   }
 
   /// A close-on-exec duplicate of `fd` numbered 5 or higher (closing

@@ -113,7 +113,7 @@ struct LinkTests {
         #expect(d.isValid)
         #expect(
           AttentionLink.customURL(for: d).absoluteString.lowercased() == text.lowercased(),
-          "accepted non-canonical \(TestFixtureText(text))"
+          "accepted non-canonical \(testFixtureText(text))"
         )
       }
     }
@@ -158,6 +158,6 @@ struct LinkTests {
 }
 
 /// Escapes controls so a failing fixture cannot affect the terminal.
-private func TestFixtureText(_ s: String) -> String {
+private func testFixtureText(_ s: String) -> String {
   s.unicodeScalars.map { $0.value < 0x20 || $0.value == 0x7F ? "\\u{\(String($0.value, radix: 16))}" : String($0) }.joined()
 }

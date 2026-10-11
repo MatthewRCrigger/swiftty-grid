@@ -116,7 +116,9 @@ struct CompanionCodecTests {
     #expect(throws: CompanionCodecError.self) {
       try CompanionCodec.decodeContext(Data(extraField.utf8))
     }
-    let statusWithText = #"{"v":1,"type":"status","status":{"state":"active","capturedAt":1800000000,"pendingInput":0,"previewAvailable":true,"lines":["secret"]}}"#
+    let statusWithText =
+      #"{"v":1,"type":"status","status":{"state":"active","capturedAt":1800000000"#
+      + #","pendingInput":0,"previewAvailable":true,"lines":["secret"]}}"#
     #expect(throws: CompanionCodecError.self) {
       try CompanionCodec.decodeContext(Data(statusWithText.utf8))
     }
@@ -188,7 +190,9 @@ struct CompanionCodecTests {
   func `timestamps must be finite and plausible`() {
     let bad = #"{"v":1,"type":"cleared","clearedAt":1}"#
     #expect(throws: CompanionCodecError.self) { try CompanionCodec.decodeContext(Data(bad.utf8)) }
-    let later = #"{"v":1,"type":"status","status":{"state":"active","capturedAt":1800000000,"lastScreenAt":1800000100,"pendingInput":0,"previewAvailable":false}}"#
+    let later =
+      #"{"v":1,"type":"status","status":{"state":"active","capturedAt":1800000000,"lastScreenAt":1800000100"#
+      + #","pendingInput":0,"previewAvailable":false}}"#
     #expect(throws: CompanionCodecError.self) {
       try CompanionCodec.decodeContext(Data(later.utf8))
     }

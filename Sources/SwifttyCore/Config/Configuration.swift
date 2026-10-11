@@ -500,30 +500,7 @@ public struct Configuration: Sendable, Equatable {
       workingDirectory =
         value.isEmpty ? nil : (value as NSString).expandingTildeInPath
     case "window-padding-x", "window-padding-y":
-      // Ghostty allows "left,right"; the larger side is used for both.
-      let v: Double
-      if value.isEmpty {
-        v =
-          key == "window-padding-x"
-          ? defaults.windowPaddingX : defaults.windowPaddingY
-      } else {
-        let parts = value.split(
-          separator: ",",
-          omittingEmptySubsequences: false
-        )
-        let numbers = parts.compactMap {
-          Double($0.trimmingCharacters(in: .whitespaces))
-        }
-        guard (1 ... 2).contains(parts.count), numbers.count == parts.count,
-          numbers.allSatisfy({ $0.isFinite && $0 >= 0 })
-        else { return invalid() }
-        v = numbers.max()!
-      }
-      if key == "window-padding-x" {
-        windowPaddingX = v
-      } else {
-        windowPaddingY = v
-      }
+      return setPadding(key, value)
     case "keybind":
       if value.isEmpty {
         keybindings = .defaults
@@ -531,6 +508,33 @@ public struct Configuration: Sendable, Equatable {
         return error
       }
     default: return "unknown key"
+    }
+    return nil
+  }
+
+  private mutating func setPadding(_ key: String, _ value: String) -> String? {
+    let defaults = Configuration()
+    func invalid() -> String { "invalid value \(value)" }
+    // Ghostty allows "left,right"; the larger side is used for both.
+    let v: Double
+    if value.isEmpty {
+      v =
+        key == "window-padding-x"
+        ? defaults.windowPaddingX : defaults.windowPaddingY
+    } else {
+      let parts = value.split(separator: ",", omittingEmptySubsequences: false)
+      let numbers = parts.compactMap {
+        Double($0.trimmingCharacters(in: .whitespaces))
+      }
+      guard (1 ... 2).contains(parts.count), numbers.count == parts.count,
+        numbers.allSatisfy({ $0.isFinite && $0 >= 0 })
+      else { return invalid() }
+      v = numbers.max()!
+    }
+    if key == "window-padding-x" {
+      windowPaddingX = v
+    } else {
+      windowPaddingY = v
     }
     return nil
   }

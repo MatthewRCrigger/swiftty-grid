@@ -56,7 +56,7 @@ public final class LocalPTYBackend: TerminalSurfaceBackend {
   /// The view observes `session.onUpdate` directly.
   public var onInvalidate: (@Sendable () -> Void)? {
     get { nil }
-    set {}
+    set { _ = newValue }
   }
 
   public var lifecycle: SurfaceLifecycle { state.withLock { $0.lifecycle } }

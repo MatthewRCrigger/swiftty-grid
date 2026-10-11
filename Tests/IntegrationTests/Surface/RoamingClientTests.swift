@@ -9,7 +9,7 @@ import Testing
 struct RoamingClientTests {
   @Test
   func `attach then first complete snapshot makes the client active`() async throws {
-    let f = RoamingFixture()
+    let f = try RoamingFixture()
     try await f.client.start(.create(GridSize(columns: 20, rows: 4)))
     #expect(await f.waitFor(.active))
     let status = await f.client.status
@@ -25,7 +25,7 @@ struct RoamingClientTests {
 
   @Test
   func `input is acknowledged and leaves the pending queue`() async throws {
-    let f = RoamingFixture()
+    let f = try RoamingFixture()
     #expect(try await f.startActive())
     #expect(await f.client.submit(.text("ls")) == .accepted(sequence: 1))
     #expect(await f.client.submit(.key(SemanticKey(.enter))) == .accepted(sequence: 2))
@@ -38,7 +38,7 @@ struct RoamingClientTests {
 
   @Test
   func `severed connection retries unacknowledged input once under the new epoch`() async throws {
-    let f = RoamingFixture()
+    let f = try RoamingFixture()
     #expect(try await f.startActive())
     // Applied but unacknowledged (1, 2) and lost in transit (3, 4).
     await f.host.set(withholdAcks: true, dropInputsAfter: .some(2))
@@ -68,7 +68,7 @@ struct RoamingClientTests {
 
   @Test
   func `input is refused while reconnecting and never queued`() async throws {
-    let f = RoamingFixture()
+    let f = try RoamingFixture()
     #expect(try await f.startActive())
     await f.connector.block()
     await f.host.severCurrent()
@@ -87,7 +87,7 @@ struct RoamingClientTests {
 
   @Test
   func `stale and older epoch snapshots never regress the display`() async throws {
-    let f = RoamingFixture()
+    let f = try RoamingFixture()
     #expect(try await f.startActive())
     #expect(await f.client.submit(.text("new")) == .accepted(sequence: 1))
     #expect(await eventually { f.sink.lastLine == "new" })
@@ -117,7 +117,7 @@ struct RoamingClientTests {
 
   @Test
   func `reconnect attempts run one at a time with backoff`() async throws {
-    let f = RoamingFixture()
+    let f = try RoamingFixture()
     #expect(try await f.startActive())
     await f.connector.fail(next: 3)
     await f.host.severCurrent()
@@ -136,7 +136,7 @@ struct RoamingClientTests {
 
   @Test
   func `expired token renews credentials through SSH resume`() async throws {
-    let f = RoamingFixture()
+    let f = try RoamingFixture()
     #expect(try await f.startActive())
     let writer = await f.host.writer
     let oldToken = await f.host.token
@@ -158,7 +158,7 @@ struct RoamingClientTests {
 
   @Test
   func `unknown session ends as session lost without replay`() async throws {
-    let f = RoamingFixture()
+    let f = try RoamingFixture()
     #expect(try await f.startActive())
     await f.host.set(dropInputsAfter: .some(0))
     #expect(await f.client.submit(.text("rm -rf build")) == .accepted(sequence: 1))
@@ -177,7 +177,7 @@ struct RoamingClientTests {
 
   @Test
   func `authenticated unknown session from SSH ends as session lost`() async throws {
-    let f = RoamingFixture()
+    let f = try RoamingFixture()
     #expect(try await f.startActive())
     await f.connector.fail(next: 100)
     await f.host.set(sessionGone: true)
@@ -192,7 +192,7 @@ struct RoamingClientTests {
   @Test
   func `session exit is reported through status and lifecycle`() async throws {
     let clock = TestClock()
-    let host = FakeHost()
+    let host = try FakeHost()
     let backend = RoamingScreenBackend(
       bootstrapper: FakeBootstrapper(host: host),
       connector: FakeConnector(host: host),
@@ -219,7 +219,7 @@ struct RoamingClientTests {
 
   @Test
   func `background detach then foreground waits for a full screen before input`() async throws {
-    let f = RoamingFixture()
+    let f = try RoamingFixture()
     #expect(try await f.startActive())
     await f.client.enterBackground()
     #expect(await f.client.state == .backgroundDetached)
@@ -242,7 +242,7 @@ struct RoamingClientTests {
 
   @Test
   func `grid proposals become ordered resize operations`() async throws {
-    let f = RoamingFixture()
+    let f = try RoamingFixture()
     #expect(try await f.startActive())
     await f.client.proposeGrid(columns: 30, rows: 5)
     #expect(await eventually { f.sink.last?.columns == 30 })
@@ -263,7 +263,7 @@ struct RoamingClientTests {
   @Test
   func `resume requests the configured grid instead of adopting the grant`() async throws {
     // The view proposed 30x5 while signing in; the session is 20x4.
-    let f = RoamingFixture(initialGrid: GridSize(columns: 30, rows: 5))
+    let f = try RoamingFixture(initialGrid: GridSize(columns: 30, rows: 5))
     try await f.client.start(.resume(f.host.sessionID))
     #expect(await f.waitFor(.active))
     let requested = f.bootstrapper.requests.withLock { $0.first?.initialGrid }
@@ -275,7 +275,7 @@ struct RoamingClientTests {
 
   @Test
   func `reattaching re-requests the grid after another client resized`() async throws {
-    let f = RoamingFixture()
+    let f = try RoamingFixture()
     #expect(try await f.startActive())
     await f.client.proposeGrid(columns: 30, rows: 5)
     #expect(await eventually { f.sink.last?.columns == 30 })
@@ -298,7 +298,7 @@ struct RoamingClientTests {
 
   @Test
   func `unanswered input marks the connection stale and recovers`() async throws {
-    let f = RoamingFixture()
+    let f = try RoamingFixture()
     let states = Mutex<[ClientConnectionState]>([])
     await f.client.setStatusHandler { status in
       states.withLock { if $0.last != status.state { $0.append(status.state) } }
@@ -318,7 +318,7 @@ struct RoamingClientTests {
 
   @Test
   func `explicit terminate closes the session`() async throws {
-    let f = RoamingFixture()
+    let f = try RoamingFixture()
     #expect(try await f.startActive())
     await f.client.close(.terminate)
     #expect(await f.client.state == .userClosed)
@@ -328,7 +328,7 @@ struct RoamingClientTests {
 
   @Test
   func `status carries no secrets`() async throws {
-    let f = RoamingFixture()
+    let f = try RoamingFixture()
     #expect(try await f.startActive())
     let text = String(describing: await f.client.status)
     let token = await f.host.token

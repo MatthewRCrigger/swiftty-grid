@@ -27,7 +27,7 @@ struct RemoteAttentionTests {
 
   @Test
   func `the inbox is read and acknowledged without a lease`() async throws {
-    try await withRegistry(launch: { shellLaunch(Self.blocked) }) { registry in
+    try await withRegistry(launch: { shellLaunch(Self.blocked) }, { registry in
       let grant = try await registry.create(grid: GridSize(columns: 80, rows: 24))
       let item = try await waitForItem(registry)
       #expect(item.category == .needsYou)
@@ -58,12 +58,12 @@ struct RemoteAttentionTests {
       }
       // Reading never took a lease.
       #expect(await registry.workspaces().first?.isAttached == false)
-    }
+    })
   }
 
   @Test
   func `bootstrap envelopes carry attention requests end to end`() async throws {
-    try await withRegistry(launch: { shellLaunch(Self.blocked) }) { registry in
+    try await withRegistry(launch: { shellLaunch(Self.blocked) }, { registry in
       _ = try await registry.create(grid: GridSize(columns: 80, rows: 24))
       _ = try await waitForItem(registry)
       let service = BootstrapService(registry: registry)
@@ -84,7 +84,7 @@ struct RemoteAttentionTests {
         from: await service.respond(toEnvelope: missing)
       )
       #expect(refused == .failure(.malformed))
-    }
+    })
   }
 
   @Test
@@ -206,7 +206,7 @@ struct RemoteAttentionTests {
   func `input pending at shell exit is retired and the writer can change`()
     async throws
   {
-    try await withRegistry(launch: { shellLaunch("sleep 0.5; exit 7") }) { registry in
+    try await withRegistry(launch: { shellLaunch("sleep 0.5; exit 7") }, { registry in
       let grant = try await registry.create(grid: GridSize(columns: 40, rows: 10))
       let client = TestClient(registry)
       _ = try await client.attached(grant)
@@ -226,14 +226,14 @@ struct RemoteAttentionTests {
       }
       // Nothing is left to block a new writer (no writerBusy).
       _ = try await registry.resume(grant.sessionID)
-    }
+    })
   }
 
   @Test
   func `an exited pane in a split workspace never ends the live panes`()
     async throws
   {
-    try await withRegistry(launch: { shellLaunch("sleep 0.3; exit 0") }) { registry in
+    try await withRegistry(launch: { shellLaunch("sleep 0.3; exit 0") }, { registry in
       let endpoint = registry.service.listenAnonymously()
       let grant = try await registry.create(grid: GridSize(columns: 80, rows: 24))
       let local = try await MuxConnection.connect(endpoint: endpoint, frontend: .native)
@@ -261,14 +261,14 @@ struct RemoteAttentionTests {
       _ = await registry.sweep(now: .now + .seconds(301))
       #expect(await registry.workspaces().map(\.id) == [grant.sessionID.workspace])
       #expect(await registry.service.panePID(live) != nil)
-    }
+    })
   }
 
   @Test
   func `a new writer resumes even with input the pane never took`() async throws {
     // Raw mode: the tty holds unread input instead of discarding it, so
     // the PTY stops accepting and the pane's input budget fills.
-    try await withRegistry(launch: { shellLaunch("stty raw -echo; exec sleep 30") }) {
+    try await withRegistry(launch: { shellLaunch("stty raw -echo; exec sleep 30") }, {
       registry in
       let grant = try await registry.create(grid: GridSize(columns: 80, rows: 24))
       let client = TestClient(registry)
@@ -298,12 +298,12 @@ struct RemoteAttentionTests {
       let fresh = try await registry.resume(grant.sessionID)
       #expect(fresh.writerID != grant.writerID)
       #expect(session.diagnostics.pendingInputOperations == 0)
-    }
+    })
   }
 
   @Test
   func `a shell that exits while detached is noticed by the sweep`() async throws {
-    try await withRegistry(launch: { shellLaunch("sleep 1; exit 0") }) { registry in
+    try await withRegistry(launch: { shellLaunch("sleep 1; exit 0") }, { registry in
       let grant = try await registry.create(grid: GridSize(columns: 40, rows: 10))
       let client = TestClient(registry)
       _ = try await client.attached(grant)
@@ -318,7 +318,7 @@ struct RemoteAttentionTests {
       try await hostEventuallyAsync("workspace ended") {
         await registry.workspaces().isEmpty ? true : nil
       }
-    }
+    })
   }
 
   @Test
@@ -363,7 +363,7 @@ struct RemoteAttentionTests {
     let output = directory.appendingPathComponent("lines")
     try await withRegistry(
       launch: { shellLaunch("stty -echo; exec cat > \"$HOME/lines\"", in: directory) }
-    ) { registry in
+    , { registry in
       let grant = try await registry.create(grid: GridSize(columns: 80, rows: 24))
       let total: UInt64 = 120
       var client = TestClient(registry)
@@ -391,7 +391,7 @@ struct RemoteAttentionTests {
       let lines = try String(contentsOf: output, encoding: .utf8)
         .split(separator: "\n").map(String.init)
       #expect(lines == (1 ... total).map { "L\($0)" })
-    }
+    })
   }
 }
 #endif

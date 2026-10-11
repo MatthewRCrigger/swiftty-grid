@@ -1,6 +1,6 @@
 excluded:
   - .build
-  - Sources/SwifttyCore/Unicode/Tables.swift
+  - Sources/SwifttyEngine/Unicode/Tables.swift
 line_length:
   warning: 160
   ignores_comments: true
