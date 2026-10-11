@@ -81,7 +81,7 @@ public actor UpdateCoordinator {
       let deadline = ContinuousClock.now + barrierTimeout
       while true {
         if cancelRequested {
-          try? await connection.execute(.quiesce(false))
+          _ = try? await connection.execute(.quiesce(false))
           await connection.close()
           phase = .cancelled
           return phase
@@ -90,7 +90,7 @@ public actor UpdateCoordinator {
         else { return fail("unexpected status reply") }
         if status.workspaces == 0, status.panes == 0, !status.attached { break }
         guard ContinuousClock.now < deadline else {
-          try? await connection.execute(.quiesce(false))
+          _ = try? await connection.execute(.quiesce(false))
           return fail(
             "\(status.workspaces) workspace(s) still running; end them or choose “End workspaces and update”"
           )

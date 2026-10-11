@@ -10,6 +10,7 @@ package enum TerminalWindowBackground {
     content: NSView,
     configuration: Configuration
   ) -> Bool {
+    let windowFrame = window.frame
     let translucent = configuration.backgroundOpacity < 1
     window.isOpaque = !translucent
     window.backgroundColor = translucent ? .clear : .windowBackgroundColor
@@ -22,10 +23,10 @@ package enum TerminalWindowBackground {
       content.removeFromSuperview()
       window.styleMask.insert(.fullSizeContentView)
       window.titlebarAppearsTransparent = true
-      let glass = NSGlassEffectView()
+      let glass = NSGlassEffectView(frame: window.contentView?.bounds ?? .zero)
       glass.style = .regular
       glass.cornerRadius = 0
-      let host = NSView()
+      let host = NSView(frame: glass.bounds)
       host.autoresizingMask = [.width, .height]
       glass.contentView = host
       host.addSubview(content)
@@ -47,6 +48,7 @@ package enum TerminalWindowBackground {
       window.titlebarAppearsTransparent = false
       window.contentView = content
     }
+    window.setFrame(windowFrame, display: false)
     window.contentView?.layoutSubtreeIfNeeded()
     return true
   }

@@ -507,15 +507,17 @@ func noisyGPU() throws -> (quiet: [Double], noisy: [Double])? {
     fontManager: CoreTextFontManager(),
     font: FontDescriptor()
   )
-  let noise = try MetalRenderer(
-    device: device,
-    fontManager: CoreTextFontManager(),
-    font: FontDescriptor()
+  let noise = Mutex(
+    try MetalRenderer(
+      device: device,
+      fontManager: CoreTextFontManager(),
+      font: FontDescriptor()
+    )
   )
   let small = try snapshot(200, 50)
   let large = try snapshot(512, 256)
   let paneTexture = target(pane, 200, 50)
-  let noiseTexture = target(noise, 512, 256)
+  let noiseTexture = noise.withLock { target($0, 512, 256) }
   func measure() -> [Double] {
     var times: [Double] = []
     for i in 0 ..< 65 {
@@ -527,16 +529,20 @@ func noisyGPU() throws -> (quiet: [Double], noisy: [Double])? {
   }
   let quiet = measure()
   let stop = Atomic(false)
+  let finished = DispatchSemaphore(value: 0)
   let noiseThread = Thread {
-    while !stop.load(ordering: .relaxed) {
-      noise.render(large, to: noiseTexture).waitUntilCompleted()
+    defer { finished.signal() }
+    noise.withLock { renderer in
+      while !stop.load(ordering: .relaxed) {
+        renderer.render(large, to: noiseTexture).waitUntilCompleted()
+      }
     }
   }
   noiseThread.start()
   Thread.sleep(forTimeInterval: 0.2)
   let noisy = measure()
   stop.store(true, ordering: .relaxed)
-  Thread.sleep(forTimeInterval: 0.1)
+  finished.wait()
   return (quiet, noisy)
 }
 

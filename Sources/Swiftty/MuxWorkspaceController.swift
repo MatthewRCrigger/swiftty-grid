@@ -66,7 +66,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private var appearanceObservation: NSKeyValueObservation?
   /// Attention inbox mirror, fed by its own subscription (not frames).
   private(set) var inbox = MuxInboxModel()
-  let inboxToolbar = MuxInboxToolbar()
+  lazy var workspaceToolbar = MuxWorkspaceToolbar(tabs: tabStrip)
   private var inboxPopover: NSPopover?
   private(set) var inboxView: MuxInboxViewController?
 
@@ -95,16 +95,11 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     tabStrip.onSelect = { [weak self] tab in self?.selectTab(tab) }
     tabStrip.onClose = { [weak self] tab in self?.closeTab(tab) }
     tabStrip.onRename = { [weak self] tab, name in self?.renameTab(tab, name) }
-    tabStrip.onNew = { [weak self] in self?.newTab() }
     layoutView.translatesAutoresizingMaskIntoConstraints = false
     layoutView.controller = self
-    content.addSubview(tabStrip)
     content.addSubview(layoutView)
     NSLayoutConstraint.activate([
-      tabStrip.topAnchor.constraint(equalTo: content.topAnchor),
-      tabStrip.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-      tabStrip.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-      layoutView.topAnchor.constraint(equalTo: tabStrip.bottomAnchor),
+      layoutView.topAnchor.constraint(equalTo: content.topAnchor),
       layoutView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
       layoutView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
       layoutView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
@@ -114,8 +109,11 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       content: content,
       configuration: configuration
     )
-    inboxToolbar.onClick = { [weak self] in self?.toggleInbox() }
-    window.toolbar = inboxToolbar.toolbar
+    workspaceToolbar.onClick = { [weak self] in self?.toggleInbox() }
+    workspaceToolbar.onNewTab = { [weak self] in self?.newTab() }
+    window.toolbar = workspaceToolbar.toolbar
+    window.toolbarStyle = .unifiedCompact
+    window.titleVisibility = .hidden
     startPipelines()
   }
 
@@ -1192,7 +1190,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   }
 
   private func refreshInbox() {
-    inboxToolbar.update(inbox.counts)
+    workspaceToolbar.update(inbox.counts)
     if inboxPopover?.isShown == true { inboxView?.update(inbox) }
   }
 

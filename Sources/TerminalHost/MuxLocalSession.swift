@@ -37,13 +37,13 @@ final class MuxLocalSession: @unchecked Sendable {
     dispatchPrecondition(condition: .onQueue(queue))
     let sink = LocalClientSink(
       onMessage: { [weak self] message in
-        self?.queue.async { self?.receive(message) }
+        self?.queue.async { [weak self] in self?.receive(message) }
       },
       onPaneChanged: { [weak self] pane in
-        self?.queue.async { self?.onPaneChanged?(pane) }
+        self?.queue.async { [weak self] in self?.onPaneChanged?(pane) }
       },
       onClosed: { [weak self] reason in
-        self?.queue.async { self?.finish(reason) }
+        self?.queue.async { [weak self] in self?.finish(reason) }
       }
     )
     let connection = service.connectLocal(remote: remote, sink: sink)

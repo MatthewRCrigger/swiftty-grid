@@ -63,16 +63,14 @@ final class MuxActivityDot: NSView {
 // MARK: Tab strip
 
 /// The window-level tab strip: icon, title, activity marker and close
-/// button per tab, plus a new-tab button. Double-click renames.
+/// button per tab. Double-click renames; narrow windows scroll horizontally.
 @MainActor
 final class MuxTabStrip: NSGlassEffectContainerView {
   var onSelect: ((TabID) -> Void)?
   var onClose: ((TabID) -> Void)?
   var onRename: ((TabID, String) -> Void)?
-  var onNew: (() -> Void)?
-
   private let stack = NSStackView()
-  private let newButton = NSButton()
+  private let scrollView = NSScrollView()
   private(set) var buttons: [MuxTabButton] = []
 
   override init(frame: NSRect) {
@@ -83,29 +81,25 @@ final class MuxTabStrip: NSGlassEffectContainerView {
     stack.orientation = .horizontal
     stack.spacing = 2
     stack.alignment = .centerY
-    stack.translatesAutoresizingMaskIntoConstraints = false
-    newButton.image = MuxIcons.image("plus", "New Tab")
-    newButton.bezelStyle = .glass
-    newButton.target = self
-    newButton.action = #selector(newClicked)
-    newButton.toolTip = "New Tab"
-    newButton.setAccessibilityLabel("New Tab")
-    newButton.translatesAutoresizingMaskIntoConstraints = false
-    content.addSubview(stack)
-    content.addSubview(newButton)
+    scrollView.drawsBackground = false
+    scrollView.horizontalScrollElasticity = .none
+    scrollView.verticalScrollElasticity = .none
+    scrollView.automaticallyAdjustsContentInsets = false
+    scrollView.translatesAutoresizingMaskIntoConstraints = false
+    scrollView.documentView = stack
+    content.addSubview(scrollView)
     NSLayoutConstraint.activate([
-      stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
-      stack.centerYAnchor.constraint(equalTo: centerYAnchor),
-      stack.trailingAnchor.constraint(
-        lessThanOrEqualTo: newButton.leadingAnchor,
-        constant: -4
-      ),
-      newButton.trailingAnchor.constraint(
+      scrollView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+      scrollView.trailingAnchor.constraint(
         equalTo: trailingAnchor,
         constant: -6
-      ), newButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+      ), scrollView.centerYAnchor.constraint(equalTo: centerYAnchor),
+      scrollView.heightAnchor.constraint(equalToConstant: 24),
+      widthAnchor.constraint(greaterThanOrEqualToConstant: 102),
       heightAnchor.constraint(equalToConstant: 30),
     ])
+    setContentHuggingPriority(.defaultHigh, for: .horizontal)
+    setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
     setAccessibilityRole(.tabGroup)
     setAccessibilityLabel("Workspace tabs")
   }
@@ -113,8 +107,20 @@ final class MuxTabStrip: NSGlassEffectContainerView {
   @available(*, unavailable)
   required init?(coder: NSCoder) { fatalError() }
 
-  @objc
-  private func newClicked() { onNew?() }
+  override var intrinsicContentSize: NSSize {
+    NSSize(width: max(102, stack.fittingSize.width + 12), height: 30)
+  }
+
+  override func layout() {
+    super.layout()
+    stack.setFrameSize(
+      NSSize(
+        width: max(stack.fittingSize.width, scrollView.bounds.width),
+        height: 24
+      )
+    )
+    stack.layoutSubtreeIfNeeded()
+  }
 
   func update(_ items: [MuxTabItem]) {
     while buttons.count > items.count {
@@ -129,6 +135,12 @@ final class MuxTabStrip: NSGlassEffectContainerView {
       stack.addArrangedSubview(b)
     }
     for (b, item) in zip(buttons, items) { b.item = item }
+    invalidateIntrinsicContentSize()
+    needsLayout = true
+    layoutSubtreeIfNeeded()
+    if let active = buttons.first(where: { $0.item?.isActive == true }) {
+      active.scrollToVisible(active.bounds)
+    }
   }
 }
 
@@ -212,6 +224,8 @@ final class MuxTabButton: NSGlassEffectView, NSTextFieldDelegate {
 
   @available(*, unavailable)
   required init?(coder: NSCoder) { fatalError() }
+
+  override var mouseDownCanMoveWindow: Bool { false }
 
   override func mouseDown(with event: NSEvent) {
     guard let item else { return }

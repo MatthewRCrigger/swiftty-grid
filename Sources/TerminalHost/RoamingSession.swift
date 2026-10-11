@@ -345,7 +345,7 @@ public final class RoamingSession: @unchecked Sendable {
           let expected = self.target?.expectedLease ?? summary.leaseGeneration
           session.request(
             .takeover(target, expectedLease: expected)
-          ) { [self] result in
+          ) { result in
             guard case let .success(.attached(attachment, ws)) = result else {
               return failAttach(.writerBusy)
             }
@@ -822,7 +822,7 @@ public final class RoamingSession: @unchecked Sendable {
       // point (including final output after exit) is included.
       service.inspect(pane: pane, { ScreenExporter.export($0, stamp: stamp) }, completion: {
         [weak self] snapshot in
-        self?.queue.async {
+        self?.queue.async { [weak self] in
           self?.captured(snapshot, stream: stream, exit: exit, to: a)
         }
       })

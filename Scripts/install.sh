@@ -5,8 +5,8 @@
 # Remote Login and firewall policy are reported, never changed.
 #
 # usage: Scripts/install.sh [options]
-#   --identity ID      signing identity; default: the first "Developer ID
-#                      Application" identity, else "-" (ad-hoc). See
+#   --identity ID      signing identity; default: match a running agent,
+#                      else the first Developer ID identity or ad-hoc. See
 #                      Scripts/package-swiftmux.sh for NOTARY_PROFILE etc.
 #   --dest DIR         install directory (default /Applications)
 #   --roaming          also set up remote clients:
@@ -54,10 +54,33 @@ roaming_dir="$HOME/Library/Application Support/SwiftMux/roaming"
 roaming_config="$roaming_dir/config.json"
 domain="gui/$(id -u)"
 
+team_of() {
+  codesign -dv "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p' | sed 's/^not set$//'
+}
+agent_info=$(launchctl print "$domain/$label" 2>/dev/null || true)
+registered_team=$(printf '%s\n' "$agent_info" \
+  | sed -n 's/.*"team-identifier" => "\(.*\)".*/\1/p' | head -n 1)
+
 # By SHA-1, so duplicate certificates with one name stay unambiguous.
 if [ -z "$identity" ]; then
-  identity=$(security find-identity -v -p codesigning \
-    | awk '/"Developer ID Application/ { print $2; exit }')
+  if [ "$restart_agent" -eq 0 ] \
+    && printf '%s\n' "$agent_info" | grep -q 'state = running'; then
+    if [ -z "$registered_team" ]; then
+      identity=-
+    else
+      identity=$(security find-identity -v -p codesigning \
+        | awk -v team="$registered_team" \
+          '/"Developer ID Application/ && index($0, "(" team ")") { print $2; exit }')
+      if [ -z "$identity" ]; then
+        echo "install.sh: no Developer ID identity for the running agent's team '$registered_team'." >&2
+        echo "  Use --identity with a matching identity, or --restart-agent (its running sessions end)." >&2
+        exit 1
+      fi
+    fi
+  else
+    identity=$(security find-identity -v -p codesigning \
+      | awk '/"Developer ID Application/ { print $2; exit }')
+  fi
   [ -n "$identity" ] || identity=-
 fi
 echo "signing with ${identity}"
@@ -74,15 +97,13 @@ if [ -f "$dev_plist" ]; then
   echo "removed development agent $dev_plist"
 fi
 
-built=$(Scripts/package-swiftmux.sh "$identity" .build/package | tail -n 1)
+Scripts/package-swiftmux.sh "$identity" .build/package
+built=.build/package/Swiftty.app
 bin=$(swift build -c release --show-bin-path)
 
 # launchd pins the registered agent to the signing team it had when
 # registered (a launch constraint); a different team is killed at spawn
 # with "Launch Constraint Violation" until the agent is re-registered.
-team_of() {
-  codesign -dv "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p' | sed 's/^not set$//'
-}
 agent_info=$(launchctl print "$domain/$label" 2>/dev/null || true)
 registered_team=$(printf '%s\n' "$agent_info" \
   | sed -n 's/.*"team-identifier" => "\(.*\)".*/\1/p' | head -n 1)

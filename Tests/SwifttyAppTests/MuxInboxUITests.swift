@@ -25,7 +25,7 @@ extension MuxNativeTests {
       to: pane
     )
     #expect(await until { c.inbox.counts.needsYou == 1 })
-    #expect(c.inboxToolbar.item.badge == .count(1))
+    #expect(c.workspaceToolbar.item.badge == .count(1))
     let request = try #require(c.inbox.sorted.first)
     #expect(MuxInboxModel.text(request).heading == "Needs an answer: tool")
     #expect(MuxInboxModel.text(request).detail == "Ok?")
@@ -42,7 +42,7 @@ extension MuxNativeTests {
     #expect(
       await until { c.inbox.counts == InboxCounts(needsYou: 0, results: 1) }
     )
-    #expect(c.inboxToolbar.item.badge == nil)
+    #expect(c.workspaceToolbar.item.badge == nil)
     c.toggleInbox()
     let result = try #require(c.inbox.sorted.first)
     #expect(result.category == .result)
@@ -149,7 +149,7 @@ extension MuxNativeTests {
           && c.inbox.sorted.first?.snoozedUntil != nil
       }
     )
-    #expect(c.inboxToolbar.item.badge == nil)
+    #expect(c.workspaceToolbar.item.badge == nil)
     let snoozed = try #require(c.inbox.sorted.first)
     #expect(
       MuxInboxModel.snoozeText(snoozed, at: Date())?.hasPrefix("Snoozed until ")
