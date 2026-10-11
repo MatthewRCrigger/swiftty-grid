@@ -205,24 +205,29 @@ struct ConnectionTests {
     else { return }
     let pane = ws.tabs[0].activePane
     try await c.attachAndShow(.id(ws.id))
+    // `cat` copies what the pane receives into a file, in order.
+    let path = NSTemporaryDirectory() + "paste-\(UUID().uuidString)"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+    try await c.send(.text("cat > '\(path)'\r"), to: pane)
+    try await Task.sleep(for: .milliseconds(300))
     let results = Mutex<[Int: Result<PasteState, MuxError>]>([:])
-    let first = String(repeating: "# filler\n", count: 8000) + "echo one-$((1+1))\n"
-    c.enqueuePaste(first, to: pane) { r in results.withLock { $0[1] = r } }
-    c.enqueuePaste("echo two-$((2+2))\n", to: pane) { r in
-      results.withLock { $0[2] = r }
+    let filler = String(repeating: "filler\n", count: 8000)
+    c.enqueuePaste(filler + "one\n", to: pane) { r in
+      results.withLock { $0[1] = r }
     }
-    c.enqueue(.text("echo three-$((3+3))\r"), to: pane)
-    let f = try await c.frame(of: pane, timeout: .seconds(20)) {
-      $0.lines.contains("three-6")
-    }
-    for _ in 0 ..< 200 where results.withLock({ $0.count }) < 2 {
-      try await Task.sleep(for: .milliseconds(10))
+    c.enqueuePaste("two\n", to: pane) { r in results.withLock { $0[2] = r } }
+    c.enqueue(.text("three\n"), to: pane)
+    c.enqueue(.key(.character(0x64), .control), to: pane)
+    var written = ""
+    for _ in 0 ..< 500 {
+      written = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+      if written.hasSuffix("three\n"), results.withLock({ $0.count }) == 2 {
+        break
+      }
+      try await Task.sleep(for: .milliseconds(20))
     }
     #expect(try results.withLock { try $0[1]?.get() } == .completed)
     #expect(try results.withLock { try $0[2]?.get() } == .completed)
-    let lines = f.lines
-    let two = try #require(lines.firstIndex(of: "two-4"))
-    let three = try #require(lines.firstIndex(of: "three-6"))
-    #expect(two < three)
+    #expect(written == filler + "one\ntwo\nthree\n")
   }
 }
