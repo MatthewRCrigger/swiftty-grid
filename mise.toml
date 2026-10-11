@@ -34,6 +34,14 @@ run = "swift run -c release swiftty"
 description = "Assemble and sign Swiftty.app with the SwiftMux agent: mise run package-swiftmux [identity]"
 run = "Scripts/package-swiftmux.sh"
 
+[tasks.install]
+description = "Install Swiftty.app, register the SwiftMux agent; --roaming adds swifttyd: mise run install [options]"
+run = "Scripts/install.sh"
+
+[tasks.uninstall]
+description = "Remove Swiftty.app, the SwiftMux agent and swifttyd: mise run uninstall [--purge] [-y]"
+run = "Scripts/uninstall.sh"
+
 [tasks.bench-swiftmux]
 description = "SwiftMux throughput, latency, CPU, memory and GPU measurements"
 run = "swift run -c release swiftmux-bench"

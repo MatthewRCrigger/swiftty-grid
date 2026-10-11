@@ -125,6 +125,8 @@ swift build
 .build/debug/swmux agent install   # development LaunchAgent for this build
 .build/debug/swmux new -s work     # inside Swiftty
 Scripts/package-swiftmux.sh [identity]   # Swiftty.app with the bundled agent (SMAppService)
+Scripts/install.sh [--roaming]           # package, install to /Applications, register the agent (+ swifttyd)
+Scripts/uninstall.sh [--purge]           # remove the app, agent and swifttyd
 ```
 
 Acceptance evidence and measurements (`mise run bench-swiftmux`) are recorded
@@ -252,7 +254,7 @@ in stream order, then sends coalesced updates
 ## Roaming SSH (RST/1)
 
 [spec.roaming.md](spec.roaming.md) (with its Swiftty integration in Appendix A) defines SSH clients for Apple
-platforms whose shells survive network changes: a per-user `swifttyd` agent on
+platforms whose shells survive network changes: the per-user SwiftMux agent on
 the Mac owns the PTY and the authoritative Swiftty terminal, and clients
 receive complete current screens over QUIC instead of a byte log. There is no
 speculative echo; typing latency is ordinary remote echo.
@@ -268,7 +270,7 @@ Appendix B of the spec records the design sources.
 | `TerminalSurface` | Client: `RoamingClient`, frontend backends (roaming, ordinary SSH, local PTY), SSH and QUIC bridges |
 | `CompanionModel` | Bounded watch/iPhone status DTOs; no Swiftty, SSH or QUIC |
 | `RoamingApp` (`Apps/Shared`) | Shared app model and SwiftUI for the direct clients |
-| `swifttyd` (`Apps/swifttyd`) | `serve`, `bootstrap --stdio`, `install`/`uninstall`/`status` |
+| `swifttyd` (`Apps/swifttyd`) | No-PTY SSH helper: `bootstrap --stdio`, `status` |
 
 Host setup (spec.inbox.md §1): there is one PTY owner, the SwiftMux service.
 `swiftmux-agent` serves remote clients from the same process as the native
@@ -303,7 +305,7 @@ client and a presentation-mode display, with and without an in-process SSH
 server. Simulator runtimes:
 
 ```sh
-Scripts/test-roaming-simulator.sh <ios-or-ipad-udid> [iOS|tvOS|visionOS]  # client in the simulator vs a real `swifttyd serve`
+Scripts/test-roaming-simulator.sh <ios-or-ipad-udid> [iOS|tvOS|visionOS]  # client in the simulator vs a real roaming SwiftMux agent
 Scripts/test-companion-watch.sh <watch-udid>                             # companion tests hosted by the watch app
 Scripts/test-real-ssh.sh                                                 # real OpenSSH (apple/container Linux VM) + real swifttyd
 ```
