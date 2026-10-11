@@ -354,14 +354,20 @@ final class PaneRuntime: @unchecked Sendable {
     }
   }
 
-  /// Disconnect, cancellation or limit failure. `completion` reports
-  /// whether payload was discarded.
-  func pasteCancel(id: UInt64, completion: @escaping @Sendable (Bool) -> Void) {
+  /// Disconnect, cancellation or limit failure. `completion` reports the
+  /// outcome by what reached the program: `partial` once any payload
+  /// byte was written (it cannot be rolled back), `aborted` when none was.
+  /// A cancelled paste is never `completed`: its sender gave up on the
+  /// rest, as the client reports it.
+  func pasteCancel(
+    id: UInt64,
+    completion: @escaping @Sendable (PasteState) -> Void
+  ) {
     queue.async { [self] in
-      let discarded = writer.cancelPaste(id: id)
+      let (discarded, wrote) = writer.cancelPaste(id: id)
       release(discarded)
       flush()
-      completion(discarded > 0)
+      completion(wrote ? .partial : .aborted)
     }
   }
 
@@ -449,7 +455,12 @@ final class PaneRuntime: @unchecked Sendable {
     queue.async { [self] in
       switch request {
       case let .lines(n): state.scrollViewport(by: n)
-      case let .pages(n): state.scrollViewport(by: n * max(1, state.rows - 1))
+      case let .pages(n):
+        // The engine clamps to history; only the product can overflow.
+        let (lines, overflow) = n.multipliedReportingOverflow(
+          by: max(1, state.rows - 1)
+        )
+        state.scrollViewport(by: overflow ? (n < 0 ? .min : .max) : lines)
       case .bottom: state.scrollViewportToBottom()
       case let .top(address):
         guard address.generation == state.addressingGeneration,

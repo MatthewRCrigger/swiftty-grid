@@ -107,6 +107,8 @@ struct FrameSlot {
   /// Token of the capture in progress; a completion carrying any other
   /// token belongs to an earlier subscription and is dropped.
   var capture: UInt64?
+  /// Budget held for `capture` until it completes or the slot goes.
+  var reserved = 0
   var inflight: (revision: UInt64, bytes: Int)?
   var lastSent: UInt64 = 0
 }

@@ -23,6 +23,8 @@ struct PaneWriter {
     var bracketed: Bool
     var lastByte: UInt8 = 0
     var started = false
+    /// Some payload byte reached the descriptor.
+    var wrote = false
   }
 
   private(set) var queue: [Segment] = []
@@ -105,9 +107,10 @@ struct PaneWriter {
 
   /// Stops a paste: a partly written chunk finishes, unstarted chunks are
   /// discarded, and the closing marker is committed if needed.
-  /// Returns the number of discarded bytes.
-  mutating func cancelPaste(id: UInt64) -> Int {
-    guard let p = paste, p.id == id else { return 0 }
+  /// Returns the number of discarded bytes and whether any payload byte
+  /// had been written (a partly written chunk counts).
+  mutating func cancelPaste(id: UInt64) -> (discarded: Int, wrote: Bool) {
+    guard let p = paste, p.id == id else { return (0, false) }
     var discarded = 0
     var kept: [Segment] = []
     for (i, s) in queue.enumerated() where i >= head {
@@ -124,7 +127,7 @@ struct PaneWriter {
       queue.append(Segment(bytes: Array("\u{1B}[201~".utf8), kind: .marker))
     }
     releaseDeferred()
-    return discarded
+    return (discarded, p.wrote)
   }
 
   private mutating func releaseDeferred() {
@@ -148,7 +151,10 @@ struct PaneWriter {
       else { return nil }
       queue[head].offset += n
       switch s.kind {
-      case .input, .paste: released += n
+      case .input: released += n
+      case let .paste(id):
+        released += n
+        if n > 0, paste?.id == id { paste?.wrote = true }
       case .reply: pendingReplyBytes -= n
       case .marker: break
       }
