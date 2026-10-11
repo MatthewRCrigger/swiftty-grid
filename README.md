@@ -11,6 +11,7 @@ Requires Xcode 27 and the tools pinned in `mise.toml`:
 
 ```sh
 mise install
+mise run build      # debug build; `mise run release` for release
 mise run test       # unit tests and real PTY sessions: sh, vim, less, tmux, top
 mise run app        # launch the macOS terminal
 mise run bench      # Release microbenchmarks
@@ -20,9 +21,12 @@ mise run format-check
 mise run test-internal
 mise run bench-storage
 mise run compare <ghostty-src> <corpus-dir>
+mise run package-swiftmux [identity]   # Swiftty.app with the SwiftMux agent
+mise run install [--roaming]           # see SwiftMux below
+mise run uninstall [--purge] [-y]
 ```
 
-The package sets `SDKROOT` for swift.org toolchains. Build the UIKit frontend
+`mise.toml` sets `SDKROOT` for swift.org toolchains. Build the UIKit frontend
 with Xcode; the package's AppKit executable scheme is macOS-only:
 
 ```sh
@@ -54,7 +58,8 @@ authentication and reconnection belong to the embedding app.
 
 `TerminalUIView(session:configuration:fontSize:)` hosts a session. An iOS app
 target can use `SwifttyMobileAppDelegate` and `SwifttyMobileSceneDelegate` for
-the reference demo. No Xcode app project or network client is included.
+the reference demo. `SwifttyMobile` includes no app project or network
+client; the roaming SSH clients under `Apps/` provide both (see Roaming SSH).
 visionOS omits accessory views, input clicks, haptics and screen-coordinate
 keyboard avoidance. tvOS additionally omits the clipboard, edit menus,
 pointer, hover, pinch, long-press and pan gestures: the focus engine can focus
@@ -73,8 +78,8 @@ and pastes to `semanticInputHandler` (never `onWrite`), `resize` proposes the
 view's grid to `gridProposalHandler`, and history is disabled. Local selection
 and copy work on the displayed frame.
 
-Both frontends take a `capabilities: SurfaceCapabilities` (default `.full`;
-`.roaming` for remote presentation). Program-initiated clipboard writes (OSC
+Both frontends expose a settable `capabilities: SurfaceCapabilities` (default
+`.full`; set `.roaming` for remote presentation). Program-initiated clipboard writes (OSC
 52) reach the pasteboard only with `remoteClipboardWrites`. Without the
 matching capability, link opening, search, scrollback, mouse reporting, paste,
 copy and text input are hidden or disabled rather than shown as nonfunctional
@@ -99,19 +104,25 @@ PTYs, terminal engines, history and workspace layouts. Frontends connect to it
 over one Mach/XPC endpoint using `SMX/1`: tagged JSON records that carry full,
 validated pane frames.
 
-- `swmux` is the terminal client. It runs only inside Swiftty
-  (`TERM_PROGRAM=swiftty`, or pass `--allow-host`). Commands: `new`, `attach`,
-  `list`, `detach`, `end`, `status`. The prefix is `C-b`; press `C-b ?` for the
-  bindings. Settings live in `~/.config/swmux/settings.json`: `prefix`,
-  `escapeDelayMilliseconds` and `remainOnExit`.
+- `swmux` is the terminal client. With no command it attaches to the newest
+  workspace or creates one. Commands: `new [-s NAME] [-c DIR] [-d] [-- CMD]`,
+  `attach [-t NAME]`, `list` (`ls`), `detach`, `end -t NAME`, `end-all`,
+  `status` and `agent install|uninstall|status`. Attaching runs only inside
+  Swiftty (`TERM_PROGRAM=swiftty`, or pass `--allow-host`). The prefix is
+  `C-b`; press `C-b ?` for the bindings. Settings live in
+  `$XDG_CONFIG_HOME/swmux/settings.json` (default `~/.config/swmux`):
+  `prefix`, `escapeDelayMilliseconds` and `remainOnExit`.
 - The service links only `SwifttyEngine`: the parser, terminal state, history,
   input encoding and PTY code, with no Metal, fonts or AppKit. `SwifttyCore`
   re-exports the engine and adds the renderer, fonts and sessions.
 - The Swiftty app's SwiftMux menu attaches a native window. Its panes render
   service frames directly through Metal. AppKit draws the tab strip (icons,
   titles, activity dots, double-click to rename), pane headers and draggable,
-  VoiceOver-adjustable dividers. Shortcuts: ⌘T new tab, ⌘D / ⇧⌘D split,
-  ⌥⌘arrows focus, ⌃⌘arrows resize, ⇧⌘↩ zoom, ⌥⌘W end pane, ⌃⌘W close tab.
+  VoiceOver-adjustable dividers. Shortcuts: ⌃⌘N new workspace, ⌃⌘D detach,
+  ⌘T new tab, ⇧⌘] / ⇧⌘[ next/previous tab, ⌘D / ⇧⌘D split, ⌥⌘arrows focus,
+  ⌃⌘arrows resize, ⇧⌘↩ zoom, ⌥⌘W end pane, ⌃⌘W close tab. The menu also
+  attaches to a named workspace, renames tabs, and stages and installs app
+  updates without replacing the bundle under a live service.
   Ending a running pane or tab asks first. Find (⌘F, ⌘G, ⇧⌘G) searches the
   service-side history, and app theme changes update the colours panes
   report to programs. Quitting the app detaches; the shells
@@ -129,6 +140,12 @@ Scripts/install.sh [--roaming]           # package, install to /Applications, re
 Scripts/uninstall.sh [--purge]           # remove the app, agent and swifttyd
 ```
 
+`install.sh` signs with the first Developer ID Application identity (else
+ad-hoc), and re-registers the agent when its signing team changes: launchd
+otherwise kills it at launch with a launch-constraint violation. The bundled
+agent can also be managed directly with
+`Swiftty.app/Contents/MacOS/swiftty --swiftmux-agent register|unregister|status`.
+
 Acceptance evidence and measurements (`mise run bench-swiftmux`) are recorded
 in section 11 of [spec.multiplexer.md](spec.multiplexer.md).
 
@@ -137,7 +154,7 @@ buffer per pane, 16 MiB frames, 1 MiB pastes and a bounded history per pane.
 
 ### Deep links
 
-Attention items (OSC 7501) can be opened from a link, as described in section 9
+Attention items (OSC 7501) can be opened from a link, as described in section 4
 of `spec.inbox.md`:
 
 ```text
@@ -174,8 +191,11 @@ https://<configured domain>/a/<locator>
 - The roaming clients (iOS/iPadOS, Catalyst, visionOS, tvOS and the Mac
   client) register the scheme through `Apps/Config/AttentionLinks.plist`. They
   route `onOpenURL`, web-browsing activities and attention Handoff into a
-  destination sheet. RST/1 does not carry attention data yet, so roaming hosts
-  report "attention not yet available over roaming".
+  destination sheet. Attention travels over the SSH bootstrap channel
+  (no-PTY `swifttyd bootstrap` requests, spec.inbox.md §3.6), not RST/1. The
+  apps show one Inbox across every configured Mac; opening an item resumes
+  the roaming attachment and asks before taking over a held workspace. There
+  is no push delivery.
 - Universal Links are off unless `SWIFTTY_LINK_DOMAINS` is set. It is a
   comma-separated list of hostnames, validated by `Scripts/link-domains.sh`
   (an invalid name fails the build). When it is unset, no target gets the
@@ -219,7 +239,7 @@ https://<configured domain>/a/<locator>
 Every SwiftMux pane parses OSC 7501 program status (protocol revision 0.3),
 whether or not it is shown, attached or leased. The service reduces each change
 in stream order, then sends coalesced updates
-([spec.inbox.md](spec.inbox.md) §8):
+([spec.inbox.md](spec.inbox.md) §3):
 
 - `MuxAttention` is a pure reducer with three separate models: the current
   status of each record, **Needs you** occurrences (one per stretch of
@@ -263,10 +283,10 @@ Appendix B of the spec records the design sources.
 | Target | Role |
 |---|---|
 | `SessionCore` | IDs, limits, input ledger (client queue, host admission), lifecycle, backoff, transfer manifests |
-| `ScreenProtocol` | RST/1 messages, framing, RFC 1950 snapshots, validation, snapshot scheduler, bootstrap envelope, `RSTConnection` |
+| `ScreenProtocol` | RST/1 messages, framing, RFC 1950 snapshots, validation, snapshot scheduler, bootstrap envelope and attention metadata, `RSTConnection` |
 | `SSHClient` | SwiftNIO SSH: host trust, password/Ed25519, exec, shell, SFTP v3 subset, resumable verified transfers |
 | `AppleTransport` | Network framework QUIC (ALPN `rst/1`, TLS 1.3, no 0-RTT), SPKI and exact-certificate pinning, host identity |
-| `TerminalHost` | macOS host: exporter, tracked PTY writer, session registry, attachment protocol, control socket |
+| `TerminalHost` | RST/1 host over the SwiftMux service (owns no PTYs): `RoamingHost` QUIC listener and grants, in-process SMX client, screen exporter, session registry, bootstrap/attention service, control socket, roaming configuration |
 | `TerminalSurface` | Client: `RoamingClient`, frontend backends (roaming, ordinary SSH, local PTY), SSH and QUIC bridges |
 | `CompanionModel` | Bounded watch/iPhone status DTOs; no Swiftty, SSH or QUIC |
 | `RoamingApp` (`Apps/Shared`) | Shared app model and SwiftUI for the direct clients |
@@ -277,8 +297,12 @@ Host setup (spec.inbox.md §1): there is one PTY owner, the SwiftMux service.
 app when a roaming configuration exists at
 `~/Library/Application Support/SwiftMux/roaming/config.json` (or
 `--roaming-config PATH`, or `$SWIFTMUX_ROAMING_CONFIG`) with an explicit
-`bindAddress`, `advertisedHost` and UDP `port` (51222 by default). Enable
-Remote Login and install the signed bootstrap helper at
+`bindAddress`, `advertisedHost` and UDP `port` (51222 by default), plus an
+optional `stateDirectory`. `--no-roaming` ignores the file; `--idle-exit
+SECONDS|never` sets the local idle exit, which roaming disables.
+`Scripts/install.sh --roaming [--host H] [--bind A] [--port N]` writes this
+file (default `<LocalHostName>.local`, `0.0.0.0`, 51222) and installs the
+helper. Enable Remote Login yourself. The signed bootstrap helper lives at
 `/usr/local/libexec/swifttyd`; it only relays `bootstrap --stdio` to the
 service's control socket (`swifttyd status` checks it). RST/1 session IDs
 are SwiftMux workspace IDs, the grant's server instance is the service
@@ -308,6 +332,8 @@ server. Simulator runtimes:
 Scripts/test-roaming-simulator.sh <ios-or-ipad-udid> [iOS|tvOS|visionOS]  # client in the simulator vs a real roaming SwiftMux agent
 Scripts/test-companion-watch.sh <watch-udid>                             # companion tests hosted by the watch app
 Scripts/test-real-ssh.sh                                                 # real OpenSSH (apple/container Linux VM) + real swifttyd
+Scripts/test-app-ui.sh '<xcodebuild destination>' [xcodebuild args]      # XCUITest of a client app vs real OpenSSH + swifttyd
+Scripts/test-keychain-signed.sh '<destination>' [team-id]                # signed, app-hosted Keychain test
 ```
 
 `test-real-ssh.sh` needs `container`. `swifttyd` is macOS-only, so the Linux
@@ -336,7 +362,7 @@ shell with each command applied once.
 Still open (spec §2.4, §13): physical Apple TV, Vision Pro and paired Apple
 Watch runs.
 
-`Scripts/test-handover.sh <iphone-udid> [switches]` runs A2: a standalone app
+`Scripts/test-handover.sh <iphone-udid> [switches] [team-id]` runs A2: a standalone app
 on the phone keeps one roaming session open while you toggle Wi-Fi, and the
 retained shell on the Mac logs one line per switch.
 
@@ -589,5 +615,5 @@ both devices. Scripted and hands-on USB shell checks with `vim`, `less`, `tmux`
 and `top` passed on the physical iPad. The user reported typing and scrolling
 equally responsive alongside Ghostty in the two-drawable Mac build.
 Battery consumption has not been measured.
-[todo.tests.md](todo.tests.md) records completed behavior checks and deferred
-checks requiring additional protocols or APIs.
+[todo.tests.md](todo.tests.md) lists deferred checks that need protocols or
+APIs Swiftty does not implement yet.
