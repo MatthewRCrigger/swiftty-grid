@@ -22,15 +22,12 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private let limits: MuxLimits
   private var config: Configuration
   private(set) var workspace: WorkspaceSnapshot?
+  /// Orders snapshots against the attach, switch and takeover replies.
+  private var sequencer = LayoutSequencer()
   /// The workspace this connection holds the lease for, from the last
   /// attach, switch or takeover reply. Snapshots of any other workspace
   /// (a late layout event after a switch) are not shown.
-  private(set) var attachedWorkspace: WorkspaceID?
-  /// Highest layout revision shown per workspace.
-  private var layoutRevisions: [WorkspaceID: UInt64] = [:]
-  /// The newest snapshot that arrived for a workspace not (yet) attached:
-  /// its layout event can overtake the switch reply.
-  private var earlySnapshot: WorkspaceSnapshot?
+  var attachedWorkspace: WorkspaceID? { sequencer.attachedWorkspace }
   private(set) var views: [PaneID: MuxPaneView] = [:]
   private(set) var containers: [PaneID: MuxPaneContainer] = [:]
   let tabStrip = MuxTabStrip()
@@ -57,6 +54,13 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// (the window then shows "SwiftMux — detached").
   var holdsLease: Bool { !detached && attachedWorkspace != nil }
   var onClose: (() -> Void)?
+  /// Receives the window that replaced this one after it lost its lease
+  /// (inbox "Open" reattaching); the app keeps one SwiftMux window.
+  var onReplaced: ((MuxWorkspaceController) -> Void)?
+  /// Connects such a replacement (tests use an in-process service).
+  var connectService: @MainActor () async throws -> MuxConnection = {
+    try await MuxWorkspaceController.connect()
+  }
   private(set) var searchBar: SearchBar?
   private var appearanceObservation: NSKeyValueObservation?
   /// Attention inbox mirror, fed by its own subscription (not frames).
@@ -428,36 +432,29 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// otherwise it is shown only for that workspace and when no older
   /// than the layout already shown.
   private func apply(_ ws: WorkspaceSnapshot, attached: Bool = false) {
-    if attached, attachedWorkspace != ws.id {
-      attachedWorkspace = ws.id
-      if let early = earlySnapshot, early.id == ws.id,
-        early.layoutRevision > ws.layoutRevision
-      {
-        earlySnapshot = nil
-        apply(early)
-        return
-      }
-      earlySnapshot = nil
-    }
-    guard ws.id == attachedWorkspace else {
-      if ws.layoutRevision >= earlySnapshot?.layoutRevision ?? 0
-        || earlySnapshot?.id != ws.id
-      {
-        earlySnapshot = ws
-      }
-      return
-    }
-    guard ws.layoutRevision >= layoutRevisions[ws.id, default: 0] else {
-      return
-    }
-    layoutRevisions[ws.id] = ws.layoutRevision
-    if let current = workspace, current.id != ws.id {
-      // Switched workspaces (inbox navigation): the service dropped the
-      // old subscriptions and geometry.
+    let update = attached ? sequencer.attached(ws) : sequencer.layout(ws)
+    switch update {
+    case nil: return
+    case .resync:
+      // The service dropped this connection's subscriptions; the layout
+      // shown is newer than the reply.
       subscribed = []
       sentGeometry = nil
-      activity = []
+      if let workspace { show(workspace) }
+    case let .show(ws, resync):
+      if resync {
+        subscribed = []
+        sentGeometry = nil
+      }
+      if let current = workspace, current.id != ws.id { activity = [] }
+      show(ws)
     }
+  }
+
+  /// The subscriptions last sent (tests).
+  var subscribedPanes: [PaneID] { subscribed }
+
+  private func show(_ ws: WorkspaceSnapshot) {
     workspace = ws
     for pane in ws.panes where titles[pane.id] == nil || !pane.title.isEmpty {
       titles[pane.id] = DisplayText.sanitize(pane.title)
@@ -1304,6 +1301,12 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       return
     }
     inboxPopover?.performClose(nil)
+    guard holdsLease else {
+      // Detached (another frontend took over): no commands without a
+      // lease; reattach like an attention link instead.
+      reattach(PaneTarget(workspace: wsID, tab: location.tab, pane: pane))
+      return
+    }
     if wsID == workspace?.id {
       guard workspace?.pane(pane) != nil else {
         notice("That pane is no longer open.")
@@ -1312,13 +1315,16 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       if pane != activePane { command(.focusPane(pane)) }
       return
     }
+    let takeOver: @MainActor (UInt64) -> Void = { [weak self] lease in
+      self?.takeOver(wsID, pane: pane, lease: lease)
+    }
     guard location.leaseHeldElsewhere else {
       command(
         .switchWorkspace(.id(wsID)),
         failed: { [weak self] error in
           // Another frontend attached in between: ask before taking over.
           if (error as? MuxError)?.code == .leaseHeld {
-            self?.confirmTakeover(wsID, pane: pane, moved: false)
+            self?.confirmTakeover(wsID, moved: false, take: takeOver)
           } else {
             self?.inboxFailed(error, alert: true)
           }
@@ -1327,7 +1333,58 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       )
       return
     }
-    confirmTakeover(wsID, pane: pane, moved: false)
+    confirmTakeover(wsID, moved: false, take: takeOver)
+  }
+
+  /// Takes over `wsID` on this connection at lease generation `lease`.
+  private func takeOver(_ wsID: WorkspaceID, pane: PaneID, lease: UInt64) {
+    command(
+      .takeover(.id(wsID), expectedLease: lease),
+      failed: { [weak self] error in
+        if (error as? MuxError)?.code == .staleRevision {
+          self?
+            .confirmTakeover(wsID, moved: true) { [weak self] lease in
+              self?.takeOver(wsID, pane: pane, lease: lease)
+            }
+        } else {
+          self?.inboxFailed(error, alert: true)
+        }
+      },
+      then: { [weak self] in self?.focusRevealed(pane) }
+    )
+  }
+
+  /// Shows `target` in a new window on a new connection, replacing this
+  /// one that lost its lease (`MuxWorkspaceController.reveal`). A
+  /// workspace held elsewhere is taken over only after confirmation.
+  private func reattach(_ target: PaneTarget, takeover lease: UInt64? = nil) {
+    Task { [weak self] in
+      guard let self else { return }
+      var replacement: MuxWorkspaceController?
+      do {
+        _ = try await Self.reveal(
+          target,
+          in: self,
+          configuration: config,
+          connect: connectService,
+          takeover: lease
+        ) { controller in
+          replacement = controller
+          controller.connectService = self.connectService
+          controller.onReplaced = self.onReplaced
+          self.onReplaced?(controller)
+        }
+      } catch let error as MuxError
+        where replacement == nil
+        && (error.code == .leaseHeld || error.code == .staleRevision)
+      {
+        confirmTakeover(target.workspace, moved: lease != nil) {
+          [weak self] lease in self?.reattach(target, takeover: lease)
+        }
+      } catch {
+        (replacement ?? self).inboxFailed(error, alert: true)
+      }
+    }
   }
 
   /// Focuses `pane` after a switch or takeover, reporting a pane that
@@ -1339,10 +1396,14 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     )
   }
 
-  /// Asks before taking over `wsID` at the lease generation listed now.
-  /// If the lease moves while asking, the takeover fails `staleRevision`
-  /// and the user is asked again about the new holder.
-  private func confirmTakeover(_ wsID: WorkspaceID, pane: PaneID, moved: Bool) {
+  /// Asks before taking over `wsID` at the lease generation listed now,
+  /// then calls `take` with it. If the lease moves while asking, the
+  /// takeover fails `staleRevision` and `take`'s caller asks again.
+  private func confirmTakeover(
+    _ wsID: WorkspaceID,
+    moved: Bool,
+    take: @escaping @MainActor (UInt64) -> Void
+  ) {
     let connection = connection
     Task { [weak self] in
       let summary: WorkspaceSummary
@@ -1366,20 +1427,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
             : "Take control of workspace “\(name)”?",
           "Another window or device controls it. Taking over disconnects it there; its programs keep running.",
           button: "Take Over"
-        ) { [weak self] in
-          self?
-            .command(
-              .takeover(.id(wsID), expectedLease: summary.leaseGeneration),
-              failed: { [weak self] error in
-                if (error as? MuxError)?.code == .staleRevision {
-                  self?.confirmTakeover(wsID, pane: pane, moved: true)
-                } else {
-                  self?.inboxFailed(error, alert: true)
-                }
-              },
-              then: { [weak self] in self?.focusRevealed(pane) }
-            )
-        }
+        ) { take(summary.leaseGeneration) }
     }
   }
 
