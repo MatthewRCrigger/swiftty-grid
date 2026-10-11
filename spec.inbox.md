@@ -107,6 +107,9 @@ It does not hold the shell.
   was queued behind a lease release and has since been superseded fails
   with `staleEpoch` and gives back any lease it got. A session never has two
   in-process clients.
+- **Answers before release.** A service answer that arrives while the lease
+  is being released is still recorded before the release. An operation the
+  pane took is therefore never sent again by the next attachment.
 - **Attach:**
   1. Fence the previous RST/1 attachment.
   2. Release its lease. If input is in flight, release only after that input
@@ -184,6 +187,8 @@ It does not hold the shell.
   | Exited (shown pane) | 5 min | Ended only if this host created it and every pane exited |
 
   - An entry whose session is attached is never swept.
+  - The sweep takes no decision from a failed workspace list. An entry
+    created after the list was requested is never taken as ended.
   - A detached session sees no layout events, so the sweep also reads the
     service's workspace list. `WorkspaceSummary.livePaneCount == 0` counts as
     every pane exited, and an entry whose workspace was ended elsewhere is
@@ -274,18 +279,47 @@ closed or wrong fd 3/4.
 - **Gaps:** a gap fails with `inputGap` and consumes nothing.
 - **Outcomes:** every in-order record consumes its sequence, whatever its
   outcome.
+- **Workspace selectors:** an empty name never matches. An exact name wins.
+  Otherwise the text is taken as an ID prefix only if it has at least 8 hex
+  digits and exactly one workspace matches; several matches fail as
+  ambiguous. Rename refuses a name another workspace already has.
+- **Launch races:** a pane whose launch completes while the service is
+  quiescing, or after an `endAllWorkspaces` that ran during the launch, is
+  ended and the request fails `quiescing`.
+- **Switching away:** `switchWorkspace` resets the old workspace's viewports
+  and search, as a lease release does.
+- **Scroll bounds:** a `.lines` or `.pages` scroll larger than the history
+  plus the maximum grid is refused, and pane arithmetic never overflows.
+- **Client ordering (`LayoutSequencer`, SwiftMuxClient):** the native window
+  and `swmux` share one sequencer. It tracks the attached workspace, keeps
+  layout revisions moving forward per workspace, and holds an early snapshot
+  for a pending switch target. Every attach, switch or takeover reply,
+  including a switch to the current workspace, resends subscriptions and
+  geometry.
+- **Client connection:**
+  - `detach()` and `execute` stop waiting after their timeout or when
+    cancelled, resuming each pending request exactly once.
+  - A failed connection always cancels its channel, so it never keeps a
+    lease.
+  - A request too large to encode is refused on its own, and long text input
+    is split into chunks.
+  - Pastes to one pane are queued, and later input waits behind them.
 - **Paste envelopes:**
   - `pasteEnd` must name the paste's pane; otherwise it fails with
     `invalidRequest` and the paste stays open.
   - A client that gives up on a paste (its retries run out, or a chunk
     fails) sends `pasteCancel(id:)`. The service discards unwritten chunks,
     closes the bracket and frees input credit, so the pane never stays in
-    paste mode.
+    paste mode. The outcome is `partial` if any byte reached the pane and
+    `aborted` if none did.
 - **Frame delivery:**
   - Each capture carries a token. A capture that completes after its pane
     was unsubscribed and resubscribed is discarded, so in-flight frame bytes
     cannot leak.
   - Leases take turns from an ordered list, each with its own pane cursor.
+  - Starting a capture reserves an estimate of its size, capped at
+    `maxFrameBytes`. Captures start only while unacknowledged frames plus
+    reservations are under `pendingFrameBudget`, so the budget is hard.
 - **Bounded paste:** `MuxInput.paste(String)` is a bounded paste of at most
   `maxPasteChunkBytes`. The service admits or refuses it whole and brackets
   it according to the pane's modes.
@@ -684,6 +718,19 @@ These suites all pass with `mise exec -- swift test`:
     window detached by a takeover does not own its workspace, and revealing
     there offers a takeover (never silently) or reattaches once the lease is
     free.
+- **Third review regressions:**
+  - `RemoteAttentionTests`: reattaching mid-input never delivers an
+    operation twice. It fails 5 of 5 runs without the fix.
+  - `ReviewTests` and `PasteOutcomeTests` (SwiftMuxTests): name selectors,
+    scroll bounds, end-all racing a launch, duplicate rename, switch
+    viewport reset, paste-cancel labels and the reserved frame budget.
+  - `LayoutSequencerTests` (7) and `ConnectionTests` (5): bounded detach,
+    cancellation, oversized requests, encode failure releasing the lease,
+    and back-to-back pastes.
+  - `TerminalFrontendTests`: switching to the current workspace keeps panes
+    live.
+  - `MuxInboxUITests`: inbox Open in a detached window reattaches after
+    confirmation.
 - **Second review regressions:**
   - `LedgerTests`: reserved operations count against the limit; an empty
     ledger admits a maximal paste; unsent operations are abandoned for a new
