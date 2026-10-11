@@ -217,6 +217,43 @@ struct TerminalClientTests {
     #expect(list.first?.isAttached == false)
   }
 
+  /// prefix-w with the current workspace's name: the service drops the
+  /// connection's subscriptions on every switch, so the client must
+  /// resubscribe or the pane stops updating.
+  @Test
+  func switchingToTheCurrentWorkspaceKeepsPanesLive() async throws {
+    let h = try Harness()
+    let connection = try await h.connect(.terminal)
+    guard
+      case let .created(ws) = try await connection.execute(
+        .newWorkspace(NewWorkspaceRequest(name: "demo", launch: shellLaunch()))
+      ),
+      case let .attached(attachment, workspace) = try await connection.execute(
+        .attach(.id(ws.id))
+      )
+    else {
+      Issue.record("setup")
+      return
+    }
+    let outer = Outer()
+    let client = TerminalClient(
+      connection: connection,
+      attachment: attachment,
+      workspace: workspace,
+      limits: .standard,
+      tty: RawTTY(input: outer.slave, output: outer.slave)
+    )
+    let run = Task { await client.run() }
+    #expect(await outer.wait { $0.last?.hasPrefix("[demo] 0:1*") == true })
+    outer.type("\u{02}w")
+    #expect(await outer.wait { $0.last?.contains("workspace (") == true })
+    outer.type("demo\r")
+    outer.type("echo after-$((6*7))\r")
+    #expect(await outer.wait { $0.contains { $0.contains("after-42") } })
+    outer.type("\u{02}d")
+    #expect(await run.value == .detached("detached from demo"))
+  }
+
   /// Layout events and the switch reply arrive on different paths: a
   /// newer layout of the target that overtakes the reply is kept, late
   /// layouts of the old workspace are ignored, and revisions never go

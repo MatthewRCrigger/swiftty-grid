@@ -794,4 +794,58 @@ extension MuxNativeTests {
     #expect(await until { window.activePane == d.pane })
     #expect(c.window?.isVisible != true)
   }
+
+  /// The in-window inbox "Open" in a window that lost its lease sends no
+  /// commands on that connection: it reattaches like an attention link,
+  /// taking over only after confirmation.
+  @Test(.enabled(if: hasMetal))
+  func `inbox open in a detached window reattaches after confirmation`()
+    async throws
+  {
+    let d = try await detachedByTakeover()
+    let c = d.fixture.controller
+    var shown: MuxWorkspaceController?
+    defer {
+      c.close()
+      shown?.close()
+    }
+    defer { Task { await d.phone.close() } }
+    let endpoint = d.fixture.endpoint
+    c.connectService = {
+      try await MuxConnection.connect(endpoint: endpoint, frontend: .native)
+    }
+    c.onReplaced = { shown = $0 }
+    var asked: [String] = []
+    var answer = false
+    c.confirmDestructive = { message in
+      asked.append(message)
+      return answer
+    }
+
+    // Declined: nothing changes hands.
+    c.openAttention(d.item)
+    #expect(await until { asked.count == 1 })
+    #expect(asked.first?.hasPrefix("Take control of workspace") == true)
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(shown == nil)
+    #expect(c.window?.isVisible == true)
+    #expect(
+      (try? await d.phone.execute(.newTab(name: nil, launch: nil))) != nil
+    )
+
+    // Confirmed: a new window takes the workspace over and shows the pane.
+    answer = true
+    c.openAttention(d.item)
+    #expect(await until { shown != nil })
+    let window = try #require(shown)
+    #expect(asked.count == 2)
+    #expect(window !== c)
+    #expect(window.holdsLease)
+    #expect(window.attachedWorkspace == d.fixture.workspace)
+    #expect(await until { window.activePane == d.pane })
+    #expect(c.window?.isVisible != true)
+    await #expect {
+      try await d.phone.execute(.newTab(name: nil, launch: nil))
+    } throws: { ($0 as? MuxError)?.code == .notAttached }
+  }
 }

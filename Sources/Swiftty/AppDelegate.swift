@@ -83,6 +83,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     controller.onClose = { [weak controller] in
       if self.mux === controller { self.mux = nil }
     }
+    // The inbox reattaching a window that lost its lease.
+    controller.onReplaced = { [weak self, weak controller] replacement in
+      self?.install(replacement, replacing: controller)
+    }
     mux = controller
   }
 
@@ -141,10 +145,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
           selector,
           configuration: config
         )
-        controller.onClose = { [weak controller] in
-          if self.mux === controller { self.mux = nil }
-        }
-        mux = controller
+        install(controller, replacing: nil)
         controller.showWindow(nil)
       } catch { NSAlert(error: error).runModal() }
     }
