@@ -150,10 +150,34 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
   required init(coder: NSCoder) { fatalError() }
 
   override var acceptsFirstResponder: Bool { true }
+  // Panes take keys by a click or the workspace's focus commands. Tab out
+  // of a text field (search, a tab rename) must not land on one and make
+  // it the active pane.
+  override var canBecomeKeyView: Bool { false }
 
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
     applyScale()
+    // The focused pane draws from its window's key state.
+    let center = NotificationCenter.default
+    for name in [
+      NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
+    ] {
+      center.removeObserver(self, name: name, object: nil)
+      if let window {
+        center.addObserver(
+          self,
+          selector: #selector(windowKeyChanged),
+          name: name,
+          object: window
+        )
+      }
+    }
+  }
+
+  @objc
+  private func windowKeyChanged() {
+    if window?.firstResponder === self { needsDisplay = true }
   }
 
   override func viewDidChangeBackingProperties() {

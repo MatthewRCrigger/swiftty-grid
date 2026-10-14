@@ -468,7 +468,9 @@ struct ConnectionTests {
     var attached = false
     for attempt in 0 ..< 200 {
       phase = "replacement attachment attempt \(attempt)"
-      if case .attached? = try? await other.execute(.attach(AttachRequest(.id(ws.id)))) {
+      if case .attached? = try? await other.execute(
+        .attach(AttachRequest(.id(ws.id)))
+      ) {
         attached = true
         break
       }

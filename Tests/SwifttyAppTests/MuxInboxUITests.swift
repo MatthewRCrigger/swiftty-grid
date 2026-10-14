@@ -678,7 +678,10 @@ extension MuxNativeTests {
                 )
               )
             )
-          ), case .attached = try await other.execute(.attach(AttachRequest(.id(created.id))))
+          ),
+          case .attached = try await other.execute(
+            .attach(AttachRequest(.id(created.id)))
+          )
         else {
           Issue.record("no second workspace")
           return

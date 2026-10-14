@@ -1,5 +1,7 @@
+import Dispatch
 import Foundation
 import SwiftMuxProtocol
+import SwifttyEngine
 
 public struct MuxServiceConfiguration: Sendable {
   /// Private fixture observation; production callers leave this nil.
@@ -124,10 +126,18 @@ final class Client {
   }
 }
 
-struct QueuedFrame {
+/// A frame sent to a client and not yet acknowledged.
+struct SentFrame {
   var revision: UInt64
   var bytes: Int
   var geometry: UInt64
+  /// The viewport revision it shows: a viewer's window, or the
+  /// controller's scroll position and search.
+  var viewport: UInt64
+}
+
+struct QueuedFrame {
+  var frame: SentFrame
   var data: Data
 }
 
@@ -138,48 +148,134 @@ struct FrameSlot {
   /// Token of the capture in progress; a completion carrying any other
   /// token belongs to an earlier subscription and is dropped.
   var capture: UInt64?
+  /// Captures with a token up to this one used a window or size that has
+  /// since changed. Their failures are not reported; the slot recaptures
+  /// (a moved window marks it dirty, a resize when the runtime applies it).
+  var supersededThrough: UInt64 = 0
   /// Budget held for `capture` until it completes or the slot goes.
   var reserved = 0
-  var inflight: (revision: UInt64, bytes: Int)?
-  var inflightGeometry: UInt64 = 0
+  var inflight: SentFrame?
   /// Newest complete frame waiting behind the one in flight. Replaced,
   /// never queued deeper than one.
   var queued: QueuedFrame?
   var lastSent: UInt64 = 0
   var lastCapture: UInt64 = 0
+
+  /// Records `frame` as sent now.
+  mutating func sent(_ frame: SentFrame) {
+    inflight = frame
+    lastSent = DispatchTime.now().uptimeNanoseconds
+  }
 }
 
-/// Initial-frame gate. Hidden panes are never required.
+/// Initial-frame gate. Which panes it waits on is derived when Ready is
+/// published (`MuxService.readyFrames`): the subscribed visible panes,
+/// less those whose capture failed. Hidden panes are never required.
 struct Readiness {
   var enabled = false
-  var required: Set<PaneID> = []
-  var installed: [PaneID: (frame: UInt64, geometry: UInt64)] = [:]
+  /// The client has named a subscription since attaching.
+  var armed = false
+  /// Acknowledged frames of subscribed panes, visible or not, so a pane
+  /// that becomes visible is already counted.
+  var installed: [PaneID: (frame: UInt64, geometry: UInt64, viewport: UInt64)] =
+    [:]
+  /// Panes whose last capture failed (reported through
+  /// `frameUnavailable`); Ready does not wait on them.
+  var failed: Set<PaneID> = []
+  /// Per resized pane, the geometry generation a frame must carry to
+  /// count; frames at an older size never do.
+  var minimumGeometry: [PaneID: UInt64] = [:]
   var sent = false
+
+  /// Starts gating with the subscription the client just named.
+  mutating func arm(_ panes: [PaneID]) {
+    guard enabled, !sent else { return }
+    armed = true
+    failed.formIntersection(panes)
+    installed = installed.filter { panes.contains($0.key) }
+  }
+
+  /// A resize produces a new frame; only that one counts, and a pane that
+  /// had failed is waited on again.
+  mutating func resized(_ pane: PaneID, to geometry: UInt64) {
+    guard enabled, !sent else { return }
+    installed.removeValue(forKey: pane)
+    failed.remove(pane)
+    minimumGeometry[pane] = geometry
+  }
+
+  /// A failed pane is captured again (its window moved); Ready waits for
+  /// the new frame.
+  mutating func retry(_ pane: PaneID) {
+    guard failed.remove(pane) != nil else { return }
+    installed.removeValue(forKey: pane)
+  }
+
+  /// Forgets a pane that left the layout.
+  mutating func forget(_ pane: PaneID) {
+    installed.removeValue(forKey: pane)
+    failed.remove(pane)
+    minimumGeometry.removeValue(forKey: pane)
+  }
+
+  /// Records an acknowledged frame of the pane's current `window` unless
+  /// Ready is out or the frame predates a resize. True when recorded (Ready
+  /// may now be due). A window that moves later is checked on publish.
+  mutating func install(
+    _ pane: PaneID,
+    _ frame: SentFrame,
+    window: UInt64,
+  ) -> Bool {
+    guard enabled, !sent, frame.viewport == window,
+      frame.geometry >= minimumGeometry[pane, default: 0]
+    else { return false }
+    installed[pane] = (frame.revision, frame.geometry, frame.viewport)
+    failed.remove(pane)
+    return true
+  }
 }
 
-/// One viewer's window. Display size never changes the PTY.
+/// A search match a viewer selected. Its rows are absolute, so they only
+/// identify the match in the history generation it came from.
+struct SelectedMatch: Sendable {
+  var range: TerminalRange
+  /// Position in the match list, kept when rows are renumbered.
+  var index: Int
+  /// Advances on reflow, clear and alternate-screen switches.
+  var historyGeneration: UInt64
+}
+
+/// One viewer's window, also what each of its captures applies. Display
+/// size never changes the PTY.
 struct ViewerViewport: Sendable {
+  /// This window's subscription; unique in the service, so a move or
+  /// search issued for an earlier one is never applied to it.
+  let id: UInt64
   var followTail: Bool
   var historyGeneration: UInt64
   var anchorRow: Int?
   var rows: Int?
   var columns: Int?
+  /// The last completed search; a step continues it.
   var searchQuery: String?
-  /// Match index from the last search reply. Capture reselects it after
+  /// Match selected by the last search reply. Capture reselects it after
   /// `search` clears the engine selection.
-  var searchSelected: Int?
+  var searchSelected: SelectedMatch?
   var revision: UInt64 = 1
 }
 
-struct ViewerCapture: Sendable {
-  var followTail: Bool
-  var historyGeneration: UInt64
-  var anchorRow: Int?
-  var rows: Int?
-  var columns: Int?
-  var searchQuery: String?
-  var searchSelected: Int?
-  var viewportRevision: UInt64
+extension ViewerViewport {
+  /// This window as a request for `pane`.
+  func request(_ pane: PaneID) -> ViewportRequest {
+    ViewportRequest(
+      pane: pane,
+      anchorRow: anchorRow,
+      followTail: followTail,
+      historyGeneration: historyGeneration,
+      rows: rows,
+      columns: columns,
+    )
+  }
 }
 
 struct ActivePaste {
@@ -209,16 +305,48 @@ struct Lease {
   var readiness = Readiness()
 }
 
+/// A window command waiting its turn, with its own reply so it can be
+/// failed early when its window goes.
+struct WaitingWindowCommand {
+  let run: (isolated MuxService) -> Void
+  let reply: MuxService.Reply
+}
+
+/// One pane's window commands for a viewer: whether one is running, and
+/// those waiting behind it.
+struct WindowCommandQueue {
+  var running = false
+  var waiting: [WaitingWindowCommand] = []
+
+  /// Removes and returns the waiting commands (to fail with
+  /// `failWindowCommands`); the running one replies itself.
+  mutating func takeWaiting() -> [WaitingWindowCommand] {
+    defer { waiting = [] }
+    return waiting
+  }
+}
+
 /// Read-only attachment. It never holds the writer lease or a paste.
 struct Viewer {
   let client: UUID
   let attachment = AttachmentID()
-  var workspace: WorkspaceID
+  let workspace: WorkspaceID
   var subscriptions: [PaneID] = []
   var frames: [PaneID: FrameSlot] = [:]
   var paneCursor = 0
-  var reportedActivity: Set<PaneID> = []
   var viewports: [PaneID: ViewerViewport] = [:]
   var readiness = Readiness()
-  var unavailable: Set<PaneID> = []
+  /// Panes already told their history anchor is stale; one notice each
+  /// until the viewer moves.
+  var staleAnchorReported: Set<PaneID> = []
+  /// Window commands per pane: present while one runs, holding those
+  /// waiting behind it (`MuxService.inWindowOrder`).
+  var windowCommands: [PaneID: WindowCommandQueue] = [:]
+  /// Frame bytes this observer holds against the shared budget.
+  var heldFrameBytes: Int {
+    frames.values.reduce(0) {
+      $0 + ($1.inflight?.bytes ?? 0) + ($1.queued?.frame.bytes ?? 0)
+        + $1.reserved
+    }
+  }
 }

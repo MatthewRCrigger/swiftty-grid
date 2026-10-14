@@ -81,6 +81,12 @@ public struct MuxLimits: Codable, Sendable, Equatable {
     else { throw MuxError(.invalidRequest, "invalid service limits") }
   }
 
+  /// A search query the service accepts: non-empty, within
+  /// `maxSearchBytes`. Clients check the same rule before sending.
+  public func validSearchQuery(_ query: String) -> Bool {
+    !query.isEmpty && query.utf8.count <= maxSearchBytes
+  }
+
   /// Bytes in one cell grid, or nil when it exceeds the dimension limits.
   public func cellCount(columns: Int, rows: Int) -> Int? {
     guard columns > 0, rows > 0, columns <= maxColumns, rows <= maxRows else {

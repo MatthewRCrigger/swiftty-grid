@@ -398,6 +398,245 @@ struct TerminalClientTests {
   }
 
   @Test
+  func theWorkspacePromptOpensAtOnceAndListsLater() async throws {
+    let h = try Harness()
+    let connection = try await h.connect(.terminal)
+    guard
+      case let .created(ws) = try await connection.execute(
+        .newWorkspace(NewWorkspaceRequest(name: "demo", launch: shellLaunch()))
+      ),
+      case let .attached(attachment, workspace) = try await connection.execute(
+        .attach(AttachRequest(.id(ws.id)))
+      )
+    else {
+      Issue.record("setup")
+      return
+    }
+    let outer = try Outer()
+    let client = TerminalClient(
+      connection: connection,
+      attachment: attachment,
+      workspace: workspace,
+      limits: .standard,
+      tty: RawTTY(input: outer.slave, output: outer.slave)
+    )
+    client.feed(Array("\u{02}w".utf8))
+    #expect(statusText(client.compose()).contains("workspace: "))
+    let deadline = ContinuousClock.now + .seconds(5)
+    while !statusText(client.compose()).contains("workspace (demo"),
+      ContinuousClock.now < deadline
+    { try await Task.sleep(for: .milliseconds(20)) }
+    #expect(statusText(client.compose()).contains("workspace (demo): "))
+    // A list arriving after the prompt closed leaves the screen alone.
+    client.feed([0x07])
+    client.feed(Array("\u{02}w".utf8))
+    client.feed([0x07])
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(!statusText(client.compose()).contains("workspace ("))
+    // Without a list, the label says why.
+    await connection.close()
+    client.feed(Array("\u{02}w".utf8))
+    let failedAt = ContinuousClock.now + .seconds(5)
+    while !statusText(client.compose()).contains("no list"),
+      ContinuousClock.now < failedAt
+    { try await Task.sleep(for: .milliseconds(20)) }
+    #expect(statusText(client.compose()).contains("workspace (no list: "))
+    // A failure arriving after the prompt closed shows as a message.
+    client.feed([0x07])
+    client.feed(Array("\u{02}w".utf8))
+    client.feed([0x07])
+    let shownAt = ContinuousClock.now + .seconds(5)
+    while !statusText(client.compose()).contains("connection"),
+      ContinuousClock.now < shownAt
+    { try await Task.sleep(for: .milliseconds(20)) }
+    #expect(!statusText(client.compose()).contains("workspace ("))
+    #expect(statusText(client.compose()).contains("connection"))
+  }
+
+  @Test
+  func workspaceListingsKeepTheTypedTextOnScreen() {
+    let names = (1 ... 20).map { "workspace-\($0)" }
+    let listing = TerminalClient.listing(names)
+    #expect(listing.count <= 40)
+    #expect(listing.hasSuffix(", +\(names.count - 2)"))
+    #expect(TerminalClient.listing(["a", "b"]) == "a, b")
+    #expect(TerminalClient.listing([]) == "none")
+    // One long name is shortened, with the count, to the budget.
+    let long = String(repeating: "n", count: 120)
+    #expect(
+      TerminalClient.listing([long, "b"]) == String(long.prefix(35)) + "…, +1"
+    )
+    #expect(TerminalClient.listing([long]) == String(long.prefix(39)) + "…")
+    // Names that fit the budget are never shortened.
+    #expect(
+      TerminalClient.listing(["backend-staging-cluster"])
+        == "backend-staging-cluster"
+    )
+    // Joiners shape a name and stay.
+    #expect(TerminalClient.listing(["👨\u{200D}💻 dev"]) == "👨\u{200D}💻 dev")
+    // Typed or pasted prompt text is one line: breaks and controls go,
+    // tabs space words.
+    func line(_ input: String) -> String {
+      TerminalClient.promptText("", adding: input)
+    }
+    #expect(line("dev\tapi\r\n\u{85}\u{2028}\u{1B}\u{7}") == "dev api")
+    // Other text stays as typed, for search.
+    #expect(line("葛\u{E0100}\u{202E}\u{E0A0}") == "葛\u{E0100}\u{202E}\u{E0A0}")
+    // A character is bounded once joined: across dropped scalars, and
+    // across keystrokes.
+    let marks = String(repeating: "\u{301}", count: 20)
+    #expect(line("a" + marks + "\u{1B}" + marks + "b") == "\u{FFFD}b")
+    let typed = (0 ..< 32)
+      .reduce("a") { text, _ in
+        TerminalClient.promptText(text, adding: "\u{301}")
+      }
+    #expect(typed == "\u{FFFD}")
+    #expect(
+      TerminalClient.noting("pane closed", in: "search: ")
+        == "search (pane closed): "
+    )
+  }
+
+  @Test
+  func aLongPromptKeepsItsTypedEndOnScreen() {
+    func render(_ status: StatusLine) -> ScreenBuffer {
+      Compositor(columns: 40, rows: 3)
+        .compose(
+          workspace: WorkspaceSnapshot(
+            id: WorkspaceID(),
+            name: "w",
+            tabs: [],
+            activeTab: TabID(),
+            panes: [],
+            layoutRevision: 1
+          ),
+          frames: [:],
+          overlays: [:],
+          status: status,
+          showCursor: false
+        )
+    }
+    var status = StatusLine()
+    status.prompt = String(repeating: "x", count: 200) + "TYPED"
+    status.promptCursor = true
+    #expect(statusText(render(status)).contains("TYPED"))
+    // A long note gives way to the typed end.
+    status.right = String(repeating: "m", count: 35)
+    #expect(statusText(render(status)).contains("TYPED"))
+    // Beside a short prompt a note shows, shortened if need be.
+    status.prompt = "search: "
+    status.right = "NOTE " + String(repeating: "m", count: 40)
+    let noted = statusText(render(status))
+    #expect(noted.hasPrefix("search: "))
+    #expect(noted.contains("NOTE"))
+    #expect(noted.contains("…"))
+    // A message or question keeps its start instead.
+    status.right = ""
+    status.prompt = "MESSAGE " + String(repeating: "y", count: 200)
+    status.promptCursor = false
+    #expect(statusText(render(status)).hasPrefix("MESSAGE "))
+    // A question shows a message beside it when there is room.
+    status.prompt = "end pane"
+    status.promptSuffix = "? (y/n)"
+    status.right = "NOTE"
+    let asked = statusText(render(status))
+    #expect(asked.hasPrefix("end pane? (y/n)"))
+    #expect(asked.contains("NOTE"))
+    // A question's suffix survives any shortening, even on a tiny line.
+    status.prompt = "end tab " + String(repeating: "t", count: 100)
+    status.promptSuffix = "? (y/n)"
+    status.right = ""
+    #expect(statusText(render(status)).hasSuffix("? (y/n)"))
+    let tiny = Compositor(columns: 5, rows: 2)
+      .compose(
+        workspace: WorkspaceSnapshot(
+          id: WorkspaceID(),
+          name: "w",
+          tabs: [],
+          activeTab: TabID(),
+          panes: [],
+          layoutRevision: 1
+        ),
+        frames: [:],
+        overlays: [:],
+        status: status,
+        showCursor: false
+      )
+    #expect(statusText(tiny).hasSuffix("y/n)"))
+    // Text the outer terminal would act on shows as "?", in place.
+    status.prompt = "a\u{1B}]52;c;eA==\u{07}b\u{202E}c\td"
+    status.promptSuffix = ""
+    status.promptCursor = true
+    #expect(statusText(render(status)).hasPrefix("a?]52;c;eA==?b?c?d"))
+  }
+
+  @Test
+  func aLongConfirmQuestionKeepsItsAnswerKeys() async throws {
+    let h = try Harness()
+    let connection = try await h.connect(.terminal)
+    guard
+      case let .created(ws) = try await connection.execute(
+        .newWorkspace(NewWorkspaceRequest(name: "demo", launch: shellLaunch()))
+      ),
+      case .attached = try await connection.execute(
+        .attach(AttachRequest(.id(ws.id)))
+      ),
+      case let .layout(renamed) = try await connection.execute(
+        .renameTab(ws.tabs[0].id, name: String(repeating: "t", count: 200))
+      )
+    else {
+      Issue.record("setup")
+      return
+    }
+    let outer = try Outer()
+    let client = TerminalClient(
+      connection: connection,
+      attachment: try #require(await connection.attachment),
+      workspace: renamed,
+      limits: .standard,
+      tty: RawTTY(input: outer.slave, output: outer.slave)
+    )
+    client.feed(Array("\u{02}&".utf8))
+    let status = statusText(client.compose())
+    #expect(status.hasPrefix("end tab "))
+    #expect(status.contains("(y/n)"))
+    client.feed(Array("n".utf8))
+    try await connection.execute(.endWorkspace(.id(ws.id)))
+    await connection.close()
+  }
+
+  @Test
+  func searchBeforeTheFirstFrameSaysSo() async throws {
+    let h = try Harness()
+    let connection = try await h.connect(.terminal)
+    guard
+      case let .created(ws) = try await connection.execute(
+        .newWorkspace(NewWorkspaceRequest(name: "demo", launch: shellLaunch()))
+      ),
+      case let .attached(attachment, workspace) = try await connection.execute(
+        .attach(AttachRequest(.id(ws.id)))
+      )
+    else {
+      Issue.record("setup")
+      return
+    }
+    let outer = try Outer()
+    let client = TerminalClient(
+      connection: connection,
+      attachment: attachment,
+      workspace: workspace,
+      limits: .standard,
+      tty: RawTTY(input: outer.slave, output: outer.slave)
+    )
+    // No frame yet: copy mode cannot start, so no prompt opens.
+    client.feed(Array("\u{02}/".utf8))
+    let screen = client.compose()
+    let status = statusText(screen)
+    #expect(status.contains("no frame yet"))
+    await connection.close()
+  }
+
+  @Test
   func copyModeLineEndUsesDisplayColumns() async throws {
     let h = try Harness()
     let connection = try await h.connect(.terminal)
@@ -435,6 +674,69 @@ struct TerminalClientTests {
     // Moving to the next word stays within the display grid.
     client.feed(Array("w".utf8))
     #expect(client.compose()[7, 0].style.flags & OuterStyle.inverse != 0)
+    // Cancelling a search prompt returns to copy mode where it was.
+    client.feed(Array("/".utf8))
+    // A paste into it keeps one line of drawable text.
+    client.feed(
+      Array("\u{1B}[200~x\u{1B}]0;t\u{07}\ty\n\u{202E}z\u{1B}[201~".utf8)
+    )
+    #expect(statusText(client.compose()).contains("search: x]0;t y?z"))
+    client.feed([0x07])
+    #expect(client.compose()[7, 0].style.flags & OuterStyle.inverse != 0)
+    // A new window arriving while the prompt is open is the one copy mode
+    // returns to.
+    client.feed(Array("/".utf8))
+    let moved = TerminalSession(columns: 8, rows: 2)
+    moved.feed(Array("MOVED\r".utf8))
+    identity.viewportRevision &+= 1
+    client.handle(
+      .frame(
+        try FrameExporter.frame(
+          from: moved.withState { $0.captureOwnedScreen() },
+          identity: identity
+        )
+      )
+    )
+    client.feed([0x07])
+    let back = client.compose()
+    #expect(back[0, 0].text == "M")
+    // Still copy mode, not the live view: the status line says so.
+    let status = statusText(back)
+    #expect(status.contains("[copy"))
+    // The pane leaving keeps a search prompt opened over it, relabelled.
+    client.feed(Array("/".utf8))
+    var gone = workspace
+    gone.layoutRevision &+= 1
+    gone.panes = []
+    client.apply(gone)
+    let closed = client.compose()
+    let notice = statusText(closed)
+    // The prompt stays open, so typing stays in it rather than reaching
+    // another pane; committing reports the pane is gone.
+    #expect(notice.contains("search (pane closed): "))
+    client.feed(Array("x".utf8))
+    #expect(statusText(client.compose()).contains("search (pane closed): x"))
+    client.feed([0x0D])
+    // The prompt closed and its commit said why.
+    #expect(!statusText(client.compose()).contains("search ("))
+    #expect(statusText(client.compose()).contains("pane closed"))
+    // A search prompt kept across a workspace switch searches nothing.
+    var restored = workspace
+    restored.layoutRevision &+= 2
+    client.apply(restored)
+    client.handle(.frame(frame))
+    client.feed(Array("\u{02}[".utf8))
+    client.feed(Array("/".utf8))
+    var elsewhere = workspace
+    elsewhere.id = WorkspaceID()
+    elsewhere.panes = []
+    client.apply(elsewhere, attached: true)
+    #expect(statusText(client.compose()).contains("search (workspace"))
+    client.feed(Array("q".utf8))
+    client.feed([0x0D])
+    // The commit refused (closing the prompt) instead of searching.
+    #expect(!statusText(client.compose()).contains("search ("))
+    #expect(statusText(client.compose()).contains("workspace changed"))
     await connection.close()
   }
 
@@ -714,4 +1016,9 @@ struct TerminalClientTests {
     #expect(client.workspace == newer)
     await connection.close()
   }
+}
+
+/// The composed status line (bottom row) as text.
+private func statusText(_ screen: ScreenBuffer) -> String {
+  (0 ..< screen.columns).map { screen[$0, screen.rows - 1].text }.joined()
 }

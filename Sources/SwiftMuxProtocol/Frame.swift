@@ -7,7 +7,8 @@ public struct FrameIdentity: Codable, Sendable, Equatable {
   /// Monotonic per pane within one server instance.
   public var revision: UInt64
   public var layoutRevision: UInt64
-  /// The accepted geometry batch these dimensions came from (0 = none).
+  /// Monotonic per pane: advances with every applied resize, whichever
+  /// lease sent it (0 = none). Not the client's batch generation.
   public var geometryGeneration: UInt64
   public var viewportRevision: UInt64
 
@@ -327,10 +328,6 @@ public struct PaneFrame: Codable, Sendable, Equatable {
 
   public var lines: [String] { (0 ..< grid.rows).map(text(row:)) }
 
-  /// Local copy of this frozen frame. New output cannot change it.
-  /// v1 copies the displayed frame only; selection does not cross pages.
-  public func copiedText() -> String { lines.joined(separator: "\n") }
-
   /// Display scalars of a cell; a blank is one space, structural cells none.
   public func scalars(row y: Int, column x: Int) -> [Unicode.Scalar] {
     let i = y * grid.columns + x
@@ -348,11 +345,14 @@ public struct PaneFrame: Codable, Sendable, Equatable {
   }
 }
 
-/// Decides which owned frame is visible. A stale server instance,
-/// attachment, geometry revision, layout revision, or older frame
-/// revision never replaces a newer installed frame.
+/// Decides which owned frame is visible. Nothing installs while
+/// unattached. A stale server instance, attachment, geometry revision, layout revision, or older frame
+/// revision never replaces a newer installed frame. A frame with the
+/// installed revision is accepted again: the service resends a complete
+/// frame on resubscription without advancing the revision.
 public struct FrameInstallation: Sendable, Equatable {
-  public private(set) var visible: [PaneID: PaneFrame] = [:]
+  /// Identity of the frame installed per pane; the gate needs no cells.
+  public private(set) var visible: [PaneID: FrameIdentity] = [:]
 
   public init() {}
 
@@ -364,16 +364,27 @@ public struct FrameInstallation: Sendable, Equatable {
   ) -> Bool {
     let identity = frame.identity
     if let server, identity.server != server { return false }
-    if let attachment, identity.attachment != attachment { return false }
-    if let current = visible[identity.pane] {
-      let shown = current.identity
+    guard let attachment, identity.attachment == attachment else {
+      return false
+    }
+    if let shown = visible[identity.pane] {
       if shown.server != identity.server { return false }
       if shown.attachment != identity.attachment { return false }
-      if identity.revision <= shown.revision { return false }
+      if identity.revision < shown.revision { return false }
       if identity.geometryGeneration < shown.geometryGeneration { return false }
       if identity.layoutRevision < shown.layoutRevision { return false }
     }
-    visible[identity.pane] = frame
+    visible[identity.pane] = identity
     return true
+  }
+
+  /// Keeps only frames of `attachment`.
+  public mutating func retain(attachment: AttachmentID) {
+    visible = visible.filter { $0.value.attachment == attachment }
+  }
+
+  /// Forgets panes that are no longer shown.
+  public mutating func retain(panes: Set<PaneID>) {
+    visible = visible.filter { panes.contains($0.key) }
   }
 }

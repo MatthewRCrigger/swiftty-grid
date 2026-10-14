@@ -15,6 +15,51 @@ struct WorkspaceUITests {
     #expect(DisplayText.sanitize("evil\u{202E}txt.exe") == "eviltxt.exe")
     #expect(DisplayText.sanitize("\u{200B}  lead  ") == "lead")
     #expect(DisplayText.sanitize("🐍 snake") == "🐍 snake")
+    // Joiners and flag tags stay only where they shape an emoji.
+    let family = "👨\u{200D}👩\u{200D}👧"
+    let wales = "🏴\u{E0067}\u{E0062}\u{E0077}\u{E006C}\u{E0073}\u{E007F}"
+    #expect(DisplayText.sanitize(family + wales) == family + wales)
+    #expect(DisplayText.sanitize("\u{200D}a\u{200D} \u{200D}") == "a")
+    #expect(DisplayText.sanitize("a\u{200D}b") == "ab")
+    let rainbow = "🏳\u{FE0F}\u{200D}🌈"
+    #expect(DisplayText.sanitize(rainbow) == rainbow)
+    // Joining scripts keep their joiners.
+    let persian = "می\u{200C}خواهم"
+    #expect(DisplayText.sanitize(persian) == persian)
+    #expect(DisplayText.sanitize("dev\u{E0041}\u{E007F}") == "dev")
+    #expect(DisplayText.sanitize("🏴\u{E0067}") == "🏴")
+    // Fillers and selectors that draw nothing are dropped; an emoji keeps
+    // its presentation selector, a letter its accents.
+    #expect(DisplayText.sanitize("a\u{3164}b\u{034F}") == "ab")
+    #expect(DisplayText.sanitize("\u{FE0F}dev\u{FE0E}") == "dev")
+    #expect(DisplayText.sanitize("❤\u{FE0F}") == "❤\u{FE0F}")
+    #expect(DisplayText.sanitize("1\u{FE0F}\u{20E3}") == "1\u{FE0F}\u{20E3}")
+    #expect(DisplayText.sanitize("build1\u{FE0F}") == "build1")
+    #expect(DisplayText.sanitize("e\u{301}") == "e\u{301}")
+    // One character joining many scalars cannot carry an unbounded title;
+    // it shows as U+FFFD, which joins nothing around it.
+    let chain = String(repeating: "👨\u{200D}", count: 500) + "👨"
+    #expect(DisplayText.sanitize(chain) == "\u{FFFD}")
+    let tags = "🏴" + String(repeating: "\u{E0061}", count: 5000) + "\u{E007F}"
+    #expect(DisplayText.sanitize(tags) == "\u{FFFD}")
+    let marks = String(repeating: "\u{301}", count: 31)
+    let flags = "🇺🇸" + marks + "🇬🇧"
+    #expect(DisplayText.sanitize(flags) == "\u{FFFD}🇬🇧")
+    let jamo = "\u{1100}" + marks + "\u{301}\u{301}" + "\u{1161}" + marks
+    let jamoShown = DisplayText.sanitize(jamo, limit: .max)
+    #expect(jamoShown == "\u{FFFD}\u{1161}" + marks)
+    #expect(DisplayText.isPlainName(jamoShown))
+    // Names must be what every client shows.
+    #expect(DisplayText.isPlainName(family + " " + wales))
+    #expect(!DisplayText.isPlainName("\u{200D}"))
+    #expect(!DisplayText.isPlainName("\u{FE0F}"))
+    #expect(!DisplayText.isPlainName("a\u{200D}b"))
+    #expect(DisplayText.plainName(" dev  api ") == "dev api")
+    #expect(DisplayText.plainName(" \u{200B}") == nil)
+    #expect(!DisplayText.isPlainName("dev\u{E0041}"))
+    #expect(!DisplayText.isPlainName("a  b"))
+    #expect(!DisplayText.isPlainName(" "))
+    #expect(!DisplayText.isPlainName("a\u{00A0}b"))
     let long = DisplayText.sanitize(String(repeating: "x", count: 500))
     #expect(long.count == DisplayText.maxTitleCharacters)
     #expect(long.hasSuffix("…"))

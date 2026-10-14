@@ -35,6 +35,8 @@ public actor MuxService {
   /// Read-only viewers. At most `SMX.maxObservers` per workspace.
   var viewers: [WorkspaceID: [Viewer]] = [:]
   var clientViewers: [UUID: WorkspaceID] = [:]
+  /// Last observer window id issued (`ViewerViewport.id`).
+  var nextWindowID: UInt64 = 0
   /// Last granted lease generation per workspace; `takeover` names it.
   private var leaseGenerations: [WorkspaceID: UInt64] = [:]
   var pendingLaunches = 0
@@ -57,6 +59,10 @@ public actor MuxService {
   /// Leases in grant order; `pump` rotates through them.
   var leaseOrder: [WorkspaceID] = []
   var workspaceCursor = 0
+  /// A workspace-list publish is queued for the end of this turn.
+  var workspacesPublishScheduled = false
+  /// Rotates which observer `pumpViewers` serves first.
+  var viewerCursor = 0
   var nextCapture: UInt64 = 0
   var idleWork: DispatchWorkItem?
   private var listeners: [SMXListener] = []
@@ -166,11 +172,16 @@ public actor MuxService {
     }
     attention.unsubscribe(id)
     if let ws = clientLeases[id] {
-      // Connection loss: cancel remaining input, release the writer lease.
-      // Observers and PTYs stay.
-      releaseLease(ws, notify: false, reason: "connection lost: \(reason)")
+      // Connection loss: nobody owns the remaining input any more, so it
+      // is fenced like a takeover. Observers and PTYs stay.
+      releaseLease(
+        ws,
+        notify: false,
+        fence: true,
+        reason: "connection lost: \(reason)",
+      )
     } else if clientViewers[id] != nil {
-      releaseViewer(id, reason: "connection lost: \(reason)")
+      releaseViewer(id, notify: false, reason: "connection lost: \(reason)")
     }
     checkIdle()
   }
@@ -272,7 +283,8 @@ public actor MuxService {
         self?.onQueue { $0.send(.reply(id: requestID, result: result), to: id) }
       }
     case let .input(record): input(record, from: id)
-    case let .frameAck(pane, revision): frameAck(pane, revision, from: id)
+    case let .frameAck(pane, revision, attachment):
+      frameAck(pane, revision, attachment: attachment, from: id)
     case .inboxAck: inboxAcknowledged(by: id)
     }
   }
@@ -360,9 +372,7 @@ public actor MuxService {
       ok()
     case let .renameWorkspace(selector, name):
       let i = try workspaceIndex(selector)
-      guard validName(name) else {
-        return fail(MuxError(.invalidRequest, "name"))
-      }
+      guard validName(name) else { return fail(invalidName) }
       // Names select workspaces, so they stay unique (as on creation).
       guard
         !workspaces.contains(where: {
@@ -376,8 +386,18 @@ public actor MuxService {
       ok()
     case .detachActive:
       // Update barrier and `swmux detach`: every holder is told.
+      // A forced release fences like a takeover: another frontend may
+      // attach next, so the holder's unwritten input must not run.
       for ws in Array(leases.keys) {
-        releaseLease(ws, notify: true, reason: "detached by request")
+        releaseLease(
+          ws,
+          notify: true,
+          fence: true,
+          reason: "detached by request",
+        )
+      }
+      for ws in Array(viewers.keys) {
+        releaseViewers(in: ws, reason: "detached by request")
       }
       ok()
     case .endAllWorkspaces:
@@ -399,7 +419,7 @@ public actor MuxService {
       if let ws = clientLeases[client.id] {
         releaseLease(ws, notify: false, reason: "detached")
       } else if clientViewers[client.id] != nil {
-        releaseViewer(client.id, reason: "detached")
+        releaseViewer(client.id, notify: false, reason: "detached")
       }
       ok()
     case let .switchWorkspace(selector):
@@ -461,6 +481,14 @@ public actor MuxService {
     }
     let ws = try workspace(request.selector)
     if request.role == .observer {
+      guard hello.capabilities.contains(.observers) else {
+        return fail(
+          MuxError(
+            .invalidRequest,
+            "observer attach needs the observers capability",
+          ),
+        )
+      }
       do throws(MuxError) {
         reply(.success(try grantViewer(ws, to: client, hello: hello)))
       } catch { fail(error) }
@@ -507,6 +535,7 @@ public actor MuxService {
       releaseLease(
         ws.id,
         notify: true,
+        fence: true,
         reason: "another frontend took control",
       )
     }
@@ -528,7 +557,9 @@ public actor MuxService {
         MuxError(.leaseHeld, "another frontend controls this workspace"),
       )
     }
-    cancelPastes(from, discardDeferredInput: true)
+    // The same writer keeps the lease: its pastes close, but queued
+    // keystrokes are not discarded (only a takeover fence does that).
+    cancelPastes(from)
     _ = setSubscriptions([], client: client.id)
     if ws.id != from, var moved = leases.removeValue(forKey: from) {
       // Leaving returns the old workspace to live output, as a release
@@ -542,6 +573,10 @@ public actor MuxService {
       if let i = leaseOrder.firstIndex(of: from) { leaseOrder[i] = ws.id }
       clientLeases[client.id] = ws.id
       publishWorkspaces()
+    }
+    // Subscriptions were cleared: the panes shown next need their own Ready.
+    if let enabled = leases[ws.id]?.readiness.enabled {
+      leases[ws.id]?.readiness = Readiness(enabled: enabled)
     }
     recordLocalUse(ws.id, by: client)
     reply(.success(.layout(snapshot(ws))))
@@ -690,8 +725,19 @@ public actor MuxService {
     }
   }
 
-  /// Sends the workspace list to metadata observers.
+  /// Sends the workspace list to metadata observers once the current turn
+  /// is done, so a change made in several steps (a teardown) sends one.
   func publishWorkspaces() {
+    guard !workspacesPublishScheduled,
+      clients.values.contains(where: \.observesWorkspaces)
+    else { return }
+    workspacesPublishScheduled = true
+    // An exit can flush early; the queued turn then has nothing to send.
+    onQueue { if $0.workspacesPublishScheduled { $0.flushWorkspaces() } }
+  }
+
+  private func flushWorkspaces() {
+    workspacesPublishScheduled = false
     let observers = clients.values.filter(\.observesWorkspaces)
     guard !observers.isEmpty else { return }
     let list = summaries
@@ -709,6 +755,7 @@ public actor MuxService {
     let fail = { (e: MuxError) in reply(.failure(e)) }
     switch command {
     case let .newTab(name, launch):
+      if let name, !validName(name) { return fail(invalidName) }
       newTab(name: name, launch: launch, in: leased, reply: reply)
     case let .selectTab(tab):
       guard let (w, t) = locate(tab: tab, in: leased) else {
@@ -721,9 +768,7 @@ public actor MuxService {
       guard let (w, t) = locate(tab: tab, in: leased) else {
         return fail(MuxError(.notFound, "tab"))
       }
-      guard validName(name) else {
-        return fail(MuxError(.invalidRequest, "name"))
-      }
+      guard validName(name) else { return fail(invalidName) }
       workspaces[w].tabs[t].name = name
       commitLayout(workspaces[w].id)
       reply(.success(.layout(snapshot(workspaces[w]))))
@@ -798,9 +843,7 @@ public actor MuxService {
     case let .setViewport(request):
       setControllerViewport(request, workspace: leased, reply: reply)
     case let .scroll(pane, request):
-      guard validScroll(request) else {
-        return fail(MuxError(.invalidRequest, "scroll distance"))
-      }
+      if let error = scrollError(request) { return fail(error) }
       guard let runtime = attachedRuntime(pane, in: leased) else {
         return fail(MuxError(.notFound, "pane"))
       }
@@ -810,9 +853,9 @@ public actor MuxService {
     case let .search(pane, query):
       search(query, pane: pane, workspace: leased, reply: reply)
     case let .searchStep(pane, forward):
-      stepSearch(forward, pane: pane, workspace: leased, reply: reply)
+      runSearch(nil, step: forward, pane: pane, workspace: leased, reply: reply)
     case let .endSearch(pane):
-      stepSearch(nil, pane: pane, workspace: leased, reply: reply)
+      runSearch(nil, step: nil, pane: pane, workspace: leased, reply: reply)
     case .status, .listWorkspaces, .newWorkspace, .endWorkspace,
       .renameWorkspace, .detachActive, .endAllWorkspaces, .attach, .detach,
       .switchWorkspace, .quiesce, .setTheme, .takeover, .observeWorkspaces,
@@ -828,18 +871,14 @@ public actor MuxService {
     workspace leased: WorkspaceID,
     reply: @escaping Reply,
   ) {
-    let fail = { (error: MuxError) in reply(.failure(error)) }
-    guard query.utf8.count <= limits.maxSearchBytes, !query.isEmpty else {
-      return fail(MuxError(.invalidRequest, "search query"))
-    }
-    guard let runtime = attachedRuntime(pane, in: leased) else {
-      return fail(MuxError(.notFound, "pane"))
-    }
-    runtime.search(query, step: nil) { reply(.success(.search($0))) }
+    if let error = searchQueryError(query) { return reply(.failure(error)) }
+    runSearch(query, step: nil, pane: pane, workspace: leased, reply: reply)
   }
 
-  private func stepSearch(
-    _ forward: Bool?,
+  /// A new search (`query`), a step, or with neither, the end of search.
+  private func runSearch(
+    _ query: String?,
+    step forward: Bool?,
     pane: PaneID,
     workspace leased: WorkspaceID,
     reply: @escaping Reply,
@@ -848,7 +887,7 @@ public actor MuxService {
       reply(.failure(MuxError(.notFound, "pane")))
       return
     }
-    runtime.search(nil, step: forward) { reply(.success(.search($0))) }
+    runtime.search(query, step: forward) { reply(.success(.search($0))) }
   }
 
   /// Lease and update-barrier admission for a command.
@@ -856,6 +895,14 @@ public actor MuxService {
     of command: MuxCommand,
     from client: Client,
   ) -> MuxError? {
+    if case .setViewport = command,
+      client.hello?.capabilities.contains(.viewerViewport) != true
+    {
+      return MuxError(
+        .invalidRequest,
+        "viewports need the viewerViewport capability",
+      )
+    }
     if clientViewers[client.id] != nil, !command.allowedForObserver {
       return MuxError(.unauthorized, "observers cannot mutate the session")
     }
@@ -875,34 +922,50 @@ public actor MuxService {
   func notFound(_ selector: WorkspaceSelector) -> MuxError {
     switch selector {
     case let .id(id): MuxError(.notFound, "workspace \(id.short)")
-    case let .name(n): MuxError(.notFound, "workspace \"\(n)\"")
+    case let .name(n):
+      MuxError(.notFound, "workspace \"\(DisplayText.sanitize(n))\"")
     case .latest: MuxError(.notFound, "no workspaces")
     }
   }
 
-  /// Relative scrolls never exceed what a pane could hold: history plus
+  /// A search query is non-empty and within the limit (either role).
+  func searchQueryError(_ query: String) -> MuxError? {
+    limits.validSearchQuery(query)
+      ? nil : MuxError(.invalidRequest, "search query")
+  }
+
+  /// A scroll distance a pane could ever move (either role): history plus
   /// a screen, in lines or (at least one line each) pages.
-  func validScroll(_ request: ScrollRequest) -> Bool {
+  func scrollError(_ request: ScrollRequest) -> MuxError? {
     switch request {
+    case .bottom, .top: return nil
     case let .lines(n), let .pages(n):
       guard limits.historyRowsPerPane >= 0, limits.maxRows >= 0 else {
-        return false
+        return Self.badScroll
       }
       let (bound, overflow) = limits.historyRowsPerPane.addingReportingOverflow(
         limits.maxRows,
       )
       // An overflowing nonnegative sum covers every Int distance, including
       // Int.min. The pane clamps the actual movement to retained history.
-      return overflow || (-bound ... bound).contains(n)
-    case .bottom, .top: return true
+      return (overflow || (-bound ... bound).contains(n)) ? nil : Self.badScroll
     }
   }
 
+  private static let badScroll = MuxError(.invalidRequest, "scroll distance")
+
+  /// Names show in every client's chrome: plain text only (no controls,
+  /// bidi overrides, invisible scalars or extra spaces).
   func validName(_ name: String) -> Bool {
-    !name.isEmpty && name.utf8.count <= limits.maxNameBytes
-      && !name.unicodeScalars.contains {
-        $0.properties.generalCategory == .control
-      }
+    name.utf8.count <= limits.maxNameBytes && DisplayText.isPlainName(name)
+  }
+
+  /// Why `validName` refused a name, for the person who typed it.
+  var invalidName: MuxError {
+    MuxError(
+      .invalidRequest,
+      "name: plain text of at most \(limits.maxNameBytes) bytes"
+    )
   }
 
   // MARK: Model queries
@@ -915,7 +978,7 @@ public actor MuxService {
       startedAt: startedAt,
       workspaces: workspaces.count,
       panes: paneCount,
-      attached: !leases.isEmpty,
+      attached: !leases.isEmpty || !viewers.isEmpty,
       quiescing: quiescing,
       innerTerm: configuration.innerTerm,
     )
@@ -1039,12 +1102,12 @@ public actor MuxService {
     guard let i = workspaces.firstIndex(where: { $0.id == id }) else { return }
     workspaces[i].layoutRevision &+= 1
     let snap = snapshot(workspaces[i])
-    if let lease = leases[id] {
-      send(.event(.layout(snap)), to: lease.client)
-    }
+    if let lease = leases[id] { send(.event(.layout(snap)), to: lease.client) }
     for viewer in viewers[id] ?? [] {
       send(.event(.layout(snap)), to: viewer.client)
     }
+    // The visible panes may have changed (tab, zoom, split, exit).
+    recheckReady(id)
     publishWorkspaces()
   }
 
@@ -1060,8 +1123,10 @@ public actor MuxService {
       // The roaming bridge exports its own screens on demand. Observers
       // still need a pump: a dirty slot is not delivered on its own.
       sink.onPaneChanged(id)
-      markViewersDirty(wsID, pane: id)
-      pump()
+      if viewerSubscribed(wsID, pane: id) {
+        markViewersDirty(wsID, pane: id)
+        pump()
+      }
       return
     }
     if reportActivity, let current = leases[wsID],
@@ -1135,10 +1200,18 @@ public actor MuxService {
 
   // MARK: Lease and lifetime
 
-  func releaseLease(_ wsID: WorkspaceID, notify: Bool, reason: String) {
+  /// `fence` (takeover, `detachActive`, connection loss) also drops the
+  /// holder's unwritten input so it cannot run under a later lease. An
+  /// explicit `detach` lets the input it was acknowledged for drain.
+  func releaseLease(
+    _ wsID: WorkspaceID,
+    notify: Bool,
+    fence: Bool = false,
+    reason: String,
+  ) {
     guard let current = leases[wsID] else { return }
     // Cancellation cleanup is queued on each pane ahead of any later input.
-    cancelPastes(wsID, discardDeferredInput: true)
+    cancelPastes(wsID, discardDeferredInput: fence)
     resetViewports(wsID)
     for slot in current.frames.values { releaseBudget(slot) }
     leases.removeValue(forKey: wsID)
@@ -1168,6 +1241,8 @@ public actor MuxService {
     if exitRequested {
       if isEmpty, let ready = onExitReady {
         onExitReady = nil
+        // The process exits in `ready`: send the queued list first.
+        if workspacesPublishScheduled { flushWorkspaces() }
         ready()
       }
       return
@@ -1233,9 +1308,10 @@ public actor MuxService {
       n + lease.frames.values.count(where: held)
     }
     let watching = viewers.values.reduce(0) { n, list in
-      n + list.reduce(0) { count, viewer in
-        count + viewer.frames.values.count(where: held)
-      }
+      n
+        + list.reduce(0) { count, viewer in
+          count + viewer.frames.values.count(where: held)
+        }
     }
     return controllers + watching
   }

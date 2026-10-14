@@ -105,8 +105,7 @@ public struct AttentionSummary: Sendable, Equatable, Codable {
     )
     .trimmingCharacters(in: .whitespaces)
     guard !cleaned.isEmpty else { return nil }
-    return cleaned.count <= limit
-      ? cleaned : String(cleaned.prefix(limit - 1)) + "…"
+    return DisplayText.head(cleaned, width: limit)
   }
 }
 

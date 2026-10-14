@@ -91,7 +91,10 @@ func show(
   columns: Int = 200,
   rows: Int = 50
 ) async throws {
-  guard case let .attached(_, snap) = try await c.execute(.attach(AttachRequest(.id(ws.id))))
+  guard
+    case let .attached(_, snap) = try await c.execute(
+      .attach(AttachRequest(.id(ws.id)))
+    )
   else { throw MuxError(.invalidRequest, "unexpected benchmark reply") }
   try await c.execute(
     .setGeometry(
@@ -433,7 +436,10 @@ func visibleLimit(
   let c = try await connect()
   let noisy = spec("while :; do cat \(corpusShellPath); done")
   var ws = try await create(c, noisy, columns: 512, rows: 255)
-  guard case let .attached(_, snap) = try await c.execute(.attach(AttachRequest(.id(ws.id))))
+  guard
+    case let .attached(_, snap) = try await c.execute(
+      .attach(AttachRequest(.id(ws.id)))
+    )
   else { throw MuxError(.invalidRequest, "unexpected benchmark reply") }
   ws = snap
   var panes = ws.tabs[0].layout.panes

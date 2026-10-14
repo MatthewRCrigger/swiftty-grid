@@ -50,7 +50,8 @@ struct LeaseTests {
     // The held one fails without takeover; metadata stays readable.
     let c = try await h.connect()
     #expect(
-      await code { _ = try await c.execute(.attach(AttachRequest(.id(w1.id)))) } == .leaseHeld
+      await code { _ = try await c.execute(.attach(AttachRequest(.id(w1.id)))) }
+        == .leaseHeld
     )
     let s = try await summary(c, w1.id)
     #expect(s.isAttached)

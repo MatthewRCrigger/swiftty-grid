@@ -529,14 +529,18 @@ struct CommandAdmissionTests {
     let connection = try await connect(peer)
     let old = AttachmentID()
     let current = AttachmentID()
-    let first = Task { try await connection.execute(.attach(AttachRequest(.latest))) }
+    let first = Task {
+      try await connection.execute(.attach(AttachRequest(.latest)))
+    }
     var second: Task<MuxReply, any Error>?
     var input: Task<Void, any Error>?
     do {
       try #require(await waitUntil { peer.requests.withLock { $0.count == 1 } })
       peer.reply(1, .attached(attachment: old, workspace: peer.workspace))
       _ = try await first.value
-      let newer = Task { try await connection.execute(.attach(AttachRequest(.latest))) }
+      let newer = Task {
+        try await connection.execute(.attach(AttachRequest(.latest)))
+      }
       second = newer
       try #require(await waitUntil { peer.requests.withLock { $0.count == 2 } })
       peer.reply(2, .attached(attachment: current, workspace: peer.workspace))
@@ -576,7 +580,9 @@ struct CommandAdmissionTests {
     var sending: Task<Void, any Error>?
     do {
       for request in UInt64(1) ... 2 {
-        let attach = Task { try await connection.execute(.attach(AttachRequest(.latest))) }
+        let attach = Task {
+          try await connection.execute(.attach(AttachRequest(.latest)))
+        }
         attaching = attach
         try #require(
           await waitUntil {
@@ -616,7 +622,9 @@ struct CommandAdmissionTests {
     let peer = CommandPeer()
     defer { peer.close() }
     let connection = try await connect(peer)
-    let caller = Task { try await connection.execute(.attach(AttachRequest(.latest))) }
+    let caller = Task {
+      try await connection.execute(.attach(AttachRequest(.latest)))
+    }
     do {
       try #require(await waitUntil { peer.requests.withLock { $0.count == 1 } })
       caller.cancel()

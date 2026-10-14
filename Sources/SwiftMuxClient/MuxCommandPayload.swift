@@ -88,8 +88,7 @@ private struct MuxCommandPayload {
       )
     case let .setSubscriptions(panes):
       try add(count: panes.count, stride: MemoryLayout<PaneID>.stride)
-    case .setViewport:
-      try add(MemoryLayout<ViewportRequest>.stride)
+    case .setViewport: try add(MemoryLayout<ViewportRequest>.stride)
     case let .search(_, query): try text(query)
     case .status, .listWorkspaces, .detachActive, .endAllWorkspaces, .quiesce,
       .detach, .observeWorkspaces, .subscribeInbox, .selectTab, .endTab,

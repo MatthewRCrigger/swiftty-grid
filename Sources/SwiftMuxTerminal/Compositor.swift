@@ -251,21 +251,65 @@ public struct Compositor {
     }
   }
 
+  /// Draws a note (a message beside a prompt) right-aligned, shortened to
+  /// `room`, or nothing when that is too little to read. Returns it.
+  @discardableResult
+  private func drawNote(
+    _ text: String,
+    room: Int,
+    y: Int,
+    style: OuterStyle,
+    into screen: inout ScreenBuffer
+  ) -> String {
+    guard !text.isEmpty, room >= Self.minimumNote else { return "" }
+    let note = DisplayText.head(text, width: room)
+    screen.write(note, x: columns - note.count, y: y, style: style)
+    return note
+  }
+
+  /// Narrowest room a note is drawn in.
+  private static let minimumNote = 4
+
   private func drawStatus(_ status: StatusLine, into screen: inout ScreenBuffer)
   {
     let y = rows - 1
     let base = OuterStyle(foreground: .palette(0), background: .palette(2))
     screen.fill(LayoutRect(x: 0, y: y, width: columns, height: 1), style: base)
     if let prompt = status.prompt {
-      screen.write(
-        prompt,
-        x: 0,
-        y: y,
-        style: OuterStyle(foreground: .palette(0), background: .palette(3))
-      )
-      if status.promptCursor {
-        screen.cursor = (min(columns - 1, prompt.count), y, 2)
+      let style = OuterStyle(foreground: .palette(0), background: .palette(3))
+      guard status.promptCursor else {
+        // A message or question keeps its start, and its suffix (answer
+        // keys) whole; a note shows in what is left when that is readable.
+        let suffix = DisplayText.tail(status.promptSuffix, width: columns)
+        let shown =
+          DisplayText.head(prompt, width: columns - suffix.count) + suffix
+        screen.write(shown, x: 0, y: y, style: style)
+        drawNote(
+          status.right,
+          room: columns - shown.count - 1,
+          y: y,
+          style: base,
+          into: &screen
+        )
+        return
       }
+      // A typed prompt keeps its end, where the cursor is, clipping from
+      // the left. It keeps its length up to half the line; a note (`right`,
+      // a message) takes what is left.
+      let line = columns - 1
+      let note = drawNote(
+        status.right,
+        room: line - min(prompt.count, line / 2) - 1,
+        y: y,
+        style: base,
+        into: &screen
+      )
+      let shown = DisplayText.tail(
+        prompt,
+        width: max(0, line - (note.isEmpty ? 0 : note.count + 1))
+      )
+      screen.write(shown, x: 0, y: y, style: style)
+      screen.cursor = (min(columns - 1, shown.count), y, 2)
       return
     }
     let right = status.right
@@ -308,10 +352,16 @@ public struct StatusLine: Sendable {
 
   public var left = ""
   public var items: [Item] = []
+  /// Right-hand status text; beside a prompt, a note (a message).
   public var right = ""
-  /// Replaces the whole line (messages, prompts).
+  /// Replaces `left` and `items`: a message, question or prompt (`right`
+  /// then shows beside it as a note when there is room).
   public var prompt: String?
+  /// `prompt` is being typed: the cursor follows it and its end stays in
+  /// view. Otherwise it keeps its start.
   public var promptCursor = false
+  /// Kept after a question however it is shortened ("? (y/n)").
+  public var promptSuffix = ""
 
   public init() {}
 }

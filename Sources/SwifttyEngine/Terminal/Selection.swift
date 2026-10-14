@@ -496,14 +496,22 @@ extension TerminalState {
     }
     searchMatches = matches
     if let selected {
-      searchSelected =
-        matches.firstIndex(of: selected) ?? matches.firstIndex(where: {
-          $0.start >= selected.start
-        }) ?? matches.indices.last
+      searchSelected = Self.index(following: selected, in: matches)
     } else {
       searchSelected = matches.indices.last
     }
     damage.setFull()
+  }
+
+  /// The same match if it is still listed, else the next newer one, else
+  /// the newest. Absolute rows keep a match's identity across trimming.
+  private static func index(
+    following selected: TerminalRange,
+    in matches: [TerminalRange]
+  ) -> Int? {
+    matches.firstIndex(of: selected) ?? matches.firstIndex {
+      $0.start >= selected.start
+    } ?? matches.indices.last
   }
 
   package mutating func refreshSearchIfNeeded() {
@@ -630,16 +638,15 @@ extension TerminalState {
     return next
   }
 
-  /// Restores a resolved match index without moving the viewport. The
-  /// caller has already placed the window. An index outside the current
-  /// list selects nothing.
-  package mutating func reselectSearchMatch(_ index: Int) {
-    guard searchMatches.indices.contains(index) else {
-      searchSelected = nil
-      return
-    }
-    searchSelected = index
+  /// Restores a match selected earlier without moving the viewport (the
+  /// caller has already placed the window). Trimmed history may have
+  /// renumbered the list; the match is found by position.
+  package mutating func reselectSearchMatch(_ match: TerminalRange) {
+    searchSelected = Self.index(following: match, in: searchMatches)
   }
+
+  /// A search query is active (it may have no matches).
+  package var isSearching: Bool { searchQuery != nil }
 
   public mutating func endSearch() {
     searchQuery = nil

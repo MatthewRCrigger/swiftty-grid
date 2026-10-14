@@ -34,9 +34,8 @@ extension MuxService {
     }
     leases[wsID]?.subscriptions = list
     leases[wsID]?.frames = frames
-    if let ws = workspaces.first(where: { $0.id == wsID }) {
-      armReadiness(controller: wsID, panes: list, workspace: ws)
-    }
+    leases[wsID]?.readiness.arm(list)
+    publishControllerReady(wsID)
     leases[wsID]?.reportedActivity.subtract(list)
     for pane in activity {
       leases[wsID]?.reportedActivity.insert(pane)
@@ -81,10 +80,8 @@ extension MuxService {
 
   /// Starts captures for one lease; returns when a throttled pane is due
   /// and whether any capture started.
-  func pump(
-    _ wsID: WorkspaceID,
-    now: UInt64,
-  ) -> (due: UInt64?, started: Bool) {
+  func pump(_ wsID: WorkspaceID, now: UInt64, ) -> (due: UInt64?, started: Bool)
+  {
     guard let current = leases[wsID], !current.subscriptions.isEmpty else {
       return (nil, false)
     }
@@ -154,14 +151,18 @@ extension MuxService {
       else { return }
       if let stale = slot.inflight { inflightFrameBytes -= stale.bytes }
       channel.send(captured.data)
-      leases[wsID]?.frames[pane]?.inflight = (captured.revision, captured.data.count)
-      leases[wsID]?.frames[pane]?.inflightGeometry = captured.geometry
-      leases[wsID]?.frames[pane]?.lastSent =
-        DispatchTime.now().uptimeNanoseconds
+      leases[wsID]?.frames[pane]?.sent(captured.sent)
       inflightFrameBytes += captured.data.count
+    case .failure where token <= slot.supersededThrough:
+      // Captured at a size since replaced: recapture, report nothing.
+      leases[wsID]?.frames[pane]?.dirty = true
     case let .failure(error):
-      // Preserve the session; report instead of omitting cells.
+      // Preserve the session; report instead of omitting cells. Ready
+      // does not wait for a pane that reported no frame.
       send(.event(.frameUnavailable(pane, error)), to: current.client)
+      if leases[wsID]?.readiness.failed.insert(pane).inserted == true {
+        publishControllerReady(wsID)
+      }
     }
     pump()
   }
@@ -183,28 +184,32 @@ extension MuxService {
   /// carrying a token no slot holds, is then dropped).
   func releaseBudget(_ slot: FrameSlot) {
     if let inflight = slot.inflight { inflightFrameBytes -= inflight.bytes }
-    if let queued = slot.queued { inflightFrameBytes -= queued.bytes }
+    if let queued = slot.queued { inflightFrameBytes -= queued.frame.bytes }
     reservedFrameBytes -= slot.reserved
   }
 
-  func frameAck(_ pane: PaneID, _ revision: UInt64, from id: UUID) {
-    if let wsID = clientLeases[id], let slot = leases[wsID]?.frames[pane],
-      let inflight = slot.inflight, inflight.revision == revision
+  func frameAck(
+    _ pane: PaneID,
+    _ revision: UInt64,
+    attachment: AttachmentID,
+    from id: UUID,
+  ) {
+    if let wsID = clientLeases[id], leases[wsID]?.attachment == attachment,
+      let slot = leases[wsID]?.frames[pane], let inflight = slot.inflight,
+      inflight.revision == revision
     {
       leases[wsID]?.frames[pane]?.inflight = nil
       inflightFrameBytes -= inflight.bytes
-      noteReady(
-        wsID,
-        controller: true,
-        pane: pane,
-        revision: revision,
-        geometry: slot.inflightGeometry,
-        acked: true,
-      )
+      let window =
+        panes[pane]?.runtime.currentViewport.load(ordering: .acquiring) ?? 0
+      if leases[wsID]?.readiness.install(pane, inflight, window: window) == true
+      {
+        publishControllerReady(wsID)
+      }
       pump()
       return
     }
-    acknowledgeViewer(pane, revision, from: id)
+    acknowledgeViewer(pane, revision, attachment: attachment, from: id)
   }
 
   // MARK: Input
@@ -346,8 +351,8 @@ extension MuxService {
     guard let paste = leases[wsID]?.pastes.removeValue(forKey: pasteID),
       let runtime = panes[paste.pane]?.runtime
     else { return }
-    runtime.pasteCancel(id: pasteID, discardDeferredInput: discardDeferredInput) {
-      [weak self] state in
+    runtime.pasteCancel(id: pasteID, discardDeferredInput: discardDeferredInput)
+    { [weak self] state in
       guard let client else { return }
       self?
         .onQueue {
@@ -356,10 +361,7 @@ extension MuxService {
     }
   }
 
-  func cancelPastes(
-    _ wsID: WorkspaceID,
-    discardDeferredInput: Bool = false,
-  ) {
+  func cancelPastes(_ wsID: WorkspaceID, discardDeferredInput: Bool = false, ) {
     for id in leases[wsID]?.pastes.keys.map(\.self) ?? [] {
       cancelPaste(
         id,

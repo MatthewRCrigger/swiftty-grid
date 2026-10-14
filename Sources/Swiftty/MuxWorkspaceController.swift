@@ -50,8 +50,6 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private var subscribed: [PaneID] = []
   private var detached = false
   private var presentationAttachment: AttachmentID?
-  /// True only after the service reports Ready for this attachment.
-  private(set) var isReady = false
   /// Lease loss leaves inbox metadata available until the window closes.
   private var closed = false
   private var closeRequested = false
@@ -94,6 +92,10 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     tabStrip.onSelect = { [weak self] tab in self?.selectTab(tab) }
     tabStrip.onClose = { [weak self] tab in self?.closeTab(tab) }
     tabStrip.onRename = { [weak self] tab, name in self?.renameTab(tab, name) }
+    // On the next turn, once AppKit has settled where focus went.
+    tabStrip.onRenameEnded = { [weak self] in
+      Task { @MainActor in self?.focusAfterRename() }
+    }
     layoutView.translatesAutoresizingMaskIntoConstraints = false
     layoutView.controller = self
     content.addSubview(layoutView)
@@ -334,12 +336,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       NSSound.beep()
       if pane != activePane { markActivity(pane) }
     case let .activity(pane): markActivity(pane)
-    case let .ready(notice):
-      guard notice.attachment == presentationAttachment else { return }
-      isReady = true
-    case let .detached(reason):
-      isReady = false
-      connectionEnded(reason)
+    case let .detached(reason): connectionEnded(reason)
     case let .paneExited(pane, status, truncated):
       if truncated, !detached {
         window?.subtitle =
@@ -352,14 +349,13 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     case let .inbox(update):
       if inbox.apply(update) { Task { await reloadInbox() } }
       refreshInbox()
-    case .paste, .frameUnavailable, .frame, .workspaces: break
+    case .paste, .frameUnavailable, .frame, .workspaces, .ready: break
     }
   }
 
   private func connectionEnded(_ reason: String) {
     guard !detached else { return }
     detached = true
-    isReady = false
     stopPipelines()
     for view in views.values { view.reset() }
     window?.title = "SwiftMux — detached (\(reason))"
@@ -386,7 +382,6 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     guard !detached else { return }
     if let attachment, presentationAttachment != attachment {
       presentationAttachment = attachment
-      isReady = false
       for view in views.values { view.reset() }
     }
     let update = attached ? sequencer.attached(ws) : sequencer.layout(ws)
@@ -453,11 +448,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     refreshChrome()
     layoutView.needsLayout = true
     layoutView.layoutSubtreeIfNeeded()
-    if let active = views[tab.activePane], window?.firstResponder !== active,
-      !(window?.firstResponder is NSText)
-    {
-      window?.makeFirstResponder(active)
-    }
+    focusActivePane()
     if visible != subscribed {
       subscribed = visible
       command(.setSubscriptions(visible))
@@ -486,7 +477,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
           symbol: MuxIcons.symbol(for: title(of: tab.activePane)),
           isActive: tab.id == ws.activeTab,
           hasActivity: tab.id != ws.activeTab
-            && tab.layout.panes.contains(where: activity.contains)
+            && tab.layout.panes.contains(where: activity.contains),
+          name: automatic ? nil : tab.name
         )
       }
     )
@@ -899,10 +891,67 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     command(.selectTab(tab))
   }
 
+  /// Tab renames sent, numbering each.
+  private var renames = 0
+  /// The refused rename the subtitle reports, and what it says.
+  private var refusal: (rename: Int, notice: String)?
+
+  /// `name` as `DisplayText.plainName` gives it (the tab strip cleans it).
   func renameTab(_ tab: TabID, _ name: String) {
-    let clean = DisplayText.sanitize(name)
-    guard !clean.isEmpty else { return }
-    command(.renameTab(tab, name: clean))
+    renames += 1
+    let rename = renames
+    command(
+      .renameTab(tab, name: name),
+      failed: { [weak self] error in
+        guard let self, !detached else { return }
+        let notice = DisplayText.sanitize("Tab not renamed: \(error)")
+        refusal = (rename, notice)
+        window?.subtitle = notice
+      },
+      then: { [weak self] in
+        guard let self else { return }
+        // A later rename that lands clears an earlier refusal, if the
+        // subtitle still reports it.
+        guard let refusal, refusal.rename < rename else { return }
+        self.refusal = nil
+        if window?.subtitle == refusal.notice { window?.subtitle = "" }
+      }
+    )
+  }
+
+  /// Keys go back to the active pane after a tab rename when they would
+  /// otherwise reach nothing (no first responder but the window). Focus a
+  /// click moved elsewhere (a pane, the search field, another rename) or
+  /// Tab moved to the next key view (a toolbar control with Full Keyboard
+  /// Access; never a pane) stays.
+  private func focusAfterRename() {
+    guard let window else { return }
+    func idle(_ w: NSWindow) -> Bool {
+      w.firstResponder == nil || w.firstResponder === w
+    }
+    // The workspace window's own keys may be idle (the edit ran there, or
+    // the strip left it mid-edit). In full screen the strip lives in
+    // AppKit's toolbar window: while the person is still there with keys
+    // reaching nothing, they go back to the workspace. Keys taken
+    // elsewhere stay.
+    var refocus = idle(window)
+    if let strip = tabStrip.window, strip !== window, strip.isKeyWindow,
+      idle(strip)
+    {
+      window.makeKey()
+      refocus = true
+    }
+    if refocus { focusActivePane() }
+  }
+
+  /// Keys go to the active pane, unless the person is typing in a text
+  /// field (search, a tab rename) and `overText` is false.
+  private func focusActivePane(overText: Bool = false) {
+    guard let window, let view = activePane.flatMap({ views[$0] }),
+      window.firstResponder !== view,
+      overText || !(window.firstResponder is NSText)
+    else { return }
+    window.makeFirstResponder(view)
   }
 
   func beginRenamingActiveTab() {
@@ -1009,7 +1058,6 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     connectionAttempts.cancel()
     inboxReadID = UUID()
     detached = true
-    isReady = false
     for view in views.values { view.cancelComposition() }
     stopPipelines()
     for task in tasks { task.cancel() }
@@ -1113,7 +1161,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
 
   private func search(_ query: String) {
     guard let pane = activePane else { return }
-    guard !query.isEmpty, query.utf8.count <= limits.maxSearchBytes else {
+    guard limits.validSearchQuery(query) else {
       command(.endSearch(pane: pane))
       return
     }
@@ -1126,7 +1174,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     if let pane = activePane {
       command(.endSearch(pane: pane))
       command(.scroll(pane: pane, .bottom))
-      if let view = views[pane] { window?.makeFirstResponder(view) }
+      focusActivePane(overText: true)
     }
   }
 
@@ -1485,7 +1533,6 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     closeRequested = true
     connectionAttempts.cancel()
     detached = true
-    isReady = false
     stopPipelines()
     Task { await detach() }
     onClose?()

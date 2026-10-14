@@ -260,6 +260,40 @@ struct ReviewTests {
     #expect(try await names(c) == ["one", "two"])
   }
 
+  /// Names show in every client's chrome: bidi overrides, invisible
+  /// scalars and blank names are refused; joiners and flag tags that shape
+  /// an emoji are not.
+  @Test
+  func renameRefusesNamesThatDoNotShowAsGiven() async throws {
+    let h = try Harness()
+    let c = try await h.connect(.control)
+    _ = try await create(c, "one")
+    for name in [
+      "a\u{202E}b", "a\u{200B}b", "a\u{2028}b", "a\u{E000}b", "\u{200D}",
+      "a\u{E0041}", " ",
+    ] {
+      #expect(
+        await code {
+          _ = try await c.execute(.renameWorkspace(.name("one"), name: name))
+        } == .invalidRequest
+      )
+    }
+    let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"
+    let wales =
+      "\u{1F3F4}\u{E0067}\u{E0062}\u{E0077}\u{E006C}\u{E0073}\u{E007F}"
+    try await c.execute(.renameWorkspace(.name("one"), name: family + wales))
+    #expect(try await names(c) == [family + wales])
+    // A new tab's name follows the same rule.
+    let ws = try await create(c, "tabs")
+    let front = try await h.connect()
+    try await front.attachAndShow(.id(ws.id))
+    #expect(
+      await code {
+        _ = try await front.execute(.newTab(name: "a\u{202E}b", launch: nil))
+      } == .invalidRequest
+    )
+  }
+
   /// Switching away returns the old workspace to live output and ends
   /// its search, as a detach does.
   @Test
@@ -305,9 +339,9 @@ struct ReviewTests {
     let c = try await h.connect()
     let ws = try await create(c, launch: busyLaunch())
     var panes = [ws.tabs[0].activePane]
-    guard case .attached = try await c.execute(.attach(AttachRequest(.id(ws.id)))) else {
-      throw MuxError(.invalidRequest)
-    }
+    guard
+      case .attached = try await c.execute(.attach(AttachRequest(.id(ws.id))))
+    else { throw MuxError(.invalidRequest) }
     for _ in 0 ..< 3 {
       guard
         case let .layout(snap) = try await c.execute(

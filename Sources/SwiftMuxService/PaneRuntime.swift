@@ -45,6 +45,8 @@ final class PaneRuntime: @unchecked Sendable {
   private struct ResizeState: Sendable {
     var pending: ResizeRequest?
     var scheduled = false
+    /// Last generation handed out; a coalesced request skips some.
+    var requested: UInt64 = 0
   }
 
   private let resizes = Mutex(ResizeState())
@@ -84,9 +86,22 @@ final class PaneRuntime: @unchecked Sendable {
   private var drainTimer: DispatchWorkItem?
   /// Every committed state change advances this.
   private(set) var revision: UInt64 = 0
+  /// Owned by this pane: the generation of the last applied geometry
+  /// request, whichever lease sent it, so it never goes backwards.
   private(set) var geometryGeneration: UInt64 = 0
-  private(set) var viewportRevision: UInt64 = 0
-  private var title = ""
+  /// Advances with committed state changes only (not viewer captures).
+  private var changeCount: UInt64 = 0
+  /// Matches of the last viewer search, valid while `changeCount` holds.
+  private var viewerSearchCache: ViewerSearchCache?
+
+  private struct ViewerSearchCache {
+    var query: String
+    var change: UInt64
+    var search: TerminalState.TerminalSearchSnapshot
+  }
+  /// Advances whenever the controller's window moves. The service reads
+  /// it too: Ready counts only a frame of the current window.
+  let currentViewport = Atomic<UInt64>(0)
   /// New on creation and on every full reset (RIS).
   private var terminalEpoch = TerminalEpochID()
   /// Status changes journaled per publish; past it the inbox resyncs
@@ -319,9 +334,9 @@ final class PaneRuntime: @unchecked Sendable {
     state.controlModeData.removeAll(keepingCapacity: true)
     for event in state.takeEvents() {
       switch event {
-      case let .title(t):
-        title = t
-        onEvent?(.title(t))
+      case let .title(raw):
+        // Cleaned once here for every client's chrome.
+        onEvent?(.title(DisplayText.sanitize(raw)))
       case .bell: onEvent?(.bell)
       case let .workingDirectory(d): onEvent?(.workingDirectory(d))
       default: break  // program clipboard writes are disabled
@@ -385,6 +400,7 @@ final class PaneRuntime: @unchecked Sendable {
 
   private func noteChange() {
     revision &+= 1
+    changeCount &+= 1
     if !changePosted.exchange(true, ordering: .acquiringAndReleasing) {
       onChange?()
     }
@@ -418,7 +434,7 @@ final class PaneRuntime: @unchecked Sendable {
       if case .focus = input {
       } else if state.viewportOffset != 0 {
         state.scrollViewportToBottom()
-        viewportRevision &+= 1
+        advanceViewport()
         noteChange()
       }
       adjust(by: bytes.count - estimate)
@@ -435,7 +451,7 @@ final class PaneRuntime: @unchecked Sendable {
       }
       if state.viewportOffset != 0 {
         state.scrollViewportToBottom()
-        viewportRevision &+= 1
+        advanceViewport()
         noteChange()
       }
       let before = writer.pendingInputBytes
@@ -590,19 +606,23 @@ final class PaneRuntime: @unchecked Sendable {
 
   // MARK: Geometry, history and search
 
-  /// Engine resize, then `TIOCSWINSZ`, in this pane's order.
-  func resize(columns: Int, rows: Int, generation: UInt64) {
-    let schedule = resizes.withLock { requests in
+  /// Engine resize, then `TIOCSWINSZ`, in this pane's order. Returns the
+  /// geometry generation frames carry once this request is applied.
+  @discardableResult
+  func resize(columns: Int, rows: Int) -> UInt64 {
+    let (generation, schedule) = resizes.withLock { requests in
+      requests.requested &+= 1
       requests.pending = ResizeRequest(
         columns: columns,
         rows: rows,
-        generation: generation,
+        generation: requests.requested,
       )
-      guard !requests.scheduled else { return false }
+      guard !requests.scheduled else { return (requests.requested, false) }
       requests.scheduled = true
-      return true
+      return (requests.requested, true)
     }
     if schedule { scheduleResize() }
+    return generation
   }
 
   /// One running resize and one replaceable pending request. Queue the next
@@ -667,28 +687,62 @@ final class PaneRuntime: @unchecked Sendable {
         }
         state.scrollViewport(by: -state.viewportRow(absoluteRow: address.row))
       }
-      viewportRevision &+= 1
+      advanceViewport()
       noteChange()
       completion(nil)
     }
   }
 
+  /// Moves the controller viewport to an anchor, addressed as a viewer's
+  /// is (either screen); `followTail` returns it to live output.
+  func setViewport(
+    followTail: Bool,
+    historyGeneration: UInt64,
+    anchorRow: Int?,
+    completion: @escaping @Sendable (MuxError?) -> Void,
+  ) {
+    queue.async { [self] in
+      guard
+        place(
+          followTail: followTail,
+          historyGeneration: historyGeneration,
+          anchorRow: anchorRow,
+        )
+      else {
+        completion(MuxError(.historyUnavailable, "history anchor is stale"))
+        return
+      }
+      advanceViewport()
+      noteChange()
+      completion(nil)
+    }
+  }
+
+  /// A step with nothing to select, or an end with no search, changes
+  /// nothing.
   func search(
     _ query: String?,
     step forward: Bool?,
     completion: @escaping @Sendable (SearchResult) -> Void,
   ) {
     queue.async { [self] in
+      let changes: Bool
       if let query {
         state.search(query)
         state.selectSearchMatch(forward: false)
+        changes = true
       } else if let forward {
-        state.selectSearchMatch(forward: forward)
+        // Nothing to step to: the window stays. (Matches are current:
+        // the parser refreshes them after every read.)
+        changes = state.selectSearchMatch(forward: forward) != nil
       } else {
+        changes = state.isSearching
         state.endSearch()
       }
-      viewportRevision &+= 1
-      noteChange()
+      if changes {
+        advanceViewport()
+        noteChange()
+      }
       completion(
         SearchResult(
           matchCount: state.searchMatches.count,
@@ -720,12 +774,16 @@ final class PaneRuntime: @unchecked Sendable {
     }
   }
 
+  private func advanceViewport() {
+    currentViewport.wrappingAdd(1, ordering: .releasing)
+  }
+
   /// Returns the viewport to live output and clears search (detach).
   func resetViewport() {
     queue.async { [self] in
       state.endSearch()
       state.scrollViewportToBottom()
-      viewportRevision &+= 1
+      advanceViewport()
       noteChange()
     }
   }
@@ -736,6 +794,17 @@ final class PaneRuntime: @unchecked Sendable {
     var data: Data
     var revision: UInt64
     var geometry: UInt64
+    /// The viewport (a viewer's window) the frame shows.
+    var viewportRevision: UInt64
+
+    var sent: SentFrame {
+      SentFrame(
+        revision: revision,
+        bytes: data.count,
+        geometry: geometry,
+        viewport: viewportRevision,
+      )
+    }
   }
 
   /// Result of applying a viewer's anchor without touching the engine
@@ -745,6 +814,7 @@ final class PaneRuntime: @unchecked Sendable {
     var historyGeneration: UInt64
     var anchorRow: Int?
     var search: SearchResult?
+    var selectedMatch: SelectedMatch?
   }
 
   /// Captures cells and metadata in one operation and encodes the frame
@@ -755,22 +825,22 @@ final class PaneRuntime: @unchecked Sendable {
     server: ServerInstanceID,
     attachment: AttachmentID,
     layoutRevision: UInt64,
-    viewport: ViewerCapture? = nil,
+    viewport: ViewerViewport? = nil,
     completion: @escaping @Sendable (Result<CapturedFrame, MuxError>) -> Void,
   ) {
     queue.async { [self] in
-      let savedOffset = state.viewportOffset
-      let savedSearch = state.snapshotSearch()
-      var failure: MuxError?
+      // The controller's capture uses the engine state as it is; only a
+      // viewer window needs saving and restoring around the capture.
+      var saved: (offset: Int, search: TerminalState.TerminalSearchSnapshot)?
       if let viewport {
-        failure = apply(viewport)
+        saved = (state.viewportOffset, state.snapshotSearch())
+        if let failure = apply(viewport) {
+          restore(offset: saved!.offset, search: saved!.search)
+          completion(.failure(failure))
+          return
+        }
       } else {
         state.refreshSearchIfNeeded()
-      }
-      if let failure {
-        restore(offset: savedOffset, search: savedSearch)
-        completion(.failure(failure))
-        return
       }
       var screen = state.captureOwnedScreen()
       let selected = state.searchSelected
@@ -778,8 +848,9 @@ final class PaneRuntime: @unchecked Sendable {
       // A viewer capture does not share the controller's revision: each
       // exported frame for this pane stays strictly newer than the last.
       if viewport != nil { revision &+= 1 }
-      let shownRevision = viewport?.viewportRevision ?? viewportRevision
-      restore(offset: savedOffset, search: savedSearch)
+      let shownRevision =
+        viewport?.revision ?? currentViewport.load(ordering: .relaxed)
+      if let saved { restore(offset: saved.offset, search: saved.search) }
       if let viewport {
         fit(
           &screen,
@@ -809,7 +880,12 @@ final class PaneRuntime: @unchecked Sendable {
         )
         completion(
           .success(
-            CapturedFrame(data: data, revision: revision, geometry: geometry)
+            CapturedFrame(
+              data: data,
+              revision: revision,
+              geometry: geometry,
+              viewportRevision: shownRevision,
+            )
           )
         )
       } catch let error as MuxError { completion(.failure(error)) } catch {
@@ -818,49 +894,68 @@ final class PaneRuntime: @unchecked Sendable {
     }
   }
 
-  /// Checks an anchor and, for a search, the match list. Restores the
-  /// controller viewport and search before returning.
+  /// Checks an anchor and, for a search, the match list. A relative
+  /// `scroll` moves from the viewer's anchor and stops at the history
+  /// edges. Searches and scrolls start from the viewer's own window (the
+  /// tail when its anchor is stale), never from the controller's.
+  /// Restores the controller viewport and search before returning.
   func resolveViewer(
     _ request: ViewportRequest,
     searchQuery: String?,
     searchStep: Bool?,
-    searchSelected: Int? = nil,
+    searchSelected: SelectedMatch? = nil,
+    scroll: ScrollRequest? = nil,
     completion: @escaping @Sendable (Result<ResolvedViewport, MuxError>) -> Void,
   ) {
     queue.async { [self] in
       let savedOffset = state.viewportOffset
       let savedSearch = state.snapshotSearch()
       defer { restore(offset: savedOffset, search: savedSearch) }
+      let anchored = place(
+        followTail: request.followTail,
+        historyGeneration: request.historyGeneration,
+        anchorRow: request.anchorRow,
+      )
+      let searching = searchQuery != nil || searchStep != nil
+      // A stale anchor leaves the controller's viewport in place; a search
+      // or scroll must start from the tail instead.
+      if !anchored, searching || scroll != nil {
+        state.scrollViewportToBottom()
+      }
       if let searchStep {
-        if let searchQuery, !searchQuery.isEmpty { state.search(searchQuery) }
+        if let searchQuery, !searchQuery.isEmpty { viewerSearch(searchQuery) }
         // `search` clears the selection. Continue from the viewer's match
         // so a step does not jump back to the last occurrence.
-        if let searchSelected { state.reselectSearchMatch(searchSelected) }
+        reselect(searchSelected)
         _ = state.selectSearchMatch(forward: searchStep)
       } else if let searchQuery {
-        state.search(searchQuery)
+        viewerSearch(searchQuery)
         _ = state.selectSearchMatch(forward: false)
-      } else if request.followTail {
-        state.scrollViewportToBottom()
-      } else if let row = request.anchorRow {
-        guard request.historyGeneration == state.addressingGeneration,
-          state.contains(absoluteRow: row)
-        else {
-          completion(
-            .failure(MuxError(.historyUnavailable, "history anchor is stale"))
-          )
-          return
+      } else if let scroll {
+        switch scroll {
+        case let .lines(n): state.scrollViewport(by: n)
+        case let .pages(n):
+          // A page is the viewer's display height, not the PTY's.
+          let page = max(1, (request.rows ?? state.rows) - 1)
+          let (lines, overflow) = n.multipliedReportingOverflow(by: page)
+          state.scrollViewport(by: overflow ? (n < 0 ? .min : .max) : lines)
+        case .bottom: state.scrollViewportToBottom()
+        case .top: break
         }
-        state.scrollViewport(by: -state.viewportRow(absoluteRow: row))
+      } else if !anchored {
+        completion(
+          .failure(MuxError(.historyUnavailable, "history anchor is stale"))
+        )
+        return
       }
       let searchResult: SearchResult? =
-        searchQuery != nil || searchStep != nil
+        searching
         ? SearchResult(
           matchCount: state.searchMatches.count,
           selected: state.searchSelected,
         ) : nil
       let follow =
-        request.followTail && searchQuery == nil && searchStep == nil
+        request.followTail && !searching && scroll == nil
         ? true : state.viewportOffset == 0
       completion(
         .success(
@@ -869,34 +964,91 @@ final class PaneRuntime: @unchecked Sendable {
             historyGeneration: state.addressingGeneration,
             anchorRow: state.absoluteRow(viewportRow: 0),
             search: searchResult,
+            selectedMatch: state.searchSelected.map {
+              SelectedMatch(
+                range: state.searchMatches[$0],
+                index: $0,
+                historyGeneration: state.addressingGeneration,
+              )
+            },
           )
         )
       )
     }
   }
 
-  /// Applies a viewer window for the duration of one capture.
-  private func apply(_ viewport: ViewerCapture) -> MuxError? {
-    if viewport.followTail {
+  /// Moves the engine viewport to a viewer window. False when the anchor
+  /// is stale; the viewport is then unchanged.
+  private func place(
+    followTail: Bool,
+    historyGeneration: UInt64,
+    anchorRow: Int?,
+  ) -> Bool {
+    if followTail {
       state.scrollViewportToBottom()
-    } else if let row = viewport.anchorRow {
-      guard viewport.historyGeneration == state.addressingGeneration,
+    } else if let row = anchorRow {
+      guard historyGeneration == state.addressingGeneration,
         state.contains(absoluteRow: row)
-      else {
-        return MuxError(.historyUnavailable, "history anchor is stale")
-      }
+      else { return false }
       state.scrollViewport(by: -state.viewportRow(absoluteRow: row))
     }
+    return true
+  }
+
+  /// Runs a viewer search, reusing the matches of an identical search
+  /// while the pane has not changed (several observers, one scan).
+  private func viewerSearch(_ query: String) {
+    if let cache = viewerSearchCache, cache.query == query,
+      cache.change == changeCount
+    {
+      state.restoreSearch(cache.search)
+      return
+    }
+    state.search(query)
+    viewerSearchCache = ViewerSearchCache(
+      query: query,
+      change: changeCount,
+      search: state.snapshotSearch(),
+    )
+  }
+
+  /// Applies a viewer window for the duration of one capture. A viewer
+  /// without a search of its own shows none, whatever the controller's.
+  private func apply(_ viewport: ViewerViewport) -> MuxError? {
+    let placed = place(
+      followTail: viewport.followTail,
+      historyGeneration: viewport.historyGeneration,
+      anchorRow: viewport.anchorRow,
+    )
+    guard placed else {
+      return MuxError(.historyUnavailable, "history anchor is stale")
+    }
     if let query = viewport.searchQuery, !query.isEmpty {
-      state.search(query)
-      if let index = viewport.searchSelected {
-        state.reselectSearchMatch(index)
-      }
+      viewerSearch(query)
+      reselect(viewport.searchSelected)
+    } else {
+      state.endSearch()
     }
     return nil
   }
 
-  private func restore(offset: Int, search: TerminalState.TerminalSearchSnapshot) {
+  /// Reselects a viewer's match: by position within its history
+  /// generation, else (rows renumbered by a clear, reflow or screen switch)
+  /// by its place in the match list, as near as the new list allows.
+  private func reselect(_ match: SelectedMatch?) {
+    guard let match else { return }
+    if match.historyGeneration == state.addressingGeneration {
+      state.reselectSearchMatch(match.range)
+    } else if !state.searchMatches.isEmpty {
+      let index = min(match.index, state.searchMatches.count - 1)
+      state.reselectSearchMatch(state.searchMatches[index])
+    }
+  }
+
+  private func restore(
+    offset: Int,
+    search: TerminalState.TerminalSearchSnapshot
+  ) {
     state.restoreSearch(search)
     let delta = offset - state.viewportOffset
     if delta != 0 { state.scrollViewport(by: delta) }
@@ -914,7 +1066,9 @@ final class PaneRuntime: @unchecked Sendable {
     wrapped.reserveCapacity(rows)
     for y in 0 ..< rows {
       let source = y < screen.rows
-      wrapped.append(source && y < screen.wrapped.count ? screen.wrapped[y] : false)
+      wrapped.append(
+        source && y < screen.wrapped.count ? screen.wrapped[y] : false
+      )
       for x in 0 ..< columns {
         if source, x < screen.columns {
           cells.append(screen.cells[y * screen.columns + x])

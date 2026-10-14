@@ -145,7 +145,9 @@ public struct ScreenBuffer: Equatable, Sendable {
     cells[i] = cell
   }
 
-  /// Writes `text` left to right (one cell per scalar; for UI strings).
+  /// Writes `text` left to right (one cell per character; for UI strings).
+  /// A character the outer terminal would act on rather than draw shows
+  /// as "?", so measurements by character count still hold.
   public mutating func write(
     _ text: String,
     x: Int,
@@ -156,7 +158,8 @@ public struct ScreenBuffer: Equatable, Sendable {
     var cx = x
     let end = min(columns, limit.map { x + $0 } ?? columns)
     for ch in text where cx < end {
-      put(ScreenCell(text: String(ch), style: style), x: cx, y: y)
+      let shown = DisplayText.draws(ch) ? String(ch) : "?"
+      put(ScreenCell(text: shown, style: style), x: cx, y: y)
       cx += 1
     }
   }

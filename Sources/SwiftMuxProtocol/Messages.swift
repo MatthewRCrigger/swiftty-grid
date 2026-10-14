@@ -60,8 +60,8 @@ public enum FrontendKind: String, Codable, Sendable {
 }
 
 /// What a client can consume beyond the original single-controller attach.
-/// A hello that omits this set is a role-less client: it attaches as the
-/// sole controller and is never sent a `ready` event.
+/// A hello that omits this set attaches only as the sole controller, is
+/// never sent a `ready` event, and cannot set a viewport.
 public struct ClientCapabilities: OptionSet, Codable, Sendable, Equatable {
   public var rawValue: UInt32
   public init(rawValue: UInt32) { self.rawValue = rawValue }
@@ -78,7 +78,7 @@ public struct ClientCapabilities: OptionSet, Codable, Sendable, Equatable {
   ]
 }
 
-/// Writer or read-only viewer. Absent on the wire means controller.
+/// Writer or read-only viewer.
 public enum AttachmentRole: String, Codable, Sendable, Equatable {
   case controller
   case observer
@@ -89,7 +89,7 @@ public struct Hello: Codable, Sendable {
   public var build: String
   public var frontend: FrontendKind
   public var terminalProfile: String?
-  /// Empty when the peer omitted the field (role-less single controller).
+  /// Empty when the peer omitted the field (single controller only).
   public var capabilities: ClientCapabilities
 
   public init(
@@ -345,49 +345,15 @@ public struct ServiceStatus: Codable, Sendable, Equatable {
 
 // MARK: Commands
 
-/// Attach payload. A role-less encoding is the historical selector alone
-/// and means controller, so older clients keep single-controller attach.
+/// Attach payload: always `{selector, role}` on the wire.
 public struct AttachRequest: Codable, Sendable, Equatable {
   public var selector: WorkspaceSelector
   public var role: AttachmentRole
-  /// When false, the wire form is the bare selector (no role key).
-  public var includesRole: Bool
 
-  public init(
-    _ selector: WorkspaceSelector,
-    role: AttachmentRole = .controller,
-    includesRole: Bool = true
-  ) {
+  public init(_ selector: WorkspaceSelector, role: AttachmentRole = .controller)
+  {
     self.selector = selector
     self.role = role
-    self.includesRole = includesRole
-  }
-
-  private enum CodingKeys: String, CodingKey { case selector, role }
-
-  public init(from decoder: any Decoder) throws {
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    if container.contains(.selector) || container.contains(.role) {
-      selector = try container.decode(WorkspaceSelector.self, forKey: .selector)
-      role =
-        try container.decodeIfPresent(AttachmentRole.self, forKey: .role)
-        ?? .controller
-      includesRole = container.contains(.role)
-    } else {
-      selector = try WorkspaceSelector(from: decoder)
-      role = .controller
-      includesRole = false
-    }
-  }
-
-  public func encode(to encoder: any Encoder) throws {
-    if !includesRole {
-      try selector.encode(to: encoder)
-      return
-    }
-    var container = encoder.container(keyedBy: CodingKeys.self)
-    try container.encode(selector, forKey: .selector)
-    try container.encode(role, forKey: .role)
   }
 }
 
@@ -674,6 +640,9 @@ public struct SearchResult: Codable, Sendable, Equatable {
     self.matchCount = matchCount
     self.selected = selected
   }
+
+  /// No search: nothing matched, nothing selected.
+  public static let empty = SearchResult(matchCount: 0, selected: nil)
 }
 
 public enum MuxReply: Codable, Sendable, Equatable {
@@ -756,8 +725,9 @@ public enum ClientMessage: Codable, Sendable {
   case hello(Hello)
   case request(id: UInt64, command: MuxCommand)
   case input(InputRecord)
-  /// Releases transport credit for the pane's in-flight frame.
-  case frameAck(pane: PaneID, revision: UInt64)
+  /// Releases transport credit for the pane's in-flight frame. A frame of
+  /// any other attachment releases nothing.
+  case frameAck(pane: PaneID, revision: UInt64, attachment: AttachmentID)
   /// The consumer took one `inbox` event (inbox flow control).
   case inboxAck(revision: UInt64)
 }

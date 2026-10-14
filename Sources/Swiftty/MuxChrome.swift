@@ -9,6 +9,9 @@ struct MuxTabItem: Equatable {
   var symbol: String
   var isActive: Bool
   var hasActivity: Bool
+  /// The tab's stored name, which a rename edits; nil for an unnamed tab
+  /// (the service's number), which shows its program instead.
+  var name: String? = nil
 }
 
 enum MuxIcons {
@@ -69,6 +72,9 @@ final class MuxTabStrip: NSGlassEffectContainerView {
   var onSelect: ((TabID) -> Void)?
   var onClose: ((TabID) -> Void)?
   var onRename: ((TabID, String) -> Void)?
+  /// A rename edit ended, however it did (renamed, unchanged, cancelled,
+  /// or its field went away).
+  var onRenameEnded: (() -> Void)?
   private let stack = NSStackView()
   private let scrollView = NSScrollView()
   private(set) var buttons: [MuxTabButton] = []
@@ -123,18 +129,39 @@ final class MuxTabStrip: NSGlassEffectContainerView {
   }
 
   func update(_ items: [MuxTabItem]) {
-    while buttons.count > items.count {
-      let b = buttons.removeLast()
+    // Each tab keeps its button, and so any rename open on it, when other
+    // tabs come or go; buttons of tabs gone are reused or removed.
+    let shown = Set(items.map(\.id))
+    var kept: [TabID: MuxTabButton] = [:]
+    var spare: [MuxTabButton] = []
+    for b in buttons {
+      if let id = b.item?.id, shown.contains(id), kept[id] == nil {
+        kept[id] = b
+      } else {
+        spare.append(b)
+      }
+    }
+    let next = items.map { item in
+      // Each button serves one tab, even if a snapshot repeats an id.
+      let b =
+        kept.removeValue(forKey: item.id) ?? spare.popLast() ?? MuxTabButton()
+      b.strip = self
+      b.item = item
+      return b
+    }
+    for b in spare {
+      // Showing no tab ends an open rename, so removal cannot commit it.
+      b.item = nil
       stack.removeArrangedSubview(b)
       b.removeFromSuperview()
     }
-    while buttons.count < items.count {
-      let b = MuxTabButton()
-      b.strip = self
-      buttons.append(b)
-      stack.addArrangedSubview(b)
+    // Only buttons out of place move.
+    for (i, b) in next.enumerated() {
+      let arranged = stack.arrangedSubviews
+      if i < arranged.count, arranged[i] === b { continue }
+      stack.insertArrangedSubview(b, at: i)
     }
-    for (b, item) in zip(buttons, items) { b.item = item }
+    buttons = next
     invalidateIntrinsicContentSize()
     needsLayout = true
     layoutSubtreeIfNeeded()
@@ -144,20 +171,66 @@ final class MuxTabStrip: NSGlassEffectContainerView {
   }
 }
 
+/// Calls `action` with each window that becomes key while it lives (its
+/// own registration, removed with it).
+@MainActor
+private final class KeyWindowWatcher: NSObject {
+  private let action: (NSWindow) -> Void
+
+  init(_ action: @escaping (NSWindow) -> Void) {
+    self.action = action
+    super.init()
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(changed(_:)),
+      name: NSWindow.didBecomeKeyNotification,
+      object: nil
+    )
+  }
+
+  @objc
+  private func changed(_ notification: Notification) {
+    if let key = notification.object as? NSWindow { action(key) }
+  }
+}
+
+/// A tab title that reports an abandoned edit, which (unlike one that
+/// ends) does not reach the delegate.
+@MainActor
+final class MuxTabLabel: NSTextField {
+  var onAbort: (() -> Void)?
+
+  @discardableResult
+  override func abortEditing() -> Bool {
+    let aborted = super.abortEditing()
+    if aborted { onAbort?() }
+    return aborted
+  }
+}
+
 @MainActor
 final class MuxTabButton: NSGlassEffectView, NSTextFieldDelegate {
   weak var strip: MuxTabStrip?
   private let icon = NSImageView()
-  let label = NSTextField(labelWithString: "")
+  let label = MuxTabLabel(labelWithString: "")
   private let dot = MuxActivityDot()
   let closeButton = NSButton()
-  private var editing = false
+  /// A rename is open. It renames `item`: setting `item` to another tab
+  /// cancels it.
+  private var renaming = false
+  /// The person changed the rename's text since it opened; only then does
+  /// ending it rename.
+  private var edited = false
+  /// While a rename is open: ends it when another window takes the keys.
+  private var keyWatcher: KeyWindowWatcher?
 
   var item: MuxTabItem? {
     didSet {
+      // An open rename belongs to the tab it began on: serving another
+      // tab, or none, ends it without renaming.
+      if oldValue?.id != item?.id { cancelRename() }
       guard let item, item != oldValue else { return }
       icon.image = MuxIcons.image(item.symbol, "")
-      if !editing { label.stringValue = item.title }
       label.font =
         item.isActive
         ? .systemFont(ofSize: 12, weight: .semibold) : .systemFont(ofSize: 12)
@@ -165,10 +238,7 @@ final class MuxTabButton: NSGlassEffectView, NSTextFieldDelegate {
         item.isActive
         ? .selectedContentBackgroundColor.withAlphaComponent(0.18) : nil
       dot.isHidden = !item.hasActivity
-      closeButton.setAccessibilityLabel("Close tab \(item.title)")
-      setAccessibilityLabel(
-        item.title + (item.hasActivity ? ", new output" : "")
-      )
+      showTitle()
       needsDisplay = true
     }
   }
@@ -188,6 +258,7 @@ final class MuxTabButton: NSGlassEffectView, NSTextFieldDelegate {
     label.translatesAutoresizingMaskIntoConstraints = false
     label.lineBreakMode = .byTruncatingTail
     label.delegate = self
+    label.onAbort = { [weak self] in self?.cancelRename() }
     label.setAccessibilityElement(false)
     closeButton.image = MuxIcons.image("xmark", "Close tab")
     closeButton.isBordered = false
@@ -236,25 +307,133 @@ final class MuxTabButton: NSGlassEffectView, NSTextFieldDelegate {
     }
   }
 
+  override func viewWillMove(toWindow newWindow: NSWindow?) {
+    super.viewWillMove(toWindow: newWindow)
+    // A fallback for an edit still open as its field changes window (a
+    // toolbar moving for full screen): it cannot follow, so it ends as
+    // losing focus does (typed text renames). Removing or hiding the field
+    // ends an edit through the delegate before this runs.
+    guard renaming, newWindow !== window else { return }
+    endAsFocusLoss()
+  }
+
+  /// Ends the edit as losing focus does (typed text renames) when its
+  /// field editor still holds the window's keys; otherwise, or if it would
+  /// not end, drops it.
+  private func endAsFocusLoss() {
+    if let window, let editor = label.currentEditor(),
+      window.firstResponder === editor
+    {
+      window.makeFirstResponder(nil)
+    }
+    cancelRename()
+  }
+
+  /// Ends an open edit without renaming: Escape, the label could not take
+  /// focus, the button now serves another tab (or none), or (as a last
+  /// resort) the field moved window, or another window took the keys,
+  /// without its edit ending.
+  /// AppKit abandoning the edit reports here too.
+  private func cancelRename() {
+    guard renaming else { return }
+    // Closed first: however ending the field editor reports back, it finds
+    // no rename open (and an editor AppKit already abandoned stays ended).
+    renaming = false
+    label.abortEditing()
+    endEditing()
+    strip?.onRenameEnded?()
+  }
+
   func beginRename() {
-    editing = true
+    // A strip out of sight (a full-screen toolbar auto-hidden) has no field
+    // to type in; a minimized window comes back below.
+    guard !renaming, let item, let window,
+      window.isVisible || window.isMiniaturized
+    else { return }
+    renaming = true
+    edited = false
     label.isEditable = true
     label.isBezeled = false
     label.drawsBackground = false
-    window?.makeFirstResponder(label)
+    // Edit the whole stored name, not the shortened label. An unnamed tab
+    // starts empty, its program's title (perhaps cut) a placeholder.
+    label.stringValue = item.name ?? ""
+    label.placeholderString = item.title
+    guard window.makeFirstResponder(label) else { return cancelRename() }
+    // The field's window must hold the keys for typing to reach it: a
+    // rename from the menu may come while another window is in front, and
+    // in full screen the strip lives in AppKit's toolbar window.
+    window.makeKeyAndOrderFront(nil)
     label.currentEditor()?.selectAll(nil)
+    // Any window: the keys may come back to the app in another one.
+    keyWatcher = KeyWindowWatcher { [weak self] key in
+      self?.keyWindowChanged(key)
+    }
   }
 
-  func controlTextDidEndEditing(_ obj: Notification) {
-    guard editing, let item else { return }
-    editing = false
-    label.isEditable = false
-    let name = DisplayText.sanitize(label.stringValue)
-    if name.isEmpty || name == item.title {
-      label.stringValue = item.title
-    } else {
-      strip?.onRename?(item.id, name)
+  /// The keys moved to another of the app's windows (in full screen,
+  /// from the toolbar window to the workspace; or back from another app
+  /// into a different window): the edit ends as losing focus does. The app
+  /// merely going inactive leaves it open.
+  private func keyWindowChanged(_ key: NSWindow) {
+    // Floating panels (a picker, an inspector) serve the edit rather than
+    // end it; other panels, popovers among them, take the person elsewhere.
+    guard renaming, key !== window, (key as? NSPanel)?.isFloatingPanel != true
+    else { return }
+    endAsFocusLoss()
+  }
+
+  /// Escape cancels the rename.
+  func control(
+    _ control: NSControl,
+    textView: NSTextView,
+    doCommandBy selector: Selector
+  ) -> Bool {
+    guard selector == #selector(NSResponder.cancelOperation(_:)) else {
+      return false
     }
+    cancelRename()
+    return true
+  }
+
+  func controlTextDidChange(_ obj: Notification) { edited = true }
+
+  func controlTextDidEndEditing(_ obj: Notification) {
+    guard renaming else { return }
+    renaming = false
+    let typed = label.stringValue
+    endEditing()
+    defer { strip?.onRenameEnded?() }
+    // Only typing renames, and only to a name the tab does not hold now
+    // (another client may have renamed it meanwhile). A cancel movement
+    // (an input method, accessibility; Escape cancels before this) renames
+    // nothing. The label shows the stored title until a rename lands.
+    let movement = obj.userInfo?[NSText.movementUserInfoKey] as? Int
+    guard edited, movement != NSTextMovement.cancel.rawValue, let item,
+      let name = DisplayText.plainName(typed), name != item.name
+    else { return }
+    strip?.onRename?(item.id, name)
+  }
+
+  private func endEditing() {
+    keyWatcher = nil
+    label.isEditable = false
+    label.isSelectable = false
+    label.placeholderString = nil
+    showTitle()
+  }
+
+  /// Shows the tab's title, or while a name is being typed, its
+  /// placeholder.
+  private func showTitle() {
+    guard let item else { return }
+    if renaming {
+      label.placeholderString = item.title
+    } else {
+      label.stringValue = item.title
+    }
+    closeButton.setAccessibilityLabel("Close tab \(item.title)")
+    setAccessibilityLabel(item.title + (item.hasActivity ? ", new output" : ""))
   }
 
   @objc

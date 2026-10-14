@@ -46,7 +46,9 @@ struct UnifiedServiceTests {
       defer { queue.sync { remote.close() } }
       do {
         if takeover {
-          _ = try await local.execute(.attach(AttachRequest(.id(grant.sessionID.workspace))))
+          _ = try await local.execute(
+            .attach(AttachRequest(.id(grant.sessionID.workspace)))
+          )
         }
         guard case .success = await remote.request(.status) else {
           throw HostTestTimeout(what: "in-process remote client ready")
@@ -210,7 +212,9 @@ struct UnifiedServiceTests {
         )
         do {
           if addLivePane {
-            _ = try await local.execute(.attach(AttachRequest(.id(grant.sessionID.workspace))))
+            _ = try await local.execute(
+              .attach(AttachRequest(.id(grant.sessionID.workspace)))
+            )
             _ = try await local.execute(
               .newTab(name: "live", launch: shellLaunch())
             )
@@ -262,7 +266,9 @@ struct UnifiedServiceTests {
           frontend: .native
         )
         do {
-          _ = try await local.execute(.attach(AttachRequest(.id(grant.sessionID.workspace))))
+          _ = try await local.execute(
+            .attach(AttachRequest(.id(grant.sessionID.workspace)))
+          )
           guard
             case .layout(let workspace) = try await local.execute(
               .newTab(name: "live", launch: shellLaunch())

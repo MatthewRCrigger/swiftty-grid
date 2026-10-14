@@ -30,6 +30,15 @@ func fail(_ message: String, code: Int32 = 1) -> Never {
   exit(code)
 }
 
+/// A name argument as every client sends names: spacing folded and
+/// invisibles dropped.
+func nameArgument(_ typed: String, flag: String) -> String {
+  guard let name = DisplayText.plainName(typed) else {
+    fail("\(flag): the name shows nothing", code: 64)
+  }
+  return name
+}
+
 var arguments = Array(CommandLine.arguments.dropFirst())
 /// Everything after `--` is the program and its arguments, never options.
 var trailing: [String]?
@@ -128,9 +137,9 @@ func attach(
   let settings: Settings
   do { settings = try Settings.load() } catch { fail("settings: \(error)") }
   let reply: MuxReply
-  do { reply = try await connection.execute(.attach(AttachRequest(selector))) } catch {
-    fail("\(error)")
-  }
+  do {
+    reply = try await connection.execute(.attach(AttachRequest(selector)))
+  } catch { fail("\(error)") }
   guard case let .attached(attachment, workspace) = reply else {
     fail("unexpected reply")
   }
@@ -314,9 +323,10 @@ case "detach":
   _ = try await c.execute(.detachActive)
 case "end", "kill":
   let parsed = parseArguments(values: ["-t"])
-  guard let name = parsed.options["-t"] else {
+  guard let typed = parsed.options["-t"] else {
     fail("end requires -t NAME", code: 64)
   }
+  let name = nameArgument(typed, flag: "-t")
   let c = await connect(.control)
   do { _ = try await c.execute(.endWorkspace(.name(name))) } catch {
     fail("\(error)")
@@ -329,7 +339,7 @@ case "end-all":
 case "new":
   let parsed = parseArguments(values: ["-s", "-c"], flags: ["-d"])
   let detached = parsed.options["-d"] != nil
-  let name = parsed.options["-s"]
+  let name = parsed.options["-s"].map { nameArgument($0, flag: "-s") }
   let dir = parsed.options["-c"]
   let cmd = trailing
   if !detached { checkHost() }
@@ -347,6 +357,7 @@ case "new":
   await attach(.id(ws.id), connection: c)
 case "attach", "a":
   let target = parseArguments(values: ["-t"]).options["-t"]
+    .map { nameArgument($0, flag: "-t") }
   checkHost()
   let c = await connect(.terminal)
   await attach(target.map { .name($0) } ?? .latest, connection: c)

@@ -46,14 +46,12 @@ struct GeometryAdmissionTests {
     )
     runtime.queue.suspend()
     for generation in 1 ... 1000 {
-      runtime.resize(
-        columns: generation.isMultiple(of: 2) ? 40 : 80,
-        rows: 10,
-        generation: UInt64(generation),
+      runtime.resize(columns: generation.isMultiple(of: 2) ? 40 : 80, rows: 10,
       )
     }
     runtime.queue.resume()
     runtime.queue.sync {
+      // One applied resize, carrying the latest request's generation.
       #expect(runtime.geometryGeneration == 1000)
       #expect(runtime.revision == 1)
     }
@@ -77,18 +75,17 @@ struct GeometryAdmissionTests {
       _ = release.wait(timeout: .now() + 5)
     }
     defer { release.signal() }
-    runtime.resize(columns: 40, rows: 10, generation: 1)
+    runtime.resize(columns: 40, rows: 10)
     #expect(started.wait(timeout: .now() + 2) == .success)
     let observed = Mutex<UInt64?>(nil)
     runtime.queue.async {
       observed.withLock { $0 = runtime.geometryGeneration }
     }
-    for generation in 2 ... 1000 {
-      runtime.resize(columns: 60, rows: 12, generation: UInt64(generation))
-    }
+    for _ in 2 ... 1000 { runtime.resize(columns: 60, rows: 12) }
     release.signal()
     runtime.queue.sync {}
     runtime.queue.sync {
+      // The burst coalesces into one more resize: the latest request.
       #expect(runtime.geometryGeneration == 1000)
       #expect(runtime.revision == 2)
     }

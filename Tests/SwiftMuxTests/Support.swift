@@ -62,9 +62,7 @@ extension MuxConnection {
       let event: MuxEvent?
       do {
         event = try await withTimeout(remaining) { try await self.nextEvent() }
-      } catch is TimeoutError {
-        break
-      }
+      } catch is TimeoutError { break }
       guard let event else { continue }
       if case let .frameUnavailable(id, error) = event, id == pane {
         last = "unavailable \(error.code) \(error.message)"
@@ -80,7 +78,10 @@ extension MuxConnection {
       }
     }
     let prefix = label.isEmpty ? "" : "\(label): "
-    throw MuxError(.notFound, "\(prefix)timed out waiting for frame; last \(last)")
+    throw MuxError(
+      .notFound,
+      "\(prefix)timed out waiting for frame; last \(last)"
+    )
   }
 
   /// Attach, size and subscribe the active tab's panes.
@@ -91,7 +92,10 @@ extension MuxConnection {
     rows: Int = 24,
     generation: UInt64 = 1
   ) async throws -> WorkspaceSnapshot {
-    guard case let .attached(_, ws) = try await execute(.attach(AttachRequest(selector)))
+    guard
+      case let .attached(_, ws) = try await execute(
+        .attach(AttachRequest(selector))
+      )
     else { throw MuxError(.invalidRequest, "attach reply") }
     let panes = ws.activeTabSnapshot!.layout.panes
     try await execute(

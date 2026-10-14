@@ -38,6 +38,8 @@ public actor MuxConnection {
   private nonisolated let commandAdmission = MuxCommandAdmission()
   public static let maxPendingCommands = MuxCommandAdmission.maxJobs
   private var commandAdmissions: [UInt64: MuxCommandAdmission.Reservation] = [:]
+  /// Outstanding `switchWorkspace` requests; their success voids Ready.
+  private var switchRequests: Set<UInt64> = []
 
   package var pendingCommandCountForTesting: Int { commandAdmissions.count }
   private var requestTimeoutDeadlines: [UInt64: ContinuousClock.Instant] = [:]
@@ -396,6 +398,10 @@ public actor MuxConnection {
       // with the first reply. Unknown or duplicate replies cannot mutate
       // the attachment or retire input belonging to the current lease.
       guard commandAdmissions.removeValue(forKey: id) != nil else { return }
+      // The new workspace's panes get their own Ready.
+      if switchRequests.remove(id) != nil, case .success = result {
+        readiness = nil
+      }
       // Timer delivery can lag behind a reply. The caller's wait expires
       // at its recorded deadline regardless of callback ordering.
       if let deadline = requestTimeoutDeadlines[id],
@@ -404,14 +410,18 @@ public actor MuxConnection {
         abandon(id, MuxError(.connectionLost, "no reply in time"))
       }
       removeRequestTimeout(id)
-      if case let .success(.attached(attachment, _)) = result {
+      if case let .success(.attached(attachment, snapshot)) = result {
         // Only a fresh attachment starts a new sequence. Repeating a
         // lease ID must not reuse acknowledged or outstanding input IDs.
         if self.attachment != attachment {
           failPendingInputs(MuxError(.notAttached))
           nextInput = 1
+          // Frames and Ready of an earlier attachment do not gate this one.
+          readiness = nil
         }
         self.attachment = attachment
+        installation.retain(attachment: attachment)
+        installation.retain(panes: Set(snapshot.panes.map(\.id)))
       }
       if let callback = callbacks.removeValue(forKey: id) {
         switch result {
@@ -450,6 +460,8 @@ public actor MuxConnection {
         guard notice.attachment == attachment, notice.server == welcome?.server
         else { return }
         readiness = notice
+      case let .layout(snapshot):
+        installation.retain(panes: Set(snapshot.panes.map(\.id)))
       case let .frame(frame):
         guard
           installation.install(
@@ -461,12 +473,7 @@ public actor MuxConnection {
           // A stale frame is not shown. Acknowledge it unless the caller
           // is deliberately holding credit.
           if !suppressesFrameAcknowledgement {
-            transmit(
-              .frameAck(
-                pane: frame.identity.pane,
-                revision: frame.identity.revision
-              )
-            )
+            acknowledgeFrame(frame.identity)
           }
           return
         }
@@ -501,9 +508,7 @@ public actor MuxConnection {
     switch event {
     case let .frame(frame):
       guard !suppressesFrameAcknowledgement else { return }
-      transmit(
-        .frameAck(pane: frame.identity.pane, revision: frame.identity.revision)
-      )
+      acknowledgeFrame(frame.identity)
     case let .inbox(update): transmit(.inboxAck(revision: update.revision))
     default: break
     }
@@ -529,6 +534,7 @@ public actor MuxConnection {
   private func failPending(_ error: MuxError) {
     clearRequestTimeouts()
     commandAdmissions = [:]
+    switchRequests = []
     for c in requests.values { c.resume(throwing: error) }
     requests = [:]
     for c in callbacks.values { c(.failure(error)) }
@@ -684,29 +690,35 @@ public actor MuxConnection {
     requests.removeValue(forKey: id)?.resume(throwing: error)
   }
 
-  /// Role-less clients encode attach as the historical selector.
-  private func wire(_ command: MuxCommand) -> MuxCommand {
-    guard capabilities.isEmpty, case let .attach(request) = command else {
-      return command
+  /// A role the connection did not negotiate is refused, never widened.
+  private func wire(_ command: MuxCommand) throws(MuxError) -> MuxCommand {
+    if case let .attach(request) = command, request.role == .observer,
+      !capabilities.contains(.observers)
+    {
+      throw MuxError(
+        .invalidRequest,
+        "observer attach needs the observers capability"
+      )
     }
-    return .attach(
-      AttachRequest(request.selector, role: .controller, includesRole: false)
-    )
+    return command
   }
 
-  /// Re-runs the shipped frame gate. An older or foreign frame does not
-  /// replace the installed one.
-  public func install(_ frame: PaneFrame) -> Bool {
-    installation.install(
-      frame,
-      server: welcome?.server,
-      attachment: attachment
-    )
+  /// Re-runs the shipped frame gate (tests). An older or foreign frame
+  /// does not replace the installed one.
+  package func install(_ frame: PaneFrame) -> Bool {
+    installation.install(frame, server: welcome?.server, attachment: attachment)
   }
 
-  /// Releases one frame credit without taking a buffered event.
-  package func acknowledgeFrame(pane: PaneID, revision: UInt64) {
-    transmit(.frameAck(pane: pane, revision: revision))
+  /// Releases one frame's credit. Tests call it to release a frame without
+  /// taking the buffered event.
+  package func acknowledgeFrame(_ identity: FrameIdentity) {
+    transmit(
+      .frameAck(
+        pane: identity.pane,
+        revision: identity.revision,
+        attachment: identity.attachment
+      )
+    )
   }
 
   /// Sends one request. A request too large to encode is refused alone;
@@ -714,6 +726,7 @@ public actor MuxConnection {
   private func request(_ id: UInt64, _ command: MuxCommand) -> MuxError? {
     do {
       channel.send(try encode(.request(id: id, command: wire(command))))
+      if case .switchWorkspace = command { switchRequests.insert(id) }
       return nil
     } catch {
       commandAdmissions.removeValue(forKey: id)
@@ -1289,7 +1302,11 @@ public actor MuxConnection {
       return
     }
     guard attachment == detaching else { return }
+    // Unattached, no frame installs; Ready of the released lease does
+    // not describe a later attachment.
     attachment = nil
+    readiness = nil
+    installation = FrameInstallation()
     failPendingInputs(MuxError(.notAttached))
   }
 

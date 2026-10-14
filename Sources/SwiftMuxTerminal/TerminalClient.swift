@@ -27,6 +27,12 @@ public final class TerminalClient {
     var label: String
     var text = ""
     var commit: @MainActor (String) -> Void
+    /// Tells one prompt from another with the same label.
+    let id = UUID()
+    /// Copy mode the prompt was opened over. Its pane's frames keep it
+    /// current, and leaving the prompt returns to it (else to normal mode).
+    /// If its pane goes, the prompt stays open, relabelled, without it.
+    var over: CopyState?
   }
 
   enum Mode {
@@ -44,8 +50,6 @@ public final class TerminalClient {
   let settings: Settings
   private var decoder: InputDecoder
   package private(set) var workspace: WorkspaceSnapshot
-  /// True only after the service reports Ready for this attachment.
-  package private(set) var isReady = false
   /// Orders snapshots against the attach and switch replies.
   private var sequencer = LayoutSequencer()
   private var frames: [PaneID: PaneFrame] = [:]
@@ -216,16 +220,8 @@ public final class TerminalClient {
     case let .frame(frame):
       guard frame.identity.attachment == attachment else { return }
       frames[frame.identity.pane] = frame
-      if case var .copy(state) = mode, state.pane == frame.identity.pane,
-        frame.identity.viewportRevision != state.frame.identity.viewportRevision
-      {
-        // A viewport reached by scrolling or search replaces the frozen
-        // frame; selection across fetched pages is not supported.
-        state.frame = frame
-        state.anchor = nil
-        state.row = min(state.row, frame.grid.rows - 1)
-        state.column = min(state.column, frame.grid.columns - 1)
-        mode = .copy(state)
+      if let state = copying, state.pane == frame.identity.pane {
+        setCopying(following(state, frame))
       }
       redraw()
     case let .layout(snapshot): apply(snapshot)
@@ -243,13 +239,8 @@ public final class TerminalClient {
       }
       redraw()
     case .bell: tty.write("\u{07}")
-    case .activity: break
-    case let .ready(notice):
-      guard notice.attachment == attachment else { return }
-      isReady = true
-    case let .detached(reason):
-      isReady = false
-      finish(.detached(reason), detach: false)
+    case .activity, .ready: break
+    case let .detached(reason): finish(.detached(reason), detach: false)
     case let .paste(_, state):
       if state != .completed { show("paste \(state.rawValue)") }
     case let .frameUnavailable(_, error): show("frame unavailable: \(error)")
@@ -275,13 +266,26 @@ public final class TerminalClient {
         subscriptions = []
         lastGeometry = nil
       }
-      if ws.id != workspace.id { frames = [:] }
-      if attached { isReady = false }
+      let sameWorkspace = ws.id == workspace.id
+      if !sameWorkspace { frames = [:] }
       workspace = ws
       let live = Set(ws.panes.map(\.id))
       frames = frames.filter { live.contains($0.key) }
-      if case let .copy(state) = mode, !live.contains(state.pane) {
-        mode = .normal
+      if let pane = copying?.pane, !live.contains(pane) {
+        // A prompt stays open so typing does not reach another pane; its
+        // commit reports the pane is gone. Copy mode just ends (a switched
+        // workspace reset its windows; a closed pane needs a notice).
+        if case var .prompt(prompt) = mode {
+          prompt.over = nil
+          prompt.label = Self.noting(
+            sameWorkspace ? "pane closed" : "workspace changed",
+            in: prompt.label
+          )
+          mode = .prompt(prompt)
+        } else {
+          mode = .normal
+          if sameWorkspace { show("pane closed") }
+        }
       }
     }
     syncLayout()
@@ -329,10 +333,14 @@ public final class TerminalClient {
     redraw()
   }
 
+  /// Sends `command`; `then` gets a successful reply. A failure whose
+  /// code is in `quiet` is dropped; any other goes to `failed` when given
+  /// (which then reports it), else shows as a message.
   private func command(
     _ command: MuxCommand,
     quietOn quiet: Set<MuxError.Code> = [],
-    then: (@MainActor (MuxReply) -> Void)? = nil
+    then: (@MainActor (MuxReply) -> Void)? = nil,
+    failed: (@MainActor (MuxError) -> Void)? = nil
   ) {
     connection.enqueue(command) { [weak self] result in
       DispatchQueue.main.async {
@@ -348,7 +356,14 @@ public final class TerminalClient {
             }
             then?(reply)
           case let .failure(error):
-            if !quiet.contains(error.code) { self.show(error.description) }
+            // Quiet codes are dropped; a caller handling the rest reports
+            // them its own way.
+            guard !quiet.contains(error.code) else { break }
+            if let failed {
+              failed(error)
+            } else {
+              self.show(error.description)
+            }
           }
         }
       }
@@ -371,7 +386,8 @@ public final class TerminalClient {
   func compose() -> ScreenBuffer {
     var shown = frames
     var overlays: [PaneID: PaneOverlay] = [:]
-    if case let .copy(state) = mode {
+    // A prompt over copy mode keeps showing the frozen copy view.
+    if let state = copying {
       shown[state.pane] = state.frame
       overlays[state.pane] = PaneOverlay(
         selection: state.anchor.map {
@@ -427,15 +443,28 @@ public final class TerminalClient {
     case let .prompt(p):
       line.prompt = p.label + p.text
       line.promptCursor = true
-    case let .confirm(question, _): line.prompt = question + " (y/n)"
+    case let .confirm(question, _):
+      line.prompt = question
+      line.promptSuffix = "? (y/n)"
     default:
+      // A program sets its title (the service sanitizes it).
       if let pane = activeTab?.activePane,
-        let title = workspace.pane(pane)?.title, !title.isEmpty
+        let full = workspace.pane(pane)?.title,
+        case let title = DisplayText.head(full, width: size.columns / 3),
+        !title.isEmpty
       {
-        line.right = "\"\(title.prefix(max(0, size.columns / 3)))\" "
+        line.right = "\"\(title)\" "
       }
     }
-    if let message, line.prompt == nil { line.prompt = message }
+    if let message {
+      // Beside an open prompt or question, else the whole line.
+      if line.prompt != nil {
+        line.right = message
+      } else {
+        line.prompt = message
+        line.right = ""
+      }
+    }
     return line
   }
 
@@ -560,21 +589,18 @@ public final class TerminalClient {
     case let .copy(state): copyMode(input, state)
     case var .prompt(prompt):
       switch input {
-      case let .text(s):
-        prompt.text += s
-        mode = .prompt(prompt)
-      case let .paste(s, _):
-        prompt.text += s.filter { !$0.isNewline }
+      case let .text(s), let .paste(s, _):
+        prompt.text = Self.promptText(prompt.text, adding: s)
         mode = .prompt(prompt)
       case .key(.backspace, _):
         if !prompt.text.isEmpty { prompt.text.removeLast() }
         mode = .prompt(prompt)
       case .key(.enter, _):
-        mode = .normal
+        leave(prompt)
         prompt.commit(prompt.text)
       case .key(.escape, _), .key(.character(0x63), .control),
         .key(.character(0x67), .control):
-        mode = .normal
+        leave(prompt)
       default: break
       }
       redraw()
@@ -680,11 +706,11 @@ public final class TerminalClient {
         }
       case "z": command(.toggleZoom(tab.id))
       case "x":
-        mode = .confirm("end pane?") { [weak self] in
+        mode = .confirm("end pane") { [weak self] in
           self?.command(.endPane(pane))
         }
       case "&":
-        mode = .confirm("end tab \(tab.name)?") { [weak self] in
+        mode = .confirm("end tab \(tab.name)") { [weak self] in
           self?.command(.endTab(tab.id))
         }
       case "d":
@@ -692,20 +718,25 @@ public final class TerminalClient {
       case "[": enterCopyMode(pane)
       case "]": if let buffer = pasteBuffer { paste(buffer, to: pane) }
       case "/":
+        // Search runs in copy mode, which needs the pane's first frame.
         enterCopyMode(pane)
-        promptSearch(pane)
+        if case let .copy(state) = mode { promptSearch(over: state) }
       case ",":
         mode = .prompt(
-          Prompt(label: "rename tab: ", text: tab.name) { [weak self] name in
-            if !name.isEmpty { self?.command(.renameTab(tab.id, name: name)) }
+          Prompt(label: "rename tab: ", text: tab.name) { [weak self] typed in
+            if let name = DisplayText.plainName(typed) {
+              self?.command(.renameTab(tab.id, name: name))
+            }
           }
         )
       case "$":
         let id = workspace.id
         mode = .prompt(
           Prompt(label: "rename workspace: ", text: workspace.name) {
-            [weak self] name in
-            guard let self, !name.isEmpty else { return }
+            [weak self] typed in
+            guard let self, let name = DisplayText.plainName(typed) else {
+              return
+            }
             self.command(.renameWorkspace(.id(id), name: name)) { _ in
               self.workspace.name = name
               self.redraw()
@@ -731,24 +762,119 @@ public final class TerminalClient {
     command(.setSplitRatio(tab: tab.id, path: split.path, ratio: ratio))
   }
 
-  private func chooseWorkspace() {
-    command(.listWorkspaces) { [weak self] reply in
-      guard let self, case let .workspaces(list) = reply else { return }
-      let names = list.map(\.name).joined(separator: ", ")
-      self.mode = .prompt(
-        Prompt(label: "workspace (\(names)): ") { [weak self] name in
-          guard let self, !name.isEmpty else { return }
-          self.command(.switchWorkspace(.name(name)))
-        }
-      )
-      self.redraw()
+  /// Names joined for a prompt label within `limit` characters, the rest
+  /// counted (", +N"). Names (plain, as the service requires) appear as
+  /// typed; only a first name too long for the budget is shortened.
+  static func listing(_ names: [String], limit: Int = 40) -> String {
+    guard let first = names.first else { return "none" }
+    func more(_ count: Int) -> String { count > 0 ? ", +\(count)" : "" }
+    // Each name shown leaves room to count the names after it.
+    let room = limit - more(names.count - 1).count
+    guard first.count <= room else {
+      return DisplayText.head(first, width: max(1, room))
+        + more(names.count - 1)
     }
+    var shown = first
+    var count = 1
+    for name in names.dropFirst() {
+      let rest = more(names.count - count - 1)
+      guard shown.count + 2 + name.count + rest.count <= limit else { break }
+      shown += ", " + name
+      count += 1
+    }
+    return shown + more(names.count - count)
+  }
+
+  /// `text` with typed or pasted `input` added as one line of a prompt:
+  /// line breaks and controls dropped, a tab as a space. The rest stays
+  /// as typed (a search matches it); the status line shows what it cannot
+  /// draw as "?". Characters are bounded once joined, however they came.
+  static func promptText(_ text: String, adding input: String) -> String {
+    var added = String.UnicodeScalarView()
+    for scalar in input.unicodeScalars {
+      switch scalar.properties.generalCategory {
+      case .lineSeparator, .paragraphSeparator: continue
+      // Line breaks (LF, CR, VT, FF, NEL) are controls too.
+      case .control: if scalar == "\t" { added.append(" ") }
+      default: added.append(scalar)
+      }
+    }
+    return DisplayText.bounded(text + String(added))
+  }
+
+  /// `label` with a note before its closing ": ".
+  static func noting(_ note: String, in label: String) -> String {
+    let base = label.hasSuffix(": ") ? String(label.dropLast(2)) : label
+    return "\(base) (\(note)): "
+  }
+
+  /// The copy state on screen: copy mode, or a prompt opened over it.
+  private var copying: CopyState? {
+    switch mode {
+    case let .copy(state): state
+    case let .prompt(prompt): prompt.over
+    default: nil
+    }
+  }
+
+  /// Replaces the copy state on screen, wherever the mode holds it.
+  private func setCopying(_ state: CopyState) {
+    switch mode {
+    case .copy: mode = .copy(state)
+    case var .prompt(prompt) where prompt.over != nil:
+      prompt.over = state
+      mode = .prompt(prompt)
+    default: break
+    }
+  }
+
+  /// Leaves a prompt for the copy mode it was opened over, else normal mode.
+  private func leave(_ prompt: Prompt) {
+    mode = prompt.over.map(Mode.copy) ?? .normal
+  }
+
+  /// Opens the workspace prompt at once; the names fill its label when
+  /// the list arrives, if the prompt is still open.
+  private func chooseWorkspace() {
+    let prompt = Prompt(label: "workspace: ") { [weak self] typed in
+      guard let self, let name = DisplayText.plainName(typed) else { return }
+      self.command(.switchWorkspace(.name(name)))
+    }
+    mode = .prompt(prompt)
+    let id = prompt.id
+    // The list, or why there is none, fills the label while it is open.
+    // False once the prompt has closed or changed.
+    let relabel = { [weak self] (text: String) -> Bool in
+      guard let self, case var .prompt(open) = self.mode, open.id == id else {
+        return false
+      }
+      open.label = text
+      self.mode = .prompt(open)
+      self.redraw()
+      return true
+    }
+    command(
+      .listWorkspaces,
+      then: { reply in
+        guard case let .workspaces(list) = reply else { return }
+        _ = relabel("workspace (\(Self.listing(list.map(\.name)))): ")
+      },
+      failed: { [weak self] error in
+        // In the label if the prompt is still open, else as a message.
+        if !relabel("workspace (no list: \(error.code)): ") {
+          self?.show(error.description)
+        }
+      }
+    )
   }
 
   // MARK: Copy mode
 
   private func enterCopyMode(_ pane: PaneID) {
-    guard let frame = frames[pane] else { return }
+    guard let frame = frames[pane] else {
+      show("no frame yet")
+      return
+    }
     mode = .copy(
       CopyState(
         pane: pane,
@@ -767,20 +893,50 @@ public final class TerminalClient {
     redraw()
   }
 
-  private func promptSearch(_ pane: PaneID) {
-    let previous = mode
-    mode = .prompt(
-      Prompt(label: "search: ") { [weak self] query in
-        guard let self else { return }
-        self.mode = previous
-        guard !query.isEmpty else { return }
-        self.command(.search(pane: pane, query: query)) { reply in
-          if case let .search(result) = reply, result.matchCount == 0 {
-            self.show("no matches")
-          }
+  /// Copy mode on a newer frame of its pane: a viewport reached by
+  /// scrolling or search replaces the frozen frame (selection across
+  /// fetched pages is not supported).
+  private func following(_ state: CopyState, _ frame: PaneFrame) -> CopyState {
+    guard
+      frame.identity.viewportRevision != state.frame.identity.viewportRevision
+    else { return state }
+    var state = state
+    state.frame = frame
+    state.anchor = nil
+    state.row = min(state.row, frame.grid.rows - 1)
+    state.column = min(state.column, frame.grid.columns - 1)
+    return state
+  }
+
+  /// Opens the search prompt over copy mode on `state.pane`.
+  private func promptSearch(over state: CopyState) {
+    let pane = state.pane
+    let openedIn = workspace.id
+    var prompt = Prompt(label: "search: ") { [weak self] query in
+      guard let self else { return }
+      // Its pane may have gone while the prompt was open.
+      guard self.workspace.id == openedIn else {
+        self.show("workspace changed")
+        return
+      }
+      guard self.workspace.pane(pane) != nil else {
+        self.show("pane closed")
+        return
+      }
+      // A query the service would refuse ends the search, as in the app.
+      guard self.limits.validSearchQuery(query) else {
+        self.command(.endSearch(pane: pane), quietOn: [.notFound])
+        if !query.isEmpty { self.show("search query too long") }
+        return
+      }
+      self.command(.search(pane: pane, query: query)) { reply in
+        if case let .search(result) = reply, result.matchCount == 0 {
+          self.show("no matches")
         }
       }
-    )
+    }
+    prompt.over = state
+    mode = .prompt(prompt)
   }
 
   private func copyMode(_ input: DecodedInput, _ initial: CopyState) {
@@ -862,8 +1018,7 @@ public final class TerminalClient {
       exitCopyMode(pane)
       return
     case (_, _, "/"):
-      mode = .copy(state)
-      promptSearch(pane)
+      promptSearch(over: state)
       redraw()
       return
     case (_, _, "n"): command(.searchStep(pane: pane, forward: false))

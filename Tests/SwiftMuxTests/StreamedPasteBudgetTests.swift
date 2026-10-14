@@ -8,6 +8,50 @@ import TestSupport
 
 @Suite(.serialized, .timeLimit(.minutes(1)))
 struct StreamedPasteBudgetTests {
+  @Test
+  func leaseEndFinishesAStartedKeyButDropsUnstartedInput() {
+    var writer = PaneWriter(replyReserve: 16)
+    writer.appendInput(Array("\u{1B}[A".utf8))
+    writer.appendInput(Array("make\r".utf8))
+    var bytes: [UInt8] = []
+    // The descriptor takes only the escape's first two bytes.
+    _ = writer.flush { buffer in
+      let n = min(2, buffer.count)
+      bytes.append(contentsOf: buffer.bindMemory(to: UInt8.self).prefix(n))
+      return n
+    }
+    #expect(writer.discardUnwrittenInput() == 5)
+    _ = writer.flush { buffer in
+      bytes.append(contentsOf: buffer.bindMemory(to: UInt8.self))
+      return buffer.count
+    }
+    #expect(bytes == Array("\u{1B}[A".utf8))
+    #expect(writer.isEmpty)
+    #expect(writer.pendingInputBytes == 0)
+  }
+
+  @Test
+  func leaseEndFinishesAStartedPasteScalar() {
+    var writer = PaneWriter(replyReserve: 16)
+    writer.beginPaste(id: 1, bracketed: false)
+    writer.appendPaste(id: 1, text: "aé b")
+    var bytes: [UInt8] = []
+    // The descriptor takes "a" and the first byte of "é".
+    _ = writer.flush { buffer in
+      let n = min(2, buffer.count)
+      bytes.append(contentsOf: buffer.bindMemory(to: UInt8.self).prefix(n))
+      return n
+    }
+    #expect(writer.discardUnwrittenInput() == 2)
+    _ = writer.flush { buffer in
+      bytes.append(contentsOf: buffer.bindMemory(to: UInt8.self))
+      return buffer.count
+    }
+    #expect(bytes == Array("aé".utf8))
+    #expect(writer.isEmpty)
+    #expect(writer.pendingInputBytes == 0)
+  }
+
   @Test(arguments: [false, true], [false, true])
   func markersRetainClosingCreditAndPreserveDeferredOrder(
     bracketed: Bool,

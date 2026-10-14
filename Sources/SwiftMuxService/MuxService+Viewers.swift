@@ -13,6 +13,10 @@ extension MuxService {
     guard !client.remote else {
       throw MuxError(.unauthorized, "roaming observers are not enabled")
     }
+    // Observer frames are only delivered over XPC.
+    guard client.local == nil else {
+      throw MuxError(.invalidRequest, "in-process clients cannot observe")
+    }
     var list = viewers[ws.id] ?? []
     guard list.count < SMX.maxObservers else {
       throw MuxError(
@@ -39,118 +43,160 @@ extension MuxService {
     return (wsID, index)
   }
 
-  func releaseViewer(_ client: UUID, reason: String) {
+  /// `notify` is false when the observer asked to leave or is gone.
+  func releaseViewer(_ client: UUID, notify: Bool, reason: String) {
     guard let (wsID, index) = viewerIndex(client) else { return }
-    let viewer = viewers[wsID]![index]
-    for slot in viewer.frames.values { releaseBudget(slot) }
-    viewers[wsID]?.remove(at: index)
+    let viewer = viewers[wsID]!.remove(at: index)
     if viewers[wsID]?.isEmpty == true { viewers[wsID] = nil }
-    clientViewers.removeValue(forKey: client)
-    send(.event(.detached(reason: reason)), to: client)
+    tearDown(viewer)
+    if notify { send(.event(.detached(reason: reason)), to: client) }
   }
 
   func releaseViewers(in wsID: WorkspaceID, reason: String) {
-    for viewer in viewers[wsID] ?? [] {
-      for slot in viewer.frames.values { releaseBudget(slot) }
-      clientViewers.removeValue(forKey: viewer.client)
+    for viewer in viewers.removeValue(forKey: wsID) ?? [] {
+      tearDown(viewer)
       send(.event(.detached(reason: reason)), to: viewer.client)
     }
-    viewers[wsID] = nil
+  }
+
+  /// Releases what a viewer already removed from `viewers` held: its frame
+  /// budget, and its waiting window commands fail.
+  func tearDown(_ viewer: Viewer) {
+    for slot in viewer.frames.values { releaseBudget(slot) }
+    clientViewers.removeValue(forKey: viewer.client)
+    failWindowCommands(
+      viewer.windowCommands.values.flatMap(\.waiting),
+      MuxError(.notAttached),
+    )
+  }
+
+  /// Fails window commands already taken from their queue. A reply only
+  /// queues its send, so this never re-enters viewer state; one pane's
+  /// commands fail in the order they were queued.
+  func failWindowCommands(
+    _ commands: [WaitingWindowCommand],
+    _ error: MuxError,
+  ) { for command in commands { command.reply(.failure(error)) } }
+
+  /// Drops `pane`'s window from a viewer (unsubscribed, or gone from the
+  /// layout): its frame budget and notices go, and its waiting window
+  /// commands fail (one in progress replies itself). Ready keeps the
+  /// pane's resize floor; `arm` trims the rest, and a pane leaving the
+  /// layout is forgotten by the caller.
+  func forgetPane(_ pane: PaneID, in viewer: inout Viewer) {
+    viewer.viewports[pane] = nil
+    viewer.staleAnchorReported.remove(pane)
+    if let slot = viewer.frames.removeValue(forKey: pane) {
+      releaseBudget(slot)
+    }
+    failWindowCommands(
+      viewer.windowCommands[pane]?.takeWaiting() ?? [],
+      MuxError(.notFound, "pane"),
+    )
   }
 
   func dropPaneFromViewers(_ pane: PaneID, workspace wsID: WorkspaceID) {
     guard var list = viewers[wsID] else { return }
     for index in list.indices {
       list[index].subscriptions.removeAll { $0 == pane }
-      list[index].viewports[pane] = nil
-      list[index].unavailable.remove(pane)
-      list[index].readiness.required.remove(pane)
-      list[index].readiness.installed.removeValue(forKey: pane)
-      if let slot = list[index].frames.removeValue(forKey: pane) {
-        releaseBudget(slot)
-      }
+      // Gone from the layout: Ready forgets it too.
+      list[index].readiness.forget(pane)
+      forgetPane(pane, in: &list[index])
     }
     viewers[wsID] = list
   }
 
-  func viewerSubscribed(_ wsID: WorkspaceID, pane: PaneID) -> Bool {
-    viewers[wsID]?.contains { $0.frames[pane] != nil } ?? false
-  }
+  /// Observers together hold at most this much of the shared budget (plus
+  /// one capture), so stalled observers cannot starve a controller.
+  var viewerFrameBudget: Int { limits.pendingFrameBudget / 4 }
 
-  func markViewersDirty(_ wsID: WorkspaceID, pane: PaneID) {
-    guard var list = viewers[wsID] else { return }
-    for index in list.indices where list[index].frames[pane] != nil {
-      list[index].frames[pane]?.dirty = true
+  /// Frame bytes all observers hold (in flight, queued or being captured).
+  var viewerFrameBytes: Int {
+    viewers.values.reduce(0) { total, list in
+      list.reduce(total) { $0 + $1.heldFrameBytes }
     }
-    viewers[wsID] = list
   }
 
-  func visiblePaneIDs(_ ws: Workspace) -> Set<PaneID> {
-    guard let tab = ws.tabs.first(where: { $0.id == ws.activeTab }) else {
-      return []
+  /// Publishes Ready wherever it is now due in the workspace. Readiness
+  /// is derived on publish, so callers only report that something changed.
+  func recheckReady(_ wsID: WorkspaceID) {
+    publishControllerReady(wsID)
+    // A failed send can drop a viewer, so look each one up afresh.
+    for client in (viewers[wsID] ?? []).map(\.client) {
+      publishViewerReady(client, in: wsID)
     }
-    if let zoom = tab.zoomedPane { return [zoom] }
-    return Set(tab.layout.panes)
   }
 
-  func armReadiness(
-    controller wsID: WorkspaceID,
-    panes: [PaneID],
-    workspace ws: Workspace,
-  ) {
-    guard var lease = leases[wsID] else { return }
-    let publish = arm(&lease.readiness, panes: panes, workspace: ws)
-    let readiness = lease.readiness
-    let attachment = lease.attachment
-    let client = lease.client
-    leases[wsID] = lease
-    guard publish else { return }
-    publishReady(
-      readiness,
-      attachment: attachment,
-      client: client,
-      store: { self.leases[wsID]?.readiness.sent = true },
-    )
-  }
-
-  /// False when this subscription must not publish Ready: the client has
-  /// not named the visible panes yet, or Ready was already sent.
-  func arm(
-    _ readiness: inout Readiness,
-    panes: [PaneID],
-    workspace ws: Workspace,
-  ) -> Bool {
-    guard readiness.enabled, !readiness.sent else { return false }
-    let visible = visiblePaneIDs(ws)
-    if panes.isEmpty, !visible.isEmpty { return false }
-    readiness.required = Set(panes).intersection(visible)
-    readiness.installed = readiness.installed.filter {
-      readiness.required.contains($0.key)
-    }
-    return true
-  }
-
-  func publishReady(
-    _ readiness: Readiness,
-    attachment: AttachmentID,
-    client: UUID,
-    store: () -> Void,
-  ) {
-    guard readiness.enabled, !readiness.sent,
-      readiness.required.isSubset(of: Set(readiness.installed.keys))
+  func publishControllerReady(_ wsID: WorkspaceID) {
+    guard let lease = leases[wsID],
+      let frames = readyFrames(
+        lease.readiness,
+        subscriptions: lease.subscriptions,
+        workspace: wsID,
+        viewport: {
+          self.panes[$0]?.runtime.currentViewport.load(ordering: .acquiring)
+            ?? 0
+        },
+      )
     else { return }
-    let frames = readiness.required.sorted {
-      $0.rawValue.uuidString < $1.rawValue.uuidString
-    }
-    .map { pane in
-      let installed = readiness.installed[pane]!
-      return ReadyNotice.PaneRevision(
-        pane: pane,
-        frameRevision: installed.frame,
-        geometryRevision: installed.geometry,
+    leases[wsID]?.readiness.sent = true
+    sendReady(frames, attachment: lease.attachment, to: lease.client)
+  }
+
+  func publishViewerReady(_ client: UUID, in wsID: WorkspaceID) {
+    guard var viewer = viewer(client, in: wsID),
+      let frames = readyFrames(
+        viewer.readiness,
+        subscriptions: viewer.subscriptions,
+        workspace: wsID,
+        viewport: { viewer.viewports[$0]?.revision ?? 0 },
+      )
+    else { return }
+    viewer.readiness.sent = true
+    store(viewer)
+    sendReady(frames, attachment: viewer.attachment, to: client)
+  }
+
+  /// Ready's initial frames once every subscribed visible pane that has
+  /// not failed is installed. Nil while waiting, and while no visible
+  /// pane is subscribed (the client has not named what it shows yet).
+  /// `viewport` is the pane's current window revision: a frame of an
+  /// older window (scrolled, searched or moved since) does not count.
+  func readyFrames(
+    _ readiness: Readiness,
+    subscriptions: [PaneID],
+    workspace wsID: WorkspaceID,
+    viewport: (PaneID) -> UInt64,
+  ) -> [ReadyNotice.PaneRevision]? {
+    guard readiness.enabled, readiness.armed, !readiness.sent,
+      let ws = workspaces.first(where: { $0.id == wsID })
+    else { return nil }
+    let visible = visiblePaneIDs(ws)
+    let shown = Set(subscriptions).intersection(visible)
+    if shown.isEmpty, !visible.isEmpty { return nil }
+    var frames: [ReadyNotice.PaneRevision] = []
+    for pane in shown.subtracting(readiness.failed) {
+      guard let installed = readiness.installed[pane],
+        installed.viewport == viewport(pane)
+      else { return nil }
+      frames.append(
+        ReadyNotice.PaneRevision(
+          pane: pane,
+          frameRevision: installed.frame,
+          geometryRevision: installed.geometry,
+        )
       )
     }
-    store()
+    return frames.sorted {
+      $0.pane.rawValue.uuidString < $1.pane.rawValue.uuidString
+    }
+  }
+
+  func sendReady(
+    _ frames: [ReadyNotice.PaneRevision],
+    attachment: AttachmentID,
+    to client: UUID,
+  ) {
     send(
       .event(
         .ready(
@@ -165,45 +211,33 @@ extension MuxService {
     )
   }
 
-  func noteReady(
-    _ wsID: WorkspaceID,
-    controller: Bool,
-    viewer client: UUID? = nil,
-    pane: PaneID,
-    revision: UInt64,
-    geometry: UInt64,
-    acked: Bool,
-  ) {
-    guard acked else { return }
-    if controller {
-      guard var lease = leases[wsID], lease.readiness.required.contains(pane)
-      else { return }
-      lease.readiness.installed[pane] = (revision, geometry)
-      let readiness = lease.readiness
-      leases[wsID] = lease
-      publishReady(
-        readiness,
-        attachment: lease.attachment,
-        client: lease.client,
-        store: { self.leases[wsID]?.readiness.sent = true },
-      )
-      return
+  func viewerSubscribed(_ wsID: WorkspaceID, pane: PaneID) -> Bool {
+    viewers[wsID]?.contains { $0.frames[pane] != nil } ?? false
+  }
+
+  func markViewersDirty(_ wsID: WorkspaceID, pane: PaneID) {
+    guard let count = viewers[wsID]?.count else { return }
+    for index in 0 ..< count {
+      viewers[wsID]?[index].frames[pane]?.dirty = true
     }
-    guard let client, var list = viewers[wsID],
-      let index = list.firstIndex(where: { $0.client == client }),
-      list[index].readiness.required.contains(pane)
-    else { return }
-    list[index].readiness.installed[pane] = (revision, geometry)
-    let viewer = list[index]
-    viewers[wsID] = list
-    publishReady(
-      viewer.readiness,
-      attachment: viewer.attachment,
-      client: viewer.client,
-      store: {
-        self.viewers[wsID]?[index].readiness.sent = true
-      },
-    )
+  }
+
+  func visiblePaneIDs(_ ws: Workspace) -> Set<PaneID> {
+    guard let tab = ws.tabs.first(where: { $0.id == ws.activeTab }) else {
+      return []
+    }
+    if let zoom = tab.zoomedPane { return [zoom] }
+    return Set(tab.layout.panes)
+  }
+
+  /// A viewer's window for `pane` moved somewhere usable. Its stale-anchor
+  /// notice and failure clear, and a late failure of a capture of the old
+  /// window cannot mark the pane failed again.
+  func recover(_ pane: PaneID, in viewer: inout Viewer) {
+    viewer.staleAnchorReported.remove(pane)
+    viewer.readiness.retry(pane)
+    viewer.frames[pane]?.supersededThrough = nextCapture
+    viewer.frames[pane]?.dirty = true
   }
 
   func setControllerViewport(
@@ -211,36 +245,27 @@ extension MuxService {
     workspace leased: WorkspaceID,
     reply: @escaping Reply,
   ) {
-    guard displaySize(request) == nil else {
-      reply(.failure(MuxError(.invalidRequest, "viewport size")))
+    // The controller's display size is its PTY geometry.
+    guard request.rows == nil, request.columns == nil else {
+      reply(
+        .failure(
+          MuxError(.invalidRequest, "a controller is sized by setGeometry")
+        )
+      )
       return
     }
     guard let runtime = attachedRuntime(request.pane, in: leased) else {
       reply(.failure(MuxError(.notFound, "pane")))
       return
     }
-    let scroll: ScrollRequest
-    if request.followTail {
-      scroll = .bottom
-    } else if let row = request.anchorRow {
-      scroll = .top(
-        HistoryAddress(
-          generation: request.historyGeneration,
-          alternateScreen: false,
-          row: row,
-        )
-      )
-    } else {
-      reply(.failure(MuxError(.invalidRequest, "viewport anchor")))
-      return
+    if let error = viewportAnchorError(request) {
+      return reply(.failure(error))
     }
-    guard validScroll(scroll) else {
-      reply(.failure(MuxError(.invalidRequest, "scroll distance")))
-      return
-    }
-    runtime.scroll(scroll) { error in
-      reply(error.map { .failure($0) } ?? .success(.ok))
-    }
+    runtime.setViewport(
+      followTail: request.followTail,
+      historyGeneration: request.historyGeneration,
+      anchorRow: request.anchorRow,
+    ) { error in reply(error.map { .failure($0) } ?? .success(.ok)) }
   }
 
   /// Nil when the display size is absent or within the frame limits.
@@ -262,63 +287,267 @@ extension MuxService {
     let fail = { (error: MuxError) in reply(.failure(error)) }
     switch command {
     case let .setSubscriptions(list):
-      if let error = setViewerSubscriptions(list, client: client, workspace: wsID)
-      {
+      if let error = setViewerSubscriptions(
+        list,
+        client: client,
+        workspace: wsID
+      ) {
         fail(error)
       } else {
         reply(.success(.ok))
       }
+    // Validation runs in the queue too, so replies keep the order sent
+    // (a command refused on arrival, as unattached, unsubscribed or over
+    // the limit, replies at once).
     case let .setViewport(request):
-      moveViewer(request, client: client, workspace: wsID, reply: reply)
+      inWindowOrder(client, wsID, request.pane, reply) {
+        service,
+        window,
+        reply in
+        if let error = service.viewerRequestError(request) {
+          return reply(.failure(error))
+        }
+        service.moveViewer(
+          request,
+          client: client,
+          window: window,
+          workspace: wsID,
+          reply: reply,
+        )
+      }
     case let .scroll(pane, request):
-      guard validScroll(request) else {
-        return fail(MuxError(.invalidRequest, "scroll distance"))
+      inWindowOrder(client, wsID, pane, reply) { service, window, reply in
+        if let error = service.scrollError(request) {
+          return reply(.failure(error))
+        }
+        service.scrollViewer(
+          pane,
+          request,
+          client: client,
+          window: window,
+          workspace: wsID,
+          reply: reply,
+        )
       }
-      scrollViewer(pane, request, client: client, workspace: wsID, reply: reply)
     case let .search(pane, query):
-      guard query.utf8.count <= limits.maxSearchBytes, !query.isEmpty else {
-        return fail(MuxError(.invalidRequest, "search query"))
+      inWindowOrder(client, wsID, pane, reply) { service, window, reply in
+        if let error = service.searchQueryError(query) {
+          return reply(.failure(error))
+        }
+        service.searchViewer(
+          pane,
+          query: query,
+          step: nil,
+          client: client,
+          window: window,
+          workspace: wsID,
+          reply: reply,
+        )
       }
-      searchViewer(
-        pane,
-        query: query,
-        step: nil,
-        client: client,
-        workspace: wsID,
-        reply: reply,
-      )
     case let .searchStep(pane, forward):
-      searchViewer(
-        pane,
-        query: nil,
-        step: forward,
-        client: client,
-        workspace: wsID,
-        reply: reply,
-      )
-    case let .endSearch(pane):
-      guard var viewer = viewer(client, in: wsID) else {
-        return fail(MuxError(.notAttached))
+      inWindowOrder(client, wsID, pane, reply) { service, window, reply in
+        service.searchViewer(
+          pane,
+          query: nil,
+          step: forward,
+          client: client,
+          window: window,
+          workspace: wsID,
+          reply: reply,
+        )
       }
-      viewer.viewports[pane]?.searchQuery = nil
-      viewer.viewports[pane]?.searchSelected = nil
-      viewer.frames[pane]?.dirty = true
-      store(viewer, client: client, workspace: wsID)
-      reply(.success(.search(SearchResult(matchCount: 0, selected: nil))))
-      pump()
-    default:
-      reply(.success(.ok))
+    case let .endSearch(pane):
+      inWindowOrder(client, wsID, pane, reply) { service, window, reply in
+        service.endViewerSearch(
+          pane,
+          client: client,
+          window: window,
+          workspace: wsID,
+          reply: reply,
+        )
+      }
+    default: reply(.success(.ok))
     }
+  }
+
+  /// Runs an observer's window commands for `pane` one at a time, in
+  /// order: each starts from the window the previous one left, so a step
+  /// continues the search before it and a scroll moves from its match.
+  /// Commands are queued per viewer and pane (`Viewer.windowCommands`), so
+  /// a resubscribe joins the same queue. One runs only while the window it
+  /// was sent for is current (window ids never repeat, so an
+  /// unsubscribe, a resubscribe or a reattach ends it); `op` gets that
+  /// window as it is then and replies exactly once, on this queue.
+  func inWindowOrder(
+    _ client: UUID,
+    _ wsID: WorkspaceID,
+    _ pane: PaneID,
+    _ reply: @escaping Reply,
+    _ op:
+      @escaping @Sendable (isolated MuxService, ViewerViewport, @escaping Reply)
+      -> Void,
+  ) {
+    // Runs the command if its window is still current when its turn comes.
+    func turn(
+      windowID: UInt64,
+      attachment: AttachmentID
+    ) -> (isolated MuxService) -> Void {
+      let finish: Reply = { [weak self] result in
+        reply(result)
+        self?
+          .onQueue { $0.windowCommandFinished(client, wsID, attachment, pane) }
+      }
+      return { service in
+        guard let viewer = service.viewer(client, in: wsID) else {
+          return finish(.failure(MuxError(.notAttached)))
+        }
+        guard let current = viewer.viewports[pane], current.id == windowID
+        else { return finish(.failure(MuxError(.notFound, "pane"))) }
+        op(service, current, finish)
+      }
+    }
+    enum Turn {
+      case now((isolated MuxService) -> Void)
+      case waiting
+      case refused(MuxError)
+    }
+    let next =
+      withViewer(client, in: wsID) { viewer -> Turn in
+        // The window the command was sent for. Ids never repeat, so a
+        // later subscription or attachment has a different one.
+        guard let window = viewer.viewports[pane]?.id else {
+          return .refused(MuxError(.notFound, "pane"))
+        }
+        // One queue per viewer and pane: a resubscribe does not start a
+        // fresh one beside commands still waiting.
+        var queue = viewer.windowCommands[pane] ?? WindowCommandQueue()
+        if queue.running, queue.waiting.count >= Self.maxWaitingCommands {
+          return .refused(MuxError(.resourceLimit, "too many window commands"))
+        }
+        defer { viewer.windowCommands[pane] = queue }
+        let run = turn(windowID: window, attachment: viewer.attachment)
+        guard queue.running else {
+          queue.running = true
+          return .now(run)
+        }
+        queue.waiting.append(WaitingWindowCommand(run: run, reply: reply))
+        return .waiting
+      } ?? .refused(MuxError(.notAttached))
+    switch next {
+    case let .now(run): run(self)
+    case .waiting: break
+    case let .refused(error): reply(.failure(error))
+    }
+  }
+
+  /// Window commands one observer pane may have waiting.
+  static let maxWaitingCommands = 32
+
+  private func windowCommandFinished(
+    _ client: UUID,
+    _ wsID: WorkspaceID,
+    _ attachment: AttachmentID,
+    _ pane: PaneID,
+  ) {
+    let next = withViewer(client, in: wsID) { viewer -> WaitingWindowCommand? in
+      guard viewer.attachment == attachment,
+        var queue = viewer.windowCommands[pane]
+      else { return nil }
+      guard !queue.waiting.isEmpty else {
+        viewer.windowCommands[pane] = nil
+        return nil
+      }
+      let next = queue.waiting.removeFirst()
+      viewer.windowCommands[pane] = queue
+      return next
+    }
+    next?.run(self)
+  }
+
+  /// Changes the stored viewer in place, by client. Whole-viewer writes
+  /// (`store`), window-command queues and settling a frame (captured and
+  /// placed, acknowledged) go through here; the pump marks captures
+  /// through the index it is iterating, within one call.
+  @discardableResult
+  func withViewer<T>(
+    _ client: UUID,
+    in wsID: WorkspaceID,
+    _ body: (inout Viewer) -> T,
+  ) -> T? {
+    guard let index = viewers[wsID]?.firstIndex(where: { $0.client == client })
+    else { return nil }
+    return body(&viewers[wsID]![index])
+  }
+  /// `withViewer` for a body with an optional result: nil when the viewer
+  /// or the result is missing.
+  @discardableResult
+  func withViewer<T>(
+    _ client: UUID,
+    in wsID: WorkspaceID,
+    _ body: (inout Viewer) -> T?,
+  ) -> T? {
+    guard let index = viewers[wsID]?.firstIndex(where: { $0.client == client })
+    else { return nil }
+    return body(&viewers[wsID]![index])
+  }
+
+  func endViewerSearch(
+    _ pane: PaneID,
+    client: UUID,
+    window: ViewerViewport,
+    workspace wsID: WorkspaceID,
+    reply: @escaping Reply,
+  ) {
+    // Nothing to end: the window and its frames stand.
+    guard window.searchQuery != nil else {
+      return reply(.success(.search(.empty)))
+    }
+    commitWindow(
+      window.id,
+      pane: pane,
+      client: client,
+      workspace: wsID,
+      reply: reply,
+      success: .search(.empty),
+    ) {
+      $0.searchQuery = nil
+      $0.searchSelected = nil
+    }
+  }
+
+  /// Stores a changed observer window as a new revision (frames of the
+  /// old one stop counting), clears its earlier failure, and replies.
+  func commitWindow(
+    _ windowID: UInt64,
+    pane: PaneID,
+    client: UUID,
+    workspace wsID: WorkspaceID,
+    reply: Reply,
+    success: MuxReply,
+    change: (inout ViewerViewport) -> Void,
+  ) {
+    guard var viewer = viewer(client, in: wsID) else {
+      return reply(.failure(MuxError(.notAttached)))
+    }
+    guard var window = viewer.viewports[pane], window.id == windowID else {
+      return reply(.failure(MuxError(.notFound, "pane")))
+    }
+    change(&window)
+    window.revision &+= 1
+    viewer.viewports[pane] = window
+    recover(pane, in: &viewer)
+    store(viewer)
+    reply(.success(success))
+    pump()
   }
 
   func viewer(_ client: UUID, in wsID: WorkspaceID) -> Viewer? {
     viewers[wsID]?.first { $0.client == client }
   }
 
-  func store(_ viewer: Viewer, client: UUID, workspace wsID: WorkspaceID) {
-    guard let index = viewers[wsID]?.firstIndex(where: { $0.client == client })
-    else { return }
-    viewers[wsID]?[index] = viewer
+  /// Writes `viewer` back over its stored copy.
+  func store(_ viewer: Viewer) {
+    withViewer(viewer.client, in: viewer.workspace) { $0 = viewer }
   }
 
   func setViewerSubscriptions(
@@ -333,172 +562,141 @@ extension MuxService {
     guard list.count <= limits.maxPanes, Set(list).count == list.count,
       list.allSatisfy(members.contains)
     else { return MuxError(.invalidRequest, "subscription list") }
-    var frames: [PaneID: FrameSlot] = [:]
+    let kept = Set(list)
+    for pane in Array(viewer.frames.keys) where !kept.contains(pane) {
+      forgetPane(pane, in: &viewer)
+    }
     for pane in list {
-      frames[pane] = viewer.frames[pane] ?? FrameSlot()
-      frames[pane]?.hiddenActivity = false
+      if viewer.frames[pane] == nil { viewer.frames[pane] = FrameSlot() }
       if viewer.viewports[pane] == nil {
+        nextWindowID &+= 1
         viewer.viewports[pane] = ViewerViewport(
+          id: nextWindowID,
           followTail: true,
           historyGeneration: 0,
           anchorRow: nil,
         )
       }
     }
-    for (pane, slot) in viewer.frames where frames[pane] == nil {
-      releaseBudget(slot)
-      viewer.viewports[pane] = nil
-    }
     viewer.subscriptions = list
-    viewer.frames = frames
-    let publish = arm(&viewer.readiness, panes: list, workspace: ws)
-    let readiness = viewer.readiness
-    let attachment = viewer.attachment
-    store(viewer, client: client, workspace: wsID)
-    guard publish else {
-      pump()
-      return nil
-    }
-    publishReady(
-      readiness,
-      attachment: attachment,
-      client: client,
-      store: {
-        if let index = self.viewers[wsID]?.firstIndex(where: {
-          $0.client == client
-        }) {
-          self.viewers[wsID]?[index].readiness.sent = true
-        }
-      },
-    )
+    viewer.readiness.arm(list)
+    store(viewer)
+    publishViewerReady(client, in: wsID)
     pump()
     return nil
   }
 
+  /// A viewport follows the tail or names an anchor row.
+  func viewportAnchorError(_ request: ViewportRequest) -> MuxError? {
+    request.followTail || request.anchorRow != nil
+      ? nil : MuxError(.invalidRequest, "viewport anchor")
+  }
+
+  /// An observer viewport request that can never resolve.
+  func viewerRequestError(_ request: ViewportRequest) -> MuxError? {
+    displaySize(request) ?? viewportAnchorError(request)
+  }
+
+  /// Applies a resolved move or search to the observer window it was
+  /// issued for, then replies `success`. A window replaced meanwhile
+  /// (unsubscribed, resubscribed or reattached: ids never repeat) is gone.
+  func applyResolved(
+    _ resolved: PaneRuntime.ResolvedViewport,
+    of request: ViewportRequest,
+    window windowID: UInt64,
+    client: UUID,
+    workspace wsID: WorkspaceID,
+    reply: Reply,
+    success: MuxReply,
+    update: (inout ViewerViewport) -> Void = { _ in },
+  ) {
+    commitWindow(
+      windowID,
+      pane: request.pane,
+      client: client,
+      workspace: wsID,
+      reply: reply,
+      success: success,
+    ) {
+      $0.followTail = resolved.followTail
+      $0.historyGeneration = resolved.historyGeneration
+      $0.anchorRow = resolved.anchorRow
+      $0.rows = request.rows
+      $0.columns = request.columns
+      update(&$0)
+    }
+  }
+
+  /// `request` is valid (`viewerRequestError`).
   func moveViewer(
     _ request: ViewportRequest,
+    scroll: ScrollRequest? = nil,
     client: UUID,
+    window: ViewerViewport,
     workspace wsID: WorkspaceID,
     reply: @escaping Reply,
   ) {
-    guard displaySize(request) == nil else {
-      reply(.failure(MuxError(.invalidRequest, "viewport size")))
-      return
+    guard let runtime = panes[request.pane]?.runtime else {
+      return reply(.failure(MuxError(.notFound, "pane")))
     }
-    guard var viewer = viewer(client, in: wsID),
-      viewer.subscriptions.contains(request.pane),
-      let runtime = panes[request.pane]?.runtime
-    else {
-      reply(.failure(MuxError(.notFound, "pane")))
-      return
-    }
-    guard request.followTail || request.anchorRow != nil else {
-      reply(.failure(MuxError(.invalidRequest, "viewport anchor")))
-      return
-    }
-    let rows = request.rows
-    let columns = request.columns
-    runtime.resolveViewer(request, searchQuery: nil, searchStep: nil) {
-      [weak self] result in
+    let windowID = window.id
+    runtime.resolveViewer(
+      request,
+      searchQuery: nil,
+      searchStep: nil,
+      scroll: scroll,
+    ) { [weak self] result in
       self?
         .onQueue { service in
           switch result {
-          case let .failure(error):
-            reply(.failure(error))
+          case let .failure(error): reply(.failure(error))
           case let .success(resolved):
-            guard var viewer = service.viewer(client, in: wsID) else {
-              reply(.failure(MuxError(.notAttached)))
-              return
-            }
-            var viewport =
-              viewer.viewports[request.pane]
-              ?? ViewerViewport(
-                followTail: true,
-                historyGeneration: resolved.historyGeneration,
-                anchorRow: nil,
-              )
-            viewport.followTail = resolved.followTail
-            viewport.historyGeneration = resolved.historyGeneration
-            viewport.anchorRow = resolved.anchorRow
-            viewport.rows = rows
-            viewport.columns = columns
-            viewport.revision &+= 1
-            viewer.viewports[request.pane] = viewport
-            viewer.unavailable.remove(request.pane)
-            viewer.frames[request.pane]?.dirty = true
-            service.store(viewer, client: client, workspace: wsID)
-            reply(.success(.ok))
-            service.pump()
+            service.applyResolved(
+              resolved,
+              of: request,
+              window: windowID,
+              client: client,
+              workspace: wsID,
+              reply: reply,
+              success: .ok,
+            )
           }
         }
     }
   }
 
+  /// `.bottom` and `.top` name an absolute window and do not depend on
+  /// the current anchor, so they recover a viewer whose anchor went
+  /// stale. Relative scrolls start from the viewer's window and stop at
+  /// the history edges.
   func scrollViewer(
     _ pane: PaneID,
     _ request: ScrollRequest,
     client: UUID,
+    window: ViewerViewport,
     workspace wsID: WorkspaceID,
     reply: @escaping Reply,
   ) {
-    guard let viewer = viewer(client, in: wsID),
-      viewer.subscriptions.contains(pane),
-      let runtime = panes[pane]?.runtime
-    else {
-      reply(.failure(MuxError(.notFound, "pane")))
-      return
+    var viewport = window.request(pane)
+    var relative: ScrollRequest?
+    switch request {
+    case .bottom:
+      viewport.followTail = true
+      viewport.anchorRow = nil
+    case let .top(address):
+      viewport.followTail = false
+      viewport.anchorRow = address.row
+      viewport.historyGeneration = address.generation
+    case .lines, .pages: relative = request
     }
-    let current = viewer.viewports[pane]
-    runtime.resolveViewer(
-      ViewportRequest(
-        pane: pane,
-        anchorRow: current?.anchorRow,
-        followTail: current?.followTail ?? true,
-        historyGeneration: current?.historyGeneration ?? 0,
-        rows: current?.rows,
-        columns: current?.columns,
-      ),
-      searchQuery: nil,
-      searchStep: nil,
-    ) { [weak self] result in
-      self?
-        .onQueue { service in
-          guard case let .success(resolved) = result else {
-            reply(.failure(MuxError(.historyUnavailable, "history anchor is stale")))
-            return
-          }
-          let viewport = ViewportRequest(
-            pane: pane,
-            anchorRow: {
-              switch request {
-              case .bottom: return nil
-              case let .top(address): return address.row
-              case let .lines(n):
-                return (resolved.anchorRow ?? 0) - n
-              case let .pages(n):
-                let page = max(1, (service.panes[pane]?.rows ?? 1) - 1)
-                return (resolved.anchorRow ?? 0) - n * page
-              }
-            }(),
-            followTail: {
-              if case .bottom = request { return true }
-              return false
-            }(),
-            historyGeneration: {
-              if case let .top(address) = request { return address.generation }
-              return resolved.historyGeneration
-            }(),
-            rows: current?.rows,
-            columns: current?.columns,
-          )
-          service.moveViewer(
-            viewport,
-            client: client,
-            workspace: wsID,
-            reply: reply,
-          )
-        }
-    }
+    moveViewer(
+      viewport,
+      scroll: relative,
+      client: client,
+      window: window,
+      workspace: wsID,
+      reply: reply,
+    )
   }
 
   func searchViewer(
@@ -506,30 +704,23 @@ extension MuxService {
     query: String?,
     step: Bool?,
     client: UUID,
+    window: ViewerViewport,
     workspace wsID: WorkspaceID,
     reply: @escaping Reply,
   ) {
-    guard var viewer = viewer(client, in: wsID),
-      viewer.subscriptions.contains(pane),
-      let runtime = panes[pane]?.runtime
-    else {
-      reply(.failure(MuxError(.notFound, "pane")))
-      return
+    guard let runtime = panes[pane]?.runtime else {
+      return reply(.failure(MuxError(.notFound, "pane")))
     }
-    let existing = query ?? viewer.viewports[pane]?.searchQuery
-    guard let existing, !existing.isEmpty || query == nil else {
-      reply(.failure(MuxError(.invalidRequest, "search query")))
-      return
+    // A step needs a search to continue.
+    guard let existing = query ?? window.searchQuery else {
+      return reply(.failure(MuxError(.invalidRequest, "search query")))
     }
-    let rows = viewer.viewports[pane]?.rows
-    let columns = viewer.viewports[pane]?.columns
-    let selected = viewer.viewports[pane]?.searchSelected
+    // Only a step continues from the stored selection.
+    let selected = query == nil ? window.searchSelected : nil
+    let windowID = window.id
+    let request = window.request(pane)
     runtime.resolveViewer(
-      ViewportRequest(
-        pane: pane,
-        followTail: false,
-        historyGeneration: viewer.viewports[pane]?.historyGeneration ?? 0,
-      ),
+      request,
       searchQuery: existing,
       searchStep: step,
       searchSelected: selected,
@@ -539,48 +730,53 @@ extension MuxService {
           switch result {
           case let .failure(error): reply(.failure(error))
           case let .success(resolved):
-            guard var viewer = service.viewer(client, in: wsID) else {
-              reply(.failure(MuxError(.notAttached)))
-              return
+            service.applyResolved(
+              resolved,
+              of: request,
+              window: windowID,
+              client: client,
+              workspace: wsID,
+              reply: reply,
+              success: .search(resolved.search ?? .empty),
+            ) {
+              $0.searchQuery = existing
+              $0.searchSelected = resolved.selectedMatch
             }
-            var viewport =
-              viewer.viewports[pane]
-              ?? ViewerViewport(
-                followTail: false,
-                historyGeneration: resolved.historyGeneration,
-                anchorRow: resolved.anchorRow,
-              )
-            viewport.followTail = resolved.followTail
-            viewport.historyGeneration = resolved.historyGeneration
-            viewport.anchorRow = resolved.anchorRow
-            viewport.searchQuery = existing
-            viewport.searchSelected = resolved.search?.selected
-            viewport.rows = rows
-            viewport.columns = columns
-            viewport.revision &+= 1
-            viewer.viewports[pane] = viewport
-            viewer.frames[pane]?.dirty = true
-            service.store(viewer, client: client, workspace: wsID)
-            reply(.success(.search(resolved.search ?? SearchResult(matchCount: 0, selected: nil))))
-            service.pump()
           }
         }
     }
   }
 
   /// Observers are served after controllers, and only while a controller
-  /// is not waiting on the shared frame budget.
+  /// is not waiting on the shared frame budget. Like workspaces, observers
+  /// take turns going first so one cannot starve the rest of the budget.
   func pumpViewers(now: UInt64) -> UInt64? {
-    guard !controllerWaitingForBudget(now: now) else { return nil }
-    var wake: UInt64?
-    for wsID in Array(viewers.keys) {
-      let count = viewers[wsID]?.count ?? 0
-      for index in 0 ..< count {
-        if let due = pumpViewer(wsID, index: index, now: now) {
-          wake = min(wake ?? due, due)
-        }
-      }
+    guard !viewers.isEmpty, !controllerWaitingForBudget(now: now) else {
+      return nil
     }
+    let order = workspaces.flatMap { ws in
+      (viewers[ws.id] ?? []).indices.map { (ws.id, $0) }
+    }
+    let n = order.count
+    let start = n == 0 ? 0 : viewerCursor % n
+    let share = viewerFrameBudget / max(1, n)
+    // Summed once per pump; pumpViewer adds what it reserves.
+    var held = viewerFrameBytes
+    var wake: UInt64?
+    var served: Int?
+    for k in 0 ..< n {
+      let i = (start + k) % n
+      let (due, started) = pumpViewer(
+        order[i].0,
+        index: order[i].1,
+        now: now,
+        held: &held,
+        share: share,
+      )
+      if started, served == nil { served = i }
+      if let due { wake = min(wake ?? due, due) }
+    }
+    viewerCursor = n == 0 ? 0 : ((served ?? start) + 1) % n
     return wake
   }
 
@@ -592,21 +788,30 @@ extension MuxService {
           continue
         }
         if slot.lastSent != 0, now &- slot.lastSent < interval { continue }
-        return inflightFrameBytes + reservedFrameBytes >= limits.pendingFrameBudget
+        return inflightFrameBytes + reservedFrameBytes
+          >= limits.pendingFrameBudget
       }
     }
     return false
   }
 
+  /// The earliest throttled pane's due time, and whether a capture began.
+  /// `held` is every observer's frame bytes; one observer may hold up to
+  /// `share` of `viewerFrameBudget`, so a stalled one cannot block the rest.
   func pumpViewer(
     _ wsID: WorkspaceID,
     index: Int,
     now: UInt64,
-  ) -> UInt64? {
-    guard let viewer = viewers[wsID]?[safe: index], !viewer.subscriptions.isEmpty
-    else { return nil }
+    held: inout Int,
+    share: Int,
+  ) -> (UInt64?, Bool) {
+    guard let viewer = viewers[wsID]?[safe: index],
+      !viewer.subscriptions.isEmpty
+    else { return (nil, false) }
+    var mine = viewer.heldFrameBytes
     let interval = limits.frameIntervalNanoseconds
     var wake: UInt64?
+    var started = false
     let order = viewer.subscriptions
     let count = order.count
     let first = viewer.paneCursor % count
@@ -616,6 +821,10 @@ extension MuxService {
       guard let slot = viewers[wsID]?[index].frames[pane], slot.dirty,
         slot.capture == nil, let record = panes[pane]
       else { continue }
+      guard let capture = viewers[wsID]?[index].viewports[pane] else {
+        assertionFailure("subscribed pane without a window")
+        continue
+      }
       let stamp = max(slot.lastSent, slot.lastCapture)
       if stamp != 0, now &- stamp < interval {
         let due = stamp + interval
@@ -624,30 +833,24 @@ extension MuxService {
       }
       // One in flight plus one replaceable newest frame.
       if slot.inflight != nil, slot.queued != nil { continue }
-      guard inflightFrameBytes + reservedFrameBytes < limits.pendingFrameBudget
-      else { return wake }
+      guard inflightFrameBytes + reservedFrameBytes < limits.pendingFrameBudget,
+        held < viewerFrameBudget, mine < share
+      else { return (wake, started) }
+      started = true
       nextCapture &+= 1
       let token = nextCapture
       let estimate = captureEstimate(record)
       reservedFrameBytes += estimate
+      held += estimate
+      mine += estimate
       viewers[wsID]?[index].frames[pane]?.dirty = false
       viewers[wsID]?[index].frames[pane]?.capture = token
       viewers[wsID]?[index].frames[pane]?.reserved = estimate
       viewers[wsID]?[index].frames[pane]?.lastCapture = now
       let attachment = viewer.attachment
+      let client = viewer.client
       let layoutRevision =
         workspaces.first { $0.id == wsID }?.layoutRevision ?? 0
-      let window = viewers[wsID]?[index].viewports[pane]
-      let capture = ViewerCapture(
-        followTail: window?.followTail ?? true,
-        historyGeneration: window?.historyGeneration ?? 0,
-        anchorRow: window?.anchorRow,
-        rows: window?.rows,
-        columns: window?.columns,
-        searchQuery: window?.searchQuery,
-        searchSelected: window?.searchSelected,
-        viewportRevision: window?.revision ?? 0,
-      )
       record.runtime.captureFrame(
         server: instance,
         attachment: attachment,
@@ -659,14 +862,14 @@ extension MuxService {
             $0.viewerFrameCaptured(
               pane,
               workspace: wsID,
-              client: viewer.client,
+              client: client,
               token: token,
               result,
             )
           }
       }
     }
-    return wake
+    return (wake, started)
   }
 
   func viewerFrameCaptured(
@@ -676,101 +879,106 @@ extension MuxService {
     token: UInt64,
     _ result: Result<PaneRuntime.CapturedFrame, MuxError>,
   ) {
-    guard let index = viewers[wsID]?.firstIndex(where: { $0.client == client }),
-      let slot = viewers[wsID]?[index].frames[pane], slot.capture == token
-    else { return }
-    viewers[wsID]?[index].frames[pane]?.capture = nil
-    viewers[wsID]?[index].frames[pane]?.reserved = 0
-    reservedFrameBytes -= slot.reserved
-    switch result {
-    case let .success(captured):
-      deliverViewerFrame(
-        captured,
-        pane: pane,
-        workspace: wsID,
-        index: index,
-        slot: slot,
-      )
-    case let .failure(error):
-      if error.code == .historyUnavailable {
-        if viewers[wsID]?[index].unavailable.contains(pane) == false {
-          viewers[wsID]?[index].unavailable.insert(pane)
-          send(.event(.frameUnavailable(pane, error)), to: client)
+    enum Outcome {
+      case send(SMXChannel, QueuedFrame)
+      case queued(QueuedFrame, replacing: QueuedFrame?)
+      /// Nothing more to send or report.
+      case settled
+      case failed(MuxError, notify: Bool, newlyFailed: Bool)
+    }
+    // Settles the capture and decides what follows: a frame is sent now or
+    // becomes the replaceable newest behind the one in flight; a failure is
+    // recorded before any notice goes out (a failed send can drop this
+    // viewer). Nil when the capture belongs to an earlier subscription.
+    var reserved = 0
+    let outcome = withViewer(client, in: wsID) { viewer -> Outcome? in
+      guard let slot = viewer.frames[pane], slot.capture == token else {
+        return nil
+      }
+      reserved = slot.reserved
+      viewer.frames[pane]?.capture = nil
+      viewer.frames[pane]?.reserved = 0
+      switch result {
+      case let .success(captured):
+        // Only XPC clients observe, and a lost client releases its viewer
+        // in the same turn.
+        guard case let .xpc(channel)? = clients[client]?.transport else {
+          assertionFailure("observer without an XPC transport")
+          return .settled
         }
-      } else {
-        send(.event(.frameUnavailable(pane, error)), to: client)
+        let frame = QueuedFrame(frame: captured.sent, data: captured.data)
+        if slot.inflight == nil {
+          viewer.frames[pane]?.sent(frame.frame)
+          return .send(channel, frame)
+        }
+        viewer.frames[pane]?.queued = frame
+        return .queued(frame, replacing: slot.queued)
+      case .failure where token <= slot.supersededThrough:
+        // The window it captured has moved: recapture, report nothing.
+        viewer.frames[pane]?.dirty = true
+        return .settled
+      case let .failure(error):
+        let newlyFailed = viewer.readiness.failed.insert(pane).inserted
+        let notify =
+          error.code != .historyUnavailable
+          || viewer.staleAnchorReported.insert(pane).inserted
+        return .failed(error, notify: notify, newlyFailed: newlyFailed)
       }
     }
-    pump()
-  }
-
-  func deliverViewerFrame(
-    _ captured: PaneRuntime.CapturedFrame,
-    pane: PaneID,
-    workspace wsID: WorkspaceID,
-    index: Int,
-    slot: FrameSlot,
-  ) {
-    guard let viewer = viewers[wsID]?[index],
-      let client = clients[viewer.client], case let .xpc(channel) = client.transport
-    else { return }
-    let queued = QueuedFrame(
-      revision: captured.revision,
-      bytes: captured.data.count,
-      geometry: captured.geometry,
-      data: captured.data,
-    )
-    if slot.inflight == nil {
-      channel.send(captured.data)
-      viewers[wsID]?[index].frames[pane]?.inflight = (queued.revision, queued.bytes)
-      viewers[wsID]?[index].frames[pane]?.inflightGeometry = queued.geometry
-      viewers[wsID]?[index].frames[pane]?.lastSent =
-        DispatchTime.now().uptimeNanoseconds
-      inflightFrameBytes += queued.bytes
-    } else {
-      if let previous = slot.queued { inflightFrameBytes -= previous.bytes }
-      viewers[wsID]?[index].frames[pane]?.queued = queued
-      inflightFrameBytes += queued.bytes
+    guard let outcome else { return }
+    reservedFrameBytes -= reserved
+    switch outcome {
+    case let .send(channel, frame):
+      channel.send(frame.data)
+      inflightFrameBytes += frame.frame.bytes
+    case let .queued(frame, replaced):
+      inflightFrameBytes += frame.frame.bytes - (replaced?.frame.bytes ?? 0)
+    case .settled: break
+    case let .failed(error, notify, newlyFailed):
+      if notify { send(.event(.frameUnavailable(pane, error)), to: client) }
+      // Ready follows the notice that explains the missing pane.
+      if newlyFailed { publishViewerReady(client, in: wsID) }
     }
+    pump()
   }
 
   func acknowledgeViewer(
     _ pane: PaneID,
     _ revision: UInt64,
+    attachment: AttachmentID,
     from id: UUID,
   ) {
-    guard let wsID = clientViewers[id],
-      let index = viewers[wsID]?.firstIndex(where: { $0.client == id }),
-      let slot = viewers[wsID]?[index].frames[pane],
-      let inflight = slot.inflight, inflight.revision == revision
+    guard let wsID = clientViewers[id], let client = clients[id],
+      case let .xpc(channel) = client.transport
     else { return }
-    viewers[wsID]?[index].frames[pane]?.inflight = nil
-    inflightFrameBytes -= inflight.bytes
-    noteReady(
-      wsID,
-      controller: false,
-      viewer: id,
-      pane: pane,
-      revision: revision,
-      geometry: slot.inflightGeometry,
-      acked: true,
-    )
-    if let queued = viewers[wsID]?[index].frames[pane]?.queued,
-      let client = clients[id], case let .xpc(channel) = client.transport
-    {
-      channel.send(queued.data)
-      viewers[wsID]?[index].frames[pane]?.queued = nil
-      viewers[wsID]?[index].frames[pane]?.inflight = (queued.revision, queued.bytes)
-      viewers[wsID]?[index].frames[pane]?.inflightGeometry = queued.geometry
-      viewers[wsID]?[index].frames[pane]?.lastSent =
-        DispatchTime.now().uptimeNanoseconds
+    // Settles the acknowledged frame, promotes the queued one (sent below),
+    // and records it for Ready.
+    let ack = withViewer(id, in: wsID) {
+      viewer -> (acked: SentFrame, next: QueuedFrame?, ready: Bool)? in
+      guard viewer.attachment == attachment, let slot = viewer.frames[pane],
+        let inflight = slot.inflight, inflight.revision == revision
+      else { return nil }
+      viewer.frames[pane]?.inflight = nil
+      if let queued = slot.queued {
+        viewer.frames[pane]?.queued = nil
+        viewer.frames[pane]?.sent(queued.frame)
+      }
+      let window = viewer.viewports[pane]?.revision ?? 0
+      let ready = viewer.readiness.install(pane, inflight, window: window)
+      return (inflight, slot.queued, ready)
     }
+    guard let ack else { return }
+    inflightFrameBytes -= ack.acked.bytes
+    if let next = ack.next { channel.send(next.data) }
+    // Last: publishing Ready can drop this viewer if its send fails.
+    if ack.ready { publishViewerReady(id, in: wsID) }
     pump()
   }
+
 }
 
-private extension Array {
-  subscript(safe index: Int) -> Element? {
+extension Array {
+  fileprivate subscript(safe index: Int) -> Element? {
     indices.contains(index) ? self[index] : nil
   }
 }

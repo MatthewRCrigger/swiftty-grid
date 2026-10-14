@@ -144,30 +144,17 @@ struct PaneWriter {
     if p.bracketed {
       queue.append(Segment(bytes: Array("\u{1B}[201~".utf8), kind: .marker))
     }
-    if discardDeferredInput {
-      var replies: [Segment] = []
-      for s in deferred {
-        if case .input = s.kind {
-          discarded += s.bytes.count
-          pendingInputBytes -= s.bytes.count
-          continue
-        }
-        replies.append(s)
-      }
-      deferred = replies
-      deferredReplyBytes = replies.reduce(0) { total, segment in
-        if case .reply = segment.kind { total + segment.bytes.count } else { total }
-      }
-    }
+    if discardDeferredInput { discarded += dropDeferredInput() }
     releaseDeferred()
     return (discarded, p.wrote)
   }
 
   /// Drops user input and paste payload that have not reached the program.
-  /// Bytes already accepted by the kernel stay. The unwritten suffix of a
-  /// chunk that has started is still this writer's and is dropped with the
-  /// unstarted chunks. Replies and markers stay. An open bracketed paste
-  /// still receives its closing marker. Used when the writer lease ends,
+  /// Bytes already accepted by the kernel stay. A started paste chunk
+  /// finishes its current UTF-8 scalar and drops the rest. A started input
+  /// record finishes whole: cutting it could split a key's escape sequence
+  /// and corrupt the next writer's first bytes. Replies and markers stay.
+  /// An open bracketed paste still receives its closing marker. Used when the writer lease ends,
   /// including after `pasteEnd` has retired the lease's paste record while
   /// bytes are still queued.
   mutating func discardUnwrittenInput() -> Int {
@@ -175,14 +162,23 @@ struct PaneWriter {
     var kept: [Segment] = []
     for (i, s) in queue.enumerated() where i >= head {
       switch s.kind {
-      case .input, .paste:
-        guard s.offset < s.bytes.count else { break }
-        // The prefix already in the kernel cannot be rewritten. Credit
-        // covers only the suffix that flush has not released.
-        discarded += s.bytes.count - s.offset
+      case .input where s.offset > 0: break
+      case .paste where s.offset > 0:
+        // Finish the scalar the kernel has started; drop the rest.
+        var end = s.offset
+        while end < s.bytes.count, s.bytes[end] & 0xC0 == 0x80 { end += 1 }
+        if end == s.bytes.count { break }
+        discarded += s.bytes.count - end
+        guard end > s.offset else { continue }
+        var started = s
+        started.bytes.removeSubrange(end...)
+        kept.append(started)
         continue
-      case .marker, .reply:
-        break
+      case .input, .paste:
+        // Nothing of it reached the kernel.
+        discarded += s.bytes.count
+        continue
+      case .marker, .reply: break
       }
       kept.append(s)
     }
@@ -191,21 +187,7 @@ struct PaneWriter {
       head = 0
       pendingInputBytes -= discarded
     }
-    var replies: [Segment] = []
-    for s in deferred {
-      if case .input = s.kind {
-        discarded += s.bytes.count
-        pendingInputBytes -= s.bytes.count
-        continue
-      }
-      replies.append(s)
-    }
-    if replies.count != deferred.count {
-      deferred = replies
-      deferredReplyBytes = replies.reduce(0) { total, segment in
-        if case .reply = segment.kind { total + segment.bytes.count } else { total }
-      }
-    }
+    discarded += dropDeferredInput()
     // A later pasteEnd must not flush the tail or release deferred
     // keystrokes. The closer was reserved with the opener; flush writes it.
     if let open = paste {
@@ -221,6 +203,31 @@ struct PaneWriter {
       }
     }
     return discarded
+  }
+
+  /// Drops keystrokes deferred behind a paste, keeping replies and their
+  /// credit. Returns the bytes dropped.
+  private mutating func dropDeferredInput() -> Int {
+    var dropped = 0
+    var replies: [Segment] = []
+    for s in deferred {
+      if case .input = s.kind {
+        dropped += s.bytes.count
+        continue
+      }
+      replies.append(s)
+    }
+    guard replies.count != deferred.count else { return 0 }
+    pendingInputBytes -= dropped
+    deferred = replies
+    deferredReplyBytes = replies.reduce(0) { total, segment in
+      if case .reply = segment.kind {
+        total + segment.bytes.count
+      } else {
+        total
+      }
+    }
+    return dropped
   }
 
   private mutating func releaseDeferred() {

@@ -143,7 +143,7 @@ extension MuxService {
 
   func newWorkspace(_ request: NewWorkspaceRequest, reply: @escaping Reply) {
     if let name = request.name, !validName(name) {
-      return reply(.failure(MuxError(.invalidRequest, "workspace name")))
+      return reply(.failure(invalidName))
     }
     if let name = request.name, workspaces.contains(where: { $0.name == name })
     {
@@ -282,11 +282,12 @@ extension MuxService {
 
   func endWorkspace(_ id: WorkspaceID) {
     guard let ws = workspaces.first(where: { $0.id == id }) else { return }
+    // Detach first: the teardown's layout commits are not for anyone.
+    releaseLease(id, notify: true, reason: "workspace ended")
+    releaseViewers(in: id, reason: "workspace ended")
     for pane in ws.allPanes { endPane(pane) }
     // endPane removes the workspace with its last pane.
     workspaces.removeAll { $0.id == id }
-    releaseLease(id, notify: true, reason: "workspace ended")
-    releaseViewers(in: id, reason: "workspace ended")
     publishWorkspaces()
   }
 
@@ -295,8 +296,7 @@ extension MuxService {
     let wsID = workspaces[w].id
     leases[wsID]?.subscriptions.removeAll { $0 == pane }
     leases[wsID]?.reportedActivity.remove(pane)
-    leases[wsID]?.readiness.required.remove(pane)
-    leases[wsID]?.readiness.installed.removeValue(forKey: pane)
+    leases[wsID]?.readiness.forget(pane)
     if let slot = leases[wsID]?.frames.removeValue(forKey: pane) {
       releaseBudget(slot)
     }
@@ -375,16 +375,31 @@ extension MuxService {
       return MuxError(.resourceLimit, "geometry pane count")
     }
     current.geometryGeneration = batch.generation
-    leases[wsID] = current
+    var resized: [PaneID: UInt64] = [:]
     for e in entries.values {
       guard let record = panes[e.pane] else { continue }
+      // Every entry advances the pane's geometry generation (frames show
+      // the batch was applied); only a changed size resets Ready.
+      let changed = record.columns != e.columns || record.rows != e.rows
       panes[e.pane]?.columns = e.columns
       panes[e.pane]?.rows = e.rows
-      record.runtime.resize(
-        columns: e.columns,
-        rows: e.rows,
-        generation: batch.generation
-      )
+      let generation = record.runtime.resize(columns: e.columns, rows: e.rows)
+      if changed { resized[e.pane] = generation }
+    }
+    // Frames at an older size, acknowledged or on the way, no longer count
+    // for Ready, and a capture at that size that fails is not reported;
+    // every resize produces a new frame. An unchanged size (a resent
+    // batch) keeps them.
+    for (pane, generation) in resized {
+      current.readiness.resized(pane, to: generation)
+      current.frames[pane]?.supersededThrough = nextCapture
+    }
+    leases[wsID] = current
+    for index in (viewers[wsID] ?? []).indices {
+      for (pane, generation) in resized {
+        viewers[wsID]![index].readiness.resized(pane, to: generation)
+        viewers[wsID]![index].frames[pane]?.supersededThrough = nextCapture
+      }
     }
     return nil
   }
