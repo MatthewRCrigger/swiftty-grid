@@ -21,5 +21,7 @@ case 10:
     Cell(glyph: UInt32.max, attributes: attributes, width: 1)
   )
 case 11: _ = checkedAllocationCount(Int.max, 16)
+case 12: _ = TerminalState(columns: 4, rows: 2).text(row: -1)
+case 13: _ = TerminalState(columns: 4, rows: 2).text(row: 2)
 default: fatalError("unknown storage probe")
 }

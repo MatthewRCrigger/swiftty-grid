@@ -47,9 +47,10 @@ public struct CompanionStaleness: Hashable, Sendable {
     return .fresh
   }
 
-  public func evaluate(_ status: CompanionStatus?, now: Date) -> CompanionFreshness {
-    evaluate(capturedAt: status?.capturedAt, now: now)
-  }
+  public func evaluate(
+    _ status: CompanionStatus?,
+    now: Date
+  ) -> CompanionFreshness { evaluate(capturedAt: status?.capturedAt, now: now) }
 }
 
 /// Permits at most one pending companion refresh (spec §2.3).
@@ -65,8 +66,10 @@ public struct RefreshGate: Hashable, Sendable {
   public private(set) var pending: Pending?
   public let timeout: TimeInterval
 
+  /// NaN and infinity never compare as an elapsed age, so they would leave
+  /// the single pending request stuck. Those values use the finite default.
   public init(timeout: TimeInterval = CompanionLimits.refreshTimeout) {
-    self.timeout = timeout
+    self.timeout = timeout.isFinite ? timeout : CompanionLimits.refreshTimeout
   }
 
   public var isPending: Bool { pending != nil }
@@ -99,7 +102,7 @@ public struct RefreshGate: Hashable, Sendable {
   public mutating func expireIfNeeded(now: Date) -> Bool {
     guard let pending else { return false }
     let age = now.timeIntervalSince(pending.startedAt)
-    guard age >= timeout || age < 0 else { return false }
+    if timeout.isFinite, age.isFinite, age >= 0, age < timeout { return false }
     self.pending = nil
     return true
   }

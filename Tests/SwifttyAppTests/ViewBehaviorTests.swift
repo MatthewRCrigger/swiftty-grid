@@ -215,7 +215,7 @@ struct ViewBehaviorTests {
     descriptor.usage = [.renderTarget]
     let texture = try #require(view.device?.makeTexture(descriptor: descriptor))
     view.session.feed(Array("\u{1B}[5mX".utf8))
-    let command = view.renderer.render(view.session.snapshot(), to: texture)
+    let command = try view.renderer.render(view.session.snapshot(), to: texture)
     command.waitUntilCompleted()
     try #require(
       command.status == .completed,

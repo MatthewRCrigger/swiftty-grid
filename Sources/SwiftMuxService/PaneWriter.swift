@@ -4,6 +4,10 @@
 /// While a paste envelope is open, replies and other input are deferred
 /// so nothing interleaves inside it; they follow the closing marker.
 struct PaneWriter {
+  /// Reserve both six-byte markers before opening an envelope, including
+  /// its closing marker while it has not yet been queued.
+  static let pasteMarkerBytes = 12
+
   enum Kind: Equatable {
     case input
     case reply
@@ -31,7 +35,8 @@ struct PaneWriter {
   private var head = 0
   private(set) var deferred: [Segment] = []
   private(set) var paste: Paste?
-  /// Bytes of input-kind segments not yet written (for credit release).
+  /// Unwritten input and markers, including an open envelope's future
+  /// closing marker (for credit release).
   private(set) var pendingInputBytes = 0
   private(set) var pendingReplyBytes = 0
   private(set) var deferredReplyBytes = 0
@@ -40,6 +45,7 @@ struct PaneWriter {
   init(replyReserve: Int) { self.replyReserve = replyReserve }
 
   var isEmpty: Bool { head == queue.count }
+
   var hasOpenPaste: Bool { paste != nil }
 
   /// Ordinary input; deferred while a paste envelope is open.
@@ -71,6 +77,7 @@ struct PaneWriter {
     precondition(paste == nil)
     paste = Paste(id: id, bracketed: bracketed)
     if bracketed {
+      pendingInputBytes += Self.pasteMarkerBytes
       queue.append(Segment(bytes: Array("\u{1B}[200~".utf8), kind: .marker))
     }
   }
@@ -151,14 +158,16 @@ struct PaneWriter {
       else { return nil }
       queue[head].offset += n
       switch s.kind {
-      case .input: released += n
+      case .input, .marker: released += n
       case let .paste(id):
         released += n
         if n > 0, paste?.id == id { paste?.wrote = true }
       case .reply: pendingReplyBytes -= n
-      case .marker: break
       }
       if queue[head].remaining > 0 { break }
+      // Admission credit can be reused before segment compaction. Release
+      // completed payloads now so their backing storage cannot accumulate.
+      queue[head] = Segment(bytes: [], kind: s.kind)
       head += 1
     }
     if head == queue.count {

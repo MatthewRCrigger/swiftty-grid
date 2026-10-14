@@ -81,7 +81,8 @@ public struct MouseEvent: Sendable, Hashable {
 }
 
 public enum TerminalInput: Sendable {
-  /// Committed text (typed characters, IME output).
+  /// Committed text (typed characters, IME output). Control actions use `.key`
+  /// and intentional protocol bytes use `.bytes`.
   case text(String)
   case key(KeyEvent)
   case paste(String)
@@ -114,7 +115,23 @@ public enum InputEncoder {
     into out: inout [UInt8]
   ) -> Bool {
     switch input {
-    case let .text(s): out.append(contentsOf: s.utf8)
+    case let .text(s):
+      guard keyboardFlags & 8 != 0, !s.isEmpty else {
+        out.append(contentsOf: s.utf8)
+        return true
+      }
+      // A composition commit has no physical key identity. Report zero,
+      // including when all-key reporting deliberately omits associated text.
+      guard s.unicodeScalars.allSatisfy(Self.isKeyTextScalar) else {
+        return false
+      }
+      var params = "0"
+      if keyboardFlags & 16 != 0 {
+        params += ";1;"
+        params += s.unicodeScalars.map { String($0.value) }
+          .joined(separator: ":")
+      }
+      appendCSI(out: &out, params, 0x75)
     case let .bytes(b): out.append(contentsOf: b)
     case let .key(event):
       // Kitty encoding needs "disambiguate" or "all keys"; other flags alone

@@ -18,7 +18,13 @@ public struct ProgramStatusStore: Sendable {
   public private(set) var journalTruncated = false
   /// Changes kept between takes; 0 (the default) keeps none.
   public var journalLimit = 0 {
-    didSet { if journalLimit <= 0 { _ = takeJournal() } }
+    didSet {
+      if journalLimit <= 0 {
+        _ = takeJournal()
+      } else if journal.count > journalLimit {
+        truncateJournal()
+      }
+    }
   }
   /// Incremented by every change, saturating at `UInt64.max`;
   /// unchanged by ignored commands. At the limit, compare snapshot
@@ -62,12 +68,14 @@ public struct ProgramStatusStore: Sendable {
   /// single `.reset`, if one happened, so consumers still see it.
   private mutating func record(_ change: ProgramStatusChange) {
     guard journalLimit > 0 else { return }
-    if !journalTruncated, journal.count >= journalLimit {
-      journalTruncated = true
-      journal = journal.contains(.reset) ? [.reset] : []
-    }
+    if !journalTruncated, journal.count >= journalLimit { truncateJournal() }
     guard journalTruncated else { return journal.append(change) }
     if change == .reset { journal = [.reset] }
+  }
+
+  private mutating func truncateJournal() {
+    journalTruncated = true
+    journal = journal.contains(.reset) ? [.reset] : []
   }
 
   /// Applies a report or clear; returns whether anything changed.
@@ -122,10 +130,7 @@ public struct ProgramStatusStore: Sendable {
     records = adopted
     revision = max(nextRevision, snapshot.revision)
     // Not a stream of changes: consumers replay the records.
-    if journalLimit > 0 {
-      journal = journal.contains(.reset) ? [.reset] : []
-      journalTruncated = true
-    }
+    if journalLimit > 0 { truncateJournal() }
     return true
   }
 

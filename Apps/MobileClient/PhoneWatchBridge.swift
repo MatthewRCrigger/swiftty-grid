@@ -3,10 +3,9 @@ import Foundation
 import MuxNavigation
 import Observation
 import RoamingApp
-import Synchronization
 
 #if canImport(WatchConnectivity)
-  import WatchConnectivity
+import WatchConnectivity
 #endif
 
 /// iPhone adapter between the app model and WatchConnectivity.
@@ -22,26 +21,56 @@ final class PhoneWatchBridge {
   /// Minimum spacing between preview captures pushed into the bridge.
   static let previewInterval: TimeInterval = 2
 
-  @ObservationIgnored private let core = SharedBridge(
-    PhoneCompanionBridge(now: .now)
+  @ObservationIgnored
+  private let core: PhoneWatchPublication?
+  @ObservationIgnored
+  private var captureGate = PreviewCaptureGate(
+    lastCapture: .distantPast,
+    interval: PhoneWatchBridge.previewInterval
   )
-  /// Latest encoded `AttentionSummaryBatch`, sent beside the status.
-  @ObservationIgnored private let attention = AttentionCache()
-  @ObservationIgnored private var lastPreviewCapture = Date.distantPast
-  @ObservationIgnored private weak var model: RoamingAppModel?
+  @ObservationIgnored
+  private var pendingPreview: Task<Void, Never>?
+  @ObservationIgnored
+  private weak var model: RoamingAppModel?
   #if canImport(WatchConnectivity)
-    @ObservationIgnored private var delegate: SessionDelegate?
+  @ObservationIgnored
+  private var delegate: SessionDelegate?
   #endif
 
-  init() {}
+  init() {
+    do {
+      let directory = try FileManager.default.url(
+        for: .applicationSupportDirectory,
+        in: .userDomainMask,
+        appropriateFor: nil,
+        create: true
+      )
+      let sequence = CompanionPublicationSequenceFile(
+        url: directory.appending(path: "Companion/publication-sequence")
+      )
+      let identity = try sequence.load()
+      core = PhoneWatchPublication(
+        bridge: PhoneCompanionBridge(
+          now: .now,
+          publicationRevision: identity.revision,
+          publisherID: identity.publisherID
+        ),
+        saveIdentity: { (try? sequence.save($0)) != nil }
+      )
+    } catch {
+      // Refuse publication if the durable watermark cannot be recovered.
+      core = nil
+    }
+  }
 
   /// Connects to the app model and, on an iPhone with WatchConnectivity
   /// support, activates the session. iPad has no paired watch.
   func attach(to model: RoamingAppModel) {
-    guard self.model == nil, model.profile.companionBridge else { return }
+    guard self.model == nil, model.profile.companionBridge, let core else {
+      return
+    }
     self.model = model
-    _ = core.withLock { $0.update(model.companionSettings, now: .now) }
-    if !model.companionSettings.sharingEnabled { attention.clear() }
+    _ = core.withBridge { $0.update(model.companionSettings, now: .now) }
     model.onSessionObservation = { [weak self] observation in
       self?.observe(observation)
     }
@@ -50,159 +79,140 @@ final class PhoneWatchBridge {
     }
     model.onCompanionSettingsChange = { [weak self] settings in
       guard let self else { return }
-      if !settings.sharingEnabled { attention.clear() }
-      if let context = core.withLock({ $0.update(settings, now: .now) }) {
-        publish(context)
+      let decision = core.withBridge {
+        bridge -> (CompanionApplicationContext?, Bool) in
+        let wasAllowed = bridge.settings.allowsPreview
+        let context = bridge.update(settings, now: .now)
+        return (context, settings.allowsPreview && !wasAllowed)
       }
+      if decision.0 != nil { publish() }
+      if decision.1 { capturePreview(force: true) }
     }
     #if canImport(WatchConnectivity)
-      guard WCSession.isSupported() else { return }
-      let delegate = SessionDelegate(core: core, attention: attention)
-      self.delegate = delegate
-      WCSession.default.delegate = delegate
-      WCSession.default.activate()
+    guard WCSession.isSupported() else { return }
+    let delegate = SessionDelegate(core: core)
+    self.delegate = delegate
+    WCSession.default.delegate = delegate
+    WCSession.default.activate()
     #endif
   }
 
   func setForeground(_ foreground: Bool) {
-    core.withLock { $0.setForeground(foreground) }
+    core?.withBridge { $0.setForeground(foreground) }
     if foreground { capturePreview(force: true) }
   }
 
   private func observe(_ observation: PhoneCompanionBridge.Observation) {
-    if let context = core.withLock({ $0.observe(observation) }) {
-      publish(context)
-    }
+    guard let core else { return }
+    if core.withBridge({ $0.observe(observation) }) != nil { publish() }
     capturePreview(force: false)
   }
 
   /// Pushes the visible rows into the bridge, throttled, only when the
   /// user opted in. The bridge discards them unless in the foreground.
   private func capturePreview(force: Bool) {
-    guard let model, model.companionSettings.allowsPreview else { return }
-    let now = Date.now
-    guard force || now.timeIntervalSince(lastPreviewCapture) >= Self.previewInterval
-    else { return }
-    guard let session = model.activeSession, let lines = session.previewLines?()
-    else {
-      core.withLock { $0.clearPreview() }
+    guard let model, let core, model.companionSettings.allowsPreview else {
+      pendingPreview?.cancel()
+      pendingPreview = nil
+      captureGate.cancelSchedule()
       return
     }
-    lastPreviewCapture = now
-    core.withLock { $0.observePreview(lines: lines, capturedAt: now) }
+    switch captureGate.decide(now: .now, force: force) {
+    case .skip: return
+    case let .schedule(delay):
+      pendingPreview?.cancel()
+      pendingPreview = Task { [weak self] in
+        try? await Task.sleep(for: .seconds(delay))
+        guard !Task.isCancelled else { return }
+        self?.capturePreview(force: true)
+      }
+    case let .capture(now):
+      pendingPreview?.cancel()
+      pendingPreview = nil
+      guard let session = model.activeSession,
+        let preview = session.companionPreview
+      else {
+        core.withBridge { $0.clearPreview() }
+        return
+      }
+      captureGate.didCapture(at: now)
+      core.withBridge {
+        $0.observePreview(lines: preview.lines, capturedAt: preview.capturedAt)
+      }
+    }
   }
 
-  private func publish(_ context: CompanionApplicationContext) {
+  private func publish() {
     #if canImport(WatchConnectivity)
-      guard WCSession.isSupported() else { return }
-      let session = WCSession.default
-      guard session.activationState == .activated, session.isPaired,
-        session.isWatchAppInstalled,
-        let dictionary = try? context.dictionary()
-      else { return }
-      // Latest-state only; status metadata, never preview text.
-      try? session.updateApplicationContext(attention.merged(into: dictionary, for: context))
+    guard WCSession.isSupported() else { return }
+    let session = WCSession.default
+    guard session.activationState == .activated, session.isPaired,
+      session.isWatchAppInstalled
+    else { return }
+    core?
+      .publish { dictionary in
+        (try? session.updateApplicationContext(dictionary)) != nil
+      }
     #endif
   }
 
-  /// Redacted attention summaries (no message text, no terminal output).
-  /// Replaces the previous batch; the companion status is resent with it.
+  /// Redacted attention summaries; no message text or terminal output.
   private func publishAttention(_ summaries: [AttentionSummary]) {
-    // Nothing is cached or sent to the watch while sharing is off.
-    guard core.withLock({ $0.settings.sharingEnabled }) else {
-      attention.clear()
-      return
-    }
-    guard let data = try? AttentionSummaryBatch(summaries: summaries).encoded()
-    else { return }
-    attention.set(data)
-    publish(core.withLock { $0.applicationContext })
-  }
-}
-
-/// The encoded attention batch, shared with the delegate queue.
-final class AttentionCache: Sendable {
-  private let data = Mutex<Data?>(nil)
-
-  func set(_ value: Data) { data.withLock { $0 = value } }
-
-  func clear() { data.withLock { $0 = nil } }
-
-  /// Adds the batch beside a status context. A `.cleared` context (sharing
-  /// off) never carries attention, and drops the cached batch.
-  func merged(
-    into dictionary: [String: Data],
-    for context: CompanionApplicationContext
-  ) -> [String: Data] {
-    guard case .status = context else {
-      clear()
-      return dictionary
-    }
-    var dictionary = dictionary
-    if let value = data.withLock({ $0 }) {
-      dictionary[AttentionSummaryBatch.dictionaryKey] = value
-    }
-    return dictionary
-  }
-}
-
-/// The bridge core behind a lock, so WatchConnectivity's delegate queue
-/// can answer immediately without hopping to the main actor.
-final class SharedBridge: Sendable {
-  private let state: Mutex<PhoneCompanionBridge>
-
-  init(_ bridge: PhoneCompanionBridge) {
-    state = Mutex(bridge)
-  }
-
-  func withLock<R: Sendable>(_ body: (inout PhoneCompanionBridge) -> R) -> R {
-    state.withLock { body(&$0) }
+    guard let core, core.setAttention(summaries) else { return }
+    publish()
   }
 }
 
 #if canImport(WatchConnectivity)
-  /// Answers watch requests from the shared core on the delegate queue.
-  final class SessionDelegate: NSObject, WCSessionDelegate, Sendable {
-    private let core: SharedBridge
-    private let attention: AttentionCache
+/// Answers watch requests from the shared core on the delegate queue.
+final class SessionDelegate: NSObject, WCSessionDelegate, Sendable {
+  private let core: PhoneWatchPublication
 
-    init(core: SharedBridge, attention: AttentionCache) {
-      self.core = core
-      self.attention = attention
-    }
+  init(core: PhoneWatchPublication) { self.core = core }
 
-    func session(
-      _ session: WCSession,
-      activationDidCompleteWith activationState: WCSessionActivationState,
-      error: (any Error)?
-    ) {
-      let context = core.withLock { $0.applicationContext }
-      guard activationState == .activated, session.isPaired,
-        let dictionary = try? context.dictionary()
-      else { return }
-      try? session.updateApplicationContext(attention.merged(into: dictionary, for: context))
-    }
-
-    func sessionDidBecomeInactive(_ session: WCSession) {}
-
-    func sessionDidDeactivate(_ session: WCSession) {
-      // Switching watches: reactivate for the newly paired one.
-      session.activate()
-    }
-
-    func session(
-      _ session: WCSession,
-      didReceiveMessageData messageData: Data,
-      replyHandler: @escaping (Data) -> Void
-    ) {
-      // Immediate reply from cached, iPhone-observed state. A malformed
-      // request gets an empty reply, which the watch rejects.
-      let reply = core.withLock { $0.reply(toMessageData: messageData) }
-      replyHandler(reply ?? Data())
-    }
-
-    func session(_ session: WCSession, didReceiveMessageData messageData: Data) {
-      // Requests without a reply handler are ignored.
+  func session(
+    _ session: WCSession,
+    activationDidCompleteWith activationState: WCSessionActivationState,
+    error: (any Error)?
+  ) {
+    guard activationState == .activated, session.isPaired,
+      session.isWatchAppInstalled
+    else { return }
+    core.publish { dictionary in
+      (try? session.updateApplicationContext(dictionary)) != nil
     }
   }
+
+  func sessionDidBecomeInactive(_ session: WCSession) {}
+
+  func sessionDidDeactivate(_ session: WCSession) {
+    // Switching watches: reactivate for the newly paired one.
+    session.activate()
+  }
+
+  func session(
+    _ session: WCSession,
+    didReceiveMessageData messageData: Data,
+    replyHandler: @escaping (Data) -> Void
+  ) {
+    // Immediate reply from cached, iPhone-observed state. A malformed
+    // request gets an empty reply, which the watch rejects.
+    let reply = core.reply(toMessageData: messageData)
+    replyHandler(reply ?? Data())
+    // A fresh whole context lets a confirmed new publisher replace its
+    // status and attention together. The receiver also handles the context
+    // arriving before this reply. Both sends use cached state only.
+    if reply != nil, session.activationState == .activated, session.isPaired,
+      session.isWatchAppInstalled
+    {
+      core.publish { dictionary in
+        (try? session.updateApplicationContext(dictionary)) != nil
+      }
+    }
+  }
+
+  func session(_ session: WCSession, didReceiveMessageData messageData: Data) {
+    // Requests without a reply handler are ignored.
+  }
+}
 #endif

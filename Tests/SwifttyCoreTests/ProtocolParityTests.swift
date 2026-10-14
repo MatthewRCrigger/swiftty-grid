@@ -602,10 +602,10 @@ struct ProtocolParityTests {
     #expect(
       TestFixture(vt.takeOutput())
         == TestFixture(
-          "\u{1B}]21;foreground=rgb:1010/2020/3030;cursor_text=;bogus=\u{1B}\\"
+          "\u{1B}]21;foreground=rgb:1010/2020/3030;cursor_text=;unknown=Ym9ndXM\u{1B}\\"
         )
     )
-    vt.feed("\u{1B}]21;foreground=;selection_background=;1=\u{07}")
+    vt.feed("\u{1B}]21;foreground;selection_background;1\u{07}")
     do {
       let ok = vt.state.palette.foreground == Palette.standard.foreground;
       #expect(ok)

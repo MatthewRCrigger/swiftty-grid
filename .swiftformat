@@ -5,5 +5,5 @@
 --wrapcollections before-first
 --stripunusedargs closure-only
 --disable redundantSelf,wrapMultilineStatementBraces,preferForLoop,hoistPatternLet,redundantReturn,swiftTestingTestCaseNames
---exclude Sources/SwifttyCore/Unicode/Tables.swift
+--exclude Sources/SwifttyEngine/Unicode/Tables.swift
 --ifdef no-indent

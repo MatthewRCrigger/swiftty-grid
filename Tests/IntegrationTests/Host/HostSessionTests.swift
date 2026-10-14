@@ -14,15 +14,104 @@ private func input(
   _ sequence: UInt64,
   _ operation: InputOperation
 ) -> ControlMessage {
-  .input(.init(attachmentEpoch: epoch, sequence: sequence, operation: operation))
+  .input(
+    .init(attachmentEpoch: epoch, sequence: sequence, operation: operation)
+  )
 }
 
 @Suite(.timeLimit(.minutes(1)))
 struct HostSessionTests {
+  @Test(arguments: [false, true])
+  func exhaustedResizeRevisionIsRejectedBeforeChangingGeometry(
+    _ pending: Bool
+  ) async throws {
+    try await withRegistry { registry in
+      let grant = try await registry.create(
+        grid: GridSize(columns: 80, rows: 24)
+      )
+      let session = try #require(registry.session(grant.sessionID))
+      let client = TestClient(registry)
+      defer { client.connection.close() }
+      _ = try await client.attached(grant)
+      _ = try await client.snapshot("initial prompt") {
+        screenText($0).contains("$")
+      }
+      let pid = try #require(await shellPID(registry, session))
+      let release = DispatchSemaphore(value: 0)
+      defer { release.signal() }
+      if pending {
+        let blocked = Mutex(false)
+        registry.service.queue.async {
+          blocked.withLock { $0 = true }
+          if release.wait(timeout: .now() + 10) == .timedOut {
+            Issue.record("resize service gate timed out")
+          }
+        }
+        try await hostEventually("resize service gate") {
+          blocked.withLock { $0 } ? true : nil
+        }
+      }
+      let resize = input(
+        1,
+        1,
+        .resize(columns: 90, rows: 30, resizeRevision: UInt64.max)
+      )
+      try await client.send(resize)
+      if !pending {
+        _ = try await client.message("maximum resize ack") {
+          if case .inputAck(1, 1) = $0 { true } else { false }
+        }
+      }
+      try await client.send(
+        input(1, 2, .resize(columns: 100, rows: 35, resizeRevision: UInt64.max))
+      )
+      _ = try await client.message("exhausted resize refused") {
+        if case let .error(error) = $0 {
+          error.code == .limitExceeded && error.sequence == 2
+        } else {
+          false
+        }
+      }
+      if pending {
+        #expect(session.diagnostics.lastAppliedInput == 0)
+        #expect(session.diagnostics.pendingInputOperations == 1)
+        #expect(session.diagnostics.resizeRevision == 0)
+        release.signal()
+      }
+      _ = try await client.message("maximum resize ack") {
+        if case .inputAck(1, 1) = $0 { true } else { false }
+      }
+      #expect(session.diagnostics.lastAppliedInput == 1)
+      #expect(session.diagnostics.pendingInputOperations == 0)
+      #expect(!session.diagnostics.writerFailed)
+      try await client.send(resize)
+      try await hostEventually("duplicate resize acknowledged") {
+        client.messages
+          .filter { if case .inputAck(1, 1) = $0 { true } else { false } }.count
+          == 2 ? true : nil
+      }
+      try await client.send(
+        input(1, 2, .committedText("echo retained-$((40+2))"))
+      )
+      try await client.send(input(1, 3, .key(SemanticKey(.enter))))
+      _ = try await client.message("input after refused resize") {
+        if case .inputAck(1, 3) = $0 { true } else { false }
+      }
+      let shown = try await client.snapshot("retained shell output") {
+        $0.textLines.contains("retained-42")
+      }
+      #expect(shown.columns == 90 && shown.rows == 30)
+      #expect(shown.resizeRevision == UInt64.max)
+      #expect(await shellPID(registry, session) == pid)
+    }
+  }
+
   @Test
   func `typed input appears in a snapshot after attaching`() async throws {
     try await withRegistry { registry in
-      let grant = try await registry.create(grid: GridSize(columns: 80, rows: 24))
+      let grant = try await registry.create(
+        grid: GridSize(columns: 80, rows: 24)
+      )
       let session = try #require(registry.session(grant.sessionID))
       // The SwiftMux service owns the shell from creation; the grant is
       // reserved until the first attachment.
@@ -37,7 +126,7 @@ struct HostSessionTests {
       #expect(await shellPID(registry, session) != nil)
       #expect(session.status.state == .attached)
       // The remote attachment holds the workspace lease.
-      let list = await registry.workspaces()
+      let list = try await registry.workspaces()
       #expect(list.first?.leaseHolder?.transport == .remote)
       _ = try await client.snapshot("prompt") { screenText($0).contains("$") }
 
@@ -62,26 +151,33 @@ struct HostSessionTests {
       // Duplicate of an applied operation: acknowledged, not rewritten.
       try await client.send(input(1, 1, .committedText("echo hello-$((40+2))")))
       try await hostEventually("second ack") {
-        client.messages.filter {
-          if case .inputAck(1, 1) = $0 { return true }
-          return false
-        }.count == 2 ? true : nil
+        client.messages
+          .filter {
+            if case .inputAck(1, 1) = $0 { return true }
+            return false
+          }
+          .count == 2 ? true : nil
       }
     }
   }
 
   @Test
-  func `losing the connection keeps the shell and reattach fences the old epoch`()
+  func
+    `losing the connection keeps the shell and reattach fences the old epoch`()
     async throws
   {
     try await withRegistry { registry in
-      let grant = try await registry.create(grid: GridSize(columns: 80, rows: 24))
+      let grant = try await registry.create(
+        grid: GridSize(columns: 80, rows: 24)
+      )
       let session = try #require(registry.session(grant.sessionID))
       let first = TestClient(registry)
       _ = try await first.attached(grant)
       try await first.send(input(1, 1, .committedText("echo marker-$((1+1))")))
       try await first.send(input(1, 2, .key(SemanticKey(.enter))))
-      _ = try await first.snapshot("marker") { $0.textLines.contains("marker-2") }
+      _ = try await first.snapshot("marker") {
+        $0.textLines.contains("marker-2")
+      }
       let pid = try #require(await shellPID(registry, session))
 
       // A1: abrupt loss never signals the shell.
@@ -137,7 +233,9 @@ struct HostSessionTests {
     async throws
   {
     try await withRegistry { registry in
-      let grant = try await registry.create(grid: GridSize(columns: 80, rows: 24))
+      let grant = try await registry.create(
+        grid: GridSize(columns: 80, rows: 24)
+      )
       let session = try #require(registry.session(grant.sessionID))
       let client = TestClient(registry)
       _ = try await client.attached(grant)
@@ -160,8 +258,8 @@ struct HostSessionTests {
       client.connection.sever()
       // A5: the service keeps parsing about 1.6 MB while detached.
       let deadline = ContinuousClock.now + .seconds(45)
-      while await !(session.currentSnapshot()?.textLines.contains("DONE-150000")
-        ?? false)
+      while await
+        !(session.currentSnapshot()?.textLines.contains("DONE-150000") ?? false)
       {
         guard ContinuousClock.now < deadline else {
           throw HostTestTimeout(what: "loop finished")
@@ -185,13 +283,19 @@ struct HostSessionTests {
   @Test
   func `resizes during alternate screen survive reattachment`() async throws {
     try await withRegistry { registry in
-      let grant = try await registry.create(grid: GridSize(columns: 80, rows: 24))
+      let grant = try await registry.create(
+        grid: GridSize(columns: 80, rows: 24)
+      )
       let client = TestClient(registry)
       _ = try await client.attached(grant)
       _ = try await client.snapshot("prompt") { screenText($0).contains("$") }
-      try await client.send(input(1, 1, .committedText("printf '\\033[?1049h'")))
+      try await client.send(
+        input(1, 1, .committedText("printf '\\033[?1049h'"))
+      )
       try await client.send(input(1, 2, .key(SemanticKey(.enter))))
-      _ = try await client.snapshot("alternate") { $0.activeBuffer == .alternate }
+      _ = try await client.snapshot("alternate") {
+        $0.activeBuffer == .alternate
+      }
 
       let sizes = [(100, 30), (60, 20), (150, 50), (120, 40)]
       for (i, size) in sizes.enumerated() {
@@ -199,7 +303,11 @@ struct HostSessionTests {
           input(
             1,
             UInt64(3 + i),
-            .resize(columns: size.0, rows: size.1, resizeRevision: UInt64(i + 1))
+            .resize(
+              columns: size.0,
+              rows: size.1,
+              resizeRevision: UInt64(i + 1)
+            )
           )
         )
       }
@@ -232,81 +340,92 @@ struct HostSessionTests {
   }
 
   @Test
-  func `terminal queries are answered once on the host and not sent to the client`()
+  func
+    `terminal queries are answered once on the host and not sent to the client`()
     async throws
   {
     let script =
       "stty -echo -icanon min 1; printf 'Q\\033[6n'; "
       + "r=$(dd bs=1 count=6 2>/dev/null | od -An -c | tr -d ' \\n'); "
       + "echo; echo \"GOT:$r\"; sleep 30"
-    try await withRegistry(launch: { shellLaunch(script) }, { registry in
-      let grant = try await registry.create(grid: GridSize(columns: 40, rows: 10))
-      let client = TestClient(registry)
-      _ = try await client.attached(grant)
-      _ = try await client.snapshot("reply read by the program") {
-        $0.textLines.contains("GOT:033[1;2R")
+    try await withRegistry(
+      launch: { shellLaunch(script) },
+      { registry in
+        let grant = try await registry.create(
+          grid: GridSize(columns: 40, rows: 10)
+        )
+        let client = TestClient(registry)
+        _ = try await client.attached(grant)
+        _ = try await client.snapshot("reply read by the program") {
+          $0.textLines.contains("GOT:033[1;2R")
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        // Answered by the pane's engine; no user input was sent. Nothing
+        // reached the client except attachment metadata and screens.
+        for message in client.messages {
+          if case .attached = message { continue }
+          Issue.record("unexpected message \(message.typeName)")
+        }
       }
-      try await Task.sleep(for: .milliseconds(200))
-      // Answered by the pane's engine; no user input was sent. Nothing
-      // reached the client except attachment metadata and screens.
-      for message in client.messages {
-        if case .attached = message { continue }
-        Issue.record("unexpected message \(message.typeName)")
-      }
-    })
+    )
   }
 
   @Test
   func `shell exit retains the final screen and status`() async throws {
     try await withRegistry(
-      launch: { shellLaunch("echo FINAL-OUTPUT; exit 3") }
-    , { registry in
-      let grant = try await registry.create(grid: GridSize(columns: 40, rows: 10))
-      let session = try #require(registry.session(grant.sessionID))
-      let client = TestClient(registry)
-      _ = try await client.attached(grant)
-      let exited = try await client.message("SessionExited") {
-        if case .sessionExited = $0 { return true }
-        return false
-      }
-      guard case let .sessionExited(epoch, status, revision) = exited else {
-        return
-      }
-      #expect(epoch == 1 && status == 3)
-      let final = try await client.snapshot("final screen") {
-        $0.screenRevision == revision
-      }
-      #expect(final.textLines.contains("FINAL-OUTPUT"))
-      #expect(session.status.state == .exited)
-      #expect(await registry.list().first?.state == .exited)
-      #expect(await registry.list().first?.exitStatus == 3)
+      launch: { shellLaunch("echo FINAL-OUTPUT; exit 3") },
+      { registry in
+        let grant = try await registry.create(
+          grid: GridSize(columns: 40, rows: 10)
+        )
+        let session = try #require(registry.session(grant.sessionID))
+        let client = TestClient(registry)
+        _ = try await client.attached(grant)
+        let exited = try await client.message("SessionExited") {
+          if case .sessionExited = $0 { return true }
+          return false
+        }
+        guard case let .sessionExited(epoch, status, revision) = exited else {
+          return
+        }
+        #expect(epoch == 1 && status == 3)
+        let final = try await client.snapshot("final screen") {
+          $0.screenRevision == revision
+        }
+        #expect(final.textLines.contains("FINAL-OUTPUT"))
+        #expect(session.status.state == .exited)
+        #expect(try await registry.list().first?.state == .exited)
+        #expect(try await registry.list().first?.exitStatus == 3)
 
-      try await client.send(input(1, 1, .committedText("x")))
-      #expect(try await client.errorCode() == .sessionExited)
+        try await client.send(input(1, 1, .committedText("x")))
+        #expect(try await client.errorCode() == .sessionExited)
 
-      // Reattaching within the retention window shows the final screen.
-      let again = TestClient(registry)
-      _ = try await again.attached(grant)
-      let shown = try await again.snapshot("retained") { $0.attachmentEpoch == 2 }
-      #expect(shown.textLines.contains("FINAL-OUTPUT"))
-      _ = try await again.message("SessionExited again") {
-        if case .sessionExited(2, 3, _) = $0 { return true }
-        return false
-      }
+        // Reattaching within the retention window shows the final screen.
+        let again = TestClient(registry)
+        _ = try await again.attached(grant)
+        let shown = try await again.snapshot("retained") {
+          $0.attachmentEpoch == 2
+        }
+        #expect(shown.textLines.contains("FINAL-OUTPUT"))
+        _ = try await again.message("SessionExited again") {
+          if case .sessionExited(2, 3, _) = $0 { return true }
+          return false
+        }
 
-      // Never swept while a client is attached to it.
-      #expect(await registry.sweep(now: .now + .seconds(301)).isEmpty)
-      again.connection.sever()
-      try await hostEventually("detached") {
-        session.status.isAttached ? nil : true
+        // Never swept while a client is attached to it.
+        #expect(await registry.sweep(now: .now + .seconds(301)).isEmpty)
+        again.connection.sever()
+        try await hostEventually("detached") {
+          session.status.isAttached ? nil : true
+        }
+        #expect(await registry.sweep(now: .now + .seconds(240)).isEmpty)
+        #expect(
+          await registry.sweep(now: .now + .seconds(301)) == [grant.sessionID]
+        )
+        // This host created the workspace and its shell exited: it ends.
+        #expect(try await registry.list().isEmpty)
       }
-      #expect(await registry.sweep(now: .now + .seconds(240)).isEmpty)
-      #expect(
-        await registry.sweep(now: .now + .seconds(301)) == [grant.sessionID]
-      )
-      // This host created the workspace and its shell exited: it ends.
-      #expect(await registry.list().isEmpty)
-    })
+    )
   }
 
   @Test
@@ -315,41 +434,48 @@ struct HostSessionTests {
     defer { try? FileManager.default.removeItem(at: directory) }
     let script =
       "trap '' HUP TERM; sleep 300 & echo $! > \"$HOME/bg\"; echo READY; wait"
-    try await withRegistry(launch: { shellLaunch(script, in: directory) }, {
-      registry in
-      let grant = try await registry.create(grid: GridSize(columns: 40, rows: 10))
-      let session = try #require(registry.session(grant.sessionID))
-      let client = TestClient(registry)
-      _ = try await client.attached(grant)
-      _ = try await client.snapshot("ready") { $0.textLines.contains("READY") }
-      let shell = try #require(await shellPID(registry, session))
-      let background = try await hostEventually("background pid") {
-        (try? String(
-          contentsOf: directory.appendingPathComponent("bg"),
-          encoding: .utf8
-        )).flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
-      }
-      #expect(isAlive(shell) && isAlive(background))
+    try await withRegistry(
+      launch: { shellLaunch(script, in: directory) },
+      { registry in
+        let grant = try await registry.create(
+          grid: GridSize(columns: 40, rows: 10)
+        )
+        let session = try #require(registry.session(grant.sessionID))
+        let client = TestClient(registry)
+        _ = try await client.attached(grant)
+        _ = try await client.snapshot("ready") {
+          $0.textLines.contains("READY")
+        }
+        let shell = try #require(await shellPID(registry, session))
+        let background = try await hostEventually("background pid") {
+          (try? String(
+            contentsOf: directory.appendingPathComponent("bg"),
+            encoding: .utf8
+          ))
+          .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        }
+        #expect(isAlive(shell) && isAlive(background))
 
-      try await client.send(.terminate(epoch: 1))
-      _ = try await client.message("Terminated") {
-        if case .terminated(1) = $0 { return true }
-        return false
-      }
-      // SIGHUP is ignored; the pane's SIGKILL ends the group.
-      try await hostEventually("process group gone", timeout: .seconds(10)) {
-        !isAlive(shell) && !isAlive(background) ? true : nil
-      }
-      try await hostEventually("session removed") {
-        registry.session(grant.sessionID) == nil ? true : nil
-      }
-      #expect(session.status.state == .terminated)
+        try await client.send(.terminate(epoch: 1))
+        _ = try await client.message("Terminated") {
+          if case .terminated(1) = $0 { return true }
+          return false
+        }
+        // SIGHUP is ignored; the pane's SIGKILL ends the group.
+        try await hostEventually("process group gone", timeout: .seconds(10)) {
+          !isAlive(shell) && !isAlive(background) ? true : nil
+        }
+        try await hostEventually("session removed") {
+          registry.session(grant.sessionID) == nil ? true : nil
+        }
+        #expect(session.status.state == .terminated)
 
-      // The revoked capability no longer attaches.
-      let late = TestClient(registry)
-      try await late.attach(grant)
-      #expect(try await late.errorCode() == .unknownSession)
-    })
+        // The revoked capability no longer attaches.
+        let late = TestClient(registry)
+        try await late.attach(grant)
+        #expect(try await late.errorCode() == .unknownSession)
+      }
+    )
   }
 }
 #endif

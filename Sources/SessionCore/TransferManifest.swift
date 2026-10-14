@@ -25,6 +25,7 @@ public struct RemoteFileIdentity: Hashable, Sendable, Codable {
 /// locally from verified reads (download). Resume re-verifies that prefix
 /// by SHA-256 before trusting it.
 public struct TransferManifest: Hashable, Sendable, Codable, Identifiable {
+  public static let maxEncodedBytes = 64 * 1024
   public enum Direction: String, Hashable, Sendable, Codable {
     case upload, download
   }
@@ -112,24 +113,40 @@ public struct TransferManifest: Hashable, Sendable, Codable, Identifiable {
   /// Whether this manifest describes a verified, published file.
   public var isComplete: Bool { state == .completed }
 
+  /// Progress remains within the source and restart history is nonnegative.
+  /// Checked at decode and again when mutable manifests are resumed.
+  public var hasValidProgress: Bool {
+    acknowledgedOffset <= sourceSize && restartCount >= 0
+  }
+
   /// Encodes the manifest for durable, non-secret storage.
   public func encoded() throws -> Data {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-    return try encoder.encode(self)
+    let data = try encoder.encode(self)
+    guard data.count <= Self.maxEncodedBytes, hasValidProgress else {
+      throw EncodingError.invalidValue(
+        self,
+        .init(
+          codingPath: [],
+          debugDescription: "invalid or oversized transfer manifest"
+        )
+      )
+    }
+    return data
   }
 
   /// Decodes a stored manifest, rejecting oversized input before parsing.
   public static func decode(_ data: Data) throws -> TransferManifest {
-    guard data.count <= 64 * 1024 else {
+    guard data.count <= Self.maxEncodedBytes else {
       throw DecodingError.dataCorrupted(
         .init(codingPath: [], debugDescription: "manifest too large")
       )
     }
     let manifest = try JSONDecoder().decode(TransferManifest.self, from: data)
-    guard manifest.acknowledgedOffset <= manifest.sourceSize else {
+    guard manifest.hasValidProgress else {
       throw DecodingError.dataCorrupted(
-        .init(codingPath: [], debugDescription: "offset beyond source")
+        .init(codingPath: [], debugDescription: "invalid transfer progress")
       )
     }
     return manifest

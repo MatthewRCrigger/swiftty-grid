@@ -75,7 +75,7 @@ func eventually(
 /// A small RST/1 host: ledgered input applied to a one-line screen,
 /// snapshots via `SnapshotFrame.encode`, and knobs for failure injection.
 actor FakeHost {
-  struct Link {
+  struct Link: Sendable {
     var connection: InMemoryRSTConnection
     var reader = ControlRecordReader()
     var epoch: UInt64?
@@ -100,6 +100,7 @@ actor FakeHost {
   var columns = 20
   var rows = 4
   var nextStream: UInt64 = 0
+  var limits = NegotiatedLimits()
 
   /// Oracle: sequences in the order the PTY applied them.
   private(set) var applied: [UInt64] = []
@@ -109,6 +110,7 @@ actor FakeHost {
   private(set) var attachCount = 0
   private(set) var detachCount = 0
   private(set) var terminateCount = 0
+  private(set) var screenAckCount = 0
 
   var links: [ObjectIdentifier: Link] = [:]
   var current: ObjectIdentifier?
@@ -117,17 +119,22 @@ actor FakeHost {
   var withholdAcks = false
   var dropInputsAfter: UInt64?
   var sendSnapshotOnAttach = true
+  var withholdAttached = false
+  private var pendingAttached: (ControlMessage, ObjectIdentifier)?
   var sessionGone = false
 
-  init() throws {
-    try ledger.authorize(writer)
-  }
+  init() throws { try ledger.authorize(writer) }
+
+  deinit { for link in links.values { link.connection.close() } }
 
   func set(
     withholdAcks: Bool? = nil,
     dropInputsAfter: UInt64?? = nil,
     sendSnapshotOnAttach: Bool? = nil,
-    sessionGone: Bool? = nil
+    sessionGone: Bool? = nil,
+    withholdAttached: Bool? = nil,
+    resizeRevision: UInt64? = nil,
+    limits: NegotiatedLimits? = nil
   ) {
     if let withholdAcks { self.withholdAcks = withholdAcks }
     if let dropInputsAfter { self.dropInputsAfter = dropInputsAfter }
@@ -135,6 +142,15 @@ actor FakeHost {
       self.sendSnapshotOnAttach = sendSnapshotOnAttach
     }
     if let sessionGone { self.sessionGone = sessionGone }
+    if let withholdAttached { self.withholdAttached = withholdAttached }
+    if let resizeRevision { self.resizeRevision = resizeRevision }
+    if let limits { self.limits = limits }
+  }
+
+  func releaseAttached() async {
+    guard let (message, id) = pendingAttached else { return }
+    pendingAttached = nil
+    await send(message, to: id)
   }
 
   func makeGrant() -> BootstrapGrant {
@@ -147,15 +163,15 @@ actor FakeHost {
       serverCertificateSHA256: hexString([1, 2, 3]),
       applicationToken: token,
       tokenExpiresAt: tokenExpiresAt,
-      initialGrid: GridSize(columns: columns, rows: rows)
+      initialGrid: GridSize(columns: columns, rows: rows),
+      limits: limits
     )
   }
 
   /// SSH bootstrap: create or resume; resume revokes the old token.
   func bootstrap(_ request: BootstrapRequest) -> BootstrapResponse {
     switch request.operation {
-    case .create:
-      return .granted(makeGrant())
+    case .create: return .granted(makeGrant())
     case .resume:
       guard !sessionGone, request.sessionID == sessionID else {
         return .failure(.unknownSession)
@@ -178,10 +194,8 @@ actor FakeHost {
     case .terminate:
       terminateCount += 1
       return .terminated(sessionID)
-    case .list:
-      return .sessions([])
-    case .attention:
-      return .failure(.unsupportedVersion)
+    case .list: return .sessions([])
+    case .attention: return .failure(.unsupportedVersion)
     }
   }
 
@@ -190,10 +204,17 @@ actor FakeHost {
     links[id] = Link(connection: connection)
     connection.start(
       RSTConnectionHandler(
-        onControl: { [self] bytes in await receive(bytes, from: id) },
-        onClosed: { _ in }
+        onControl: { [weak self] bytes in await self?.receive(bytes, from: id)
+        },
+        onClosed: { [weak self] _ in Task { await self?.forget(id) } }
       )
     )
+  }
+
+  private func forget(_ id: ObjectIdentifier) {
+    links.removeValue(forKey: id)
+    if current == id { current = nil }
+    if pendingAttached?.1 == id { pendingAttached = nil }
   }
 
   /// Another client (e.g. the Mac app) resized the session.
@@ -217,14 +238,32 @@ actor FakeHost {
 
   func exit(status: Int32) async {
     guard let current, let epoch = links[current]?.epoch else { return }
-    await send(.sessionExited(epoch: epoch, status: status, finalScreenRevision: screenRevision), to: current)
+    await send(
+      .sessionExited(
+        epoch: epoch,
+        status: status,
+        finalScreenRevision: screenRevision
+      ),
+      to: current
+    )
+  }
+
+  /// Delivers the exact frame whose header a test used to set its limits.
+  func sendEncodedSnapshotForTesting(_ payload: [UInt8]) async throws {
+    let id = try #require(current)
+    let link = try #require(links[id])
+    nextStream += 1
+    try await link.connection.sendSnapshot(payload, stream: nextStream)
   }
 
   /// Sends the current screen on the current connection.
   func sendScreen() async {
     guard let current, let epoch = links[current]?.epoch else { return }
     screenRevision += 1
-    await sendSnapshot(makeSnapshot(epoch: epoch, revision: screenRevision), to: current)
+    await sendSnapshot(
+      makeSnapshot(epoch: epoch, revision: screenRevision),
+      to: current
+    )
   }
 
   /// Sends an arbitrary screen (stale-frame tests) without touching the
@@ -236,7 +275,37 @@ actor FakeHost {
     await sendSnapshot(snapshot, to: current)
   }
 
+  /// Sends a frame while leaving input/probe responses blackholed.
+  func sendUnansweredScreen(
+    epoch: UInt64,
+    revision: UInt64,
+    malformed: Bool = false,
+    wrongSession: Bool = false
+  ) async throws {
+    let id = try #require(current)
+    let link = try #require(links[id])
+    var snapshot = makeSnapshot(epoch: epoch, revision: revision)
+    if wrongSession { snapshot.sessionID = SessionID.random() }
+    let payload = malformed ? [0] : try SnapshotFrame.encode(snapshot)
+    nextStream += 1
+    try await link.connection.sendSnapshot(payload, stream: nextStream)
+  }
+
   var currentEpoch: UInt64? { current.flatMap { links[$0]?.epoch } }
+
+  func sendControlForTesting(_ message: ControlMessage) async {
+    guard let current else { return }
+    await send(message, to: current)
+  }
+
+  func sendSnapshotForTesting(_ snapshot: ScreenSnapshot) async {
+    guard let current else { return }
+    await sendSnapshot(snapshot, to: current)
+  }
+
+  func snapshotForTesting() -> ScreenSnapshot {
+    makeSnapshot(epoch: max(1, epoch), revision: screenRevision + 1)
+  }
 
   // MARK: Protocol
 
@@ -272,18 +341,20 @@ actor FakeHost {
       epoch += 1
       links[id]?.epoch = epoch
       current = id
-      await send(
-        .attached(
-          .init(
-            attachmentEpoch: epoch,
-            writerID: attach.writerID,
-            lastFullyAppliedInputSequence: ledger.lastApplied,
-            partialInputSequence: ledger.partialSequence,
-            resizeRevision: resizeRevision
-          )
-        ),
-        to: id
+      let attached = ControlMessage.attached(
+        .init(
+          attachmentEpoch: epoch,
+          writerID: attach.writerID,
+          lastFullyAppliedInputSequence: ledger.lastApplied,
+          partialInputSequence: ledger.partialSequence,
+          resizeRevision: resizeRevision
+        )
       )
+      if withholdAttached {
+        pendingAttached = (attached, id)
+      } else {
+        await send(attached, to: id)
+      }
       if sendSnapshotOnAttach { await sendScreen() }
     case let .input(input):
       received.append(
@@ -299,18 +370,15 @@ actor FakeHost {
       }
       if let limit = dropInputsAfter, input.sequence > limit { return }
       await apply(input, from: id)
-    case let .ping(e, nonce):
-      await send(.pong(epoch: e, nonce: nonce), to: id)
+    case let .ping(e, nonce): await send(.pong(epoch: e, nonce: nonce), to: id)
     case let .detach(e):
       detachCount += 1
       await send(.detached(epoch: e), to: id)
     case let .terminate(e):
       terminateCount += 1
       await send(.terminated(epoch: e), to: id)
-    case .screenAck:
-      break
-    default:
-      await send(.error(.init(.malformed)), to: id)
+    case .screenAck: screenAckCount += 1
+    default: await send(.error(.init(.malformed)), to: id)
     }
   }
 
@@ -336,7 +404,8 @@ actor FakeHost {
         resizes.append(input.operation)
       }
       ledger.record(input.sequence, operation: input.operation, bytes: bytes)
-      let done = bytes.isEmpty ? ledger.completeHead() : ledger.wrote(bytes.count)
+      let done =
+        bytes.isEmpty ? ledger.completeHead() : ledger.wrote(bytes.count)
       precondition(done == input.sequence)
       applied.append(input.sequence)
       if case let .committedText(t) = input.operation { text += t }
@@ -347,19 +416,19 @@ actor FakeHost {
       await sendScreen()
     case .alreadyApplied:
       await send(.inputAck(epoch: epoch, sequence: input.sequence), to: id)
-    case .inProgress:
-      break
+    case .inProgress: break
     case let .rejected(rejection):
-      await send(.error(.init(RSTErrorCode(rejection), sequence: input.sequence)), to: id)
+      await send(
+        .error(.init(RSTErrorCode(rejection), sequence: input.sequence)),
+        to: id
+      )
     }
   }
 
   private func send(_ message: ControlMessage, to id: ObjectIdentifier) async {
     guard let link = links[id], !link.blackHole else { return }
     let record: [UInt8]
-    do {
-      record = try ControlRecord.encode(message)
-    } catch {
+    do { record = try ControlRecord.encode(message) } catch {
       Issue.record(error)
       return
     }
@@ -374,9 +443,7 @@ actor FakeHost {
     nextStream += 1
     let stream = nextStream
     let payload: [UInt8]
-    do {
-      payload = try SnapshotFrame.encode(snapshot)
-    } catch {
+    do { payload = try SnapshotFrame.encode(snapshot) } catch {
       Issue.record(error)
       return
     }
@@ -416,7 +483,8 @@ final class FakeBootstrapper: RemoteBootstrapper {
 
   init(host: FakeHost) { self.host = host }
 
-  func bootstrap(_ request: BootstrapRequest) async throws -> BootstrapResponse {
+  func bootstrap(_ request: BootstrapRequest) async throws -> BootstrapResponse
+  {
     requests.withLock { $0.append(request) }
     let fail = unreachableCount.withLock { n -> Bool in
       guard n > 0 else { return false }
@@ -430,6 +498,7 @@ final class FakeBootstrapper: RemoteBootstrapper {
 
 actor FakeConnector: RSTConnector {
   let host: FakeHost
+  private(set) var currentConnection: InMemoryRSTConnection?
   private(set) var connectCount = 0
   private(set) var inFlight = 0
   private(set) var maxInFlight = 0
@@ -455,9 +524,7 @@ actor FakeConnector: RSTConnector {
     inFlight += 1
     maxInFlight = max(maxInFlight, inFlight)
     defer { inFlight -= 1 }
-    if blocked {
-      await withCheckedContinuation { waiters.append($0) }
-    }
+    if blocked { await withCheckedContinuation { waiters.append($0) } }
     // Hold the slot briefly so overlapping attempts would be observed.
     try? await Task.sleep(for: .milliseconds(2))
     if failuresRemaining > 0 {
@@ -466,6 +533,7 @@ actor FakeConnector: RSTConnector {
     }
     let (client, server) = InMemoryRSTConnection.pair()
     await host.accept(server)
+    currentConnection = client
     return client
   }
 }
@@ -538,10 +606,17 @@ struct RoamingFixture {
 /// A credit-respecting channel: output is delivered only while credit
 /// remains (overshooting by at most one chunk, like a transport read).
 final class FakeByteChannel: TerminalByteChannel {
+  private enum Delivery {
+    case output([UInt8])
+    case exit(TerminalChannelExit)
+  }
+
   struct State {
     var handler: TerminalChannelHandler?
     var credit = 0
     var pending: [[UInt8]] = []
+    var pendingExit: TerminalChannelExit?
+    var finished = false
     var delivering = false
     var delivered = 0
     var writes: [[UInt8]] = []
@@ -552,7 +627,7 @@ final class FakeByteChannel: TerminalByteChannel {
   let state = Mutex(State())
 
   func start(_ handler: TerminalChannelHandler) {
-    state.withLock { $0.handler = handler }
+    state.withLock { if !$0.finished { $0.handler = handler } }
     pumpOutput()
   }
 
@@ -563,41 +638,59 @@ final class FakeByteChannel: TerminalByteChannel {
 
   /// Remote program output.
   func feed(_ chunk: [UInt8]) {
-    state.withLock { $0.pending.append(chunk) }
+    state.withLock { s in
+      guard !s.finished, s.pendingExit == nil else { return }
+      s.pending.append(chunk)
+    }
     pumpOutput()
   }
 
   func exit(_ exit: TerminalChannelExit) {
-    let handler = state.withLock { $0.handler }
-    handler?.onExit(exit)
+    state.withLock { s in
+      guard !s.finished, s.pendingExit == nil else { return }
+      s.pendingExit = exit
+    }
+    pumpOutput()
   }
 
   private func pumpOutput() {
     let claimed = state.withLock { s -> Bool in
-      guard !s.delivering else { return false }
+      guard !s.delivering, !s.finished else { return false }
       s.delivering = true
       return true
     }
     guard claimed else { return }
     while true {
-      let next = state.withLock { s -> ([UInt8], TerminalChannelHandler)? in
-        guard s.credit > 0, !s.pending.isEmpty, let handler = s.handler else {
+      let next = state.withLock { s -> (Delivery, TerminalChannelHandler)? in
+        guard let handler = s.handler else {
           s.delivering = false
           return nil
         }
-        let chunk = s.pending.removeFirst()
-        s.credit -= chunk.count
-        s.delivered += chunk.count
-        return (chunk, handler)
+        if !s.pending.isEmpty {
+          guard s.credit > 0 else {
+            s.delivering = false
+            return nil
+          }
+          let chunk = s.pending.removeFirst()
+          s.credit -= chunk.count
+          s.delivered += chunk.count
+          return (.output(chunk), handler)
+        }
+        if let exit = s.pendingExit {
+          s.pendingExit = nil
+          s.finished = true
+          s.handler = nil
+          return (.exit(exit), handler)
+        }
+        s.delivering = false
+        return nil
       }
-      guard let (chunk, handler) = next else { break }
-      handler.onOutput(chunk)
+      guard let (delivery, handler) = next else { break }
+      switch delivery {
+      case let .output(chunk): handler.onOutput(chunk)
+      case let .exit(exit): handler.onExit(exit)
+      }
     }
-    // Credit granted while finishing: deliver it too.
-    let again = state.withLock { s in
-      s.credit > 0 && !s.pending.isEmpty && !s.delivering
-    }
-    if again { pumpOutput() }
   }
 
   func write(_ bytes: [UInt8]) async throws {
@@ -608,6 +701,8 @@ final class FakeByteChannel: TerminalByteChannel {
     state.withLock { $0.resizes.append(GridSize(columns: columns, rows: rows)) }
   }
 
+  // Keep credit-driven delivery available as a probe: backpressure tests
+  // must detect credit incorrectly returned by a backend after close.
   func close() async { state.withLock { $0.closed = true } }
 
   var delivered: Int { state.withLock { $0.delivered } }

@@ -4,11 +4,7 @@ public enum SSHClientError: Error, Equatable, Sendable {
   /// The presented host key differs from the trusted key for this host
   /// identity. Fails closed and blocks automatic reconnection until the
   /// user explicitly replaces the trusted key.
-  case hostKeyChanged(
-    host: HostIdentity,
-    expected: String,
-    presented: String
-  )
+  case hostKeyChanged(host: HostIdentity, expected: String, presented: String)
   /// An unknown host key was not approved by the trust decider.
   case hostKeyRejected(host: HostIdentity, fingerprint: String)
   /// The trust store could not be read or updated.
@@ -16,6 +12,9 @@ public enum SSHClientError: Error, Equatable, Sendable {
   /// The server rejected every offered credential.
   case authenticationFailed
   case connectTimeout
+  case execTimeout
+  /// Remote session-channel acceptance or PTY/shell setup exceeded its deadline.
+  case channelSetupTimeout
   case connectionClosed
   case invalidConfiguration(String)
   /// The server refused a channel or channel request.

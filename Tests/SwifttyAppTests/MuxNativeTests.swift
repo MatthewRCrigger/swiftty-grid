@@ -8,6 +8,7 @@ import SwiftMuxService
 import SwifttyCore
 import SwifttyMac
 import Testing
+import TestSupport
 
 /// Drives the native SwiftMux window against an in-process service with
 /// real shells: Metal presentation, semantic input, IME, frozen selection,
@@ -18,15 +19,7 @@ struct MuxNativeTests {
   nonisolated static let hasMetal = MTLCreateSystemDefaultDevice() != nil
 
   static func launcher() throws -> String {
-    var dir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-    while dir.path != "/" {
-      for config in ["debug", "out/Products/Debug", "release"] {
-        let path = dir.appending(path: ".build/\(config)/swmux-launcher").path
-        if FileManager.default.isExecutableFile(atPath: path) { return path }
-      }
-      dir = dir.deletingLastPathComponent()
-    }
-    throw MuxError(.notFound, "build swmux-launcher first (swift build)")
+    try NativeTestProducts.launcherPath()
   }
 
   struct Fixture {
@@ -38,7 +31,7 @@ struct MuxNativeTests {
 
   func open() async throws -> Fixture {
     _ = NSApplication.shared
-    let service = MuxService(
+    let service = try MuxService(
       configuration: MuxServiceConfiguration(launcherPath: try Self.launcher())
     )
     let endpoint = service.listenAnonymously()
@@ -46,31 +39,58 @@ struct MuxNativeTests {
       endpoint: endpoint,
       frontend: .native
     )
-    let launch = LaunchSpec(
-      command: ["/bin/sh"],
-      workingDirectory: "/tmp",
-      environment: [
-        "PATH": "/usr/bin:/bin", "PS1": "$ ", "HOME": NSTemporaryDirectory(),
-      ]
-    )
-    guard
-      case let .created(ws) = try await connection.execute(
-        .newWorkspace(NewWorkspaceRequest(launch: launch))
+    do {
+      let launch = LaunchSpec(
+        command: ["/bin/sh"],
+        workingDirectory: "/tmp",
+        environment: [
+          "PATH": "/usr/bin:/bin", "PS1": "$ ", "HOME": NSTemporaryDirectory(),
+        ]
       )
-    else { throw MuxError(.invalidRequest) }
-    let controller = try await MuxWorkspaceController.open(
-      .id(ws.id),
-      configuration: Configuration(),
-      connection: connection
-    )
-    controller.window?.isReleasedWhenClosed = false
-    controller.showWindow(nil)
-    return Fixture(
-      service: service,
-      endpoint: endpoint,
-      controller: controller,
-      workspace: ws.id
-    )
+      guard
+        case let .created(ws) = try await connection.execute(
+          .newWorkspace(NewWorkspaceRequest(launch: launch))
+        )
+      else { throw MuxError(.invalidRequest) }
+      let controller = try await MuxWorkspaceController.open(
+        .id(ws.id),
+        configuration: Configuration(),
+        connection: connection
+      )
+      controller.window?.isReleasedWhenClosed = false
+      controller.showWindow(nil)
+      return Fixture(
+        service: service,
+        endpoint: endpoint,
+        controller: controller,
+        workspace: ws.id
+      )
+    } catch {
+      await connection.close()
+      await withCheckedContinuation { continuation in
+        service.prepareToExit { continuation.resume() }
+      }
+      throw error
+    }
+  }
+
+  func retire(_ fixture: Fixture) async {
+    await fixture.controller.detach()
+    fixture.controller.close()
+    await withCheckedContinuation { continuation in
+      fixture.service.prepareToExit { continuation.resume() }
+    }
+  }
+
+  func withFixture(
+    _ work: @MainActor (Fixture) async throws -> Void
+  ) async throws {
+    let fixture = try await open()
+    try await RuntimeFixture.withCleanup {
+      try await work(fixture)
+    } cleanup: {
+      await retire(fixture)
+    }
   }
 
   /// Draws (the display link is not running in tests) until `predicate`
@@ -189,6 +209,7 @@ struct MuxNativeTests {
   func `splits, divider ratios and close detach keep the shell`() async throws {
     let f = try await open()
     let c = f.controller
+    defer { c.close() }
     let first = try #require(c.activePane)
     let firstView = try #require(c.views[first])
     let full = try #require(await waitPresented(firstView) { _ in true })
@@ -221,19 +242,23 @@ struct MuxNativeTests {
       endpoint: f.endpoint,
       frontend: .control
     )
-    var attached = true
-    for _ in 0 ..< 100 where attached {
-      if case let .status(s) = try await control.execute(.status) {
-        attached = s.attached
+    try await RuntimeFixture.withCleanup {
+      var attached = true
+      for _ in 0 ..< 100 where attached {
+        if case let .status(s) = try await control.execute(.status) {
+          attached = s.attached
+        }
+        try await Task.sleep(for: .milliseconds(20))
       }
-      try await Task.sleep(for: .milliseconds(20))
+      #expect(!attached)
+      guard
+        case let .workspaces(list) = try await control.execute(.listWorkspaces)
+      else { return }
+      #expect(list.first?.paneCount == 2)
+      #expect(await f.service.panePID(first) == pid)
+    } cleanup: {
+      await control.close()
     }
-    #expect(!attached)
-    guard
-      case let .workspaces(list) = try await control.execute(.listWorkspaces)
-    else { return }
-    #expect(list.first?.paneCount == 2)
-    #expect(await f.service.panePID(first) == pid)
   }
 
   @Test(.enabled(if: hasMetal))

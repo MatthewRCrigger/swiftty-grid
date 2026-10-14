@@ -65,6 +65,7 @@ public final class RoamingSession: @unchecked Sendable {
   let queue: DispatchQueue
   private let service: MuxService
   private let statusBox: Mutex<Status>
+  private let snapshotEncoder: @Sendable (ScreenSnapshot) throws -> [UInt8]
   private let encodeQueue = DispatchQueue(
     label: "swiftmux.roaming.snapshot-encode",
     qos: .utility
@@ -76,6 +77,21 @@ public final class RoamingSession: @unchecked Sendable {
 
   // MARK: Owner-queue state
 
+  /// Revocation is visible to the service without entering the owner queue.
+  /// Commands admitted before revocation may finish; later ones are refused.
+  private final class LeaseAdmission: Sendable {
+    private let active = Mutex(true)
+    private let connection: any RSTConnection
+
+    init(connection: any RSTConnection) { self.connection = connection }
+
+    var isAllowed: Bool { active.withLock { $0 } && !connection.isClosed }
+
+    func revoke() { active.withLock { $0 = false } }
+  }
+
+  private var leaseAdmission: LeaseAdmission?
+  private var authorizationToken: ApplicationToken?
   private var ledger: HostInputLedger
   private var attachment: HostAttachment?
   private var mux: MuxLocalSession?
@@ -84,6 +100,7 @@ public final class RoamingSession: @unchecked Sendable {
   /// Called once the previous lease is fully released.
   private var afterClose: [() -> Void] = []
   private var closing = false
+  private var awaitingServiceClose = false
   private var inputInFlight = false
   /// Increments per attach; only the newest may acquire the lease.
   private var attachGeneration: UInt64 = 0
@@ -112,13 +129,17 @@ public final class RoamingSession: @unchecked Sendable {
     service: MuxService,
     grid: GridSize,
     floor: Floor = Floor(),
-    pendingInputLimit: Int = RSTLimits.maxPendingInputBytes
+    pendingInputLimit: Int = RSTLimits.maxPendingInputBytes,
+    snapshotEncoder: @escaping @Sendable (ScreenSnapshot) throws -> [UInt8] = {
+      try SnapshotFrame.encode($0)
+    }
   ) {
     epoch = floor.epoch
     screenRevision = floor.screenRevision
     resizeRevision = floor.resizeRevision
     self.id = id
     self.service = service
+    self.snapshotEncoder = snapshotEncoder
     columns = grid.columns
     rows = grid.rows
     ledger = HostInputLedger(byteLimit: pendingInputLimit)
@@ -142,6 +163,13 @@ public final class RoamingSession: @unchecked Sendable {
 
   public var status: Status { statusBox.withLock { $0 } }
 
+  var attachmentAttemptGeneration: UInt64 { queue.sync { attachGeneration } }
+
+  /// Whether an attachment is waiting for its service lease.
+  var isAcquiringLease: Bool {
+    queue.sync { mux != nil && muxAttachment == nil }
+  }
+
   public var diagnostics: Diagnostics {
     queue.sync {
       Diagnostics(
@@ -157,13 +185,26 @@ public final class RoamingSession: @unchecked Sendable {
   }
 
   /// Where a replacement session must start (see `Floor`).
-  public var floor: Floor {
+  public var floor: Floor { queue.sync { floorOnQueue() } }
+
+  private func floorOnQueue() -> Floor {
+    var floor = Floor()
+    floor.epoch = epoch
+    floor.screenRevision = screenRevision
+    floor.resizeRevision = resizeRevision
+    return floor
+  }
+
+  /// Checks retention and closes remote admission on the same owner turn,
+  /// so a pending lease cannot advance beyond the retired revision floor.
+  func retire(
+    when shouldRetire: (Status) -> Bool
+  ) -> (status: Status, floor: Floor)? {
     queue.sync {
-      var floor = Floor()
-      floor.epoch = epoch
-      floor.screenRevision = screenRevision
-      floor.resizeRevision = resizeRevision
-      return floor
+      let status = statusBox.withLock { $0 }
+      guard shouldRetire(status) else { return nil }
+      endAuthorizationOnQueue()
+      return (status, floorOnQueue())
     }
   }
 
@@ -172,11 +213,19 @@ public final class RoamingSession: @unchecked Sendable {
 
   /// Installs `writer` for subsequent input (bootstrap create/resume). A
   /// different writer may take over only when no admitted operation is
-  /// incomplete.
-  public func authorize(
-    writer: WriterID
-  ) throws(HostInputLedger.Rejection) {
-    let result: Result<Void, HostInputLedger.Rejection> = queue.sync {
+  /// incomplete. Terminated sessions refuse authorization.
+  public func authorize(writer: WriterID) throws(HostInputLedger.Rejection) {
+    guard try authorize(writer: writer, token: nil) else { throw .wrongWriter }
+  }
+
+  /// Returns false when the workspace's remote authorization has ended.
+  @discardableResult
+  func authorize(
+    writer: WriterID,
+    token: ApplicationToken?
+  ) throws(HostInputLedger.Rejection) -> Bool {
+    let result: Result<Bool, HostInputLedger.Rejection> = queue.sync {
+      guard !terminated else { return .success(false) }
       do throws(HostInputLedger.Rejection) {
         if ledger.writerID != writer, !inputInFlight {
           // Operations here are written whole or not at all, and none is
@@ -185,12 +234,12 @@ public final class RoamingSession: @unchecked Sendable {
           ledger.abandonUnsent()
         }
         try ledger.authorize(writer)
-        return .success(())
-      } catch {
-        return .failure(error)
-      }
+        revokeLeaseAdmission()
+        authorizationToken = token
+        return .success(true)
+      } catch { return .failure(error) }
     }
-    try result.get()
+    return try result.get()
   }
 
   /// An owned export of the active pane's screen (diagnostics and tests).
@@ -198,25 +247,29 @@ public final class RoamingSession: @unchecked Sendable {
     let (pane, stamp) = queue.sync { (activePane, stamp(epoch: epoch)) }
     guard let pane else { return nil }
     return await withCheckedContinuation { continuation in
-      service.inspect(pane: pane, { ScreenExporter.export($0, stamp: stamp) }, completion: {
-        continuation.resume(returning: $0)
-      })
+      service.inspect(
+        pane: pane,
+        { ScreenExporter.export($0, stamp: stamp) },
+        completion: { continuation.resume(returning: $0) }
+      )
     }
   }
 
-  /// The service ended the workspace: close any attachment.
-  func markTerminated() {
-    queue.async { [self] in
-      guard !terminated else { return }
-      terminated = true
-      statusBox.withLock { $0.state = .terminated }
-      if let a = attachment {
-        a.isCurrent = false
-        a.closeAfterFlush()
-      }
-      attachment = nil
-      closeMux {}
+  private func endAuthorizationOnQueue() {
+    guard !terminated else { return }
+    revokeLeaseAdmission()
+    terminated = true
+    authorizationToken = nil
+    statusBox.withLock {
+      $0.state = .terminated
+      $0.isAttached = false
     }
+    if let a = attachment {
+      a.isCurrent = false
+      a.closeAfterFlush()
+    }
+    attachment = nil
+    closeMux {}
   }
 
   // MARK: Attachment entry points (from HostAttachment)
@@ -224,6 +277,8 @@ public final class RoamingSession: @unchecked Sendable {
   func attach(
     _ attachment: HostAttachment,
     writer: WriterID,
+    token: ApplicationToken? = nil,
+    expiresAt: ContinuousClock.Instant? = nil,
     takeover: Bool = false,
     target: ResumeTarget? = nil
   ) async -> AttachOutcome<UInt64> {
@@ -232,9 +287,12 @@ public final class RoamingSession: @unchecked Sendable {
         // Owner-queue state: read by `acquireLease` on this queue.
         allowTakeover = takeover || target?.expectedLease != nil
         self.target = target
-        attachOnQueue(attachment, writer: writer) {
-          continuation.resume(returning: $0)
-        }
+        attachOnQueue(
+          attachment,
+          writer: writer,
+          token: token,
+          expiresAt: expiresAt
+        ) { continuation.resume(returning: $0) }
       }
     }
   }
@@ -258,12 +316,21 @@ public final class RoamingSession: @unchecked Sendable {
   private func attachOnQueue(
     _ a: HostAttachment,
     writer: WriterID,
+    token: ApplicationToken?,
+    expiresAt: ContinuousClock.Instant?,
     completion: @escaping (AttachOutcome<UInt64>) -> Void
   ) {
     guard !terminated else { return completion(.failure(.unknownSession)) }
-    guard ledger.writerID == writer else {
-      return completion(.failure(.unauthorized))
+    guard !a.connection.isClosed else {
+      return completion(.failure(.notAttached))
     }
+    guard ledger.writerID == writer, let token,
+      authorizationToken?.matches(token) == true
+    else { return completion(.failure(.unauthorized)) }
+    if let expiresAt, ContinuousClock.now >= expiresAt {
+      return completion(.failure(.expired))
+    }
+    revokeLeaseAdmission()
     // Fence: the previous connection closes and its later input is
     // rejected because it is no longer the current attachment. Its lease
     // is released (after any in-flight input) before this one asks.
@@ -279,34 +346,66 @@ public final class RoamingSession: @unchecked Sendable {
       guard generation == attachGeneration else {
         return completion(.failure(.staleEpoch))
       }
-      acquireLease(a, writer: writer, generation: generation, completion: completion)
+      acquireLease(
+        a,
+        writer: writer,
+        token: token,
+        expiresAt: expiresAt,
+        generation: generation,
+        completion: completion
+      )
     }
   }
 
   private func acquireLease(
     _ a: HostAttachment,
     writer: WriterID,
+    token: ApplicationToken,
+    expiresAt: ContinuousClock.Instant?,
     generation: UInt64,
     completion: @escaping (AttachOutcome<UInt64>) -> Void
   ) {
     guard !terminated else { return completion(.failure(.unknownSession)) }
+    guard !a.connection.isClosed else {
+      return completion(.failure(.notAttached))
+    }
+    guard ledger.writerID == writer, authorizationToken?.matches(token) == true
+    else { return completion(.failure(.unauthorized)) }
+    if let expiresAt, ContinuousClock.now >= expiresAt {
+      return completion(.failure(.expired))
+    }
+    let admission = LeaseAdmission(connection: a.connection)
+    leaseAdmission = admission
     let session = MuxLocalSession(queue: queue)
     // Fails this attach without touching a newer one's client.
     let failAttach = { [self] (code: RSTErrorCode) in
-      if mux === session {
-        closeMux {}
-      } else {
-        session.close()
-      }
-      completion(.failure(code))
+      admission.revoke()
+      if mux === session { closeMux {} } else { session.close() }
+      completion(.failure(terminated ? .unknownSession : code))
     }
-    let leaseGranted = { [self] (attachment: AttachmentID, ws: WorkspaceSnapshot) in
-      guard mux === session, generation == attachGeneration else {
-        // Superseded while acquiring: give the lease back.
-        session.close()
-        return completion(.failure(.staleEpoch))
+    let refusal = { [self] () -> RSTErrorCode? in
+      if terminated { return .unknownSession }
+      if mux !== session || generation != attachGeneration {
+        return .staleEpoch
       }
-      self.leaseGranted(a, writer: writer, attachment: attachment, ws, completion)
+      if a.connection.isClosed { return .notAttached }
+      if ledger.writerID != writer || authorizationToken?.matches(token) != true
+      {
+        return .unauthorized
+      }
+      if let expiresAt, ContinuousClock.now >= expiresAt { return .expired }
+      return nil
+    }
+    let leaseGranted = {
+      [self] (attachment: AttachmentID, ws: WorkspaceSnapshot) in
+      if let code = refusal() { return failAttach(code) }
+      self.leaseGranted(
+        a,
+        writer: writer,
+        attachment: attachment,
+        ws,
+        completion
+      )
     }
     session.onEvent = { [weak self, weak session] event in
       guard let self, let session, self.mux === session else { return }
@@ -329,35 +428,50 @@ public final class RoamingSession: @unchecked Sendable {
     mux = session
     session.connect(to: service, frontend: .native, remote: true)
     let target = WorkspaceSelector.id(workspace)
-    session.request(.attach(target)) { [self] result in
-      switch result {
-      case let .success(.attached(attachment, ws)):
-        leaseGranted(attachment, ws)
-      case let .failure(error) where error.code == .leaseHeld && allowTakeover:
-        // Explicitly requested at bootstrap: name the lease being
-        // displaced so a newer holder is never taken over by accident.
-        session.request(.listWorkspaces) { [self] list in
-          guard case let .success(.workspaces(summaries)) = list,
-            let summary = summaries.first(where: { $0.id == workspace })
-          else { return failAttach(.unknownSession) }
-          // A link names the lease the user agreed to displace; a plain
-          // takeover names the one just listed.
-          let expected = self.target?.expectedLease ?? summary.leaseGeneration
+    session.request(
+      .attach(target),
+      expiresAt: expiresAt,
+      isAdmitted: { admission.isAllowed },
+      { [self] result in
+        if let code = refusal() { return failAttach(code) }
+        switch result {
+        case let .success(.attached(attachment, ws)):
+          leaseGranted(attachment, ws)
+        case let .failure(error)
+        where error.code == .leaseHeld && allowTakeover:
+          // Explicitly requested at bootstrap: name the lease being
+          // displaced so a newer holder is never taken over by accident.
           session.request(
-            .takeover(target, expectedLease: expected)
-          ) { result in
-            guard case let .success(.attached(attachment, ws)) = result else {
-              return failAttach(.writerBusy)
+            .listWorkspaces,
+            expiresAt: expiresAt,
+            isAdmitted: { admission.isAllowed },
+            { [self] list in
+              if let code = refusal() { return failAttach(code) }
+              guard case let .success(.workspaces(summaries)) = list,
+                let summary = summaries.first(where: { $0.id == workspace })
+              else { return failAttach(.unknownSession) }
+              // A link names the lease the user agreed to displace; a plain
+              // takeover names the one just listed.
+              let expected =
+                self.target?.expectedLease ?? summary.leaseGeneration
+              session.request(
+                .takeover(target, expectedLease: expected),
+                expiresAt: expiresAt,
+                isAdmitted: { admission.isAllowed },
+                { result in
+                  if let code = refusal() { return failAttach(code) }
+                  guard case let .success(.attached(attachment, ws)) = result
+                  else { return failAttach(.writerBusy) }
+                  leaseGranted(attachment, ws)
+                }
+              )
             }
-            leaseGranted(attachment, ws)
-          }
+          )
+        case let .failure(error): failAttach(Self.code(error))
+        case .success: failAttach(.internalError)
         }
-      case let .failure(error):
-        failAttach(Self.code(error))
-      case .success:
-        failAttach(.internalError)
       }
-    }
+    )
   }
 
   private static func code(_ error: MuxError) -> RSTErrorCode {
@@ -419,20 +533,32 @@ public final class RoamingSession: @unchecked Sendable {
     closeMux {}
   }
 
+  private func revokeLeaseAdmission() {
+    leaseAdmission?.revoke()
+    // Pending requests retain their own ticket; the owner need not retain
+    // a closed transport after its attachment has gone away.
+    leaseAdmission = nil
+  }
+
   /// Releases the lease after any in-flight input is answered: input
   /// sent to the service is applied (FIFO), so its outcome must be
   /// recorded before the connection goes away.
   private func closeMux(then next: @escaping () -> Void) {
+    revokeLeaseAdmission()
     afterClose.append(next)
+    guard !awaitingServiceClose else { return }
     guard mux != nil else { return drainAfterClose() }
     closing = true
     guard !inputInFlight else { return }
-    let closed = mux
+    guard let closed = mux else { return }
     mux = nil
     muxAttachment = nil
     closing = false
-    closed?.close()
-    drainAfterClose()
+    awaitingServiceClose = true
+    closed.close { [self] in
+      awaitingServiceClose = false
+      drainAfterClose()
+    }
   }
 
   private func drainAfterClose() {
@@ -444,6 +570,7 @@ public final class RoamingSession: @unchecked Sendable {
   /// The service ended the lease without being asked (another frontend
   /// took over, or the workspace ended).
   private func leaseLost(reason code: RSTErrorCode) {
+    revokeLeaseAdmission()
     // Input the service admitted before releasing the lease was answered
     // first (FIFO); anything later was refused, so nothing is uncertain.
     let lost = mux
@@ -481,7 +608,9 @@ public final class RoamingSession: @unchecked Sendable {
       exited(status)
     case .detached:
       // Ask whether the workspace still exists rather than parse text.
-      mux?.request(.listWorkspaces) { [self] result in
+      guard let session = mux else { return }
+      session.request(.listWorkspaces) { [self, weak session] result in
+        guard let session, mux === session else { return }
         if case let .success(.workspaces(list)) = result,
           !list.contains(where: { $0.id == workspace })
         {
@@ -495,18 +624,8 @@ public final class RoamingSession: @unchecked Sendable {
   }
 
   private func markTerminatedOnQueue() {
-    terminated = true
-    statusBox.withLock { $0.state = .terminated }
-    if let a = attachment {
-      a.send(.terminated(epoch: a.epoch))
-      a.isCurrent = false
-      a.closeAfterFlush()
-    }
-    attachment = nil
-    let lost = mux
-    mux = nil
-    muxAttachment = nil
-    lost?.close()
+    if let a = attachment { a.send(.terminated(epoch: a.epoch)) }
+    endAuthorizationOnQueue()
   }
 
   /// Follows the workspace's active pane.
@@ -515,7 +634,8 @@ public final class RoamingSession: @unchecked Sendable {
       return
     }
     layoutRevision = ws.layoutRevision
-    let allExited = !ws.panes.isEmpty && ws.panes.allSatisfy { $0.exitStatus != nil }
+    let allExited =
+      !ws.panes.isEmpty && ws.panes.allSatisfy { $0.exitStatus != nil }
     statusBox.withLock { $0.allPanesExited = allExited }
     let pane = ws.activeTabSnapshot?.activePane
     let summary = pane.flatMap { ws.pane($0) }
@@ -592,15 +712,13 @@ public final class RoamingSession: @unchecked Sendable {
     }
     touch()
     switch message {
-    case let .input(input):
-      admit(input, from: a)
+    case let .input(input): admit(input, from: a)
     case let .screenAck(_, revision):
       for stream in a.scheduler.acknowledged(revision: revision) {
         a.connection.cancelSnapshot(stream: stream)
       }
       pumpSnapshots(a)
-    case let .ping(_, nonce):
-      a.send(.pong(epoch: a.epoch, nonce: nonce))
+    case let .ping(_, nonce): a.send(.pong(epoch: a.epoch, nonce: nonce))
     case .detach:
       a.send(.detached(epoch: a.epoch))
       detachOnQueue(a)
@@ -629,14 +747,17 @@ public final class RoamingSession: @unchecked Sendable {
       sequence: sequence,
       operation: input.operation
     ) {
-    case .alreadyApplied:
-      a.send(.inputAck(epoch: a.epoch, sequence: sequence))
+    case .alreadyApplied: a.send(.inputAck(epoch: a.epoch, sequence: sequence))
     case .inProgress:
       // Still queued for the pane; its acknowledgment follows.
       break
     case let .rejected(rejection):
       a.send(.error(.init(RSTErrorCode(rejection), sequence: sequence)))
     case .admit:
+      if case .resize = input.operation, !canAdmitResize() {
+        a.send(.error(.init(.limitExceeded, sequence: sequence)))
+        return
+      }
       guard !writerFailed else {
         a.send(.error(.init(.internalError, sequence: sequence)))
         return
@@ -648,12 +769,26 @@ public final class RoamingSession: @unchecked Sendable {
     }
   }
 
+  /// Include queued resizes: a preceding operation can exhaust the revision
+  /// before this one reaches the service. Refuse before reserving its sequence.
+  private func canAdmitResize() -> Bool {
+    var projected = resizeRevision
+    for entry in ledger.admitted {
+      if case let .resize(_, _, requested) = entry.operation {
+        let (next, overflow) = projected.addingReportingOverflow(1)
+        guard !overflow else { return false }
+        projected = max(next, requested)
+      }
+    }
+    return projected < UInt64.max
+  }
+
   /// Submits the ledger's head to the pane, one operation at a time, so
   /// a refused operation can be retried without reordering.
   private func pumpInput() {
     guard !inputInFlight, !writerFailed, exitStatus == nil, !retryScheduled,
-      let mux, mux.isOpen, let smx = muxAttachment,
-      let pane = activePane, let head = ledger.admitted.first
+      let mux, mux.isOpen, let smx = muxAttachment, let pane = activePane,
+      let head = ledger.admitted.first
     else { return }
     inputInFlight = true
     let done: (MuxError?) -> Void = { [weak self] error in
@@ -666,8 +801,18 @@ public final class RoamingSession: @unchecked Sendable {
       mux.input(.input(.paste(text)), attachment: smx, pane: pane, done)
     case let .key(key):
       let (name, modifiers) = Self.muxKey(key)
-      mux.input(.input(.key(name, modifiers)), attachment: smx, pane: pane, done)
+      mux.input(
+        .input(.key(name, modifiers)),
+        attachment: smx,
+        pane: pane,
+        done
+      )
     case let .resize(c, r, revision):
+      let (nextRevision, overflow) = resizeRevision.addingReportingOverflow(1)
+      guard !overflow else {
+        done(MuxError(.invalidRequest, "resize revision exhausted"))
+        return
+      }
       geometryGeneration += 1
       let batch = GeometryBatch(
         layoutRevision: layoutRevision,
@@ -679,17 +824,13 @@ public final class RoamingSession: @unchecked Sendable {
         if case .success = result {
           self.columns = c
           self.rows = r
-          self.resizeRevision = max(self.resizeRevision + 1, revision)
+          self.resizeRevision = max(nextRevision, revision)
           self.statusBox.withLock { s in
             s.columns = c
             s.rows = r
           }
         }
-        if case let .failure(error) = result {
-          done(error)
-        } else {
-          done(nil)
-        }
+        if case let .failure(error) = result { done(error) } else { done(nil) }
       }
     }
   }
@@ -725,6 +866,16 @@ public final class RoamingSession: @unchecked Sendable {
     }
     switch error.code {
     case .resourceLimit, .staleGeometry, .staleRevision:
+      // A record larger than the peer's chunk or empty-pane budget is
+      // refused forever. Retrying it holds every later operation.
+      if error.code == .resourceLimit, let limits = mux?.welcome?.limits,
+        let head = ledger.admitted.first, head.sequence == sequence,
+        Self.permanentlyExceeds(head.operation, limits: limits)
+      {
+        for done in ledger.discard(through: sequence) { acknowledge(done) }
+        pumpAfterAnswer = true
+        break
+      }
       // Nothing was written; retry after the pane drains or the layout
       // settles, never in a tight loop.
       guard !closing else { break }
@@ -748,6 +899,28 @@ public final class RoamingSession: @unchecked Sendable {
       // retire it and continue; the writer stays usable.
       for done in ledger.discard(through: sequence) { acknowledge(done) }
       pumpAfterAnswer = true
+    }
+  }
+
+  private static func permanentlyExceeds(
+    _ operation: InputOperation,
+    limits: MuxLimits
+  ) -> Bool {
+    switch operation {
+    case let .committedText(text):
+      return MuxService.permanentlyExceedsText(
+        utf8Count: text.utf8.count,
+        limits: limits
+      )
+    case let .paste(text):
+      let newlines = text.utf8.reduce(0) { $0 + ($1 == 0x0A ? 1 : 0) }
+      return MuxService.permanentlyExceedsPaste(
+        utf8Count: text.utf8.count,
+        newlineCount: newlines,
+        limits: limits
+      )
+    case .key: return MuxService.permanentlyExceedsKey(limits: limits)
+    case .resize: return false
     }
   }
 
@@ -799,8 +972,7 @@ public final class RoamingSession: @unchecked Sendable {
     guard a === attachment, a.isCurrent, let pane = activePane else { return }
     let now = ContinuousClock.now
     switch a.scheduler.next(now: now) {
-    case .idle:
-      return
+    case .idle: return
     case let .wait(until):
       guard !a.timerArmed else { return }
       a.timerArmed = true
@@ -820,12 +992,16 @@ public final class RoamingSession: @unchecked Sendable {
       let exit = exitStatus
       // Exported in the pane's order, so every byte parsed before this
       // point (including final output after exit) is included.
-      service.inspect(pane: pane, { ScreenExporter.export($0, stamp: stamp) }, completion: {
-        [weak self] snapshot in
-        self?.queue.async { [weak self] in
-          self?.captured(snapshot, stream: stream, exit: exit, to: a)
+      service.inspect(
+        pane: pane,
+        { ScreenExporter.export($0, stamp: stamp) },
+        completion: { [weak self] snapshot in
+          self?.queue
+            .async { [weak self] in
+              self?.captured(snapshot, stream: stream, exit: exit, to: a)
+            }
         }
-      })
+      )
     }
   }
 
@@ -859,34 +1035,53 @@ public final class RoamingSession: @unchecked Sendable {
     stream: UInt64,
     to a: HostAttachment
   ) {
+    let encode = snapshotEncoder
     encodeQueue.async { [weak self] in
-      guard let payload = try? SnapshotFrame.encode(snapshot) else { return }
+      let payload: [UInt8]
+      do { payload = try encode(snapshot) } catch {
+        self?.snapshotFailed(stream: stream, to: a, retry: true)
+        return
+      }
       Task {
         do {
           try await a.connection.sendSnapshot(payload, stream: stream)
         } catch {
-          guard let self else { return }
-          self.queue.async {
-            guard a === self.attachment, a.isCurrent else { return }
-            a.scheduler.failed(stream: stream)
-            if (error as? RSTTransportError) != .closed {
-              self.pumpSnapshots(a)
-            }
-          }
+          self?
+            .snapshotFailed(
+              stream: stream,
+              to: a,
+              retry: (error as? RSTTransportError) != .closed
+            )
         }
       }
+    }
+  }
+
+  /// Encoding and transport failures settle on the attachment's owner queue.
+  private func snapshotFailed(stream: UInt64, to a: HostAttachment, retry: Bool)
+  {
+    queue.async { [weak self] in
+      guard let self, a === attachment, a.isCurrent,
+        a.scheduler.streams.contains(where: { $0.id == stream })
+      else { return }
+      a.scheduler.failed(stream: stream)
+      if retry { pumpSnapshots(a) }
     }
   }
 }
 
 extension Duration {
   var dispatchInterval: DispatchTimeInterval {
+    guard self >= .zero else { return .nanoseconds(0) }
     let (seconds, attoseconds) = components
     let nanos = seconds.multipliedReportingOverflow(by: 1_000_000_000)
-    guard !nanos.overflow, seconds >= 0 else {
-      return seconds < 0 ? .nanoseconds(0) : .never
-    }
-    return .nanoseconds(Int(nanos.partialValue + attoseconds / 1_000_000_000))
+    let total = nanos.partialValue.addingReportingOverflow(
+      attoseconds / 1_000_000_000
+    )
+    guard !nanos.overflow, !total.overflow,
+      let value = Int(exactly: total.partialValue)
+    else { return .never }
+    return .nanoseconds(value)
   }
 }
 #endif

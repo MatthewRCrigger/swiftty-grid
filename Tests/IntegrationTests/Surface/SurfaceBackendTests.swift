@@ -1,4 +1,5 @@
 import Dispatch
+import Foundation
 import ScreenProtocol
 import SessionCore
 import Synchronization
@@ -31,17 +32,14 @@ struct PresentationMapperTests {
         background: RGBColor(0x00FF00),
         underlineColor: RGBColor(0x0000FF),
         attributes: [.bold, .italic, .curlyUnderline, .strikethrough]
-      ),
-      CellStyle(attributes: [.inverse, .dottedUnderline, .overline]),
+      ), CellStyle(attributes: [.inverse, .dottedUnderline, .overline]),
       CellStyle(attributes: [.doubleUnderline, .faint, .invisible, .blink]),
       CellStyle(attributes: [.dashedUnderline]),
     ]
     s.cells[0] = [
       ScreenCell("e\u{301}", width: 1, style: 1),
-      ScreenCell("界", width: 2, style: 2),
-      .continuation,
-      ScreenCell("👍🏽", width: 2, style: 3),
-      ScreenCell("", width: 0, style: 3),
+      ScreenCell("界", width: 2, style: 2), .continuation,
+      ScreenCell("👍🏽", width: 2, style: 3), ScreenCell("", width: 0, style: 3),
       ScreenCell("x", width: 1, style: 4),
     ]
     s.wrapped = [true, false]
@@ -50,7 +48,8 @@ struct PresentationMapperTests {
   }
 
   @Test
-  func `mapping preserves cells widths styles cursor and screen flags`() throws {
+  func `mapping preserves cells widths styles cursor and screen flags`() throws
+  {
     let frame = try PresentationMapper.frame(from: sample())
     #expect(frame.columns == 6 && frame.rows == 2)
     #expect(frame.cells.count == 12)
@@ -72,10 +71,18 @@ struct PresentationMapperTests {
     #expect(styles[1].foreground == 0xFF0000)
     #expect(styles[1].background == 0x00FF00)
     #expect(styles[1].underlineColor == 0x0000FF)
-    #expect(styles[1].flags == [.bold, .italic, .underline, .underlineStyleA, .strikethrough])
-    #expect(styles[2].flags == [.inverse, .underline, .underlineStyleB, .overline])
+    #expect(
+      styles[1].flags == [
+        .bold, .italic, .underline, .underlineStyleA, .strikethrough,
+      ]
+    )
+    #expect(
+      styles[2].flags == [.inverse, .underline, .underlineStyleB, .overline]
+    )
     #expect(styles[3].flags == [.doubleUnderline, .faint, .invisible, .blink])
-    #expect(styles[4].flags == [.underline, .underlineStyleA, .underlineStyleB])
+    #expect(
+      styles[4].flags == [.underline, .underlineStyleA, .underlineStyleB]
+    )
     #expect(styles.allSatisfy { $0.flags.isDisjoint(with: .structural) })
   }
 
@@ -174,7 +181,10 @@ struct SSHStreamBackendTests {
     #expect(backend.capabilities.localProcess == false)
 
     #expect(await backend.submit(.text("ls")) == .accepted(sequence: nil))
-    #expect(await backend.submit(.key(SemanticKey(.enter))) == .accepted(sequence: nil))
+    #expect(
+      await backend.submit(.key(SemanticKey(.enter)))
+        == .accepted(sequence: nil)
+    )
     #expect(await eventually { channel.written == Array("ls\r".utf8) })
 
     // A cursor position query is answered once, over the channel.
@@ -184,7 +194,9 @@ struct SSHStreamBackendTests {
     )
 
     await backend.proposeGrid(columns: 100, rows: 30)
-    #expect(await eventually { channel.resizes == [GridSize(columns: 100, rows: 30)] })
+    #expect(
+      await eventually { channel.resizes == [GridSize(columns: 100, rows: 30)] }
+    )
     #expect(session.withState { $0.columns } == 100)
 
     channel.exit(.exited(0))
@@ -194,19 +206,44 @@ struct SSHStreamBackendTests {
   }
 
   @Test
-  func `a view resizing the session directly resizes the remote PTY once`() async {
+  func `a view resizing the session directly resizes the remote PTY once`()
+    async
+  {
     let session = TerminalSession(columns: 80, rows: 24)
     let channel = FakeByteChannel()
     let backend = SSHStreamBackend(channel: channel, session: session)
     backend.start()
     // Views call `session.resize` themselves on layout.
     session.resize(columns: 120, rows: 40)
-    #expect(await eventually { channel.resizes == [GridSize(columns: 120, rows: 40)] })
+    #expect(
+      await eventually { channel.resizes == [GridSize(columns: 120, rows: 40)] }
+    )
     // Output batches that leave the grid alone send nothing more.
     channel.feed(Array("hello".utf8))
     session.resize(columns: 120, rows: 40)
     try? await Task.sleep(for: .milliseconds(50))
     #expect(channel.resizes == [GridSize(columns: 120, rows: 40)])
+    await backend.close()
+  }
+
+  @Test
+  func `parsed program output records when the screen was installed`()
+    async throws
+  {
+    let session = TerminalSession(columns: 20, rows: 5)
+    let channel = FakeByteChannel()
+    let backend = SSHStreamBackend(channel: channel, session: session)
+    let installed = Mutex<[Date]>([])
+    backend.onScreenInstalled = { date in installed.withLock { $0.append(date) }
+    }
+    backend.start()
+    channel.feed(Array("hi".utf8))
+    #expect(await eventually { !installed.withLock { $0.isEmpty } })
+    #expect(session.withState { $0.screenLines.joined().contains("hi") })
+    let count = installed.withLock { $0.count }
+    session.resize(columns: 30, rows: 6)
+    try await Task.sleep(for: .milliseconds(40))
+    #expect(installed.withLock { $0.count } == count)
     await backend.close()
   }
 }
@@ -215,7 +252,9 @@ struct SSHStreamBackendTests {
 struct LocalPTYBackendTests {
   @Test
   func `local PTY backend runs a shell with full capabilities`() async throws {
-    let backend = LocalPTYBackend(session: TerminalSession(columns: 40, rows: 5))
+    let backend = LocalPTYBackend(
+      session: TerminalSession(columns: 40, rows: 5)
+    )
     #expect(backend.capabilities == .full)
     var configuration = SessionConfiguration()
     configuration.command = ["/bin/sh"]
@@ -226,3 +265,61 @@ struct LocalPTYBackendTests {
   }
 }
 #endif
+
+struct FakeByteChannelTests {
+  @Test(arguments: [false, true])
+  func exitWaitsForCreditHeldOutputAndIsDeliveredOnce(_ beforeStart: Bool) {
+    let channel = FakeByteChannel()
+    let events = Mutex<[String]>([])
+    let handler = TerminalChannelHandler(
+      onOutput: { bytes in events.withLock { $0.append("output \(bytes)") } },
+      onExit: { exit in events.withLock { $0.append("exit \(exit)") } }
+    )
+    if !beforeStart { channel.start(handler) }
+    channel.feed([1, 2, 3])
+    channel.feed([4, 5])
+    channel.exit(.exited(7))
+    channel.exit(.exited(42))
+    if beforeStart { channel.start(handler) }
+    #expect(events.withLock { $0.isEmpty })
+    channel.grantCredit(3)
+    #expect(events.withLock { $0 } == ["output [1, 2, 3]"])
+    channel.grantCredit(2)
+    #expect(
+      events.withLock { $0 } == [
+        "output [1, 2, 3]", "output [4, 5]", "exit exited(7)",
+      ]
+    )
+    channel.feed([6])
+    channel.grantCredit(1)
+    channel.exit(.exited(99))
+    #expect(events.withLock { $0.count } == 3)
+  }
+
+  @Test
+  func reentrantExitCannotOvertakeTheCurrentOutputCallback() {
+    let channel = FakeByteChannel()
+    let events = Mutex<[String]>([])
+    channel.start(
+      TerminalChannelHandler(
+        onOutput: { [weak channel] bytes in
+          events.withLock { $0.append("begin \(bytes)") }
+          if bytes == [1] {
+            channel?.feed([2])
+            channel?.exit(.exited(7))
+            channel?.exit(.exited(42))
+          }
+          events.withLock { $0.append("end \(bytes)") }
+        },
+        onExit: { exit in events.withLock { $0.append("exit \(exit)") } }
+      )
+    )
+    channel.grantCredit(2)
+    channel.feed([1])
+    #expect(
+      events.withLock { $0 } == [
+        "begin [1]", "end [1]", "begin [2]", "end [2]", "exit exited(7)",
+      ]
+    )
+  }
+}

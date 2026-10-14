@@ -30,12 +30,8 @@ public struct BootstrapService: Sendable {
     let request: BootstrapRequest
     do {
       request = try BootstrapEnvelope.decode(BootstrapRequest.self, from: bytes)
-    } catch {
-      return .failure(.malformed)
-    }
-    do {
-      try request.validate()
-    } catch {
+    } catch { return .failure(.malformed) }
+    do { try request.validate() } catch {
       switch error {
       case .unsupportedProtocol, .tooManyProtocols:
         return .failure(.unsupportedVersion)
@@ -49,10 +45,10 @@ public struct BootstrapService: Sendable {
   static func envelope(_ response: BootstrapResponse) -> [UInt8] {
     if let bytes = try? BootstrapEnvelope.encode(response) { return bytes }
     do {
-      return try BootstrapEnvelope.encode(BootstrapResponse.failure(.internalError))
-    } catch {
-      preconditionFailure("Cannot encode bootstrap failure: \(error)")
-    }
+      return try BootstrapEnvelope.encode(
+        BootstrapResponse.failure(.internalError)
+      )
+    } catch { preconditionFailure("Cannot encode bootstrap failure: \(error)") }
   }
 
   /// `bootstrap --stdio` core: validates one request envelope, forwards
@@ -79,12 +75,11 @@ public struct BootstrapService: Sendable {
         envelope: canonical,
         timeout: timeout
       )
-    } catch {
-      return envelope(.failure(.agentUnavailable))
-    }
+    } catch { return envelope(.failure(.agentUnavailable)) }
     // Forward only a well-formed response.
-    guard (try? BootstrapEnvelope.decode(BootstrapResponse.self, from: reply))
-      != nil
+    guard
+      (try? BootstrapEnvelope.decode(BootstrapResponse.self, from: reply))
+        != nil
     else { return envelope(.failure(.agentUnavailable)) }
     return reply
   }
@@ -93,8 +88,6 @@ public struct BootstrapService: Sendable {
   /// the limit is rejected before the body is read.
   public static func readEnvelope(
     from fd: Int32
-  ) throws(FramingError) -> [UInt8] {
-    try TerminalHost.readEnvelope(fd)
-  }
+  ) throws(FramingError) -> [UInt8] { try TerminalHost.readEnvelope(fd) }
 }
 #endif

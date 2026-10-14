@@ -29,7 +29,8 @@ import SwiftMuxProtocol
 public enum AttentionLocator {
   public static let version: UInt8 = 1
   /// Largest encoded payload: header, seven UUIDs, incarnation, path.
-  public static let maxPayloadBytes = 3 + 7 * 16 + 8 + 1 + RecordPathGrammar.maxBytes
+  public static let maxPayloadBytes =
+    3 + 7 * 16 + 8 + 1 + RecordPathGrammar.maxBytes
   /// Longest locator text (base64url of `maxPayloadBytes`, unpadded).
   public static let maxLength = (maxPayloadBytes * 4 + 2) / 3
   static let minPayloadBytes = 3 + 6 * 16 + 8 + 1
@@ -81,9 +82,7 @@ public enum AttentionLocator {
   ) throws(DecodeError) -> AttentionDestination {
     guard !text.isEmpty else { throw .empty }
     guard text.utf8.count <= maxLength else { throw .tooLong }
-    guard let bytes = Base64URL.decode(text) else {
-      throw .invalidCharacters
-    }
+    guard let bytes = Base64URL.decode(text) else { throw .invalidCharacters }
     // Rejects alternative spellings of the same bytes (stray low bits).
     guard Base64URL.encode(bytes) == text else { throw .nonCanonical }
     guard bytes.count >= minPayloadBytes else { throw .truncated }
@@ -136,12 +135,10 @@ public enum AttentionLocator {
     mutating func bytes(_ count: Int) throws(DecodeError) -> ArraySlice<UInt8> {
       guard count <= bytes.count - offset else { throw .truncated }
       defer { offset += count }
-      return bytes[offset..<offset + count]
+      return bytes[offset ..< offset + count]
     }
 
-    mutating func byte() throws(DecodeError) -> UInt8 {
-      try bytes(1).first!
-    }
+    mutating func byte() throws(DecodeError) -> UInt8 { try bytes(1).first! }
 
     mutating func uuid() throws(DecodeError) -> UUID {
       let b = Array(try bytes(16))
@@ -170,8 +167,12 @@ enum Base64URL {
     out.reserveCapacity((bytes.count * 4 + 2) / 3)
     var i = 0
     while i + 3 <= bytes.count {
-      let n = UInt32(bytes[i]) << 16 | UInt32(bytes[i + 1]) << 8 | UInt32(bytes[i + 2])
-      for shift in [18, 12, 6, 0] { out.append(alphabet[Int(n >> UInt32(shift) & 63)]) }
+      let n =
+        UInt32(bytes[i]) << 16 | UInt32(bytes[i + 1]) << 8
+        | UInt32(bytes[i + 2])
+      for shift in [18, 12, 6, 0] {
+        out.append(alphabet[Int(n >> UInt32(shift) & 63)])
+      }
       i += 3
     }
     let rest = bytes.count - i
@@ -200,9 +201,9 @@ enum Base64URL {
     for c in input {
       let v: UInt32
       switch c {
-      case 0x41...0x5A: v = UInt32(c - 0x41)
-      case 0x61...0x7A: v = UInt32(c - 0x61 + 26)
-      case 0x30...0x39: v = UInt32(c - 0x30 + 52)
+      case 0x41 ... 0x5A: v = UInt32(c - 0x41)
+      case 0x61 ... 0x7A: v = UInt32(c - 0x61 + 26)
+      case 0x30 ... 0x39: v = UInt32(c - 0x30 + 52)
       case 0x2D: v = 62  // -
       case 0x5F: v = 63  // _
       default: return nil

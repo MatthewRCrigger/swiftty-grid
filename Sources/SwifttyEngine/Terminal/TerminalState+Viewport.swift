@@ -109,7 +109,8 @@ extension TerminalState {
 
   /// Text of active-screen row `y` with trailing blanks trimmed.
   public func text(row y: Int) -> String {
-    Self.text(of: grid._unsafeCells(row: y), self)
+    precondition(y >= 0 && y < rows, "row out of bounds")
+    return Self.text(of: grid._unsafeCells(row: y), self)
   }
 
   /// The visible screen as text lines (trailing blanks trimmed).

@@ -37,7 +37,10 @@ let package = Package(
         .library(name: "TestSupport", targets: ["TestSupport"]),
     ],
     targets: [
-        .target(name: "SwifttyCore", resources: [.copy("Renderer/Shaders.metal")],
+        .target(name: "SwifttyEngine",
+                swiftSettings: [.enableExperimentalFeature("Lifetimes")]),
+        .target(name: "SwifttyCore", dependencies: ["SwifttyEngine"],
+                resources: [.copy("Renderer/Shaders.metal")],
                 swiftSettings: [.enableExperimentalFeature("Lifetimes")]),
         .target(name: "SwifttyMobile", dependencies: ["SwifttyCore"]),
         .target(name: "TestSupport", path: "Tests/Support"),

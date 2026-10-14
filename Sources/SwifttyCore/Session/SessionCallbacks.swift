@@ -13,6 +13,8 @@ final class SessionCallbacks: @unchecked Sendable {
     var onProgramOutput: (@Sendable ([UInt8]) -> Void)?
     var onControlModeData: (@Sendable ([UInt8]) -> Void)?
     var semanticInput: (@Sendable (TerminalInput) -> Void)?
+    var inputHandler: (@Sendable (TerminalInput) -> Void)?
+    var ptyInputAdmission: PTYInputAdmission?
     var gridProposal: (@Sendable (Int, Int) -> Void)?
   }
 
@@ -191,5 +193,46 @@ final class SessionCallbacks: @unchecked Sendable {
       lock.unlock()
       withExtendedLifetime(previous) {}
     }
+  }
+
+  var inputHandler: (@Sendable (TerminalInput) -> Void)? {
+    get {
+      lock.lock()
+      let handler = state.inputHandler
+      lock.unlock()
+      return handler
+    }
+    set {
+      lock.lock()
+      let previous = state.inputHandler
+      state.inputHandler = newValue
+      lock.unlock()
+      withExtendedLifetime(previous) {}
+    }
+  }
+
+  var ptyInputAdmission: PTYInputAdmission? {
+    lock.lock()
+    let admission = state.ptyInputAdmission
+    lock.unlock()
+    return admission
+  }
+
+  /// A second local wrapper must not replace the current writer's credit
+  /// or native input handler, even before either wrapper starts its child.
+  func installPTYInputAdmission(
+    _ admission: PTYInputAdmission,
+    handler: @escaping @Sendable (TerminalInput) -> Void
+  ) {
+    lock.lock()
+    guard state.ptyInputAdmission == nil else {
+      lock.unlock()
+      return
+    }
+    let previous = state.inputHandler
+    state.ptyInputAdmission = admission
+    state.inputHandler = handler
+    lock.unlock()
+    withExtendedLifetime(previous) {}
   }
 }

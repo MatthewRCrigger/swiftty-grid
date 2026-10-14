@@ -9,29 +9,32 @@ import Testing
 
 struct PTYProcessTests {
   @Test
+  func aLiveChildHasNotStartedExiting() throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+    process.arguments = ["30"]
+    try process.run()
+    defer {
+      process.terminate()
+      process.waitUntilExit()
+    }
+    #expect(!PTYProcessExit.hasStartedExiting(pid_t(process.processIdentifier)))
+  }
+
+  @Test
   func `direct PTY callers still observe slave closure`() async throws {
     let process = try PTYProcess.spawn(
       SessionConfiguration(command: ["/usr/bin/true"]),
       columns: 10,
       rows: 2
     )
-    var result: pid_t
-    repeat {
-      result = waitpid(process.pid, nil, 0)
-    } while result < 0 && errno == EINTR
-    #expect(result == process.pid)
-    var byte: UInt8 = 0
-    var count = -1
-    var readError: Int32 = 0
-    let deadline = ContinuousClock.now + .seconds(1)
-    repeat {
-      count = withUnsafeMutableBytes(of: &byte) {
-        process.master.read(into: $0)
-      }
-      readError = errno
-      guard count < 0, readError == EAGAIN || readError == EINTR else { break }
-      try await Task.sleep(for: .milliseconds(10))
-    } while ContinuousClock.now < deadline
+    let owned = OwnedChildWait(process.pid)
+    defer { #expect(owned.terminate()) }
+    _ = try #require(owned.collect())
+    let (count, readError) = try await waitForSlaveClosure(
+      process.master.rawValue,
+      deadline: ContinuousClock.now + .seconds(1)
+    )
     #expect(
       count == 0 || (count < 0 && readError == EIO),
       "read returned \(count), errno \(readError)"
@@ -50,11 +53,9 @@ struct PTYProcessTests {
       retainingSlaveForDrain: true,
     )
     let child = try #require(process?.pid)
-    var result: pid_t
-    repeat {
-      result = waitpid(child, nil, 0)
-    } while result < 0 && errno == EINTR
-    try #require(result == child)
+    let owned = OwnedChildWait(child)
+    defer { #expect(owned.terminate()) }
+    _ = try #require(owned.collect())
     let masterFD = try #require(process).master.rawValue
     let duplicate = dup(masterFD)
     try #require(duplicate >= 0)
@@ -79,30 +80,148 @@ struct PTYProcessTests {
       }
     }
     try #require(status == 0)
-    defer {
-      kill(unrelated, SIGKILL)
-      while waitpid(unrelated, nil, 0) < 0, errno == EINTR {}
-    }
+    let other = OwnedChildWait(unrelated)
+    defer { #expect(other.terminate()) }
     weak let retained = process
     process = nil
     try #require(retained == nil)
-    var byte: UInt8 = 0
-    var count = -1
-    var readError: Int32 = 0
-    // Teardown hangs up asynchronously; under a loaded parallel test run it
-    // can take longer than a second. Success ends the wait immediately.
-    let deadline = ContinuousClock.now + .seconds(10)
-    repeat {
-      count = withUnsafeMutableBytes(of: &byte) { master.read(into: $0) }
-      readError = errno
-      guard count < 0, readError == EAGAIN || readError == EINTR else { break }
-      try await Task.sleep(for: .milliseconds(10))
-    } while ContinuousClock.now < deadline
+    let (count, readError) = try await waitForSlaveClosure(
+      master.rawValue,
+      deadline: ContinuousClock.now + .seconds(10)
+    )
     #expect(kill(unrelated, 0) == 0)
     #expect(
       count == 0 || (count < 0 && readError == EIO),
       "read returned \(count), errno \(readError)"
     )
+  }
+
+  @Test
+  func `slave closure is sampled after a delayed polling resume`() async throws
+  {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+      at: directory,
+      withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let gate = directory.appendingPathComponent("exit")
+    let process = try PTYProcess.spawn(
+      SessionConfiguration(command: [
+        "/bin/sh", "-c", "while [ ! -f \"$1\" ]; do /bin/sleep 0.01; done",
+        "sh", gate.path,
+      ]),
+      columns: 10,
+      rows: 2
+    )
+    let owned = OwnedChildWait(process.pid)
+    defer { #expect(owned.terminate()) }
+    let deadline = ContinuousClock.now + .milliseconds(100)
+    var suspended = false
+    let (count, readError) = try await waitForSlaveClosure(
+      process.master.rawValue,
+      deadline: deadline,
+      pause: {
+        suspended = true
+        try Data().write(to: gate)
+        _ = try #require(owned.collect())
+        // Confirm native hangup before resuming the suspended observer.
+        // The extra sample does not consume output: this child writes none.
+        let (fresh, freshError) = try await waitForSlaveClosure(
+          process.master.rawValue,
+          deadline: ContinuousClock.now + .seconds(3)
+        )
+        try #require(fresh == 0 || (fresh < 0 && freshError == EIO))
+        try await Task.sleep(
+          until: deadline + .milliseconds(20),
+          clock: .continuous
+        )
+      }
+    )
+    #expect(suspended)
+    #expect(count == 0 || (count < 0 && readError == EIO))
+  }
+
+  @Test
+  func `slave closure deadlines do not sleep after timeout`() async throws {
+    let process = try PTYProcess.spawn(
+      SessionConfiguration(command: ["/bin/sleep", "30"]),
+      columns: 10,
+      rows: 2
+    )
+    let owned = OwnedChildWait(process.pid)
+    defer { #expect(owned.terminate()) }
+    var paused = false
+    let (count, readError) = try await waitForSlaveClosure(
+      process.master.rawValue,
+      deadline: ContinuousClock.now - .seconds(1),
+      pause: { paused = true }
+    )
+    #expect(!paused)
+    #expect(count < 0 && (readError == EAGAIN || readError == EINTR))
+    #expect(kill(process.pid, 0) == 0)
+  }
+
+  @Test
+  func publishedPIDIsSampledAfterADelayedPollingResume() async throws {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+      at: directory,
+      withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let pidFile = directory.appendingPathComponent("pid")
+    let gate = directory.appendingPathComponent("publish")
+    let process = try PTYProcess.spawn(
+      SessionConfiguration(command: [
+        "/bin/sh", "-c",
+        "while [ ! -f \"$1\" ]; do /bin/sleep 0.01; done; printf '%s' \"$$\" > \"$2.tmp\"; /bin/mv \"$2.tmp\" \"$2\"; exec /bin/sleep 30",
+        "sh", gate.path, pidFile.path,
+      ]),
+      columns: 10,
+      rows: 2,
+    )
+    let owned = OwnedChildWait(process.pid)
+    defer { #expect(owned.terminate()) }
+    let deadline = ContinuousClock.now + .milliseconds(200)
+    var paused = false
+    let observed = try await waitForPublishedPID(
+      pidFile,
+      deadline: deadline,
+      pause: {
+        paused = true
+        try Data().write(to: gate)
+        let publicationDeadline = ContinuousClock.now + .seconds(2)
+        while !FileManager.default.fileExists(atPath: pidFile.path),
+          ContinuousClock.now < publicationDeadline
+        { try await Task.sleep(for: .milliseconds(2)) }
+        let published = try String(contentsOf: pidFile, encoding: .utf8)
+        try #require(pid_t(published) == process.pid)
+        try await Task.sleep(
+          until: deadline + .milliseconds(20),
+          clock: .continuous
+        )
+      }
+    )
+    #expect(paused)
+    #expect(observed == process.pid)
+  }
+
+  @Test
+  func unpublishedPIDDeadlineDoesNotPause() async throws {
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent(
+      UUID().uuidString
+    )
+    var paused = false
+    let pid = try await waitForPublishedPID(
+      file,
+      deadline: ContinuousClock.now - .seconds(1),
+      pause: { paused = true }
+    )
+    #expect(pid == nil)
+    #expect(!paused)
   }
 
   @Test(arguments: [false, true])
@@ -144,14 +263,11 @@ struct PTYProcessTests {
     )
     defer { session.stop() }
     let deadline = ContinuousClock.now + .seconds(10)
-    var pid: pid_t?
-    while pid == nil, ContinuousClock.now < deadline {
-      if let text = try? String(contentsOf: pidFile, encoding: .utf8) {
-        pid = pid_t(text)
-      }
-      if pid == nil { try await Task.sleep(for: .milliseconds(10)) }
-    }
-    let child = try #require(pid)
+    let pid = try await waitForPublishedPID(pidFile, deadline: deadline)
+    let child = try #require(
+      pid,
+      "PID publication missing; exists=\(FileManager.default.fileExists(atPath: pidFile.path)), exit=\(String(describing: exitCode.withLock { $0 }))"
+    )
     // Delay reading through the final write and the child's exit attempt.
     // With a retained slave, Darwin can wait for output to drain before
     // making the child waitable; without it, exit discards the output.
@@ -317,8 +433,8 @@ struct PTYProcessTests {
     }
     do {
       let process = try PTYProcess.spawn(configuration, columns: 10, rows: 2)
-      kill(process.pid, SIGKILL)
-      while waitpid(process.pid, nil, 0) < 0, errno == EINTR {}
+      let owned = OwnedChildWait(process.pid)
+      #expect(owned.terminate())
       Issue.record("invalid process configuration was spawned")
     } catch { #expect(error.code == EINVAL) }
     let session = TerminalSession(columns: 10, rows: 2)
@@ -363,10 +479,8 @@ struct PTYProcessTests {
       rows: Int.max,
       cellPixelSize: (Int.max, Int.max),
     )
-    defer {
-      kill(process.pid, SIGKILL)
-      while waitpid(process.pid, nil, 0) < 0, errno == EINTR {}
-    }
+    let owned = OwnedChildWait(process.pid)
+    defer { #expect(owned.terminate()) }
     func dimensions() -> [UInt16] {
       var size = winsize()
       #expect(ioctl(process.master.rawValue, TIOCGWINSZ, &size) == 0)
@@ -385,4 +499,49 @@ struct PTYProcessTests {
     #expect(dimensions() == [UInt16.max, UInt16.max, 0, 0])
   }
 }
+
+private func waitForPublishedPID(
+  _ file: URL,
+  deadline: ContinuousClock.Instant,
+  pause: () async throws -> Void = {
+    try await Task.sleep(for: .milliseconds(10))
+  }
+) async throws -> pid_t? {
+  while true {
+    // Sampling precedes the deadline check after every suspension. A
+    // delayed observer must not discard an already-published PID.
+    if let text = try? String(contentsOf: file, encoding: .utf8),
+      let pid = pid_t(text), pid > 0
+    {
+      return pid
+    }
+    guard ContinuousClock.now < deadline else { return nil }
+    try await pause()
+  }
+}
+
+private func waitForSlaveClosure(
+  _ descriptor: Int32,
+  deadline: ContinuousClock.Instant,
+  pause: () async throws -> Void = {
+    try await Task.sleep(for: .milliseconds(10))
+  }
+) async throws -> (Int, Int32) {
+  var byte: UInt8 = 0
+  var count = -1
+  var readError: Int32 = 0
+  while true {
+    count = withUnsafeMutableBytes(of: &byte) {
+      Darwin.read(descriptor, $0.baseAddress, $0.count)
+    }
+    readError = errno
+    guard count < 0, readError == EAGAIN || readError == EINTR else { break }
+    // A resumed task samples the descriptor before testing the deadline:
+    // scheduler delays must not turn a completed hangup into a stale EAGAIN.
+    guard ContinuousClock.now < deadline else { break }
+    try await pause()
+  }
+  return (count, readError)
+}
+
 #endif

@@ -49,7 +49,9 @@ struct LeaseTests {
     try await b.attachAndShow(.id(w2.id))
     // The held one fails without takeover; metadata stays readable.
     let c = try await h.connect()
-    #expect(await code { _ = try await c.execute(.attach(.id(w1.id))) } == .leaseHeld)
+    #expect(
+      await code { _ = try await c.execute(.attach(.id(w1.id))) } == .leaseHeld
+    )
     let s = try await summary(c, w1.id)
     #expect(s.isAttached)
     #expect(s.leaseHolder?.transport == .local)
@@ -69,7 +71,9 @@ struct LeaseTests {
     // A prompt for an older controller is stale.
     #expect(
       await code {
-        _ = try await b.execute(.takeover(.id(ws.id), expectedLease: generation - 1))
+        _ = try await b.execute(
+          .takeover(.id(ws.id), expectedLease: generation - 1)
+        )
       } == .staleRevision
     )
     guard
@@ -79,7 +83,10 @@ struct LeaseTests {
     else { throw MuxError(.invalidRequest) }
     // The old holder is told and its attachment admits nothing.
     var told = false
-    while let event = try await withTimeout(.seconds(5), { try await a.nextEvent() }) {
+    while let event = try await withTimeout(
+      .seconds(5),
+      { try await a.nextEvent() }
+    ) {
       if case .detached = event {
         told = true
         break
@@ -105,14 +112,16 @@ struct LeaseTests {
   func observersSeeLeaseChangesWithoutALease() async throws {
     let h = try Harness()
     let o = try await h.connect(.control)
-    guard case .workspaces = try await o.execute(.observeWorkspaces(true)) else {
-      throw MuxError(.invalidRequest)
-    }
+    guard case .workspaces = try await o.execute(.observeWorkspaces(true))
+    else { throw MuxError(.invalidRequest) }
     let a = try await h.connect()
     let ws = try await create(a, "obs")
     try await a.attachAndShow(.id(ws.id))
     var attached = false
-    while let event = try await withTimeout(.seconds(5), { try await o.nextEvent() }) {
+    while let event = try await withTimeout(
+      .seconds(5),
+      { try await o.nextEvent() }
+    ) {
       if case let .workspaces(list) = event,
         list.first(where: { $0.id == ws.id })?.isAttached == true
       {
@@ -162,8 +171,7 @@ struct LeaseTests {
     guard
       case let .layout(split) = try await c.execute(
         .split(pane: a, axis: .leftRight, launch: shellLaunch())
-      ),
-      let b = split.activeTabSnapshot?.layout.panes.first(where: { $0 != a })
+      ), let b = split.activeTabSnapshot?.layout.panes.first(where: { $0 != a })
     else { throw MuxError(.invalidRequest, "split") }
     let attachment = await c.attachment!
     func record(

@@ -3,27 +3,10 @@ import SwiftMuxClient
 import SwiftMuxProtocol
 import SwiftMuxService
 import Testing
+import TestSupport
 
 /// The launcher built alongside the tests (`swift build` builds it).
-func launcherPath() throws -> String {
-  if let path = ProcessInfo.processInfo.environment["SWMUX_LAUNCHER"] {
-    return path
-  }
-  var dir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-  while dir.path != "/" {
-    for config in [
-      "debug", "release", "out/Products/Debug", "out/Products/Release",
-    ] {
-      let candidate = dir.appending(path: ".build/\(config)/swmux-launcher")
-        .path
-      if FileManager.default.isExecutableFile(atPath: candidate) {
-        return candidate
-      }
-    }
-    dir = dir.deletingLastPathComponent()
-  }
-  throw MuxError(.notFound, "swmux-launcher not built; run swift build first")
-}
+func launcherPath() throws -> String { try NativeTestProducts.launcherPath() }
 
 struct Harness {
   let service: MuxService
@@ -32,7 +15,11 @@ struct Harness {
   init(limits: MuxLimits = .standard) throws {
     var config = MuxServiceConfiguration(launcherPath: try launcherPath())
     config.limits = limits
-    service = MuxService(configuration: config)
+    try self.init(configuration: config)
+  }
+
+  init(configuration: MuxServiceConfiguration) throws {
+    service = try MuxService(configuration: configuration)
     endpoint = service.listenAnonymously()
   }
 

@@ -25,9 +25,9 @@ jobs:
         shell: bash
         run: |
           case '${{ matrix.configuration }}' in
-            debug) swift test ;;
-            release) swift test -c release ;;
-            internal-checks) swift test -Xswiftc -DSWIFTTY_INTERNAL_CHECKS ;;
+            debug) Scripts/test-native.sh ;;
+            release) Scripts/test-native.sh -c release ;;
+            internal-checks) Scripts/test-native.sh -Xswiftc -DSWIFTTY_INTERNAL_CHECKS ;;
           esac
       - name: Build production products
         if: matrix.configuration == 'release'

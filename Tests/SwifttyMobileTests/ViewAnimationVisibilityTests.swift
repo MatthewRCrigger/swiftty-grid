@@ -160,7 +160,7 @@ extension ViewLifecycleTests {
     let texture = try #require(
       view.renderer.device.makeTexture(descriptor: descriptor)
     )
-    let command = view.renderer.render(view.session.snapshot(), to: texture)
+    let command = try view.renderer.render(view.session.snapshot(), to: texture)
     command.waitUntilCompleted()
     try #require(command.status == .completed && view.renderer.hasBlinkingText)
   }

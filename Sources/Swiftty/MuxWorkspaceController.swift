@@ -1,6 +1,5 @@
 import AppKit
 import MuxNavigation
-import ServiceManagement
 import Synchronization
 import SwiftMuxClient
 import SwiftMuxProtocol
@@ -12,11 +11,6 @@ import SwifttyMac
 /// Closing the window or quitting detaches; panes keep running.
 @MainActor
 final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
-  private enum InputJob: Sendable {
-    case input(MuxInput, PaneID)
-    case paste(String, PaneID)
-  }
-
   private let connection: MuxConnection
   private let server: ServerInstanceID
   private let limits: MuxLimits
@@ -42,18 +36,28 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// Test hook: answers destructive confirmations without a sheet.
   var confirmDestructive: ((String) async -> Bool)?
   let layoutView = MuxLayoutView()
-  private var inputs: AsyncStream<InputJob>.Continuation?
+  private var inputs: MuxInputQueue?
   private var commands: AsyncStream<@Sendable () async -> Void>.Continuation?
+  /// Buffered commands, in addition to the one already dispatched.
+  static let maxQueuedCommands = 64
+  private var pipelineTasks: [Task<Void, Never>] = []
   private var tasks: [Task<Void, Never>] = []
+  private let connectionAttempts = MuxConnectionAttempts()
   private var geometryGeneration: UInt64 = 0
   private var sentGeometry: (revision: UInt64, entries: [GeometryBatch.Entry])?
   private var geometryScheduled = false
+  private var geometryDeferred = false
   private var subscribed: [PaneID] = []
   private var detached = false
+  private var presentationAttachment: AttachmentID?
+  /// Lease loss leaves inbox metadata available until the window closes.
+  private var closed = false
+  private var closeRequested = false
+  var isClosed: Bool { closed || closeRequested }
   /// Whether this window still holds its workspace's lease: false once
   /// it detached, lost its connection or another frontend took over
   /// (the window then shows "SwiftMux — detached").
-  var holdsLease: Bool { !detached && attachedWorkspace != nil }
+  var holdsLease: Bool { !isClosed && !detached && attachedWorkspace != nil }
   var onClose: (() -> Void)?
   /// Receives the window that replaced this one after it lost its lease
   /// (inbox "Open" reattaching); the app keeps one SwiftMux window.
@@ -69,6 +73,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   lazy var workspaceToolbar = MuxWorkspaceToolbar(tabs: tabStrip)
   private var inboxPopover: NSPopover?
   private(set) var inboxView: MuxInboxViewController?
+  private var inboxReadID = UUID()
 
   private init(
     connection: MuxConnection,
@@ -79,15 +84,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     server = welcome.server
     limits = welcome.limits
     config = configuration
-    let window = NSWindow(
-      contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
-      styleMask: [.titled, .closable, .miniaturizable, .resizable],
-      backing: .buffered,
-      defer: false
-    )
-    window.title = "SwiftMux"
-    window.tabbingMode = .disallowed
-    window.center()
+    let window = Self.makeWorkspaceWindow()
     super.init(window: window)
     window.delegate = self
     let content = workspaceContent
@@ -120,88 +117,6 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   @available(*, unavailable)
   required init?(coder: NSCoder) { fatalError() }
 
-  // MARK: Service connection
-
-  enum ServiceState: Equatable {
-    case available
-    case requiresApproval
-    case unavailable(String)
-  }
-
-  /// Registers the bundled agent when running from an app bundle and
-  /// reports its state; never starts a second service on its own.
-  static func ensureAgent() -> ServiceState {
-    guard Bundle.main.bundleURL.pathExtension == "app" else {
-      return .available
-    }
-    let service = SMAppService.agent(plistName: SMX.agentPlistName)
-    switch service.status {
-    case .enabled: return .available
-    case .requiresApproval: return .requiresApproval
-    case .notFound:
-      return .unavailable(
-        "The SwiftMux helper is missing from this app bundle."
-      )
-    case .notRegistered:
-      do {
-        try service.register()
-        return service.status == .requiresApproval
-          ? .requiresApproval : .available
-      } catch {
-        return .unavailable(
-          "Registering the SwiftMux helper failed: \(error.localizedDescription)"
-        )
-      }
-    @unknown default: return .unavailable("Unknown SwiftMux helper state.")
-    }
-  }
-
-  static func connect() async throws -> MuxConnection {
-    switch ensureAgent() {
-    case .available: break
-    case .requiresApproval:
-      SMAppService.openSystemSettingsLoginItems()
-      throw MuxUnavailable(
-        message:
-          "Allow the SwiftMux helper in System Settings › Login Items. It keeps terminals running after Swiftty closes."
-      )
-    case let .unavailable(reason): throw MuxUnavailable(message: reason)
-    }
-    do { return try await MuxConnection.connect(frontend: .native) } catch let
-      error as MuxError where error.code == .incompatibleVersion
-    {
-      // Preserve the running service and its sessions.
-      throw MuxUnavailable(
-        message: "The running SwiftMux service is a different version "
-          + "(\(error.message)). Reopen the Swiftty version that started "
-          + "it, or end its sessions with `swmux end-all` before updating."
-      )
-    } catch {
-      // A bundled agent registered under another signing team is killed
-      // at launch (launch constraint) until it is registered again.
-      let remedy =
-        Bundle.main.bundleURL.pathExtension == "app"
-        ? "If Swiftty was re-signed, reinstall it with Scripts/install.sh "
-          + "or run `swiftty --swiftmux-agent unregister`, then reopen Swiftty."
-        : "Install it with `swmux agent install`."
-      throw MuxUnavailable(
-        message: "SwiftMux service unavailable (\(error)). \(remedy)"
-      )
-    }
-  }
-
-  /// Attaches to `selector` (creating a workspace when nil) in a new window.
-  static func open(
-    _ selector: WorkspaceSelector?,
-    configuration: Configuration
-  ) async throws -> MuxWorkspaceController {
-    try await open(
-      selector,
-      configuration: configuration,
-      connection: connect()
-    )
-  }
-
   /// Attaches over an existing connection (also used by tests with an
   /// in-process service). With `expectedLease`, explicitly takes over the
   /// workspace from whoever holds that lease generation; callers pass it
@@ -210,11 +125,16 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     _ selector: WorkspaceSelector?,
     configuration: Configuration,
     connection: MuxConnection,
-    takeover expectedLease: UInt64? = nil
+    takeover expectedLease: UInt64? = nil,
+    beforeReturnForTesting: (
+      @MainActor (MuxWorkspaceController) async -> Void
+    )? = nil,
   ) async throws -> MuxWorkspaceController {
+    try Task.checkCancellation()
     guard let welcome = await connection.welcome else {
       throw MuxError(.connectionLost)
     }
+    try Task.checkCancellation()
     let target: WorkspaceSelector
     if let selector {
       target = selector
@@ -229,58 +149,45 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
               launch: LaunchSpec(
                 workingDirectory: FileManager.default
                   .homeDirectoryForCurrentUser.path,
-                environment: env
-              )
-            )
-          )
+                environment: env,
+              ),
+            ),
+          ),
+          timeout: .seconds(5),
         )
       else { throw MuxError(.invalidRequest, "unexpected reply") }
       target = .id(ws.id)
     }
+    try Task.checkCancellation()
     let attach: MuxCommand =
       expectedLease.map { .takeover(target, expectedLease: $0) }
       ?? .attach(target)
-    guard case let .attached(_, ws) = try await connection.execute(attach)
+    guard
+      case let .attached(attachment, ws) = try await connection.execute(
+        attach,
+        timeout: .seconds(5)
+      )
     else { throw MuxError(.invalidRequest, "unexpected attach reply") }
+    try Task.checkCancellation()
     let controller = MuxWorkspaceController(
       connection: connection,
       welcome: welcome,
-      configuration: configuration
+      configuration: configuration,
     )
-    controller.apply(ws, attached: true)
+    controller.apply(ws, attached: true, attachment: attachment)
     controller.startEvents()
     controller.startInbox()
     controller.sendTheme()
     controller.observeAppearance()
-    return controller
-  }
-
-  /// Opens `selector` on the new `connection` and only then leaves
-  /// `current` (one SwiftMux window and lease at a time). A failed attach
-  /// (`leaseHeld` before a confirmed takeover, `staleRevision`, …)
-  /// closes `connection` and leaves `current` with its window and lease.
-  static func replace(
-    _ current: MuxWorkspaceController?,
-    with selector: WorkspaceSelector,
-    configuration: Configuration,
-    connection: MuxConnection,
-    takeover expectedLease: UInt64? = nil
-  ) async throws -> MuxWorkspaceController {
-    let controller: MuxWorkspaceController
     do {
-      controller = try await open(
-        selector,
-        configuration: configuration,
-        connection: connection,
-        takeover: expectedLease
-      )
+      await beforeReturnForTesting?(controller)
+      try Task.checkCancellation()
+      try await connection.checkOpen()
+      try Task.checkCancellation()
     } catch {
-      await connection.close()
+      await controller.detach()
+      controller.close()
       throw error
-    }
-    if let current {
-      await current.detach()
-      current.close()
     }
     return controller
   }
@@ -296,10 +203,12 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     _ target: PaneTarget,
     in current: MuxWorkspaceController?,
     configuration: Configuration,
-    connect: @MainActor () async throws -> MuxConnection,
+    connect: @escaping @MainActor () async throws -> MuxConnection,
     takeover expectedLease: UInt64? = nil,
-    attached: (MuxWorkspaceController) -> Void = { _ in }
+    attached: (MuxWorkspaceController) -> Void = { _ in },
   ) async throws -> MuxWorkspaceController {
+    try Task.checkCancellation()
+    guard current?.isClosed != true else { throw CancellationError() }
     if let current, current.attachedWorkspace == target.workspace,
       current.holdsLease
     {
@@ -310,54 +219,68 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
         // The lease moved before the detach event arrived: attach afresh.
       }
     }
+    guard current?.isClosed != true else { throw CancellationError() }
+    let connection: MuxConnection
+    if let current {
+      connection = try await current.connectionAttempts.connect(connect)
+    } else {
+      connection = try await connect()
+    }
     let controller = try await replace(
       current,
       with: .id(target.workspace),
       configuration: configuration,
-      connection: connect(),
-      takeover: expectedLease
+      connection: connection,
+      takeover: expectedLease,
     )
+    do { try Task.checkCancellation() } catch {
+      await controller.detach()
+      controller.close()
+      throw error
+    }
     attached(controller)
     try await controller.revealAttention(pane: target.pane, tab: target.tab)
     return controller
-  }
-
-  /// Workspaces known to the service (no lease needed).
-  static func listWorkspaces() async throws -> [WorkspaceSummary] {
-    let connection = try await connect()
-    defer { Task { await connection.close() } }
-    guard
-      case let .workspaces(list) = try await connection.execute(.listWorkspaces)
-    else { return [] }
-    return list
   }
 
   // MARK: Pipelines
 
   /// One ordered input writer and one ordered command executor.
   private func startPipelines() {
-    let (inputStream, inputContinuation) = AsyncStream<InputJob>.makeStream()
-    inputs = inputContinuation
-    let connection = connection
-    tasks.append(
-      Task.detached {
-        for await job in inputStream {
-          switch job {
-          case let .input(input, pane): await connection.post(input, to: pane)
-          case let .paste(text, pane):
-            _ = try? await connection.paste(text, to: pane)
+    inputs = MuxInputQueue(connection: connection, limits: limits) {
+      [weak self] message in
+      guard let self, !detached else { return }
+      window?.subtitle = DisplayText.sanitize(message)
+    }
+    let (commandStream, commandContinuation) = AsyncStream<
+      @Sendable () async -> Void
+    >
+    .makeStream(bufferingPolicy: .bufferingOldest(Self.maxQueuedCommands))
+    commands = commandContinuation
+    pipelineTasks.append(
+      Task.detached { [weak self] in
+        for await command in commandStream {
+          guard !Task.isCancelled else { break }
+          await command()
+          // A full queue may defer the newest divider proposal. Retry
+          // as accepted jobs drain, without adding a polling task.
+          await self?.flushRatio()
+          await MainActor.run { [weak self] in
+            guard let self, geometryDeferred else { return }
+            sendGeometry()
           }
         }
       }
     )
-    let (commandStream, commandContinuation) = AsyncStream<
-      @Sendable () async -> Void
-    >
-    .makeStream()
-    commands = commandContinuation
-    tasks.append(
-      Task.detached { for await command in commandStream { await command() } }
-    )
+  }
+
+  private func stopPipelines() {
+    inputs?.stop()
+    inputs = nil
+    commands?.finish()
+    commands = nil
+    for task in pipelineTasks { task.cancel() }
+    pipelineTasks.removeAll()
   }
 
   /// Consumes events off the main actor; imports frames there and hops
@@ -381,12 +304,18 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
             default: await self?.handle(event)
             }
           }
+          if !Task.isCancelled {
+            await self?.connectionEnded("connection closed")
+          }
         } catch { await self?.connectionEnded(String(describing: error)) }
       }
     )
   }
 
   private func present(_ presentation: MuxPresentation) {
+    guard !detached,
+      presentation.frame.identity.attachment == presentationAttachment
+    else { return }
     views[presentation.frame.identity.pane]?
       .receive(presentation, server: server)
   }
@@ -399,12 +328,13 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       titles[pane] = DisplayText.sanitize(title)
       refreshChrome()
     case let .bell(pane):
+      guard !detached else { return }
       NSSound.beep()
       if pane != activePane { markActivity(pane) }
     case let .activity(pane): markActivity(pane)
     case let .detached(reason): connectionEnded(reason)
     case let .paneExited(pane, status, truncated):
-      if truncated {
+      if truncated, !detached {
         window?.subtitle =
           "A pane was force-killed; its final output may be incomplete"
       }
@@ -422,6 +352,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private func connectionEnded(_ reason: String) {
     guard !detached else { return }
     detached = true
+    stopPipelines()
     for view in views.values { view.reset() }
     window?.title = "SwiftMux — detached (\(reason))"
   }
@@ -437,7 +368,18 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// or takeover and names the workspace this connection now holds;
   /// otherwise it is shown only for that workspace and when no older
   /// than the layout already shown.
-  private func apply(_ ws: WorkspaceSnapshot, attached: Bool = false) {
+  private func apply(
+    _ ws: WorkspaceSnapshot,
+    attached: Bool = false,
+    attachment: AttachmentID? = nil
+  ) {
+    // Metadata remains available after lease loss, but this window no
+    // longer presents layouts from its retired interactive attachment.
+    guard !detached else { return }
+    if let attachment, presentationAttachment != attachment {
+      presentationAttachment = attachment
+      for view in views.values { view.reset() }
+    }
     let update = attached ? sequencer.attached(ws) : sequencer.layout(ws)
     switch update {
     case nil: return
@@ -522,7 +464,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
 
   /// Tab strip, pane headers and window title from the current snapshot.
   private func refreshChrome() {
-    guard let ws = workspace else { return }
+    guard !detached, let ws = workspace else { return }
     tabStrip.update(
       ws.tabs.map { tab in
         let name = DisplayText.sanitize(tab.name)
@@ -558,6 +500,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   }
 
   private func markActivity(_ pane: PaneID) {
+    guard !detached else { return }
     guard pane != activePane || !subscribed.contains(pane) else { return }
     guard activity.insert(pane).inserted else { return }
     refreshChrome()
@@ -663,26 +606,32 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   }
 
   private func flushRatio() {
-    guard !ratioSending, !detached, let proposal = ratioProposal else { return }
+    guard !ratioSending, !detached, let proposal = ratioProposal, let commands
+    else { return }
     ratioSending = true
     let connection = connection
-    commands?
-      .yield {
-        let reply = try? await connection.execute(
-          .setSplitRatio(
-            tab: proposal.tab,
-            path: proposal.path,
-            ratio: proposal.ratio
-          )
+    let admission = commands.yield {
+      let reply = try? await connection.execute(
+        .setSplitRatio(
+          tab: proposal.tab,
+          path: proposal.path,
+          ratio: proposal.ratio
         )
-        await MainActor.run { [weak self] in
-          guard let self else { return }
-          ratioSending = false
-          if ratioProposal == proposal { ratioProposal = nil }
-          if case let .layout(ws)? = reply { apply(ws) }
-          flushRatio()
-        }
+      )
+      await MainActor.run { [weak self] in
+        guard let self else { return }
+        ratioSending = false
+        if ratioProposal == proposal { ratioProposal = nil }
+        if case let .layout(ws)? = reply { apply(ws) }
+        flushRatio()
       }
+    }
+    // A refused job owns no completion that could clear this flag.
+    // Keep only the latest proposal for the pipeline's next retry.
+    guard case .enqueued = admission else {
+      ratioSending = false
+      return
+    }
   }
 
   /// Coalesces superseded geometry into one batch per run loop turn.
@@ -698,7 +647,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   }
 
   private func sendGeometry() {
-    guard !detached, let ws = workspace else { return }
+    guard !detached, let ws = workspace, let commands else { return }
     let entries =
       views.compactMap { id, view -> GeometryBatch.Entry? in
         guard view.superview != nil, view.bounds.width > 0,
@@ -728,15 +677,22 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       entries: entries
     )
     let connection = connection
-    commands?
-      .yield {
-        do { try await connection.execute(.setGeometry(batch)) } catch let error
-          as MuxError where error.code == .staleGeometry
-        {
-          // A newer layout is on its way; resend once it arrives.
-          await MainActor.run { [weak self] in self?.sentGeometry = nil }
-        } catch {}
-      }
+    let admission = commands.yield {
+      do { try await connection.execute(.setGeometry(batch)) } catch let error
+        as MuxError where error.code == .staleGeometry
+      {
+        // A newer layout is on its way; resend once it arrives.
+        await MainActor.run { [weak self] in self?.sentGeometry = nil }
+      } catch {}
+    }
+    guard case .enqueued = admission else {
+      // This batch was never accepted. Retry current dimensions when
+      // the existing pipeline next makes room, rather than caching it.
+      sentGeometry = nil
+      geometryDeferred = true
+      return
+    }
+    geometryDeferred = false
   }
 
   // MARK: Actions
@@ -745,50 +701,77 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// logged; with it, the failure is handed back and `then` is skipped.
   private func command(
     _ command: MuxCommand,
+    cancelled: @escaping @Sendable () -> Bool = { false },
     failed: (@MainActor @Sendable (any Error) -> Void)? = nil,
-    then: (@MainActor @Sendable () -> Void)? = nil
+    then: (@MainActor @Sendable () -> Void)? = nil,
   ) {
+    guard let commands else {
+      failed?(MuxError(.notAttached))
+      return
+    }
     let connection = connection
-    commands?
-      .yield {
-        do {
-          let reply = try await connection.execute(command)
-          switch reply {
-          case let .attached(_, ws):
-            await MainActor.run { [weak self] in self?.apply(ws, attached: true)
-            }
-          case let .layout(ws):
-            // A switch reply names the workspace now held.
-            var switched = false
-            if case .switchWorkspace = command { switched = true }
-            await MainActor.run { [weak self] in
-              self?.apply(ws, attached: switched)
-            }
-          default: break
+    let admission = commands.yield {
+      do {
+        if cancelled() { throw CancellationError() }
+        let reply = try await connection.execute(command)
+        switch reply {
+        case let .attached(attachment, ws):
+          await MainActor.run { [weak self] in
+            self?.apply(ws, attached: true, attachment: attachment)
           }
-          if let then { await then() }
-        } catch {
-          if let failed {
-            await failed(error)
-            return
+        case let .layout(ws):
+          // A switch reply names the workspace now held.
+          var switched = false
+          if case .switchWorkspace = command { switched = true }
+          await MainActor.run { [weak self] in
+            self?.apply(ws, attached: switched)
           }
-          await MainActor.run {
-            FileHandle.standardError.write(
-              Data("swiftty: swiftmux: \(error)\n".utf8)
-            )
-          }
+        default: break
+        }
+        if let then { await then() }
+      } catch {
+        if Task.isCancelled {
+          if let failed { await failed(MuxError(.notAttached)) }
+          return
+        }
+        if let failed {
+          await failed(error)
+          return
+        }
+        await MainActor.run {
+          FileHandle.standardError.write(
+            Data("swiftty: swiftmux: \(error)\n".utf8),
+          )
         }
       }
+    }
+    switch admission {
+    case .enqueued: break
+    case .dropped:
+      let error = MuxError(
+        .resourceLimit,
+        "Too many pending workspace commands"
+      )
+      if let failed {
+        failed(error)
+      } else {
+        FileHandle.standardError.write(
+          Data("swiftty: swiftmux: \(error)\n".utf8)
+        )
+      }
+    case .terminated: failed?(MuxError(.notAttached))
+    @unknown default: failed?(MuxError(.resourceLimit))
+    }
   }
 
   func send(_ input: MuxInput, to pane: PaneID) {
     guard !detached else { return }
-    inputs?.yield(.input(input, pane))
+    inputs?.send(input, to: pane)
   }
 
   func paste(_ text: String, to pane: PaneID) {
     guard !detached else { return }
-    inputs?.yield(.paste(text, pane))
+    inputs?.paste(text, to: pane)
   }
 
   func scroll(_ pane: PaneID, lines: Int) {
@@ -840,6 +823,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// first when it is not the active one), for attention links. The
   /// layout reply makes the pane's view first responder.
   func reveal(pane: PaneID, tab: TabID?) {
+    guard holdsLease else { return }
     if let tab = tab ?? workspace?.tab(containing: pane)?.id { selectTab(tab) }
     if pane != activePane { command(.focusPane(pane)) }
     showWindow(nil)
@@ -850,45 +834,55 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// `reveal(pane:tab:)` that reports failure: `notAttached` once this
   /// window no longer holds the lease, or the service's refusal.
   func revealAttention(pane: PaneID, tab: TabID?) async throws {
+    try Task.checkCancellation()
     guard holdsLease else { throw MuxError(.notAttached) }
     if let tab = tab ?? workspace?.tab(containing: pane)?.id,
       tab != workspace?.activeTab
     {
       try await execute(.selectTab(tab))
     }
+    try Task.checkCancellation()
+    guard holdsLease else { throw MuxError(.notAttached) }
     if pane != activePane { try await execute(.focusPane(pane)) }
+    try Task.checkCancellation()
+    guard holdsLease else { throw MuxError(.notAttached) }
     reveal(pane: pane, tab: nil)
   }
 
   /// Runs `command` in order with the others and waits for its outcome.
+  /// Cancellation stops waiting and skips commands not yet dispatched;
+  /// a command already sent to the service may still commit.
   /// A command dropped unrun (the queue ended on detach) fails
   /// `notAttached`.
   private func execute(_ command: MuxCommand) async throws {
-    try await withCheckedThrowingContinuation {
-      (done: CheckedContinuation<Void, any Error>) in
-      let once = Once(done)
-      self.command(
-        command,
-        failed: { error in once.resume(throwing: error) },
-        then: { once.resume() }
-      )
+    let state = Mutex(MuxCommandWait())
+    try await withTaskCancellationHandler {
+      try Task.checkCancellation()
+      try await withCheckedThrowingContinuation {
+        (done: CheckedContinuation<Void, any Error>) in
+        let once = MuxCommandCompletion(done)
+        let cancelled = state.withLock { state in
+          state.once = once
+          return state.cancelled
+        }
+        guard !cancelled else {
+          once.resume(throwing: CancellationError())
+          return
+        }
+        self.command(
+          command,
+          cancelled: { state.withLock { $0.cancelled } },
+          failed: { error in once.resume(throwing: error) },
+          then: { once.resume() },
+        )
+      }
+    } onCancel: {
+      let once = state.withLock { state in
+        state.cancelled = true
+        return state.once
+      }
+      once?.resume(throwing: CancellationError())
     }
-  }
-
-  /// Resumes a continuation exactly once; released unresumed, it fails.
-  private final class Once: Sendable {
-    private let done: Mutex<CheckedContinuation<Void, any Error>?>
-
-    init(_ done: CheckedContinuation<Void, any Error>) {
-      self.done = Mutex(done)
-    }
-
-    func resume(throwing error: (any Error)? = nil) {
-      guard let done = self.done.withLock({ $0.take() }) else { return }
-      if let error { done.resume(throwing: error) } else { done.resume() }
-    }
-
-    deinit { resume(throwing: MuxError(.notAttached)) }
   }
 
   func selectTab(_ tab: TabID) {
@@ -967,9 +961,10 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     button: String = "End",
     _ action: @escaping @MainActor () -> Void
   ) {
+    guard !isClosed else { return }
     guard ask else { return action() }
     Task { @MainActor [weak self] in
-      guard let self else { return }
+      guard let self, !isClosed else { return }
       let ok: Bool
       if let hook = confirmDestructive {
         ok = await hook(message)
@@ -987,7 +982,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
           ok = alert.runModal() == .alertFirstButtonReturn
         }
       }
-      if ok { action() }
+      if ok, !isClosed { action() }
     }
   }
 
@@ -1000,14 +995,17 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
 
   /// Releases the lease; panes, layout and history stay with the service.
   func detach() async {
-    guard !detached else { return }
+    guard !closed else { return }
+    closed = true
+    connectionAttempts.cancel()
+    inboxReadID = UUID()
     detached = true
     for view in views.values { view.cancelComposition() }
-    inputs?.finish()
-    commands?.finish()
+    stopPipelines()
+    for task in tasks { task.cancel() }
     await connection.detach()
     await connection.close()
-    for task in tasks { task.cancel() }
+    tasks.removeAll()
   }
 
   // MARK: Theme
@@ -1144,6 +1142,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// Rereads the first page of each section (after subscribing, a
   /// `resync` or a stale or missing item).
   func reloadInbox() async {
+    let id = UUID()
+    inboxReadID = id
     var pages: [InboxQuery.Section: InboxPage] = [:]
     for section in MuxInboxModel.sections {
       do {
@@ -1152,8 +1152,10 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
             .inbox(InboxQuery(section: section, limit: inboxPageLimit))
           )
         else { throw MuxError(.invalidRequest, "unexpected inbox reply") }
+        guard inboxReadID == id, !Task.isCancelled else { return }
         pages[section] = page
       } catch {
+        guard inboxReadID == id, !Task.isCancelled else { return }
         inboxFailed(error, alert: false)
         return
       }
@@ -1164,6 +1166,9 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
 
   /// Reads the next page of every section that has one ("Load More").
   func loadMoreInbox() async {
+    let id = UUID()
+    inboxReadID = id
+    var pages: [InboxQuery.Section: InboxPage] = [:]
     for section in MuxInboxModel.sections {
       guard let cursor = inbox.cursors[section] else { continue }
       do {
@@ -1178,14 +1183,18 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
             )
           )
         else { throw MuxError(.invalidRequest, "unexpected inbox reply") }
-        inbox.append(page, section: section)
+        guard inboxReadID == id, !Task.isCancelled else { return }
+        pages[section] = page
       } catch {
+        guard inboxReadID == id, !Task.isCancelled else { return }
         // A cursor the service no longer accepts: start over.
         inboxFailed(error, alert: true)
         await reloadInbox()
         return
       }
     }
+    guard inboxReadID == id, !Task.isCancelled else { return }
+    for (section, page) in pages { inbox.append(page, section: section) }
     refreshInbox()
   }
 
@@ -1201,6 +1210,10 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   }
 
   private func inboxProblem(_ message: String, alert: Bool) {
+    if isClosed {
+      if !alert { inboxMessage = message }
+      return
+    }
     inboxMessage = message
     if inboxPopover?.isShown == true {
       inboxView?.show(message: message)
@@ -1283,11 +1296,11 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     Task { [weak self] in
       do {
         let reply = try await connection.execute(command)
-        guard let self, let location = checked(reply, item, alert: alert) else {
-          return
-        }
+        guard let self, !isClosed,
+          let location = checked(reply, item, alert: alert)
+        else { return }
         then?(location)
-      } catch { self?.inboxFailed(error, alert: alert) }
+      } catch { if let self, !isClosed { inboxFailed(error, alert: alert) } }
     }
   }
 
@@ -1394,14 +1407,17 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
           controller.onReplaced = self.onReplaced
           self.onReplaced?(controller)
         }
-      } catch let error as MuxError
-        where replacement == nil
+      } catch is CancellationError { return } catch let error as MuxError
+        where replacement == nil && !isClosed
         && (error.code == .leaseHeld || error.code == .staleRevision)
       {
         confirmTakeover(target.workspace, moved: lease != nil) {
           [weak self] lease in self?.reattach(target, takeover: lease)
         }
-      } catch { (replacement ?? self).inboxFailed(error, alert: true) }
+      } catch {
+        let recipient = replacement ?? self
+        if !recipient.isClosed { recipient.inboxFailed(error, alert: true) }
+      }
     }
   }
 
@@ -1428,24 +1444,30 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       do {
         guard
           case let .workspaces(list) = try await connection.execute(
-            .listWorkspaces
-          ), let found = list.first(where: { $0.id == wsID })
-        else { throw MuxError(.notFound) }
+            .listWorkspaces,
+            timeout: .seconds(5)
+          )
+        else {
+          throw MuxError(.invalidRequest, "unexpected workspace-list reply")
+        }
+        guard let found = list.first(where: { $0.id == wsID }) else {
+          throw MuxError(.notFound)
+        }
         summary = found
       } catch {
-        self?.inboxFailed(error, alert: true)
+        if let self, !isClosed { inboxFailed(error, alert: true) }
         return
       }
+      guard let self, !isClosed else { return }
       let name = DisplayText.sanitize(summary.name)
-      self?
-        .confirmThen(
-          true,
-          moved
-            ? "Control of workspace “\(name)” changed while you were deciding. Take control now?"
-            : "Take control of workspace “\(name)”?",
-          "Another window or device controls it. Taking over disconnects it there; its programs keep running.",
-          button: "Take Over"
-        ) { take(summary.leaseGeneration) }
+      confirmThen(
+        true,
+        moved
+          ? "Control of workspace “\(name)” changed while you were deciding. Take control now?"
+          : "Take control of workspace “\(name)”?",
+        "Another window or device controls it. Taking over disconnects it there; its programs keep running.",
+        button: "Take Over"
+      ) { take(summary.leaseGeneration) }
     }
   }
 
@@ -1464,6 +1486,10 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   }
 
   func windowWillClose(_ notification: Notification) {
+    closeRequested = true
+    connectionAttempts.cancel()
+    detached = true
+    stopPipelines()
     Task { await detach() }
     onClose?()
   }

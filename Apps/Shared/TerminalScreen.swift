@@ -14,7 +14,7 @@ public struct TerminalSurfaceFactory: Sendable {
 }
 
 extension EnvironmentValues {
-  @Entry public var terminalSurfaceFactory: TerminalSurfaceFactory? = nil
+  @Entry public var terminalSurfaceFactory: TerminalSurfaceFactory?
 }
 
 /// The terminal screen for one session: connection state, pending input
@@ -36,6 +36,9 @@ public struct TerminalScreen: View {
       Divider()
       if let factory {
         factory.make(model)
+          // Native renderers and surface tasks belong to this model's
+          // session; a replacement must start with a fresh hierarchy.
+          .id(model.id)
       } else {
         TerminalSurfacePlaceholder(model: model)
       }

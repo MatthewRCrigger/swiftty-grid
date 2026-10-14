@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import ServiceManagement
+import SwiftMuxClient
 import SwiftMuxProtocol
 
 // `swiftty --swiftmux-agent register|unregister|status` manages the bundled
@@ -22,14 +23,9 @@ if let i = arguments.firstIndex(of: "--swiftmux-agent") {
     switch action {
     case "register": try service.register()
     case "unregister":
-      let done = DispatchSemaphore(value: 0)
-      nonisolated(unsafe) var failure: (any Error)?
-      service.unregister { error in
-        failure = error
-        done.signal()
+      try AgentUnregisterWait.run { completion in
+        service.unregister(completionHandler: completion)
       }
-      done.wait()
-      if let failure { throw failure }
     case "status": break
     default:
       FileHandle.standardError.write(

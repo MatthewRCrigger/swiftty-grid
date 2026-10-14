@@ -88,6 +88,17 @@ public enum ScreenExporter {
       wrapped.append(state.grid.isWrapped(y))
     }
 
+    var exportedStyles = styles.styles
+    if exportedStyles.count > RSTLimits.maxStyles {
+      // There are at most maxStyles cells. A table with one extra style
+      // therefore has a distinct nonplain style for every cell: the reserved
+      // plain entry is unused. Remove it without dropping any cell's style.
+      exportedStyles.removeFirst()
+      for y in cells.indices {
+        for x in cells[y].indices { cells[y][x].style -= 1 }
+      }
+    }
+
     let cursor = state.cursor
     let shape: CursorShape =
       switch state.cursorStyle {
@@ -113,7 +124,7 @@ public enum ScreenExporter {
       reverseVideo: state.modes.contains(.reverseVideo),
       title: boundedTitle(state.title),
       wrapped: wrapped,
-      styles: styles.styles,
+      styles: exportedStyles,
       cells: cells,
       lastFullyAppliedInputSequence: stamp.lastFullyAppliedInputSequence
     )
@@ -205,8 +216,7 @@ struct StyleTable {
 
   /// Palette and direct colors resolve to RGB; the default color is nil
   /// so the client applies its own default.
-  static func resolve(_ color: TerminalColor, _ palette: Palette) -> RGBColor?
-  {
+  static func resolve(_ color: TerminalColor, _ palette: Palette) -> RGBColor? {
     switch color.kind {
     case .default: nil
     case let .palette(index): RGBColor(palette.colors[Int(index)])

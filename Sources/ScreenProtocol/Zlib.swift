@@ -1,9 +1,10 @@
 import Compression
 import Foundation
+import zlib
 
-/// RFC 1950 zlib framing over the Compression framework's raw DEFLATE
-/// (`COMPRESSION_ZLIB` produces and consumes RFC 1951 data without the
-/// zlib header or Adler-32 trailer, which are handled here).
+/// RFC 1950 framing with Compression for encoding and zlib for strict
+/// decoding of raw DEFLATE. The header and Adler-32 trailer are handled
+/// here.
 public enum Zlib {
   public enum Error: Swift.Error, Equatable {
     case header
@@ -34,7 +35,8 @@ public enum Zlib {
   public static func compress(_ input: [UInt8]) -> [UInt8] {
     // CMF 0x78: deflate, 32 KiB window. FLG 0x9C: default level, check bits.
     var out: [UInt8] = [0x78, 0x9C]
-    guard case let .ok(body) = run(COMPRESSION_STREAM_ENCODE, input, limit: .max)
+    guard
+      case let .ok(body) = run(COMPRESSION_STREAM_ENCODE, input, limit: .max)
     else { preconditionFailure("deflate failed") }
     out.append(contentsOf: body)
     let checksum = adler32(input)
@@ -54,26 +56,71 @@ public enum Zlib {
     guard input.count >= 6 else { throw .truncated }
     let cmf = input[0]
     let flg = input[1]
+    // Reject preset dictionaries.
     guard cmf & 0x0F == 8, cmf >> 4 <= 7,
-      (UInt16(cmf) << 8 | UInt16(flg)) % 31 == 0,
-      flg & 0x20 == 0  // no preset dictionary
+      (UInt16(cmf) << 8 | UInt16(flg)) % 31 == 0, flg & 0x20 == 0
     else { throw .header }
     let body = Array(input[2 ..< input.count - 4])
     let output: [UInt8]
-    switch run(COMPRESSION_STREAM_DECODE, body, limit: limit) {
+    switch inflateBody(body, limit: limit) {
     case let .ok(bytes): output = bytes
     case .limit: throw .outputLimit
     case .truncated: throw .truncated
     case .failed: throw .corrupt
     }
     let t = input.suffix(4).map(UInt32.init)
-    let expected = t[t.startIndex] << 24 | t[t.startIndex + 1] << 16
-      | t[t.startIndex + 2] << 8 | t[t.startIndex + 3]
+    let expected =
+      t[t.startIndex] << 24 | t[t.startIndex + 1] << 16 | t[t.startIndex + 2]
+      << 8 | t[t.startIndex + 3]
     guard adler32(output) == expected else { throw .checksum }
     return output
   }
 
-  private enum Outcome { case ok([UInt8]), limit, truncated, failed }
+  private enum Outcome {
+    case ok([UInt8])
+    case limit
+    case truncated
+    case failed
+  }
+
+  /// Use zlib for decoding: Compression may consume bytes past the end
+  /// of a DEFLATE stream, hiding trailing data from its caller.
+  private static func inflateBody(_ input: [UInt8], limit: Int) -> Outcome {
+    guard input.count <= UInt32.max else { return .failed }
+    var stream = z_stream()
+    guard
+      inflateInit2_(
+        &stream,
+        -MAX_WBITS,
+        ZLIB_VERSION,
+        Int32(MemoryLayout<z_stream>.size)
+      ) == Z_OK
+    else { return .failed }
+    defer { inflateEnd(&stream) }
+    let chunk = 64 * 1024
+    var output: [UInt8] = []
+    var buffer = [UInt8](repeating: 0, count: chunk)
+    return input.withUnsafeBufferPointer { src in
+      stream.next_in = UnsafeMutablePointer(mutating: src.baseAddress)
+      stream.avail_in = UInt32(src.count)
+      while true {
+        let status = buffer.withUnsafeMutableBufferPointer { dst in
+          stream.next_out = dst.baseAddress!
+          stream.avail_out = UInt32(chunk)
+          return inflate(&stream, Z_NO_FLUSH)
+        }
+        let produced = chunk - Int(stream.avail_out)
+        guard produced <= limit - output.count else { return .limit }
+        output.append(contentsOf: buffer.prefix(produced))
+        switch status {
+        case Z_STREAM_END: return stream.avail_in == 0 ? .ok(output) : .failed
+        case Z_OK: if stream.avail_in == 0, produced == 0 { return .truncated }
+        case Z_BUF_ERROR: return .truncated
+        default: return .failed
+        }
+      }
+    }
+  }
 
   /// Streams through `compression_stream`, stopping as soon as the output
   /// would exceed `limit`.
@@ -116,7 +163,8 @@ public enum Zlib {
         case COMPRESSION_STATUS_OK:
           // Input consumed without reaching the end of the stream.
           if stream.src_size == 0, produced == 0 {
-            return operation == COMPRESSION_STREAM_DECODE ? .truncated : .ok(output)
+            return operation == COMPRESSION_STREAM_DECODE
+              ? .truncated : .ok(output)
           }
         case COMPRESSION_STATUS_END: return .ok(output)
         default: return .failed

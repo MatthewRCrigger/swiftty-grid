@@ -25,7 +25,8 @@ final class RoamingAppUITests: XCTestCase {
     continueAfterFailure = false
     let env = ProcessInfo.processInfo.environment
     guard let host = env["RST_UI_HOST"], let port = env["RST_UI_PORT"],
-      let password = env["RST_UI_PASSWORD"], let fingerprint = env["RST_UI_FINGERPRINT"]
+      let password = env["RST_UI_PASSWORD"],
+      let fingerprint = env["RST_UI_FINGERPRINT"]
     else {
       throw XCTSkip("Run through Scripts/test-app-ui.sh (RST_UI_* not set)")
     }
@@ -74,32 +75,37 @@ final class RoamingAppUITests: XCTestCase {
     waitForScreen(containing: "set-kept-7")
 
     #if os(iOS) && !targetEnvironment(macCatalyst)
-      // Suspension detaches; foreground return reattaches the same
-      // session and installs a complete screen before input (spec §9).
-      XCUIDevice.shared.press(.home)
-      XCTAssertTrue(
-        app.wait(for: .runningBackgroundSuspended, timeout: 10)
-          || app.wait(for: .runningBackground, timeout: 1),
-        "app did not reach the background"
-      )
-      sleep(3)
-      app.activate()
-      XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
-      waitForConnected()
-      typeLine("echo back-$UI_MARK")
-      waitForScreen(containing: "back-kept-7")
+    // Suspension detaches; foreground return reattaches the same
+    // session and installs a complete screen before input (spec §9).
+    XCUIDevice.shared.press(.home)
+    XCTAssertTrue(
+      app.wait(for: .runningBackgroundSuspended, timeout: 10)
+        || app.wait(for: .runningBackground, timeout: 1),
+      "app did not reach the background"
+    )
+    sleep(3)
+    app.activate()
+    XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+    waitForConnected()
+    typeLine("echo back-$UI_MARK")
+    waitForScreen(containing: "back-kept-7")
     #endif
 
     // SFTP over its own connection to the OpenSSH server (the script puts
     // ui-note.txt in ~/files); credentials come from memory.
     openSessionMenuItem(id: "session.files", title: "Files…")
     let path = element("sftp.path")
-    XCTAssertTrue(path.waitForExistence(timeout: 30), "SFTP browser did not list")
+    XCTAssertTrue(
+      path.waitForExistence(timeout: 30),
+      "SFTP browser did not list"
+    )
     waitUntil("SFTP home listed") { self.path(path) == "/home/rst" }
     let folder = app.buttons["files"].firstMatch
     XCTAssertTrue(folder.waitForExistence(timeout: 10))
     press(folder)
-    waitUntil("SFTP entered /home/rst/files") { self.path(path) == "/home/rst/files" }
+    waitUntil("SFTP entered /home/rst/files") {
+      self.path(path) == "/home/rst/files"
+    }
     XCTAssertTrue(anyText("ui-note.txt").waitForExistence(timeout: 10))
     press(element("sftp.done"))
     XCTAssertTrue(path.waitForNonExistence(timeout: 10))
@@ -107,7 +113,10 @@ final class RoamingAppUITests: XCTestCase {
     // Detach keeps the shell on the host; reopening resumes it.
     openSessionMenuItem(id: "session.detach", title: "Detach")
     let resumable = anyText("Detached session — open to resume")
-    XCTAssertTrue(resumable.waitForExistence(timeout: 10), "no resumable session listed")
+    XCTAssertTrue(
+      resumable.waitForExistence(timeout: 10),
+      "no resumable session listed"
+    )
     openHost("UI Box")
     waitForConnected()
     typeLine("echo again-$UI_MARK")
@@ -162,9 +171,9 @@ final class RoamingAppUITests: XCTestCase {
   /// first reaches the Mac over the LAN.
   private func allowLocalNetworkIfAsked() {
     #if os(iOS) && !targetEnvironment(simulator) && !targetEnvironment(macCatalyst)
-      let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-      let allow = springboard.alerts.buttons["Allow"].firstMatch
-      if allow.waitForExistence(timeout: 8) { allow.tap() }
+    let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+    let allow = springboard.alerts.buttons["Allow"].firstMatch
+    if allow.waitForExistence(timeout: 8) { allow.tap() }
     #endif
   }
 
@@ -178,7 +187,9 @@ final class RoamingAppUITests: XCTestCase {
   }
 
   private func waitForConnected() {
-    waitUntil("connected", timeout: 60) { self.statusLabel().hasPrefix("Connected") }
+    waitUntil("connected", timeout: 60) {
+      self.statusLabel().hasPrefix("Connected")
+    }
   }
 
   /// Interactive shells may drop typeahead sent before their prompt. The
@@ -204,19 +215,23 @@ final class RoamingAppUITests: XCTestCase {
   }
 
   private func waitForScreen(containing text: String) {
-    waitUntil("screen shows \(text)", timeout: 30) { self.screenText().contains(text) }
+    waitUntil("screen shows \(text)", timeout: 30) {
+      self.screenText().contains(text)
+    }
   }
 
   private func openSessionMenuItem(id: String, title: String) {
     let menu = element("session.menu")
     XCTAssertTrue(menu.waitForExistence(timeout: 10))
     press(menu)
-    let byID = app.descendants(matching: .any).matching(identifier: id).firstMatch
+    let byID = app.descendants(matching: .any).matching(identifier: id)
+      .firstMatch
     if byID.waitForExistence(timeout: 3) {
       press(byID)
       return
     }
-    let item = app.menuItems[title].exists ? app.menuItems[title] : app.buttons[title]
+    let item =
+      app.menuItems[title].exists ? app.menuItems[title] : app.buttons[title]
     XCTAssertTrue(item.waitForExistence(timeout: 5), "no \(title) menu item")
     press(item)
   }
@@ -231,35 +246,49 @@ final class RoamingAppUITests: XCTestCase {
 
   /// Text shown anywhere, matched by label or (macOS) value.
   private func anyText(_ text: String) -> XCUIElement {
-    app.descendants(matching: .any).matching(
-      NSPredicate(format: "label == %@ OR value == %@ OR label CONTAINS %@", text, text, text)
-    ).firstMatch
+    app.descendants(matching: .any)
+      .matching(
+        NSPredicate(
+          format: "label == %@ OR value == %@ OR label CONTAINS %@",
+          text,
+          text,
+          text
+        )
+      )
+      .firstMatch
   }
 
   /// A saved host's row: a static text on iOS, one combined button whose
   /// label starts with the nickname on macOS.
   private func hostRow(_ nickname: String) -> XCUIElement {
-    app.descendants(matching: .any).matching(
-      NSPredicate(format: "label == %@ OR label BEGINSWITH %@", nickname, nickname + ",")
-    ).firstMatch
+    app.descendants(matching: .any)
+      .matching(
+        NSPredicate(
+          format: "label == %@ OR label BEGINSWITH %@",
+          nickname,
+          nickname + ","
+        )
+      )
+      .firstMatch
   }
 
   /// A click on macOS (synthesized taps do not focus fields there), a tap
   /// elsewhere.
   private func press(_ element: XCUIElement) {
     #if os(macOS) || targetEnvironment(macCatalyst)
-      // Rows can report not hittable while a sheet finishes closing.
-      let deadline = Date.now.addingTimeInterval(5)
-      while !element.isHittable, Date.now < deadline {
-        RunLoop.current.run(until: .now.addingTimeInterval(0.2))
-      }
-      if element.isHittable {
-        element.click()
-      } else {
-        element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
-      }
+    // Rows can report not hittable while a sheet finishes closing.
+    let deadline = Date.now.addingTimeInterval(5)
+    while !element.isHittable, Date.now < deadline {
+      RunLoop.current.run(until: .now.addingTimeInterval(0.2))
+    }
+    if element.isHittable {
+      element.click()
+    } else {
+      element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        .click()
+    }
     #else
-      element.tap()
+    element.tap()
     #endif
   }
 
@@ -267,20 +296,25 @@ final class RoamingAppUITests: XCTestCase {
     // Mac Catalyst's toolbar bridge keeps labels but drops SwiftUI
     // identifiers, so toolbar items also match by their label.
     let labels: [String: [String]] = [
-      "hosts.add": ["Add Host"], "host.save": ["Save"], "terminal.close": ["Close"],
+      "hosts.add": ["Add Host"], "host.save": ["Save"],
+      "terminal.close": ["Close"],
       // Catalyst shows a toolbar menu as "More".
       "session.menu": ["Session", "More"], "sftp.done": ["Done"],
     ]
     if let names = labels[id] {
-      return app.descendants(matching: .any).matching(
-        NSPredicate(
-          format: "identifier == %@ OR (elementType IN %@ AND (label IN %@ OR title IN %@))",
-          id,
-          [XCUIElement.ElementType.button, .menuButton, .popUpButton].map(\.rawValue),
-          names,
-          names
+      return app.descendants(matching: .any)
+        .matching(
+          NSPredicate(
+            format:
+              "identifier == %@ OR (elementType IN %@ AND (label IN %@ OR title IN %@))",
+            id,
+            [XCUIElement.ElementType.button, .menuButton, .popUpButton]
+              .map(\.rawValue),
+            names,
+            names
+          )
         )
-      ).firstMatch
+        .firstMatch
     }
     return app.descendants(matching: .any).matching(identifier: id).firstMatch
   }
@@ -292,11 +326,11 @@ final class RoamingAppUITests: XCTestCase {
 
   private func screenText() -> String {
     #if os(macOS) || targetEnvironment(macCatalyst)
-      // The AppKit terminal is itself an accessible text view.
-      let view = app.textViews.firstMatch
-      if view.exists, let value = view.value as? String, !value.isEmpty {
-        return value
-      }
+    // The AppKit terminal is itself an accessible text view.
+    let view = app.textViews.firstMatch
+    if view.exists, let value = view.value as? String, !value.isEmpty {
+      return value
+    }
     #endif
     let probe = element("terminal.screen")
     guard probe.exists else { return "" }
@@ -310,11 +344,11 @@ final class RoamingAppUITests: XCTestCase {
   /// The terminal has keyboard focus once shown; type into it.
   private func terminalInputTarget() -> XCUIElement {
     #if os(macOS)
-      return app
+    return app
     #else
-      let terminal = app.descendants(matching: .any)["Terminal"].firstMatch
-      if terminal.exists, !terminal.hasFocusForTyping { press(terminal) }
-      return terminal.exists ? terminal : app
+    let terminal = app.descendants(matching: .any)["Terminal"].firstMatch
+    if terminal.exists, !terminal.hasFocusForTyping { press(terminal) }
+    return terminal.exists ? terminal : app
     #endif
   }
 
@@ -325,15 +359,17 @@ final class RoamingAppUITests: XCTestCase {
     }
     press(field)
     #if os(macOS) || targetEnvironment(macCatalyst)
-      field.typeKey("a", modifierFlags: .command)
-      field.typeText(text)
+    field.typeKey("a", modifierFlags: .command)
+    field.typeText(text)
     #else
-      let current = field.value as? String ?? ""
-      let placeholder = field.placeholderValue ?? ""
-      if !current.isEmpty, current != placeholder {
-        field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count))
-      }
-      field.typeText(text)
+    let current = field.value as? String ?? ""
+    let placeholder = field.placeholderValue ?? ""
+    if !current.isEmpty, current != placeholder {
+      field.typeText(
+        String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count)
+      )
+    }
+    field.typeText(text)
     #endif
   }
 

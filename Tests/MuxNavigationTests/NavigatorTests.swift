@@ -7,8 +7,12 @@ import Testing
 /// (and was not) sent.
 actor FakeService: AttentionService {
   enum Call: Equatable {
-    case epoch, locate(AttentionReference), lease(WorkspaceID)
-    case open(PaneTarget, takeover: UInt64?), markSeen(AttentionReference), close
+    case epoch
+    case locate(AttentionReference)
+    case lease(WorkspaceID)
+    case open(PaneTarget, takeover: UInt64?)
+    case markSeen(AttentionReference)
+    case close
   }
 
   var epoch: ServerInstanceID
@@ -20,6 +24,11 @@ actor FakeService: AttentionService {
   /// Suspends `locate` until released (delayed results).
   var locateGate: CheckedContinuation<Void, Never>?
   var holdLocate = false
+  var holdOpen = false
+  var openGate: CheckedContinuation<Void, Never>?
+  private var holdClose = false
+  private var closeGate: CheckedContinuation<Void, Never>?
+  private(set) var activated = false
   private(set) var calls: [Call] = []
 
   init(epoch: ServerInstanceID) { self.epoch = epoch }
@@ -36,6 +45,19 @@ actor FakeService: AttentionService {
     locateGate = nil
   }
   var isHolding: Bool { locateGate != nil }
+  func setHoldOpen() { holdOpen = true }
+  var isHoldingOpen: Bool { openGate != nil }
+  func releaseOpen() {
+    openGate?.resume();
+    openGate = nil
+  }
+  func setHoldClose() { holdClose = true }
+  var isHoldingClose: Bool { closeGate != nil }
+  func releaseClose() {
+    holdClose = false
+    closeGate?.resume()
+    closeGate = nil
+  }
 
   func serviceEpoch() async throws(AttentionServiceError) -> ServerInstanceID {
     calls.append(.epoch)
@@ -46,40 +68,61 @@ actor FakeService: AttentionService {
     _ reference: AttentionReference
   ) async throws(AttentionServiceError) -> AttentionLocation {
     calls.append(.locate(reference))
-    if holdLocate {
-      await withCheckedContinuation { locateGate = $0 }
-    }
+    if holdLocate { await withCheckedContinuation { locateGate = $0 } }
     if let locateError { throw locateError }
-    return locations[reference.occurrence] ?? AttentionLocation(availability: .missing)
+    return locations[reference.occurrence]
+      ?? AttentionLocation(availability: .missing)
   }
 
-  func leaseState(of workspace: WorkspaceID) async throws(AttentionServiceError) -> LeaseState {
+  func leaseState(
+    of workspace: WorkspaceID
+  ) async throws(AttentionServiceError) -> LeaseState {
     calls.append(.lease(workspace))
     return lease
   }
 
-  func open(_ target: PaneTarget, takeover: UInt64?) async throws(AttentionServiceError) {
+  func open(
+    _ target: PaneTarget,
+    takeover: UInt64?
+  ) async throws(AttentionServiceError) {
     calls.append(.open(target, takeover: takeover))
-    if !openResults.isEmpty, let error = openResults.removeFirst() { throw error }
+    if holdOpen { await withCheckedContinuation { openGate = $0 } }
+    guard !Task.isCancelled else { throw .other("Opening cancelled") }
+    if !openResults.isEmpty, let error = openResults.removeFirst() {
+      throw error
+    }
+    activated = true
   }
 
-  func markSeen(_ reference: AttentionReference) async throws(AttentionServiceError) {
-    calls.append(.markSeen(reference))
-  }
+  func markSeen(
+    _ reference: AttentionReference
+  ) async throws(AttentionServiceError) { calls.append(.markSeen(reference)) }
 
-  func close() async { calls.append(.close) }
+  func close() async {
+    calls.append(.close)
+    if holdClose { await withCheckedContinuation { closeGate = $0 } }
+  }
 }
 
-final class FakeConnector: AttentionServiceConnector, @unchecked Sendable {
+actor FakeConnector: AttentionServiceConnector {
   let service: FakeService
   var error: AttentionServiceError?
+  private var nextService: FakeService?
   private(set) var connectedHosts: [UUID] = []
 
   init(service: FakeService) { self.service = service }
+  func setError(_ error: AttentionServiceError?) { self.error = error }
+  func setNextService(_ service: FakeService) { nextService = service }
 
-  func connect(to host: NavigationHost) async throws(AttentionServiceError) -> any AttentionService {
+  func connect(
+    to host: NavigationHost
+  ) async throws(AttentionServiceError) -> any AttentionService {
     connectedHosts.append(host.id)
     if let error { throw error }
+    if let nextService {
+      self.nextService = nil
+      return nextService
+    }
     return service
   }
 }
@@ -110,7 +153,11 @@ struct Harness {
   var url: URL { AttentionLink.customURL(for: destination) }
 
   var target: PaneTarget {
-    PaneTarget(workspace: destination.workspaceID, tab: destination.tabID, pane: destination.paneID)
+    PaneTarget(
+      workspace: destination.workspaceID,
+      tab: destination.tabID,
+      pane: destination.paneID
+    )
   }
 
   func location(
@@ -128,8 +175,15 @@ struct Harness {
     )
   }
 
-  func preview(_ item: AttentionItem? = nil, lease: Bool = false) -> AttentionPreview {
-    AttentionPreview(item: item ?? sampleItem(for: destination), target: target, leaseHeldElsewhere: lease)
+  func preview(
+    _ item: AttentionItem? = nil,
+    lease: Bool = false
+  ) -> AttentionPreview {
+    AttentionPreview(
+      item: item ?? sampleItem(for: destination),
+      target: target,
+      leaseHeldElsewhere: lease
+    )
   }
 
   func seen() async -> [AttentionReference] {
@@ -146,7 +200,8 @@ struct Harness {
 @Suite("Attention navigator")
 @MainActor
 struct NavigatorTests {
-  @Test func exactOccurrenceOpensAndMarksSeen() async {
+  @Test
+  func exactOccurrenceOpensAndMarksSeen() async {
     let h = Harness()
     await h.service.set(h.location(.available), for: h.destination.occurrenceID)
     await h.navigator.open(h.url)
@@ -163,33 +218,41 @@ struct NavigatorTests {
     #expect(await h.seen().count == 1)
   }
 
-  @Test func rejectedLinkContactsNothing() async {
+  @Test
+  func rejectedLinkContactsNothing() async {
     let h = Harness()
-    await h.navigator.open(URL(string: "swiftty://attention/open?ref=x&host=evil.example")!)
+    await h.navigator.open(
+      URL(string: "swiftty://attention/open?ref=x&host=evil.example")!
+    )
     #expect(h.navigator.state == .rejected(.unexpectedQuery))
-    #expect(h.connector.connectedHosts.isEmpty)
+    #expect(await h.connector.connectedHosts.isEmpty)
     #expect(await h.service.calls.isEmpty)
   }
 
-  @Test func unknownHostRequiresExplicitSelection() async {
+  @Test
+  func unknownHostRequiresExplicitSelection() async {
     let other = NavigationHost(id: UUID(), name: "Laptop")
     let h = Harness(hosts: [other], includeLinkedHost: false)
     await h.service.set(h.location(.available), for: h.destination.occurrenceID)
     await h.navigator.open(h.url)
     #expect(h.navigator.state == .needsHostSelection([other]))
-    #expect(h.connector.connectedHosts.isEmpty)
+    #expect(await h.connector.connectedHosts.isEmpty)
     // A host that is not configured is ignored.
     await h.navigator.selectHost(NavigationHost(id: UUID(), name: "Injected"))
-    #expect(h.connector.connectedHosts.isEmpty)
+    #expect(await h.connector.connectedHosts.isEmpty)
     await h.navigator.selectHost(other)
-    #expect(h.connector.connectedHosts == [other.id])
+    #expect(await h.connector.connectedHosts == [other.id])
     #expect(h.navigator.state == .ready(h.preview()))
   }
 
-  @Test func staleOccurrenceIsShownNotRedirected() async {
+  @Test
+  func staleOccurrenceIsShownNotRedirected() async {
     let h = Harness()
     let item = sampleItem(for: h.destination, resolution: .superseded)
-    await h.service.set(h.location(.stale, item: item), for: h.destination.occurrenceID)
+    await h.service.set(
+      h.location(.stale, item: item),
+      for: h.destination.occurrenceID
+    )
     await h.navigator.open(h.url)
     #expect(h.navigator.state == .stale(h.preview(item)))
     // No Open in pane from a stale item.
@@ -199,20 +262,28 @@ struct NavigatorTests {
     #expect(await h.seen() == [h.destination.reference])
   }
 
-  @Test func resolvedButAvailableIsStale() async {
+  @Test
+  func resolvedButAvailableIsStale() async {
     let h = Harness()
     let item = sampleItem(for: h.destination, resolution: .resolved)
-    await h.service.set(h.location(.available, item: item), for: h.destination.occurrenceID)
+    await h.service.set(
+      h.location(.available, item: item),
+      for: h.destination.occurrenceID
+    )
     await h.navigator.open(h.url)
     #expect(h.navigator.state == .stale(h.preview(item)))
   }
 
-  @Test func differentOccurrenceIsNeverSubstituted() async {
+  @Test
+  func differentOccurrenceIsNeverSubstituted() async {
     let h = Harness()
     // A misbehaving service answers with a newer occurrence of the same
     // source (same label): it must not be shown or acknowledged.
     let newer = sampleItem(for: h.destination, occurrence: OccurrenceID())
-    await h.service.set(h.location(.available, item: newer), for: h.destination.occurrenceID)
+    await h.service.set(
+      h.location(.available, item: newer),
+      for: h.destination.occurrenceID
+    )
     await h.navigator.open(h.url)
     #expect(h.navigator.state == .missing(.notFound))
     await h.navigator.didView()
@@ -221,7 +292,8 @@ struct NavigatorTests {
     #expect(await h.opens().isEmpty)
   }
 
-  @Test func otherPaneIsNeverSubstituted() async {
+  @Test
+  func otherPaneIsNeverSubstituted() async {
     let h = Harness()
     var location = h.location(.available)
     location.pane = PaneID()
@@ -230,7 +302,8 @@ struct NavigatorTests {
     #expect(h.navigator.state == .missing(.notFound))
   }
 
-  @Test func serviceRestartIsMissingBeforeAnyLookup() async {
+  @Test
+  func serviceRestartIsMissingBeforeAnyLookup() async {
     let h = Harness()
     await h.service.set(h.location(.available), for: h.destination.occurrenceID)
     await h.service.setEpochForTest(ServerInstanceID())
@@ -240,7 +313,8 @@ struct NavigatorTests {
     #expect(await h.service.calls == [.epoch])
   }
 
-  @Test func missingOccurrence() async {
+  @Test
+  func missingOccurrence() async {
     let h = Harness()
     await h.navigator.open(h.url)
     #expect(h.navigator.state == .missing(.notFound))
@@ -249,10 +323,18 @@ struct NavigatorTests {
     #expect(h.navigator.state == .missing(.notFound))
   }
 
-  @Test func leaseElsewhereRequiresConfirmedTakeover() async {
+  @Test
+  func leaseElsewhereRequiresConfirmedTakeover() async {
     let h = Harness()
-    let holder = LeaseHolder(transport: .remote, frontend: .native, since: Date(timeIntervalSince1970: 5))
-    await h.service.set(h.location(.available, leaseHeldElsewhere: true), for: h.destination.occurrenceID)
+    let holder = LeaseHolder(
+      transport: .remote,
+      frontend: .native,
+      since: Date(timeIntervalSince1970: 5)
+    )
+    await h.service.set(
+      h.location(.available, leaseHeldElsewhere: true),
+      for: h.destination.occurrenceID
+    )
     await h.service.setLease(LeaseState(generation: 7, holder: holder))
     // A plain attach is refused while the other device holds the lease.
     await h.service.setOpenResults([.leaseHeld, .leaseHeld])
@@ -260,7 +342,11 @@ struct NavigatorTests {
     // Metadata stays viewable while another device controls the pane.
     #expect(h.navigator.state == .ready(h.preview(lease: true)))
     await h.navigator.openInPane()
-    let offer = TakeoverOffer(preview: h.preview(lease: true), expectedLease: 7, holder: holder)
+    let offer = TakeoverOffer(
+      preview: h.preview(lease: true),
+      expectedLease: 7,
+      holder: holder
+    )
     #expect(h.navigator.state == .confirmTakeover(offer))
     #expect(await h.opens() == [.open(h.target, takeover: nil)])
     h.navigator.declineTakeover()
@@ -278,7 +364,8 @@ struct NavigatorTests {
     )
   }
 
-  @Test func leaseTakenWhileOpeningOffersTakeover() async {
+  @Test
+  func leaseTakenWhileOpeningOffersTakeover() async {
     let h = Harness()
     await h.service.set(h.location(.available), for: h.destination.occurrenceID)
     await h.service.setOpenResults([.leaseHeld, .leaseChanged])
@@ -308,32 +395,43 @@ struct NavigatorTests {
     )
   }
 
-  @Test func offlineIsRecoverable() async {
+  @Test
+  func offlineIsRecoverable() async {
     let h = Harness()
-    h.connector.error = .offline("no route")
+    await h.connector.setError(.offline("no route"))
     await h.navigator.open(h.url)
     #expect(h.navigator.state == .unavailable(reason: "no route"))
-    h.connector.error = nil
+    await h.connector.setError(nil)
     await h.service.set(h.location(.available), for: h.destination.occurrenceID)
     await h.navigator.retry()
     #expect(h.navigator.state == .ready(h.preview()))
   }
 
-  @Test func unsupportedTransportIsUnavailable() async {
+  @Test
+  func unsupportedTransportIsUnavailable() async {
     let h = Harness()
     let navigator = AttentionNavigator(
       configuration: AttentionLinkConfiguration(),
       hosts: StaticHostDirectory([h.host]),
-      connector: UnavailableAttentionConnector(reason: "attention not yet available over roaming")
+      connector: UnavailableAttentionConnector(
+        reason: "attention not yet available over roaming"
+      )
     )
     await navigator.open(h.url)
-    #expect(navigator.state == .unavailable(reason: "attention not yet available over roaming"))
+    #expect(
+      navigator.state
+        == .unavailable(reason: "attention not yet available over roaming")
+    )
   }
 
-  @Test func paneExitedOpensRetainedResult() async {
+  @Test
+  func paneExitedOpensRetainedResult() async {
     let h = Harness()
     let item = sampleItem(for: h.destination, resolution: .paneExited)
-    await h.service.set(h.location(.paneExited, item: item), for: h.destination.occurrenceID)
+    await h.service.set(
+      h.location(.paneExited, item: item),
+      for: h.destination.occurrenceID
+    )
     await h.navigator.open(h.url)
     #expect(h.navigator.state == .paneExited(h.preview(item)))
     await h.navigator.openInPane()
@@ -341,7 +439,8 @@ struct NavigatorTests {
     #expect(await h.seen() == [h.destination.reference])
   }
 
-  @Test func paneExitingDuringOpen() async {
+  @Test
+  func paneExitingDuringOpen() async {
     let h = Harness()
     await h.service.set(h.location(.available), for: h.destination.occurrenceID)
     await h.service.setOpenResults([.paneExited])
@@ -353,14 +452,18 @@ struct NavigatorTests {
 
   /// blocked → working → blocked gives occurrences O1 and O2. A delayed
   /// notification for O1 must acknowledge O1 only, never O2.
-  @Test func delayedNotificationDoesNotAcknowledgeNewer() async {
+  @Test
+  func delayedNotificationDoesNotAcknowledgeNewer() async {
     let h = Harness()
     let o1 = h.destination
     var o2 = o1
     o2.occurrenceID = OccurrenceID()
     let o1Item = sampleItem(for: o1, resolution: .superseded)
     await h.service.set(h.location(.stale, item: o1Item), for: o1.occurrenceID)
-    await h.service.set(h.location(.available, item: sampleItem(for: o2)), for: o2.occurrenceID)
+    await h.service.set(
+      h.location(.available, item: sampleItem(for: o2)),
+      for: o2.occurrenceID
+    )
     await h.navigator.open(AttentionLink.customURL(for: o1))
     #expect(h.navigator.state == .stale(h.preview(o1Item)))
     await h.navigator.didView()
@@ -369,15 +472,21 @@ struct NavigatorTests {
 
   /// A slow lookup for an older link must not overwrite or acknowledge
   /// the navigation that replaced it.
-  @Test func newerNavigationCancelsDelayedResult() async {
+  @Test
+  func newerNavigationCancelsDelayedResult() async {
     let h = Harness()
     let o1 = h.destination
     var o2 = o1
     o2.occurrenceID = OccurrenceID()
     await h.service.set(h.location(.available), for: o1.occurrenceID)
-    await h.service.set(h.location(.available, item: sampleItem(for: o2)), for: o2.occurrenceID)
+    await h.service.set(
+      h.location(.available, item: sampleItem(for: o2)),
+      for: o2.occurrenceID
+    )
     await h.service.setHoldLocate(true)
-    let first = Task { await h.navigator.open(AttentionLink.customURL(for: o1)) }
+    let first = Task {
+      await h.navigator.open(AttentionLink.customURL(for: o1))
+    }
     while !(await h.service.isHolding) { await Task.yield() }
     await h.service.setHoldLocate(false)
     await h.navigator.open(AttentionLink.customURL(for: o2))
@@ -391,7 +500,8 @@ struct NavigatorTests {
     #expect(await h.seen() == [o2.reference])
   }
 
-  @Test func cancelDropsEverything() async {
+  @Test
+  func cancelDropsEverything() async {
     let h = Harness()
     await h.service.set(h.location(.available), for: h.destination.occurrenceID)
     await h.navigator.open(h.url)
@@ -401,6 +511,37 @@ struct NavigatorTests {
     await h.navigator.openInPane()
     #expect(await h.seen().isEmpty)
     #expect(await h.opens().isEmpty)
+  }
+
+  @Test
+  func cancelStopsTheInProgressPaneActivation() async {
+    let h = Harness()
+    await h.service.set(h.location(.available), for: h.destination.occurrenceID)
+    await h.navigator.open(h.url)
+    await h.service.setHoldOpen()
+    let task = Task { await h.navigator.openInPane() }
+    while !(await h.service.isHoldingOpen) { await Task.yield() }
+    h.navigator.cancel()
+    await h.service.releaseOpen()
+    await task.value
+    #expect(await h.service.activated == false)
+    #expect(h.navigator.state == .idle)
+    #expect(await h.seen().isEmpty)
+  }
+
+  @Test
+  func cancellingFromTheOpeningObserverContactsNoOpener() async {
+    let h = Harness()
+    await h.service.set(h.location(.available), for: h.destination.occurrenceID)
+    await h.navigator.open(h.url)
+    let navigator = h.navigator
+    navigator.onStateChange = { [weak navigator] state in
+      if case .opening = state { navigator?.cancel() }
+    }
+    await navigator.openInPane()
+    #expect(navigator.state == .idle)
+    #expect(await h.opens().isEmpty)
+    #expect(await h.seen().isEmpty)
   }
 }
 

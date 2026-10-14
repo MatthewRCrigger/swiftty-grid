@@ -32,11 +32,11 @@ struct RendererTests {
     )
     let width = Int(renderer.cellSize.width) * 32 + 16
     let height = Int(renderer.cellSize.height) * 2 + 16
-    _ = render(renderer, session.snapshot(), width: width, height: height)
+    _ = try render(renderer, session.snapshot(), width: width, height: height)
     session.feed(Array("\u{1B}[H\u{1B}[2KZ".utf8))
     let snapshot = session.snapshot()
     #expect(!snapshot.damage.contains(row: 1))
-    let actual = render(renderer, snapshot, width: width, height: height)
+    let actual = try render(renderer, snapshot, width: width, height: height)
     let fresh = try MetalRenderer(
       device: device,
       fontManager: CoreTextFontManager(),
@@ -44,7 +44,7 @@ struct RendererTests {
       atlasSize: 64,
       atlasMaximumSize: 64,
     )
-    let expected = render(fresh, snapshot, width: width, height: height)
+    let expected = try render(fresh, snapshot, width: width, height: height)
     let matches = actual.pixels == expected.pixels
     #expect(
       matches,
@@ -75,9 +75,9 @@ struct RendererTests {
     let width = Int(renderer.cellSize.width) * 2 + 16
     let height = Int(renderer.cellSize.height) + 16
     renderer.options.cursorStyle = .block
-    let block = render(renderer, snapshot, width: width, height: height)
+    let block = try render(renderer, snapshot, width: width, height: height)
     renderer.options.cursorStyle = .bar
-    let bar = render(renderer, snapshot, width: width, height: height)
+    let bar = try render(renderer, snapshot, width: width, height: height)
     let pixel = ((8 + Int(renderer.cellSize.height) / 2) * width + 8) * 4
     // Cell colors and uniform alpha are quantized separately, so their
     // rounding may differ by one unit from the GPU's floating-point blend.
@@ -119,7 +119,7 @@ struct RendererTests {
     session.feed(Array("\u{1B}]11;#204060\u{7}\u{1B}[?25l \u{1B}[41m ".utf8))
     let cw = Int(renderer.cellSize.width)
     let ch = Int(renderer.cellSize.height)
-    let frame = render(
+    let frame = try render(
       renderer,
       session.snapshot(),
       width: cw * 2 + 16,
@@ -154,10 +154,25 @@ struct RendererTests {
     let width = Int(renderer.cellSize.width) * 2 + 16
     let height = Int(renderer.cellSize.height) + 16
     renderer.options.backgroundOpacity = sample.0
-    let actual = render(renderer, snapshot, width: width, height: height)
+    let actual = try render(renderer, snapshot, width: width, height: height)
     renderer.options.backgroundOpacity = sample.1
-    let expected = render(renderer, snapshot, width: width, height: height)
+    let expected = try render(renderer, snapshot, width: width, height: height)
     #expect(actual.pixels == expected.pixels)
+  }
+
+  @Test
+  func `shaping cache follows the supplied font`() throws {
+    let manager = CoreTextFontManager()
+    let small = manager.resolve(FontDescriptor(size: 13, scale: 1))
+    let large = manager.resolve(FontDescriptor(size: 26, scale: 1))
+    let shaper = Shaper()
+    let scalars: [UInt32] = [0x41, 0x42]
+    for font in [small, large, small] {
+      let glyphs = shaper.shape(scalars, style: [], font: font)
+      let first = try #require(glyphs.first)
+      #expect(CTFontGetSize(first.font) == CTFontGetSize(font.faces[0]))
+      #expect(CFEqual(first.font, font.faces[0]))
+    }
   }
 
   @Test
@@ -438,7 +453,7 @@ struct RendererTests {
       let texture = try #require(
         renderer.device.makeTexture(descriptor: descriptor)
       )
-      let command = renderer.render(snapshot, to: texture)
+      let command = try renderer.render(snapshot, to: texture)
       command.waitUntilCompleted()
       try #require(
         command.status == .completed,
@@ -595,13 +610,13 @@ struct RendererTests {
     fresh.options = renderer.options
     let width = Int(renderer.cellSize.width) * 8 + 16
     let height = Int(renderer.cellSize.height) * 3 + 16
-    _ = render(renderer, session.snapshot(), width: width, height: height)
+    _ = try render(renderer, session.snapshot(), width: width, height: height)
     session.feed(Array("\u{1B}[2;3H".utf8))
     let moved = session.snapshot()
     #expect(moved.damage.isEmpty)
-    let expected = render(fresh, moved, width: width, height: height)
+    let expected = try render(fresh, moved, width: width, height: height)
     #expect(
-      render(renderer, moved, width: width, height: height).pixels
+      try render(renderer, moved, width: width, height: height).pixels
         == expected.pixels
     )
   }
@@ -622,7 +637,7 @@ struct RendererTests {
     renderer.options.preedit = Array("XYZ".unicodeScalars)
     renderer.options.preeditSelection =
       caret ? NSRange(location: 1, length: 0) : nil
-    let live = render(
+    let live = try render(
       renderer,
       session.snapshot(),
       width: width,
@@ -633,18 +648,18 @@ struct RendererTests {
     #expect(history.viewportOffset == 1)
     renderer.options.preedit = []
     renderer.options.preeditSelection = nil
-    let expected = render(renderer, history, width: width, height: height)
+    let expected = try render(renderer, history, width: width, height: height)
     renderer.options.preedit = Array("XYZ".unicodeScalars)
     renderer.options.preeditSelection =
       caret ? NSRange(location: 1, length: 0) : nil
     #expect(
-      render(renderer, history, width: width, height: height).pixels
+      try render(renderer, history, width: width, height: height).pixels
         == expected.pixels
     )
     session.scrollViewport(by: -1)
     #expect(
-      render(renderer, session.snapshot(), width: width, height: height).pixels
-        == live.pixels
+      try render(renderer, session.snapshot(), width: width, height: height)
+        .pixels == live.pixels
     )
   }
 
@@ -667,7 +682,7 @@ struct RendererTests {
     let blank = TerminalSession(columns: 12, rows: 2)
     let width = Int(renderer.cellSize.width) * 12 + 16
     let height = Int(renderer.cellSize.height) * 2 + 16
-    let expected = render(
+    let expected = try render(
       renderer,
       expectedSession.snapshot(),
       width: width,
@@ -678,7 +693,7 @@ struct RendererTests {
     renderer.options.cursorVisible = false
     // Composition caret stays steady during terminal cursor blink.
     renderer.options.cursorOpacity = 0
-    let actual = render(
+    let actual = try render(
       renderer,
       blank.snapshot(),
       width: width,
@@ -703,7 +718,7 @@ struct RendererTests {
     blank.feed(Array("\u{1B}[?25l".utf8))
     let width = Int(renderer.cellSize.width) * 12 + 16
     let height = Int(renderer.cellSize.height) * 2 + 16
-    let expected = render(
+    let expected = try render(
       renderer,
       expectedSession.snapshot(),
       width: width,
@@ -711,7 +726,7 @@ struct RendererTests {
     )
     renderer.options.preedit = Array("A👩‍💻Z".unicodeScalars)
     renderer.options.preeditSelection = NSRange(location: 3, length: 1)
-    let actual = render(
+    let actual = try render(
       renderer,
       blank.snapshot(),
       width: width,
@@ -735,9 +750,9 @@ struct RendererTests {
     renderer.options.preedit = Array("AB".unicodeScalars)
     let width = Int(renderer.cellSize.width) * 2 + 16
     let height = Int(renderer.cellSize.height) * 2 + 16
-    let baseline = render(renderer, snapshot, width: width, height: height)
+    let baseline = try render(renderer, snapshot, width: width, height: height)
     renderer.options.preeditSelection = NSRange(location: 2, length: 0)
-    let actual = render(renderer, snapshot, width: width, height: height)
+    let actual = try render(renderer, snapshot, width: width, height: height)
     let edge = 8 + Int(renderer.cellSize.width) * 2 - 1
     let y = 8 + Int(renderer.cellSize.height) / 2
     let color = snapshot.palette.cursor
@@ -749,18 +764,18 @@ struct RendererTests {
     #expect(actual.pixels != baseline.pixels)
     renderer.options.isFocused = false
     #expect(
-      render(renderer, snapshot, width: width, height: height).pixels
+      try render(renderer, snapshot, width: width, height: height).pixels
         == baseline.pixels
     )
     renderer.options.isFocused = true
     renderer.options.preeditSelection = NSRange(location: 0, length: 0)
     #expect(
-      render(renderer, snapshot, width: width, height: height).pixels
+      try render(renderer, snapshot, width: width, height: height).pixels
         != actual.pixels
     )
     renderer.options.preeditSelection = nil
     #expect(
-      render(renderer, snapshot, width: width, height: height).pixels
+      try render(renderer, snapshot, width: width, height: height).pixels
         == baseline.pixels
     )
   }
@@ -783,14 +798,14 @@ struct RendererTests {
     blank.feed(Array("\u{1B}[?25l".utf8))
     let width = Int(renderer.cellSize.width) * 12 + 16
     let height = Int(renderer.cellSize.height) * 2 + 16
-    let expected = render(
+    let expected = try render(
       renderer,
       composed.snapshot(),
       width: width,
       height: height
     )
     renderer.options.preedit = Array(text.unicodeScalars)
-    let actual = render(
+    let actual = try render(
       renderer,
       blank.snapshot(),
       width: width,
@@ -820,14 +835,14 @@ struct RendererTests {
     blank.feed(Array(position.utf8))
     let width = Int(renderer.cellSize.width) * 5 + 16
     let height = Int(renderer.cellSize.height) * 2 + 16
-    let expected = render(
+    let expected = try render(
       renderer,
       composed.snapshot(),
       width: width,
       height: height
     )
     renderer.options.preedit = Array(text.unicodeScalars)
-    let actual = render(
+    let actual = try render(
       renderer,
       blank.snapshot(),
       width: width,
@@ -860,20 +875,20 @@ struct RendererTests {
     composed.feed(Array("\u{1B}[?25l\(base)\(position)\u{1B}[4m\(text)".utf8))
     let width = Int(renderer.cellSize.width) * 8 + 16
     let height = Int(renderer.cellSize.height) * 2 + 16
-    let expected = render(
+    let expected = try render(
       renderer,
       composed.snapshot(),
       width: width,
       height: height
     )
-    let baseline = render(renderer, snapshot, width: width, height: height)
+    let baseline = try render(renderer, snapshot, width: width, height: height)
     // Only the composition changes between these frames.
     snapshot.damage = .none
     renderer.options.preedit = Array(text.unicodeScalars)
-    let actual = render(renderer, snapshot, width: width, height: height)
+    let actual = try render(renderer, snapshot, width: width, height: height)
     #expect(actual.pixels == expected.pixels)
     renderer.options.preedit = []
-    let restored = render(renderer, snapshot, width: width, height: height)
+    let restored = try render(renderer, snapshot, width: width, height: height)
     #expect(restored.pixels == baseline.pixels)
   }
 
@@ -896,14 +911,14 @@ struct RendererTests {
     )
     let width = Int(renderer.cellSize.width) * 8 + 16
     let height = Int(renderer.cellSize.height) * 2 + 16
-    let expected = render(
+    let expected = try render(
       renderer,
       composed.snapshot(),
       width: width,
       height: height
     )
     renderer.options.preedit = ["x"]
-    let actual = render(
+    let actual = try render(
       renderer,
       original.snapshot(),
       width: width,
@@ -949,7 +964,7 @@ struct RendererTests {
     _ snapshot: RenderSnapshot,
     width: Int,
     height: Int
-  ) -> Frame {
+  ) throws -> Frame {
     let d = MTLTextureDescriptor.texture2DDescriptor(
       pixelFormat: .bgra8Unorm,
       width: width,
@@ -959,7 +974,7 @@ struct RendererTests {
     d.usage = [.renderTarget, .shaderRead]
     d.storageMode = .shared
     let texture = renderer.device.makeTexture(descriptor: d)!
-    let command = renderer.render(snapshot, to: texture)
+    let command = try renderer.render(snapshot, to: texture)
     command.waitUntilCompleted()
     #expect(
       command.status == .completed,
@@ -986,7 +1001,7 @@ struct RendererTests {
     session.feed(Array("X \u{1B}[41m \u{1B}[0m中😀e\u{301}".utf8))
     let w = Int(renderer.cellSize.width) * 10 + 16
     let h = Int(renderer.cellSize.height) * 3 + 16
-    let frame = render(renderer, session.snapshot(), width: w, height: h)
+    let frame = try render(renderer, session.snapshot(), width: w, height: h)
     let bg = Palette.standard.background
 
     #expect(
@@ -1033,17 +1048,17 @@ struct RendererTests {
     if equalSequence { prior = first.snapshot() }
     let width = Int(renderer.cellSize.width) * 8 + 16
     let height = Int(renderer.cellSize.height) * 2 + 16
-    _ = render(renderer, prior, width: width, height: height)
+    _ = try render(renderer, prior, width: width, height: height)
     let next = second.snapshot()
     #expect(next.damage.isEmpty)
     #expect(next.sequence == prior.sequence + (equalSequence ? 0 : 1))
-    let actual = render(renderer, next, width: width, height: height)
+    let actual = try render(renderer, next, width: width, height: height)
     let fresh = try MetalRenderer(
       device: device,
       fontManager: CoreTextFontManager(),
       font: FontDescriptor()
     )
-    let expected = render(fresh, next, width: width, height: height)
+    let expected = try render(fresh, next, width: width, height: height)
     let framesMatch = actual.pixels == expected.pixels
     #expect(framesMatch)
   }
@@ -1064,7 +1079,7 @@ struct RendererTests {
       session.feed(
         Array("\u{1B}[\(i % 5 + 1);\(i + 1)H\u{1B}[3\(i % 7)mrow\(i)".utf8)
       )
-      last = render(incremental, session.snapshot(), width: w, height: h)
+      last = try render(incremental, session.snapshot(), width: w, height: h)
     }
     // A fresh renderer drawing the final state from scratch must agree.
     let fresh = try MetalRenderer(
@@ -1073,7 +1088,7 @@ struct RendererTests {
       font: FontDescriptor()
     )
     session.withState { _ in }
-    let reference = render(fresh, session.snapshot(), width: w, height: h)
+    let reference = try render(fresh, session.snapshot(), width: w, height: h)
     let final = try #require(last)
     #expect(final.pixels == reference.pixels)
   }
@@ -1103,8 +1118,8 @@ struct RendererTests {
     #expect(!plain.font.shapes && shaped.font.shapes)
     let w = Int(plain.cellSize.width) * 24 + 16
     let h = Int(plain.cellSize.height) * 2 + 16
-    let a = render(plain, session.snapshot(), width: w, height: h)
-    let b = render(shaped, session.snapshot(), width: w, height: h)
+    let a = try render(plain, session.snapshot(), width: w, height: h)
+    let b = try render(shaped, session.snapshot(), width: w, height: h)
     // Menlo has no ligatures, so shaping must reproduce the per-cell glyphs.
     let differing = zip(a.pixels, b.pixels)
       .filter { abs(Int($0) - Int($1)) > 8 }.count

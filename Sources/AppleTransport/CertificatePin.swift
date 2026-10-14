@@ -149,9 +149,7 @@ public struct CertificatePin: Hashable, Sendable {
     }
     guard leafDER == certificateDER else { throw .certificateMismatch }
     let certificate: Certificate
-    do {
-      certificate = try Certificate(derEncoded: Array(leafDER))
-    } catch {
+    do { certificate = try Certificate(derEncoded: Array(leafDER)) } catch {
       throw .malformedCertificate
     }
     guard now >= certificate.notValidBefore else { throw .notYetValid }

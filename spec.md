@@ -125,6 +125,14 @@ with spaces. Unbracketed LF/CRLF becomes one CR; bracketed paste preserves line
 endings and frames empty input. Unsupported upstream protocols/API cases are
 tracked separately in [todo.tests.md](todo.tests.md).
 
+Committed typing/IME text without a physical key uses key code zero when Kitty
+flag 8 is set; flag 16 adds its Unicode scalars as associated text. Other flags
+retain UTF-8 commits. Key-report mode refuses committed text containing C0, DEL
+or C1 controls; control actions use key events and explicit byte writes stay raw.
+PTY and SSH admission reserve the largest possible encoding before queueing,
+because keyboard modes can change before encoding. This may refuse a large
+commit even when its current UTF-8 encoding would fit the pending-byte limit.
+
 ## OSC 7501 program status
 
 The core owns protocol validation, state, lifecycle and support replies.
@@ -158,6 +166,8 @@ report must be discarded in full, without applying a truncated prefix.
 - Omitted `id` addresses the root (`""` in the API). Non-root IDs are slash-separated
   nonempty `[A-Za-z0-9_.+-]` segments. Invalid IDs reject the whole report,
   including clears; they must never fall back to root.
+- Trim surrounding whitespace on keys and values before field validation;
+  a spaced `id` must retain its scope rather than become an omitted ID.
 - `progress` is decimal 0–100 for `working`/`blocked`; invalid values are absent.
   `kind` applies only to `blocked`: `permission`, `question` or `auth`;
   unknown values are absent. `app` uses the segment character set.

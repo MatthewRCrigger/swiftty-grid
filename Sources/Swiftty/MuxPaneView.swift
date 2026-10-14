@@ -26,14 +26,14 @@ struct FrozenSelection: Equatable {
   /// Ordered, unit-expanded bounds clamped to the frame.
   func span(in frame: PaneFrame) -> HighlightSpan {
     let cols = frame.grid.columns
-    let ordered = anchor < head
-    var start = ordered ? anchor : head
-    var end = ordered ? head : anchor
     func clamp(_ p: (row: Int, column: Int)) -> (row: Int, column: Int) {
       (min(max(p.row, 0), frame.grid.rows - 1), min(max(p.column, 0), cols - 1))
     }
-    start = clamp(start)
-    end = clamp(end)
+    let a = clamp(anchor)
+    let b = clamp(head)
+    let ordered = a < b
+    var start = ordered ? a : b
+    var end = ordered ? b : a
     switch unit {
     case .cell: break
     case .line:
@@ -232,6 +232,9 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
     presented = nil
     frozen = nil
     selection = nil
+    pendingAnchor = nil
+    selectionDragged = false
+    scrollAccumulator = 0
     cancelComposition()
     needsDisplay = true
   }
@@ -274,7 +277,7 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
         }
         NSAccessibility.post(element: self, notification: .valueChanged)
       }
-    case .busy, .noDrawable:
+    case .busy, .noDrawable, .resourceUnavailable:
       // Keep the newest pending frame; redraw when capacity returns.
       guard !retryScheduled, window != nil else { return }
       retryScheduled = true
@@ -463,9 +466,13 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
 
   /// Ends selection and resumes current frames.
   func clearSelection() {
-    guard selection != nil || frozen != nil else { return }
+    guard selection != nil || frozen != nil || pendingAnchor != nil else {
+      return
+    }
     selection = nil
     frozen = nil
+    pendingAnchor = nil
+    selectionDragged = false
     needsDisplay = true
   }
 

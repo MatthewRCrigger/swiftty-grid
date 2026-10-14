@@ -17,7 +17,6 @@ struct RoamingHostDirectory: AttentionHostDirectory {
   }
 }
 
-
 /// One followed link: a navigator bound to this app's hosts.
 @MainActor
 final class AttentionLinkSession: Identifiable {
@@ -26,7 +25,9 @@ final class AttentionLinkSession: Identifiable {
 
   init(model: RoamingAppModel, connector: any AttentionServiceConnector) {
     navigator = AttentionNavigator(
-      configuration: AttentionLinkConfiguration(infoDictionary: Bundle.main.infoDictionary),
+      configuration: AttentionLinkConfiguration(
+        infoDictionary: Bundle.main.infoDictionary
+      ),
       hosts: RoamingHostDirectory(model: model),
       connector: connector
     )
@@ -44,30 +45,36 @@ extension View {
 /// Opens an attention destination in the current scene's navigator.
 struct OpenAttentionAction {
   var handler: @MainActor (AttentionDestination) -> Void = { _ in }
-  @MainActor func callAsFunction(_ destination: AttentionDestination) {
+  @MainActor
+  func callAsFunction(_ destination: AttentionDestination) {
     handler(destination)
   }
 }
 
 extension EnvironmentValues {
-  @Entry var openAttention = OpenAttentionAction()
+  @Entry
+  var openAttention = OpenAttentionAction()
 }
 
 struct AttentionLinkRouting: ViewModifier {
   let model: RoamingAppModel
-  @State private var session: AttentionLinkSession?
+  @State
+  private var session: AttentionLinkSession?
+  @State
+  private var startTask: Task<Void, Never>?
 
   func body(content: Content) -> some View {
-    content
-      .onOpenURL { url in open { await $0.open(url) } }
+    content.onOpenURL { url in open { await $0.open(url) } }
       .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
         guard let url = activity.webpageURL else { return }
         open { await $0.open(url) }
       }
-      .onContinueUserActivity(AttentionHandoffRequest.activityType) { activity in
+      .onContinueUserActivity(AttentionHandoffRequest.activityType) {
+        activity in
         // A watch handoff carries only a locator; it is resolved through
         // this device's hosts like any link and never grants a lease.
-        guard let request = AttentionHandoffRequest(userInfo: activity.userInfo),
+        guard
+          let request = AttentionHandoffRequest(userInfo: activity.userInfo),
           let destination = try? request.destination()
         else { return }
         open { await $0.open(destination) }
@@ -75,26 +82,57 @@ struct AttentionLinkRouting: ViewModifier {
       // Inbox entries open through the same navigator, in this scene.
       .environment(
         \.openAttention,
-        OpenAttentionAction { destination in open { await $0.open(destination) } }
+        OpenAttentionAction { destination in open { await $0.open(destination) }
+        }
       )
       // iPadOS/visionOS/Catalyst: an attention link goes to an existing
       // window (this one, when it is frontmost) instead of a new scene;
       // every scene shares the one app model and its single terminal.
       .preferringAttentionEvents()
-      .sheet(item: $session) { session in
-        AttentionDestinationView(navigator: session.navigator) { self.session = nil }
-          .macSheetFrame(width: 440, height: 320)
-          .presentationBackground(.clear)
+      .sheet(item: presentedSession) { session in
+        AttentionDestinationView(navigator: session.navigator) {
+          dismissSession(session.id)
+        }
+        .macSheetFrame(width: 440, height: 320).presentationBackground(.clear)
+        .connectionPrompts(model).onDisappear { session.navigator.cancel() }
       }
+      .onDisappear { if let session { dismissSession(session.id) } }
+  }
+
+  private var presentedSession: Binding<AttentionLinkSession?> {
+    let id = session?.id
+    return Binding(
+      get: { session },
+      set: { if $0 == nil, let id { dismissSession(id) } }
+    )
+  }
+
+  private func dismissSession(_ id: UUID) {
+    guard session?.id == id else { return }
+    startTask?.cancel()
+    startTask = nil
+    session?.navigator.cancel()
+    session = nil
+    model.modalDepth -= 1
   }
 
   /// A newer link replaces the current one; the old navigator's late
   /// results are dropped with it.
-  private func open(_ start: @escaping @MainActor (AttentionNavigator) async -> Void) {
+  private func open(
+    _ start: @escaping @MainActor (AttentionNavigator) async -> Void
+  ) {
+    startTask?.cancel()
     session?.navigator.cancel()
-    let next = AttentionLinkSession(model: model, connector: RoamingAttentionConnector(model: model))
+    if session == nil { model.modalDepth += 1 }
+    let next = AttentionLinkSession(
+      model: model,
+      connector: RoamingAttentionConnector(model: model)
+    )
     session = next
-    Task { await start(next.navigator) }
+    startTask = Task {
+      guard session?.id == next.id, !Task.isCancelled else { return }
+      await start(next.navigator)
+    }
   }
 }
 
@@ -106,12 +144,13 @@ struct AttentionDestinationView: View {
 
   var body: some View {
     NavigationStack {
-      content
-        .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .glassSurface()
-        .glassButtonStyle()
-        .navigationTitle("Attention")
+      content.padding()
+        .frame(
+          maxWidth: .infinity,
+          maxHeight: .infinity,
+          alignment: .topLeading
+        )
+        .glassSurface().glassButtonStyle().navigationTitle("Attention")
         .toolbar {
           ToolbarItem(placement: .cancellationAction) {
             Button("Close") {
@@ -123,10 +162,10 @@ struct AttentionDestinationView: View {
     }
   }
 
-  @ViewBuilder private var content: some View {
+  @ViewBuilder
+  private var content: some View {
     switch navigator.state {
-    case .idle:
-      ProgressView()
+    case .idle: ProgressView()
     case .rejected:
       message(
         "This link can't be opened",
@@ -137,18 +176,21 @@ struct AttentionDestinationView: View {
       VStack(alignment: .leading, spacing: 12) {
         Text("Choose a host").font(.headline)
         if hosts.isEmpty {
-          Text("Add the Mac this link came from to your hosts first. Links never add hosts.")
-            .foregroundStyle(.secondary)
+          Text(
+            "Add the Mac this link came from to your hosts first. Links never add hosts."
+          )
+          .foregroundStyle(.secondary)
         } else {
-          Text("This link names a host this device doesn't know. Pick one of your own hosts.")
-            .foregroundStyle(.secondary)
+          Text(
+            "This link names a host this device doesn't know. Pick one of your own hosts."
+          )
+          .foregroundStyle(.secondary)
           ForEach(hosts) { host in
             Button(host.name) { Task { await navigator.selectHost(host) } }
           }
         }
       }
-    case let .connecting(host):
-      ProgressView("Connecting to \(host.name)…")
+    case let .connecting(host): ProgressView("Connecting to \(host.name)…")
     case let .unavailable(reason):
       VStack(alignment: .leading, spacing: 12) {
         message("Unavailable", reason, symbol: "wifi.exclamationmark")
@@ -181,7 +223,11 @@ struct AttentionDestinationView: View {
       )
     case let .paneExited(preview):
       VStack(alignment: .leading, spacing: 12) {
-        message("The pane exited", "Its final output may still be retained.", symbol: "stop.circle")
+        message(
+          "The pane exited",
+          "Its final output may still be retained.",
+          symbol: "stop.circle"
+        )
         item(preview)
         Button("Show Final Output") { Task { await navigator.openInPane() } }
       }
@@ -190,21 +236,27 @@ struct AttentionDestinationView: View {
       VStack(alignment: .leading, spacing: 12) {
         message(
           offer.controllerChanged
-            ? "Another client took control first" : "Another client controls this workspace",
+            ? "Another client took control first"
+            : "Another client controls this workspace",
           "Taking over disconnects it. Its shells keep running.",
           symbol: "person.2.badge.gearshape"
         )
-        Button("Take Over", role: .destructive) { Task { await navigator.confirmTakeover() } }
+        Button("Take Over", role: .destructive) {
+          Task { await navigator.confirmTakeover() }
+        }
         Button("Not Now") { navigator.declineTakeover() }
       }
-    case .opening:
-      ProgressView("Opening…")
+    case .opening: ProgressView("Opening…")
     case .opened:
       message("Opened", "The pane is active.", symbol: "checkmark.circle")
     }
   }
 
-  private func message(_ title: String, _ detail: String, symbol: String) -> some View {
+  private func message(
+    _ title: String,
+    _ detail: String,
+    symbol: String
+  ) -> some View {
     VStack(alignment: .leading, spacing: 6) {
       Label(title, systemImage: symbol).font(.headline)
       Text(verbatim: detail).foregroundStyle(.secondary)
@@ -218,7 +270,8 @@ struct AttentionDestinationView: View {
       if let app = status.app { Text(verbatim: app).font(.caption) }
       if let title = status.title { Text(verbatim: title) }
       if let message = status.message {
-        Text(verbatim: message).font(.callout).foregroundStyle(.secondary).lineLimit(6)
+        Text(verbatim: message).font(.callout).foregroundStyle(.secondary)
+          .lineLimit(6)
       }
     }
     .accessibilityElement(children: .combine)
@@ -238,9 +291,9 @@ extension View {
   @ViewBuilder
   fileprivate func preferringAttentionEvents() -> some View {
     #if os(tvOS)
-      self
+    self
     #else
-      handlesExternalEvents(preferring: ["attention", "/a/"], allowing: ["*"])
+    handlesExternalEvents(preferring: ["attention", "/a/"], allowing: ["*"])
     #endif
   }
 }

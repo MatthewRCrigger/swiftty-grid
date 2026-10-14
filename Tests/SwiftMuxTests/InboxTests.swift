@@ -1,7 +1,8 @@
 import Foundation
+import MuxAttention
 import SwiftMuxClient
 import SwiftMuxProtocol
-import SwiftMuxService
+@testable import SwiftMuxService
 import Testing
 
 /// The OSC 7501 attention inbox through the service (spec.inbox.md §3;
@@ -68,6 +69,125 @@ struct InboxTests {
 
   private func ref(_ item: AttentionItem) -> AttentionReference {
     AttentionReference(source: item.source, occurrence: item.occurrence)
+  }
+
+  @Test
+  func snoozeReplacementClearingAndExpiryNotifySubscribersWithoutLease()
+    async throws
+  {
+    let h = try Harness()
+    let c = try await h.connect(.control)
+    do {
+      _ = try await create(
+        c,
+        "printf '\(Self.osc("state=blocked:kind=question"))'; exec sleep 30"
+      )
+      let item = try #require(
+        try await poll(c) { !$0.items.isEmpty }.items.first
+      )
+      let reference = ref(item)
+      for index in 0 ..< 32 {
+        let until = Date().addingTimeInterval(Double(86400 + index))
+        let location = try await locate(c, .snooze(reference, until: until))
+        #expect(location.item?.snoozedUntil == until)
+      }
+      guard
+        case let .inbox(snapshot) = try await c.execute(.subscribeInbox(true))
+      else { throw MuxError(.invalidRequest, "subscribe reply") }
+      #expect(snapshot.counts.needsYou == 0)
+      _ = try await locate(c, .snooze(reference, until: nil))
+      _ = try await updates(c) { received in
+        received.contains { update in
+          update.counts.needsYou == 1
+            && update.changed.contains {
+              $0.occurrence == item.occurrence && $0.snoozedUntil == nil
+            }
+        }
+      }
+      let until = Date().addingTimeInterval(0.2)
+      let snoozed = try await locate(c, .snooze(reference, until: until))
+      let revision = try #require(snoozed.item?.revision)
+      _ = try await updates(c) { received in
+        received.contains { update in
+          update.counts.needsYou == 0
+            && update.changed.contains {
+              $0.occurrence == item.occurrence && $0.snoozedUntil == until
+            }
+        }
+      }
+      // No query or metadata command triggers this final update.
+      _ = try await updates(c) { received in
+        received.contains { update in
+          update.counts.needsYou == 1
+            && update.changed.contains {
+              $0.source == item.source && $0.occurrence == item.occurrence
+                && $0.snoozedUntil == nil && $0.revision > revision
+            }
+        }
+      }
+      guard
+        case let .workspaces(workspaces) = try await c.execute(.listWorkspaces)
+      else { throw MuxError(.invalidRequest, "workspaces reply") }
+      #expect(workspaces.allSatisfy { !$0.isAttached })
+    } catch {
+      _ = try? await c.execute(.endAllWorkspaces)
+      await c.close()
+      throw error
+    }
+    try await c.execute(.endAllWorkspaces)
+    await c.close()
+  }
+
+  @Test
+  func successiveSnoozeExpiriesRearmAndNotifyEachExactOccurrence() async throws
+  {
+    let h = try Harness()
+    let c = try await h.connect(.control)
+    do {
+      let reports =
+        Self.osc("state=blocked:id=first:kind=question")
+        + Self.osc("state=blocked:id=second:kind=question")
+      _ = try await create(c, "printf '\(reports)'; exec sleep 30")
+      let items = try await poll(c) { $0.items.count == 2 }.items
+      let first = try #require(items.first { $0.source.recordPath == "first" })
+      let second = try #require(
+        items.first { $0.source.recordPath == "second" }
+      )
+      let now = Date()
+      _ = try await locate(
+        c,
+        .snooze(ref(first), until: now.addingTimeInterval(0.5))
+      )
+      _ = try await locate(
+        c,
+        .snooze(ref(second), until: now.addingTimeInterval(1.0))
+      )
+      _ = try await c.execute(.subscribeInbox(true))
+      _ = try await updates(c) { received in
+        received.contains { update in
+          update.counts.needsYou == 1
+            && update.changed.contains {
+              $0.occurrence == first.occurrence && $0.source == first.source
+                && $0.snoozedUntil == nil
+            }
+        }
+      }
+      _ = try await updates(c) { received in
+        received.contains { update in
+          update.counts.needsYou == 2
+            && update.changed.contains {
+              $0.occurrence == second.occurrence && $0.source == second.source
+                && $0.snoozedUntil == nil
+            }
+        }
+      }
+    } catch {
+      _ = try? await c.execute(.endAllWorkspaces)
+      await c.close()
+      throw error
+    }
+    try await c.execute(.endAllWorkspaces)
+    await c.close()
   }
 
   /// Inbox updates until `predicate` holds over all received so far.
@@ -281,6 +401,75 @@ struct InboxTests {
     }
     #expect(try await slow.nextEvent() == nil)
     try await control.execute(.endAllWorkspaces)
+  }
+
+  @Test
+  func `oversized inbox event disconnect frees its subscriber slot`()
+    async throws
+  {
+    var limits = MuxLimits.standard
+    limits.maxFrameBytes = 1
+    limits.inboxSubscribers = 1
+    limits.inboxPageSize = 1
+    let h = try Harness(limits: limits)
+    let control = try await h.connect()
+    let subscriber = try await h.connect()
+    var replacement: MuxConnection?
+    do {
+      let ws = try await create(control, "exec sleep 30")
+      let pane = try #require(ws.panes.first).id
+      _ = try await subscriber.execute(.subscribeInbox(true))
+      // Valid per-record text sizes, but one batch exceeds the server wire
+      // limit. Inject a single reduction turn so PTY read timing cannot split it.
+      let changes: [StatusChange] = (0 ..< 40)
+        .map {
+          .report(
+            StatusRecord(
+              path: "error\($0)",
+              state: .error,
+              message: String(repeating: "x", count: 2048)
+            )
+          )
+        }
+      await withCheckedContinuation { continuation in
+        h.service.onQueue { service in
+          service.paneEvent(pane, .status(TerminalEpochID(), changes))
+          continuation.resume()
+        }
+      }
+      let disconnected = try await withTimeout(.seconds(5)) {
+        do {
+          while try await subscriber.nextEvent() != nil {}
+          return false
+        } catch let error as MuxError { return error.code == .connectionLost }
+      }
+      #expect(disconnected)
+      guard case let .status(status) = try await control.execute(.status) else {
+        throw MuxError(.invalidRequest, "status reply")
+      }
+      #expect(status.panes == 1)
+      guard
+        case let .inbox(page) = try await control.execute(
+          .inbox(InboxQuery(limit: 1))
+        )
+      else { throw MuxError(.invalidRequest, "inbox reply") }
+      #expect(page.items.count == 1)
+      #expect(page.counts.needsYou == 40)
+      // There is only one subscriber slot; reuse proves service-side teardown.
+      let next = try await h.connect()
+      replacement = next
+      _ = try await next.execute(.subscribeInbox(true))
+      try await control.execute(.endAllWorkspaces)
+      await next.close()
+      await subscriber.close()
+      await control.close()
+    } catch {
+      _ = try? await control.execute(.endAllWorkspaces)
+      await replacement?.close()
+      await subscriber.close()
+      await control.close()
+      throw error
+    }
   }
 
   @Test

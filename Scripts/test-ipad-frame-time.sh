@@ -56,6 +56,8 @@ project = {
                 'PRODUCT_BUNDLE_IDENTIFIER': 'dev.chr33s.swiftty.review.renderer.tests',
                 'TEST_HOST': '$(BUILT_PRODUCTS_DIR)/SwifttyFrameReview.app/SwifttyFrameReview',
                 'BUNDLE_LOADER': '$(TEST_HOST)',
+                'SWIFT_ACTIVE_COMPILATION_CONDITIONS':
+                    '$(inherited) SWIFTTY_REQUIRE_FRAME_BENCHMARK',
             }},
         },
     },
@@ -71,4 +73,5 @@ cd "$review_workspace"
 xcodegen generate --spec project.json
 xcodebuild -scheme SwifttyFrameReview -configuration Release \
     -destination "platform=iOS,id=$1" -derivedDataPath "$review_workspace/build" \
+    -resultBundlePath "$review_workspace/FrameTime.xcresult" \
     -collect-test-diagnostics never test

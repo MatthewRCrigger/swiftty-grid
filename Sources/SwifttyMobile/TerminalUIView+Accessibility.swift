@@ -121,6 +121,7 @@ extension TerminalUIView: @MainActor UIAccessibilityReadingContent {
   override public func accessibilityScroll(
     _ direction: UIAccessibilityScrollDirection
   ) -> Bool {
+    guard effectiveCapabilities.scrollback else { return false }
     let sign: Int
     switch direction {
     case .up, .next: sign = -1

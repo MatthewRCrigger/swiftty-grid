@@ -6,10 +6,91 @@ import SwiftMuxProtocol
 @testable import Swiftty
 import SwifttyCore
 import Testing
+import TestSupport
 
 /// The native attention inbox: toolbar badge, popover rows, seen versus
 /// resolved, and review of results (spec.inbox.md §3; acceptance 15).
 extension MuxNativeTests {
+  @Test(arguments: ["reset", "append", "update"])
+  func `removal history overflow never resurrects an old occurrence`(
+    _ delivery: String
+  ) {
+    let source = AttentionSource(
+      serviceEpoch: ServerInstanceID(),
+      pane: PaneID(),
+      terminalEpoch: TerminalEpochID(),
+      recordPath: "",
+      recordIncarnation: 1
+    )
+    let item = AttentionItem(
+      occurrence: OccurrenceID(),
+      source: source,
+      workspace: WorkspaceID(),
+      tab: nil,
+      category: .needsYou,
+      resolution: .open,
+      status: AttentionStatus(
+        source: source,
+        state: .blocked,
+        updatedAt: Date()
+      ),
+      createdAt: Date(),
+      updatedAt: Date(),
+      revision: 1
+    )
+    let old = InboxPage(
+      items: [item],
+      counts: InboxCounts(needsYou: 1),
+      revision: 1,
+      nextCursor: "old"
+    )
+    var model = MuxInboxModel()
+    model.reset([.needsYou: old])
+    _ = model.apply(
+      InboxUpdate(
+        revision: 2,
+        counts: InboxCounts(),
+        changed: [],
+        removed: [item.occurrence]
+      )
+    )
+    for index in 0 ..< MuxInboxModel.tombstoneLimit {
+      _ = model.apply(
+        InboxUpdate(
+          revision: UInt64(index + 3),
+          counts: InboxCounts(),
+          changed: [],
+          removed: [OccurrenceID()]
+        )
+      )
+    }
+    switch delivery {
+    case "reset": model.reset([.needsYou: old])
+    case "append": model.append(old, section: .needsYou)
+    default:
+      _ = model.apply(
+        InboxUpdate(
+          revision: 1,
+          counts: old.counts,
+          changed: [item],
+          removed: []
+        )
+      )
+    }
+    #expect(model.items.isEmpty)
+    #expect(model.counts == InboxCounts())
+    // A current authoritative page can still adopt the occurrence.
+    let fresh = InboxPage(
+      items: [item],
+      counts: old.counts,
+      revision: UInt64(MuxInboxModel.tombstoneLimit + 3),
+      nextCursor: nil
+    )
+    model.reset([.needsYou: fresh])
+    #expect(model.items[item.occurrence] == item)
+    #expect(model.counts == old.counts)
+  }
+
   static func osc(_ body: String) -> String {
     "printf '\\033]7501;\(body)\\007'\r"
   }
@@ -24,9 +105,8 @@ extension MuxNativeTests {
       .text(Self.osc("state=blocked:kind=question:app=tool:msg=T2s/")),
       to: pane
     )
-    #expect(await until { c.inbox.counts.needsYou == 1 })
+    let request = try await waitForRequest(in: c, from: pane)
     #expect(c.workspaceToolbar.item.badge == .count(1))
-    let request = try #require(c.inbox.sorted.first)
     #expect(MuxInboxModel.text(request).heading == "Needs an answer: tool")
     #expect(MuxInboxModel.text(request).detail == "Ok?")
 
@@ -137,8 +217,7 @@ extension MuxNativeTests {
     let c = f.controller
     let pane = try #require(c.activePane)
     c.send(.text(Self.osc("state=blocked:kind=permission:app=tool")), to: pane)
-    #expect(await until { c.inbox.counts.needsYou == 1 })
-    let request = try #require(c.inbox.sorted.first)
+    let request = try await waitForRequest(in: c, from: pane)
     #expect(MuxInboxModel.canSnooze(request))
     #expect(MuxInboxModel.snoozeText(request, at: Date()) == nil)
 
@@ -179,8 +258,7 @@ extension MuxNativeTests {
     }
     let pane = try #require(c.activePane)
     c.send(.text(Self.osc("state=blocked:kind=question:app=tool")), to: pane)
-    #expect(await until { c.inbox.counts.needsYou == 1 })
-    let request = try #require(c.inbox.sorted.first)
+    let request = try await waitForRequest(in: c, from: pane)
     c.send(.text(Self.osc("state=working")), to: pane)
     #expect(await until { c.inbox.items.isEmpty })
 
@@ -252,56 +330,62 @@ extension MuxNativeTests {
   func `opening a workspace held elsewhere asks again when control moves`()
     async throws
   {
-    let f = try await open()
-    defer { f.controller.close() }
-    let c = f.controller
-    let other = try await MuxConnection.connect(
-      endpoint: f.endpoint,
-      frontend: .native
-    )
-    defer { Task { await other.close() } }
-    let launch = LaunchSpec(
-      command: ["/bin/sh"],
-      workingDirectory: "/tmp",
-      environment: [
-        "PATH": "/usr/bin:/bin", "PS1": "$ ", "HOME": NSTemporaryDirectory(),
-      ]
-    )
-    guard
-      case let .created(created) = try await other.execute(
-        .newWorkspace(NewWorkspaceRequest(launch: launch))
-      ),
-      case let .attached(_, ws) = try await other.execute(
-        .attach(.id(created.id))
-      ), let pane = ws.activeTabSnapshot?.activePane
-    else {
-      Issue.record("no second workspace")
-      return
-    }
-    await other.post(
-      .text(Self.osc("state=blocked:kind=question:app=far")),
-      to: pane
-    )
-    #expect(await until { c.inbox.sorted.contains { $0.workspace == ws.id } })
-    let item = try #require(c.inbox.sorted.first { $0.workspace == ws.id })
+    try await withFixture { f in
+      let c = f.controller
+      let other = try await MuxConnection.connect(
+        endpoint: f.endpoint,
+        frontend: .native
+      )
+      try await RuntimeFixture.withCleanup {
+        let launch = LaunchSpec(
+          command: ["/bin/sh"],
+          workingDirectory: "/tmp",
+          environment: [
+            "PATH": "/usr/bin:/bin", "PS1": "$ ",
+            "HOME": NSTemporaryDirectory(),
+          ]
+        )
+        guard
+          case let .created(created) = try await other.execute(
+            .newWorkspace(NewWorkspaceRequest(launch: launch))
+          ),
+          case let .attached(_, ws) = try await other.execute(
+            .attach(.id(created.id))
+          ), let pane = ws.activeTabSnapshot?.activePane
+        else {
+          Issue.record("no second workspace")
+          return
+        }
+        await other.post(
+          .text(Self.osc("state=blocked:kind=question:app=far")),
+          to: pane
+        )
+        #expect(
+          await until { c.inbox.sorted.contains { $0.workspace == ws.id } }
+        )
+        let item = try #require(c.inbox.sorted.first { $0.workspace == ws.id })
 
-    // The holder reattaches while the user decides: the first takeover
-    // is refused as stale and the user is asked again.
-    var asked: [String] = []
-    c.confirmDestructive = { message in
-      asked.append(message)
-      if asked.count == 1 {
-        _ = try? await other.execute(.detach)
-        _ = try? await other.execute(.attach(.id(ws.id)))
+        // The holder reattaches while the user decides: the first takeover
+        // is refused as stale and the user is asked again.
+        var asked: [String] = []
+        c.confirmDestructive = { message in
+          asked.append(message)
+          if asked.count == 1 {
+            _ = try? await other.execute(.detach)
+            _ = try? await other.execute(.attach(.id(ws.id)))
+          }
+          return true
+        }
+        c.openAttention(item)
+        #expect(await until { c.workspace?.id == ws.id })
+        #expect(asked.count == 2)
+        #expect(asked.first?.hasPrefix("Take control of workspace") == true)
+        #expect(asked.last?.contains("changed while you were deciding") == true)
+        #expect(await until { c.activePane == pane })
+      } cleanup: {
+        await other.close()
       }
-      return true
     }
-    c.openAttention(item)
-    #expect(await until { c.workspace?.id == ws.id })
-    #expect(asked.count == 2)
-    #expect(asked.first?.hasPrefix("Take control of workspace") == true)
-    #expect(asked.last?.contains("changed while you were deciding") == true)
-    #expect(await until { c.activePane == pane })
   }
 
   @Test
@@ -514,104 +598,119 @@ extension MuxNativeTests {
   func `a late layout event for the previous workspace is ignored`()
     async throws
   {
-    let f = try await open()
-    defer { f.controller.close() }
-    let c = f.controller
-    let previous = try #require(c.workspace)
-    let other = try await MuxConnection.connect(
-      endpoint: f.endpoint,
-      frontend: .native
-    )
-    defer { Task { await other.close() } }
-    let launch = LaunchSpec(
-      command: ["/bin/sh"],
-      workingDirectory: "/tmp",
-      environment: [
-        "PATH": "/usr/bin:/bin", "PS1": "$ ", "HOME": NSTemporaryDirectory(),
-      ]
-    )
-    guard
-      case let .created(created) = try await other.execute(
-        .newWorkspace(NewWorkspaceRequest(launch: launch))
-      ),
-      case let .attached(_, ws) = try await other.execute(
-        .attach(.id(created.id))
-      ), let pane = ws.activeTabSnapshot?.activePane
-    else {
-      Issue.record("no second workspace")
-      return
-    }
-    await other.post(
-      .text(Self.osc("state=blocked:kind=question:app=far")),
-      to: pane
-    )
-    #expect(await until { c.inbox.sorted.contains { $0.workspace == ws.id } })
-    let item = try #require(c.inbox.sorted.first { $0.workspace == ws.id })
-    _ = try await other.execute(.detach)
-    c.openAttention(item)
-    #expect(await until { c.workspace?.id == ws.id })
-    #expect(c.attachedWorkspace == ws.id)
+    try await withFixture { f in
+      let c = f.controller
+      let previous = try #require(c.workspace)
+      let other = try await MuxConnection.connect(
+        endpoint: f.endpoint,
+        frontend: .native
+      )
+      try await RuntimeFixture.withCleanup {
+        let launch = LaunchSpec(
+          command: ["/bin/sh"],
+          workingDirectory: "/tmp",
+          environment: [
+            "PATH": "/usr/bin:/bin", "PS1": "$ ",
+            "HOME": NSTemporaryDirectory(),
+          ]
+        )
+        guard
+          case let .created(created) = try await other.execute(
+            .newWorkspace(NewWorkspaceRequest(launch: launch))
+          ),
+          case let .attached(_, ws) = try await other.execute(
+            .attach(.id(created.id))
+          ), let pane = ws.activeTabSnapshot?.activePane
+        else {
+          Issue.record("no second workspace")
+          return
+        }
+        await other.post(
+          .text(Self.osc("state=blocked:kind=question:app=far")),
+          to: pane
+        )
+        #expect(
+          await until { c.inbox.sorted.contains { $0.workspace == ws.id } }
+        )
+        let item = try #require(c.inbox.sorted.first { $0.workspace == ws.id })
+        _ = try await other.execute(.detach)
+        c.openAttention(item)
+        #expect(await until { c.workspace?.id == ws.id })
+        #expect(c.attachedWorkspace == ws.id)
 
-    // The previous workspace's layout event lands after the switch.
-    var late = previous
-    late.layoutRevision += 100
-    c.handle(.layout(late))
-    #expect(c.workspace?.id == ws.id)
-    #expect(c.attachedWorkspace == ws.id)
-    // An older layout of the current workspace is not shown either.
-    var older = try #require(c.workspace)
-    older.layoutRevision -= 1
-    older.name = "stale"
-    c.handle(.layout(older))
-    #expect(c.workspace?.name != "stale")
+        // The previous workspace's layout event lands after the switch.
+        var late = previous
+        late.layoutRevision += 100
+        c.handle(.layout(late))
+        #expect(c.workspace?.id == ws.id)
+        #expect(c.attachedWorkspace == ws.id)
+        // An older layout of the current workspace is not shown either.
+        var older = try #require(c.workspace)
+        older.layoutRevision -= 1
+        older.name = "stale"
+        c.handle(.layout(older))
+        #expect(c.workspace?.name != "stale")
+      } cleanup: {
+        await other.close()
+      }
+    }
   }
 
   @Test(.enabled(if: hasMetal))
   func `a refused attach keeps the current window and closes its connection`()
     async throws
   {
-    let f = try await open()
-    defer { f.controller.close() }
-    let c = f.controller
-    let other = try await MuxConnection.connect(
-      endpoint: f.endpoint,
-      frontend: .native
-    )
-    defer { Task { await other.close() } }
-    guard
-      case let .created(created) = try await other.execute(
-        .newWorkspace(
-          NewWorkspaceRequest(
-            launch: LaunchSpec(command: ["/bin/sh"], workingDirectory: "/tmp")
-          )
-        )
-      ), case .attached = try await other.execute(.attach(.id(created.id)))
-    else {
-      Issue.record("no second workspace")
-      return
-    }
-    let connection = try await MuxConnection.connect(
-      endpoint: f.endpoint,
-      frontend: .native
-    )
-    // Held elsewhere and no takeover confirmed: refused, nothing left.
-    await #expect {
-      _ = try await MuxWorkspaceController.replace(
-        c,
-        with: .id(created.id),
-        configuration: Configuration(),
-        connection: connection
+    try await withFixture { f in
+      let c = f.controller
+      let other = try await MuxConnection.connect(
+        endpoint: f.endpoint,
+        frontend: .native
       )
-    } throws: { ($0 as? MuxError)?.code == .leaseHeld }
-    #expect(c.workspace?.id == f.workspace)
-    #expect(c.window?.isVisible == true)
-    // The new connection was closed: its event stream ends at once.
-    #expect(await (try? connection.nextEvent()) == nil)
-    // The current window still holds its lease and works.
-    let pane = try #require(c.activePane)
-    c.split(.leftRight)
-    #expect(await until { c.workspace?.panes.count == 2 })
-    #expect(c.workspace?.pane(pane) != nil)
+      var ownedReplacement: MuxConnection?
+      try await RuntimeFixture.withCleanup {
+        guard
+          case let .created(created) = try await other.execute(
+            .newWorkspace(
+              NewWorkspaceRequest(
+                launch: LaunchSpec(
+                  command: ["/bin/sh"],
+                  workingDirectory: "/tmp"
+                )
+              )
+            )
+          ), case .attached = try await other.execute(.attach(.id(created.id)))
+        else {
+          Issue.record("no second workspace")
+          return
+        }
+        let connection = try await MuxConnection.connect(
+          endpoint: f.endpoint,
+          frontend: .native
+        )
+        ownedReplacement = connection
+        // Held elsewhere and no takeover confirmed: refused, nothing left.
+        await #expect {
+          _ = try await MuxWorkspaceController.replace(
+            c,
+            with: .id(created.id),
+            configuration: Configuration(),
+            connection: connection
+          )
+        } throws: { ($0 as? MuxError)?.code == .leaseHeld }
+        #expect(c.workspace?.id == f.workspace)
+        #expect(c.window?.isVisible == true)
+        // The new connection was closed: its event stream ends at once.
+        #expect(await (try? connection.nextEvent()) == nil)
+        // The current window still holds its lease and works.
+        let pane = try #require(c.activePane)
+        c.split(.leftRight)
+        #expect(await until { c.workspace?.panes.count == 2 })
+        #expect(c.workspace?.pane(pane) != nil)
+      } cleanup: {
+        await ownedReplacement?.close()
+        await other.close()
+      }
+    }
   }
 
   /// A window on workspace W with an open request, then detached because
@@ -624,29 +723,67 @@ extension MuxNativeTests {
     let host = NavigationHost(id: UUID(), name: "This Mac")
   }
 
+  /// Counts may arrive on a resync before the asynchronous page reload.
+  /// Capture the request in the same observation that proves readiness.
+  private func waitForRequest(
+    in controller: MuxWorkspaceController,
+    from pane: PaneID
+  ) async throws -> AttentionItem {
+    var readyItem: AttentionItem?
+    try #require(
+      await until {
+        readyItem = controller.inbox.sorted.first {
+          $0.source.pane == pane && $0.category == .needsYou
+        }
+        return controller.inbox.counts.needsYou == 1 && readyItem != nil
+      }
+    )
+    return try #require(readyItem)
+  }
+
   func detachedByTakeover() async throws -> DetachedFixture {
     let f = try await open()
     let c = f.controller
-    let pane = try #require(c.activePane)
-    c.send(.text(Self.osc("state=blocked:kind=question:app=tool")), to: pane)
-    #expect(await until { c.inbox.counts.needsYou == 1 })
-    let item = try #require(c.inbox.sorted.first)
-    #expect(c.holdsLease)
-    let phone = try await MuxConnection.connect(
-      endpoint: f.endpoint,
-      frontend: .native
-    )
-    guard
-      case let .workspaces(list) = try await phone.execute(.listWorkspaces),
-      let summary = list.first(where: { $0.id == f.workspace }),
-      case .attached = try await phone.execute(
-        .takeover(.id(f.workspace), expectedLease: summary.leaseGeneration)
+    var ownedPhone: MuxConnection?
+    do {
+      let pane = try #require(c.activePane)
+      c.send(.text(Self.osc("state=blocked:kind=question:app=tool")), to: pane)
+      let item = try await waitForRequest(in: c, from: pane)
+      try #require(c.holdsLease)
+      let phone = try await MuxConnection.connect(
+        endpoint: f.endpoint,
+        frontend: .native
       )
-    else { throw MuxError(.invalidRequest, "no takeover") }
-    #expect(await until { !c.holdsLease })
-    // Still showing W: the old ownership check matched here.
-    #expect(c.workspace?.id == f.workspace)
-    return DetachedFixture(fixture: f, phone: phone, item: item, pane: pane)
+      ownedPhone = phone
+      guard
+        case let .workspaces(list) = try await phone.execute(.listWorkspaces),
+        let summary = list.first(where: { $0.id == f.workspace }),
+        case .attached = try await phone.execute(
+          .takeover(.id(f.workspace), expectedLease: summary.leaseGeneration)
+        )
+      else { throw MuxError(.invalidRequest, "no takeover") }
+      try #require(await until { !c.holdsLease })
+      // Still showing W: the old ownership check matched here.
+      try #require(c.workspace?.id == f.workspace)
+      try Task.checkCancellation()
+      return DetachedFixture(fixture: f, phone: phone, item: item, pane: pane)
+    } catch {
+      await ownedPhone?.close()
+      await retire(f)
+      throw error
+    }
+  }
+
+  func withDetachedFixture(
+    _ work: @MainActor (DetachedFixture) async throws -> Void
+  ) async throws {
+    let d = try await detachedByTakeover()
+    try await RuntimeFixture.withCleanup {
+      try await work(d)
+    } cleanup: {
+      await d.phone.close()
+      await retire(d.fixture)
+    }
   }
 
   /// The router's opener over `AppDelegate`-style window replacement.
@@ -693,106 +830,103 @@ extension MuxNativeTests {
   func `a window detached by a takeover does not own its workspace`()
     async throws
   {
-    let d = try await detachedByTakeover()
-    let c = d.fixture.controller
-    defer { c.close() }
-    defer { Task { await d.phone.close() } }
-    // Commands without a lease fail rather than only being logged.
-    await #expect {
-      try await c.revealAttention(pane: d.pane, tab: nil)
-    } throws: { ($0 as? MuxError)?.code == .notAttached }
-    let preview = AttentionPreview(
-      item: d.item,
-      target: PaneTarget(workspace: d.fixture.workspace, tab: nil, pane: d.pane),
-      leaseHeldElsewhere: true
-    )
-    #expect(
-      AttentionLinkRouter.leaseNote(preview, owned: false)
-        == "Another client controls this workspace."
-    )
-    #expect(AttentionLinkRouter.leaseNote(preview, owned: true) == nil)
+    try await withDetachedFixture { d in
+      let c = d.fixture.controller
+      // Commands without a lease fail rather than only being logged.
+      await #expect {
+        try await c.revealAttention(pane: d.pane, tab: nil)
+      } throws: { ($0 as? MuxError)?.code == .notAttached }
+      let preview = AttentionPreview(
+        item: d.item,
+        target: PaneTarget(
+          workspace: d.fixture.workspace,
+          tab: nil,
+          pane: d.pane
+        ),
+        leaseHeldElsewhere: true
+      )
+      #expect(
+        AttentionLinkRouter.leaseNote(preview, owned: false)
+          == "Another client controls this workspace."
+      )
+      #expect(AttentionLinkRouter.leaseNote(preview, owned: true) == nil)
+    }
   }
 
   @Test(.enabled(if: hasMetal))
   func `revealing in a detached window offers a takeover, never silently`()
     async throws
   {
-    let d = try await detachedByTakeover()
-    let c = d.fixture.controller
-    var shown: MuxWorkspaceController?
-    defer {
-      c.close()
-      shown?.close()
-    }
-    defer { Task { await d.phone.close() } }
-    let navigator = navigator(d) { shown = $0 }
-    let destination = AttentionDestination(
-      hostProfileID: d.host.id,
-      item: d.item,
-      intent: .reveal
-    )
-    await navigator.open(destination)
-    guard case .ready = navigator.state else {
-      Issue.record("not ready: \(navigator.state)")
-      return
-    }
-    await navigator.openInPane()
-    // The plain attach is refused: an explicit offer, not `.opened`.
-    guard case let .confirmTakeover(offer) = navigator.state else {
-      Issue.record("no takeover offer: \(navigator.state)")
-      return
-    }
-    #expect(shown == nil)
-    #expect(try await isSeen(d, destination) == false)
-    // The phone still controls W and the old window is kept.
-    #expect(
-      (try? await d.phone.execute(.newTab(name: nil, launch: nil))) != nil
-    )
-    #expect(c.window?.isVisible == true)
-    #expect(!c.holdsLease)
+    try await withDetachedFixture { d in
+      let c = d.fixture.controller
+      var shown: MuxWorkspaceController?
+      defer { shown?.close() }
+      let navigator = navigator(d) { shown = $0 }
+      let destination = AttentionDestination(
+        hostProfileID: d.host.id,
+        item: d.item,
+        intent: .reveal
+      )
+      await navigator.open(destination)
+      guard case .ready = navigator.state else {
+        Issue.record("not ready: \(navigator.state)")
+        return
+      }
+      await navigator.openInPane()
+      // The plain attach is refused: an explicit offer, not `.opened`.
+      guard case let .confirmTakeover(offer) = navigator.state else {
+        Issue.record("no takeover offer: \(navigator.state)")
+        return
+      }
+      #expect(shown == nil)
+      #expect(try await isSeen(d, destination) == false)
+      // The phone still controls W and the old window is kept.
+      #expect(
+        (try? await d.phone.execute(.newTab(name: nil, launch: nil))) != nil
+      )
+      #expect(c.window?.isVisible == true)
+      #expect(!c.holdsLease)
 
-    // Confirmed: the new window takes W over and shows the pane.
-    await navigator.confirmTakeover()
-    #expect(navigator.state == .opened(offer.preview.target))
-    let window = try #require(shown)
-    #expect(window !== c)
-    #expect(window.holdsLease)
-    #expect(window.attachedWorkspace == d.fixture.workspace)
-    #expect(await until { window.activePane == d.pane })
-    #expect(c.window?.isVisible != true)
-    #expect(try await isSeen(d, destination))
+      // Confirmed: the new window takes W over and shows the pane.
+      await navigator.confirmTakeover()
+      #expect(navigator.state == .opened(offer.preview.target))
+      let window = try #require(shown)
+      #expect(window !== c)
+      #expect(window.holdsLease)
+      #expect(window.attachedWorkspace == d.fixture.workspace)
+      #expect(await until { window.activePane == d.pane })
+      #expect(c.window?.isVisible != true)
+      #expect(try await isSeen(d, destination))
+    }
   }
 
   @Test(.enabled(if: hasMetal))
   func `revealing in a detached window reattaches once the lease is free`()
     async throws
   {
-    let d = try await detachedByTakeover()
-    let c = d.fixture.controller
-    var shown: MuxWorkspaceController?
-    defer {
-      c.close()
-      shown?.close()
+    try await withDetachedFixture { d in
+      let c = d.fixture.controller
+      var shown: MuxWorkspaceController?
+      defer { shown?.close() }
+      _ = try await d.phone.execute(.detach)
+      let navigator = navigator(d) { shown = $0 }
+      let destination = AttentionDestination(
+        hostProfileID: d.host.id,
+        item: d.item,
+        intent: .reveal
+      )
+      await navigator.open(destination)
+      await navigator.openInPane()
+      guard case .opened = navigator.state else {
+        Issue.record("not opened: \(navigator.state)")
+        return
+      }
+      let window = try #require(shown)
+      #expect(window !== c)
+      #expect(window.holdsLease)
+      #expect(await until { window.activePane == d.pane })
+      #expect(c.window?.isVisible != true)
     }
-    defer { Task { await d.phone.close() } }
-    _ = try await d.phone.execute(.detach)
-    let navigator = navigator(d) { shown = $0 }
-    let destination = AttentionDestination(
-      hostProfileID: d.host.id,
-      item: d.item,
-      intent: .reveal
-    )
-    await navigator.open(destination)
-    await navigator.openInPane()
-    guard case .opened = navigator.state else {
-      Issue.record("not opened: \(navigator.state)")
-      return
-    }
-    let window = try #require(shown)
-    #expect(window !== c)
-    #expect(window.holdsLease)
-    #expect(await until { window.activePane == d.pane })
-    #expect(c.window?.isVisible != true)
   }
 
   /// The in-window inbox "Open" in a window that lost its lease sends no
@@ -802,50 +936,47 @@ extension MuxNativeTests {
   func `inbox open in a detached window reattaches after confirmation`()
     async throws
   {
-    let d = try await detachedByTakeover()
-    let c = d.fixture.controller
-    var shown: MuxWorkspaceController?
-    defer {
-      c.close()
-      shown?.close()
-    }
-    defer { Task { await d.phone.close() } }
-    let endpoint = d.fixture.endpoint
-    c.connectService = {
-      try await MuxConnection.connect(endpoint: endpoint, frontend: .native)
-    }
-    c.onReplaced = { shown = $0 }
-    var asked: [String] = []
-    var answer = false
-    c.confirmDestructive = { message in
-      asked.append(message)
-      return answer
-    }
+    try await withDetachedFixture { d in
+      let c = d.fixture.controller
+      var shown: MuxWorkspaceController?
+      defer { shown?.close() }
+      let endpoint = d.fixture.endpoint
+      c.connectService = {
+        try await MuxConnection.connect(endpoint: endpoint, frontend: .native)
+      }
+      c.onReplaced = { shown = $0 }
+      var asked: [String] = []
+      var answer = false
+      c.confirmDestructive = { message in
+        asked.append(message)
+        return answer
+      }
 
-    // Declined: nothing changes hands.
-    c.openAttention(d.item)
-    #expect(await until { asked.count == 1 })
-    #expect(asked.first?.hasPrefix("Take control of workspace") == true)
-    try await Task.sleep(for: .milliseconds(200))
-    #expect(shown == nil)
-    #expect(c.window?.isVisible == true)
-    #expect(
-      (try? await d.phone.execute(.newTab(name: nil, launch: nil))) != nil
-    )
+      // Declined: nothing changes hands.
+      c.openAttention(d.item)
+      #expect(await until { asked.count == 1 })
+      #expect(asked.first?.hasPrefix("Take control of workspace") == true)
+      try await Task.sleep(for: .milliseconds(200))
+      #expect(shown == nil)
+      #expect(c.window?.isVisible == true)
+      #expect(
+        (try? await d.phone.execute(.newTab(name: nil, launch: nil))) != nil
+      )
 
-    // Confirmed: a new window takes the workspace over and shows the pane.
-    answer = true
-    c.openAttention(d.item)
-    #expect(await until { shown != nil })
-    let window = try #require(shown)
-    #expect(asked.count == 2)
-    #expect(window !== c)
-    #expect(window.holdsLease)
-    #expect(window.attachedWorkspace == d.fixture.workspace)
-    #expect(await until { window.activePane == d.pane })
-    #expect(c.window?.isVisible != true)
-    await #expect {
-      try await d.phone.execute(.newTab(name: nil, launch: nil))
-    } throws: { ($0 as? MuxError)?.code == .notAttached }
+      // Confirmed: a new window takes the workspace over and shows the pane.
+      answer = true
+      c.openAttention(d.item)
+      #expect(await until { shown != nil })
+      let window = try #require(shown)
+      #expect(asked.count == 2)
+      #expect(window !== c)
+      #expect(window.holdsLease)
+      #expect(window.attachedWorkspace == d.fixture.workspace)
+      #expect(await until { window.activePane == d.pane })
+      #expect(c.window?.isVisible != true)
+      await #expect {
+        try await d.phone.execute(.newTab(name: nil, launch: nil))
+      } throws: { ($0 as? MuxError)?.code == .notAttached }
+    }
   }
 }

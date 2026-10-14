@@ -146,13 +146,29 @@ extension TerminalState {
     return "rgb:\(c(rgb >> 16))/\(c(rgb >> 8))/\(c(rgb))"
   }
 
-  /// Parses `rgb:R/G/B` (1–4 hex digits each) or `#RRGGBB`.
+  /// Parses `rgb:R/G/B` or `#RGB`, with 1–4 hex digits per component.
+  /// Hash notation supplies the high bits; `rgb:` scales each component.
   static func parseColor(_ spec: Substring) -> UInt32? {
-    if spec.hasPrefix("#"), spec.count == 7,
-      spec.dropFirst().allSatisfy(\.isHexDigit),
-      let v = UInt32(spec.dropFirst(), radix: 16)
-    {
-      return v
+    if spec.hasPrefix("#") {
+      let digits = spec.dropFirst()
+      let count = digits.count
+      guard [3, 6, 9, 12].contains(count), digits.allSatisfy(\.isHexDigit)
+      else { return nil }
+      let width = count / 3
+      var rgb: UInt32 = 0
+      var start = digits.startIndex
+      for _ in 0 ..< 3 {
+        let end = digits.index(start, offsetBy: width)
+        guard let value = UInt32(digits[start ..< end], radix: 16) else {
+          return nil
+        }
+        // X11 places the specified bits at the top of a 16-bit channel.
+        // The palette stores its most significant byte.
+        let byte = (value << (16 - width * 4)) >> 8
+        rgb = rgb << 8 | byte
+        start = end
+      }
+      return rgb
     }
     guard spec.hasPrefix("rgb:") else { return nil }
     let parts = spec.dropFirst(4)

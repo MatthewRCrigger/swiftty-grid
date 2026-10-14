@@ -67,10 +67,16 @@ public struct Parser: ~Copyable {
   // OSC payload, grown on demand and reused.
   private var osc: UnsafeMutablePointer<UInt8>
   private var oscCount = 0
+  /// First nonzero byte of the numeric command, maintained as bytes arrive.
+  private var oscCommandStart = 0
   private var oscCapacity: Int
   /// An OSC body failed validation or passed its limit: drop it whole.
   private var oscOverflow = false
   public static let maxOSCBytes = 8 << 20
+  /// OSC 4/21 can expand small queries into many replies. This body limit
+  /// keeps one command's replies below 64 KiB while allowing all 256
+  /// palette entries, including their full 16-bit RGB specifications.
+  public static let maxColorOSCBytes = 8 << 10
 
   // Scratch for decoded scalars of a mixed (non-ASCII) printable run.
   private let scalars: UnsafeMutablePointer<UInt32>
@@ -138,6 +144,7 @@ public struct Parser: ~Copyable {
       osc = .allocate(capacity: oscCapacity)
     }
     oscCount = continuation.osc.count
+    oscCommandStart = continuation.osc.prefix { $0 == 0x30 }.count
     continuation.osc.withUnsafeBufferPointer { buffer in
       if let base = buffer.baseAddress {
         osc.update(from: base, count: buffer.count)
@@ -305,8 +312,26 @@ public struct Parser: ~Copyable {
   public mutating func consume(
     _ buffer: UnsafeBufferPointer<UInt8>,
     into terminal: inout TerminalState
-  ) {
-    guard let base = buffer.baseAddress, !buffer.isEmpty else { return }
+  ) { _ = consume(buffer, into: &terminal, replyLimit: nil) }
+
+  /// Parses a prefix, stopping after replies reach the threshold. One
+  /// complete command may cross it; parser state and the remaining bytes
+  /// belong to the caller until it drains those replies and resumes.
+  package mutating func consumePrefix(
+    _ buffer: UnsafeBufferPointer<UInt8>,
+    into terminal: inout TerminalState,
+    replyLimit: Int
+  ) -> Int {
+    precondition(replyLimit > 0)
+    return consume(buffer, into: &terminal, replyLimit: replyLimit)
+  }
+
+  private mutating func consume(
+    _ buffer: UnsafeBufferPointer<UInt8>,
+    into terminal: inout TerminalState,
+    replyLimit: Int?
+  ) -> Int {
+    guard let base = buffer.baseAddress, !buffer.isEmpty else { return 0 }
     defer {
       terminal.refreshSearchIfNeeded()
       terminal._checkInvariants()
@@ -314,6 +339,7 @@ public struct Parser: ~Copyable {
     let n = buffer.count
     var i = 0
     while i < n {
+      if let replyLimit, terminal.output.count >= replyLimit { break }
       if state == .controlMode || state == .dcsPassthrough {
         // Hand over everything up to the next ESC/CAN/SUB in one piece.
         var end = i
@@ -362,6 +388,7 @@ public struct Parser: ~Copyable {
       step(base[i], &terminal)
       i += 1
     }
+    return i
   }
 
   /// Index of the first byte in `from..<to` outside 0x20...0x7E.
@@ -440,6 +467,7 @@ public struct Parser: ~Copyable {
     case 0x18, 0x1A:  // CAN, SUB
       if state == .oscString {
         oscCount = 0
+        oscCommandStart = 0
         oscOverflow = false
       }
       if state == .dcsPassthrough { t.discardControlString() }
@@ -561,6 +589,7 @@ public struct Parser: ~Copyable {
     case 0x5B: enterCSI()  // [
     case 0x5D:
       oscCount = 0;
+      oscCommandStart = 0;
       oscOverflow = false;
       state = .oscString  // ]
     case 0x50:
@@ -760,6 +789,9 @@ public struct Parser: ~Copyable {
   }
 
   private mutating func appendOSC(_ byte: UInt8) {
+    if oscCount >= Self.maxColorOSCBytes, !oscOverflow, isColorOSC {
+      oscOverflow = true
+    }
     // OSC 7501 has its own bound, below the generic one; a longer
     // report is discarded rather than truncated.
     if oscCount >= ProgramStatusCommand.maxBodyBytes, !oscOverflow,
@@ -780,13 +812,22 @@ public struct Parser: ~Copyable {
       osc = grown
       oscCapacity *= 2
     }
+    if oscCommandStart == oscCount, byte == 0x30 { oscCommandStart += 1 }
     osc[oscCount] = byte
     oscCount += 1
   }
 
+  private var isColorOSC: Bool {
+    let start = oscCommandStart
+    if start + 1 < oscCount, osc[start] == 0x34, osc[start + 1] == 0x3B {
+      return true
+    }
+    return start + 2 < oscCount && osc[start] == 0x32 && osc[start + 1] == 0x31
+      && osc[start + 2] == 0x3B
+  }
+
   private var isClipboardOSC: Bool {
-    var start = 0
-    while start < oscCount, osc[start] == 0x30 { start += 1 }
+    let start = oscCommandStart
     return start + 2 < oscCount && osc[start] == 0x35 && osc[start + 1] == 0x32
       && osc[start + 2] == 0x3B
   }
@@ -804,6 +845,7 @@ public struct Parser: ~Copyable {
       )
     }
     oscCount = 0
+    oscCommandStart = 0
     oscOverflow = false
   }
 }

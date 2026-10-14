@@ -31,48 +31,102 @@ repository_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
 stop() {
   dir=$1
   [ -d "$dir" ] || return 0
+  cleanup_status=0
   for f in relay bridge host; do
-    if [ -s "$dir/$f.pid" ]; then
-      kill "$(cat "$dir/$f.pid")" 2>/dev/null || true
-      rm -f "$dir/$f.pid"
+    if [ -e "$dir/$f.pid" ] || [ -L "$dir/$f.pid" ]; then
+      if ! pid=$(cat "$dir/$f.pid"); then
+        echo "cannot read $dir/$f.pid" >&2
+        cleanup_status=1
+        continue
+      fi
+      case "$pid" in
+        *[!0-9]*|0*|'') echo "invalid PID in $dir/$f.pid" >&2; cleanup_status=1; continue ;;
+      esac
+      if ! [ "$pid" -gt 1 ] 2>/dev/null || ! [ "$pid" -le 2147483647 ] 2>/dev/null; then
+        echo "invalid PID in $dir/$f.pid" >&2
+        cleanup_status=1
+        continue
+      fi
+      if kill -0 "$pid" 2>/dev/null && ! kill "$pid" 2>/dev/null; then
+        echo "cannot stop PID $pid" >&2
+        cleanup_status=1
+        continue
+      fi
+      rm -f "$dir/$f.pid" || cleanup_status=1
     fi
   done
-  if [ -s "$dir/container.name" ]; then
-    container rm -f "$(cat "$dir/container.name")" >/dev/null 2>&1 || true
-    rm -f "$dir/container.name"
+  if [ -e "$dir/container.name" ] || [ -L "$dir/container.name" ]; then
+    container_name=$(cat "$dir/container.name") || return 1
+    case "$container_name" in
+      *[!a-zA-Z0-9-]*|'') echo "invalid container name in $dir/container.name" >&2; return 1 ;;
+    esac
+    case "$container_name" in
+      swiftty-rst-ssh-*) ;;
+      *) echo "unrecognized fixture container in $dir/container.name" >&2; return 1 ;;
+    esac
+    if ! container rm -f "$container_name" >/dev/null 2>&1; then
+      echo "cannot remove fixture container $container_name" >&2
+      return 1
+    fi
+    rm -f "$dir/container.name" || return 1
   fi
+  return "$cleanup_status"
 }
 
 case $1 in
-  stop) [ "$#" -eq 2 ] || usage; stop "$2"; exit 0 ;;
-  start) ;;
+  stop) [ "$#" -eq 2 ] || usage; stop "$2"; exit $? ;;
+  start) [ "$#" -le 2 ] || usage ;;
   *) usage ;;
 esac
 
 command -v container >/dev/null || { echo "apple/container required" >&2; exit 1; }
+umask 077
 workspace=${2:-$(mktemp -d /tmp/rstr.XXXXXX)}
 mkdir -p "$workspace"
 workspace=$(CDPATH= cd "$workspace" && pwd)
-name="swiftty-rst-ssh-$$"
+for marker in host.pid bridge.pid relay.pid container.name; do
+  [ ! -e "$workspace/$marker" ] && [ ! -L "$workspace/$marker" ] || {
+    echo "fixture resources already recorded in $workspace; stop them before starting" >&2
+    exit 1
+  }
+done
+# Validate and normalize both advertised ports before building or spawning resources.
+ports=$(python3 -I "$repository_root/Scripts/real-ssh-config.py" ports \
+  "${RST_QUIC_PORT-$((51500 + $$ % 400))}" "${RST_SSH_PORT-$((52000 + $$ % 400))}") \
+  || exit 2
+read quic_port ssh_port <<EOF
+$ports
+EOF
+setup_complete=0
+cleanup_start() {
+  setup_status=$?
+  trap - EXIT
+  trap '' INT TERM
+  if [ "$setup_complete" -eq 0 ]; then
+    stop "$workspace" || echo "fixture cleanup incomplete: $workspace" >&2
+  fi
+  exit "$setup_status"
+}
+trap cleanup_start EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+fixture_id=$(uuidgen)
+name="swiftty-rst-ssh-$$-$(printf '%s' "$fixture_id" | tr 'A-Z' 'a-z')"
 echo "Workspace: $workspace" >&2
 fail() {
   echo "$*" >&2
-  stop "$workspace"
   exit 1
 }
-trap 'stop "$workspace"' INT TERM
 
 container build --progress plain -t swiftty-rst-ssh:test \
   -f "$repository_root/Tests/RealSSH/Containerfile" \
   "$repository_root/Tests/RealSSH" >"$workspace/build.log" 2>&1 \
   || fail "container build failed; see $workspace/build.log"
 
-(cd "$repository_root" && mise exec -- swift build --product swiftmux-agent && mise exec -- swift build --product swmux-launcher && mise exec -- swift build --product swifttyd >"$workspace/swift-build.log" 2>&1) \
+(cd "$repository_root" && mise exec -- swift build --product swiftmux-agent && mise exec -- swift build --product swmux-launcher && mise exec -- swift build --product swifttyd) >"$workspace/swift-build.log" 2>&1 \
   || fail "swifttyd build failed; see $workspace/swift-build.log"
 bin_dir="$(cd "$repository_root" && mise exec -- swift build --show-bin-path)"
 host_bin="$bin_dir/swiftmux-agent"
-# RST_QUIC_PORT / RST_SSH_PORT pin ports, e.g. for router port forwarding.
-quic_port=${RST_QUIC_PORT:-$((51500 + $$ % 400))}
 # RST_PUBLIC_HOST=<this Mac's LAN address> serves physical devices: swifttyd
 # and the SSH relay listen on all interfaces and grants advertise that
 # address. Default: loopback only (simulators and local tests).
@@ -82,10 +136,17 @@ if [ -n "$public_host" ]; then
 else
   bind_address=127.0.0.1; advertised=127.0.0.1; relay_bind=127.0.0.1
 fi
-printf '{"bindAddress":"%s","advertisedHost":"%s","port":%s,"stateDirectory":"%s/state"}' \
-  "$bind_address" "$advertised" "$quic_port" "$workspace" >"$workspace/config.json"
+python3 -I - "$bind_address" "$advertised" "$quic_port" "$workspace/state" <<'PY' >"$workspace/config.json"
+import json, sys
+bind, host, port, state = sys.argv[1:]
+json.dump(dict(bindAddress=bind, advertisedHost=host, port=int(port), stateDirectory=state), sys.stdout)
+PY
 "$host_bin" --mach-service "com.chr33s.swiftty.swiftmux.test.$$" --launcher "$bin_dir/swmux-launcher" --roaming-config "$workspace/config.json" </dev/null >/dev/null 2>"$workspace/host.log" &
-echo $! >"$workspace/host.pid"
+host_pid=$!
+echo "$host_pid" >"$workspace/host.pid"
+python3 -I "$repository_root/Scripts/real-ssh-readiness.py" host "$host_pid" \
+  "$bin_dir/swifttyd" "$workspace/config.json" >"$workspace/host-readiness.log" 2>&1 \
+  || fail "host did not start; see $workspace/host-readiness.log"
 
 password=$(openssl rand -hex 12)
 seed=$(openssl rand -hex 32)
@@ -113,103 +174,56 @@ xcrun swiftc -O "$workspace/pubkey.swift" -o "$workspace/pubkey" 2>"$workspace/p
 authorized=$("$workspace/pubkey" "$seed")
 
 # The VM reaches the host through the default network's gateway.
-gateway=$(container network list | awk '$1=="default"{print $2}' | sed 's|\.0/24|.1|')
+networks=$(container network list --format json)
+gateway=$(printf '%s\n' "$networks" | python3 -I "$repository_root/Scripts/real-ssh-config.py" gateway) \
+  || fail "container default network has no gateway"
 bridge_port=$((51900 + $$ % 90))
+echo "$name" >"$workspace/container.name"
 container run -d --name "$name" \
   -e RST_PASSWORD="$password" -e RST_AUTHORIZED_KEY="$authorized" \
   -e RST_BRIDGE="$gateway:$bridge_port" swiftty-rst-ssh:test >/dev/null \
   || fail "container run failed"
-echo "$name" >"$workspace/container.name"
 
-python3 -I - "$gateway" "$bridge_port" "$workspace/state/control.sock" \
-  >"$workspace/bridge.log" 2>&1 <<'PY' &
-import socket, sys, threading
-host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-def pump(a, b):
-    try:
-        while (data := a.recv(65536)):
-            b.sendall(data)
-    finally:
-        try: b.shutdown(socket.SHUT_WR)
-        except OSError: pass
-def serve(client):
-    upstream = socket.socket(socket.AF_UNIX)
-    upstream.connect(path)
-    t = threading.Thread(target=pump, args=(client, upstream)); t.start()
-    pump(upstream, client); t.join(); client.close(); upstream.close()
-listener = socket.socket(); listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-listener.bind((host, port)); listener.listen(8)
-print("bridge ready", flush=True)
-while True:
-    c, _ = listener.accept()
-    threading.Thread(target=serve, args=(c,), daemon=True).start()
-PY
-echo $! >"$workspace/bridge.pid"
+python3 -I "$repository_root/Scripts/real-ssh-proxy.py" bridge \
+  "$gateway" "$bridge_port" "$workspace/state/control.sock" \
+  "$workspace/bridge.ready" "$fixture_id" >"$workspace/bridge.log" 2>&1 &
+bridge_pid=$!
+echo "$bridge_pid" >"$workspace/bridge.pid"
+python3 -I "$repository_root/Scripts/real-ssh-readiness.py" listener "$bridge_pid" \
+  "$workspace/bridge.ready" "$fixture_id" >"$workspace/bridge-readiness.log" 2>&1 \
+  || fail "bridge did not start; see $workspace/bridge-readiness.log"
 
-i=0
-until address=$(container inspect "$name" 2>/dev/null | python3 -I -c '
-import sys, json
-d = json.load(sys.stdin)[0]
-print(d["status"]["networks"][0]["ipv4Address"].split("/")[0])' 2>/dev/null) && [ -n "$address" ] \
-  && container exec "$name" test -s /tmp/hostkey.pub 2>/dev/null; do
-  i=$((i + 1)); [ $i -lt 100 ] || fail "container did not start"
-  sleep 0.2
-done
+address=$(python3 -I "$repository_root/Scripts/real-ssh-readiness.py" container \
+  "$host_pid" "$name" 2>"$workspace/container-readiness.log") \
+  || fail "container did not start; see $workspace/container-readiness.log"
 hostkey=$(container exec "$name" cut -d' ' -f1,2 /tmp/hostkey.pub)
+[ -n "$hostkey" ] || fail "container returned no SSH host key"
 echo "$hostkey" >"$workspace/hostkey.pub"
-fingerprint=$(ssh-keygen -lf "$workspace/hostkey.pub" | awk '{print $2}')
+key_details=$(ssh-keygen -lf "$workspace/hostkey.pub")
+fingerprint=$(printf '%s\n' "$key_details" | awk '{print $2}')
+[ -n "$fingerprint" ] || fail "SSH host key has no fingerprint"
 
-ssh_port=${RST_SSH_PORT:-$((52000 + $$ % 400))}
-python3 -I - "$ssh_port" "$name" "$relay_bind" >"$workspace/relay.log" 2>&1 <<'PY' &
-import socket, subprocess, sys, threading
-port, name, bind = int(sys.argv[1]), sys.argv[2], sys.argv[3]
-def serve(client):
-    # Reach sshd through the container daemon, not the VM network.
-    proc = subprocess.Popen(
-        ["container", "exec", "-i", name, "socat", "STDIO", "TCP:127.0.0.1:22"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
-    def up():
-        try:
-            while (data := client.recv(65536)):
-                proc.stdin.write(data)
-        except OSError:
-            pass
-        finally:
-            try: proc.stdin.close()
-            except OSError: pass
-    t = threading.Thread(target=up); t.start()
-    try:
-        while (data := proc.stdout.read1(65536) if hasattr(proc.stdout, "read1") else proc.stdout.read(65536)):
-            client.sendall(data)
-    except OSError:
-        pass
-    try: client.shutdown(socket.SHUT_WR)
-    except OSError: pass
-    t.join(); proc.wait(); client.close()
-listener = socket.socket(); listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-listener.bind((bind, port)); listener.listen(16)
-while True:
-    c, _ = listener.accept()
-    threading.Thread(target=serve, args=(c,), daemon=True).start()
-PY
-echo $! >"$workspace/relay.pid"
-i=0
-until nc -z 127.0.0.1 "$ssh_port" 2>/dev/null; do
-  i=$((i + 1)); [ $i -lt 50 ] || fail "relay did not start"; sleep 0.1
-done
+python3 -I "$repository_root/Scripts/real-ssh-proxy.py" relay \
+  "$relay_bind" "$ssh_port" "$name" "$workspace/relay.ready" "$fixture_id" \
+  >"$workspace/relay.log" 2>&1 &
+relay_pid=$!
+echo "$relay_pid" >"$workspace/relay.pid"
+python3 -I "$repository_root/Scripts/real-ssh-readiness.py" listener "$relay_pid" \
+  "$workspace/relay.ready" "$fixture_id" >"$workspace/relay-readiness.log" 2>&1 \
+  || fail "relay did not start; see $workspace/relay-readiness.log"
+python3 -I "$repository_root/Scripts/real-ssh-readiness.py" alive \
+  "$host_pid" "$bridge_pid" "$relay_pid" || fail "fixture process exited during setup"
 echo "OpenSSH at $address:22 via 127.0.0.1:$ssh_port; bridge $gateway:$bridge_port; swifttyd QUIC $advertised:$quic_port" >&2
 
-cat >"$workspace/env" <<ENV
-export RST_REAL_SSH_HOST=$advertised
-export RST_REAL_SSH_PORT=$ssh_port
-export RST_REAL_SSH_USER=rst
-export RST_REAL_SSH_PASSWORD=$password
-export RST_REAL_SSH_HOSTKEY='$hostkey'
-export RST_REAL_SSH_FINGERPRINT=$fingerprint
-export RST_REAL_SSH_KEY_HEX=$seed
-export RST_REAL_SSH_QUIC_PORT=$quic_port
-export RST_REAL_SSH_ENV_DIR=$workspace
-ENV
+python3 -I - "$advertised" "$ssh_port" "$password" "$hostkey" "$fingerprint" \
+  "$seed" "$quic_port" "$workspace" <<'PY' >"$workspace/env"
+import shlex, sys
+keys = ["HOST", "PORT", "PASSWORD", "HOSTKEY", "FINGERPRINT", "KEY_HEX", "QUIC_PORT", "ENV_DIR"]
+print("export RST_REAL_SSH_USER=rst")
+for key, value in zip(keys, sys.argv[1:]):
+    print(f"export RST_REAL_SSH_{key}={shlex.quote(value)}")
+PY
 chmod 600 "$workspace/env"
-trap - INT TERM
 echo "$workspace/env"
+setup_complete=1
+trap - EXIT INT TERM

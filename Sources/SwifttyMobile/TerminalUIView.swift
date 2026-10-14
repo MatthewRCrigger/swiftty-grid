@@ -738,8 +738,8 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
         }
       }
       #endif
-      renderer.draw(snapshot, in: self)
-      drewFrame = true
+      drewFrame = renderer.draw(snapshot, in: self)
+      if !drewFrame { redraw.request() }
     }
     cursorBlinks = configuration.cursorStyleBlink ?? snapshot.cursor.isBlinking
     if surfaceVisible { updateBlinkTimer() } else { updateFrameDriving() }
@@ -943,6 +943,10 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   private func capabilitiesChanged() {
     let available = effectiveCapabilities
     lastModes = available.effectiveModes(programModes)
+    if !available.textInput {
+      releaseHardwareKeys()
+      discardComposition()
+    }
     if !available.search, isSearchVisible { hideSearch() }
     if !available.scrollback {
       stopMomentum()
@@ -991,21 +995,38 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
 
   /// Tells VoiceOver the screen changed, at most twice a second.
   private func postAccessibilityChange() {
+    requestAccessibilityPost {
+      UIAccessibility.post(notification: .layoutChanged, argument: nil)
+    }
+  }
+
+  func requestAccessibilityPost(
+    isVoiceOverRunning: @escaping @MainActor () -> Bool = {
+      UIAccessibility.isVoiceOverRunning
+    },
+    _ post: @escaping @MainActor () -> Void
+  ) {
+    guard isSurfaceVisible, !isRenderingPaused, isVoiceOverRunning() else {
+      return
+    }
+    guard !accessibilityPostPending else { return }
     let now = CACurrentMediaTime()
     let wait = 0.5 - (now - lastAccessibilityPost)
     guard wait > 0 else {
       lastAccessibilityPost = now
-      UIAccessibility.post(notification: .layoutChanged, argument: nil)
+      post()
       return
     }
-    guard !accessibilityPostPending else { return }
     accessibilityPostPending = true
     DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
       MainActor.assumeIsolated {
         guard let self else { return }
         self.accessibilityPostPending = false
+        guard self.isSurfaceVisible, !self.isRenderingPaused,
+          isVoiceOverRunning()
+        else { return }
         self.lastAccessibilityPost = CACurrentMediaTime()
-        UIAccessibility.post(notification: .layoutChanged, argument: nil)
+        post()
       }
     }
   }

@@ -37,8 +37,9 @@ public struct SSHExecResult: Hashable, Sendable {
 
 /// Runs one exec request on a session channel without a PTY: sends
 /// stdin then EOF, and collects bounded stdout/stderr until close.
-final class ExecChannelHandler: ChannelInboundHandler {
+final class ExecChannelHandler: ChannelDuplexHandler {
   typealias InboundIn = SSHChannelData
+  typealias OutboundIn = SSHChannelData
 
   private let command: String
   private let stdin: [UInt8]
@@ -52,6 +53,7 @@ final class ExecChannelHandler: ChannelInboundHandler {
     exitSignal: nil
   )
   private var started = false
+  private var closing = false
   private var failure: SSHClientError?
   private var timer: Scheduled<Void>?
 
@@ -68,16 +70,24 @@ final class ExecChannelHandler: ChannelInboundHandler {
   }
 
   func handlerAdded(context: ChannelHandlerContext) {
-    context.channel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+    context.channel
+      .setOption(ChannelOptions.allowRemoteHalfClosure, value: true)
       .whenFailure { [channel = context.channel] _ in
         channel.close(promise: nil)
       }
   }
 
   func channelActive(context: ChannelHandlerContext) {
-    let channel = context.channel
-    timer = context.eventLoop.scheduleTask(in: TimeAmount(limits.timeout)) {
-      channel.close(promise: nil)
+    guard !closing else {
+      context.fireChannelActive()
+      return
+    }
+    let bound = NIOLoopBound((self, context), eventLoop: context.eventLoop)
+    timer = context.eventLoop.scheduleTask(
+      in: TimeAmount(clamping: limits.timeout)
+    ) {
+      let (handler, context) = bound.value
+      handler.fail(.execTimeout, context: context)
     }
     context.triggerUserOutboundEvent(
       SSHChannelRequestEvent.ExecRequest(command: command, wantReply: true),
@@ -88,7 +98,7 @@ final class ExecChannelHandler: ChannelInboundHandler {
 
   func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
     switch event {
-    case is ChannelSuccessEvent where !started:
+    case is ChannelSuccessEvent where !started && !closing:
       started = true
       if !stdin.isEmpty {
         var buffer = context.channel.allocator.buffer(capacity: stdin.count)
@@ -99,22 +109,20 @@ final class ExecChannelHandler: ChannelInboundHandler {
         )
       }
       context.close(mode: .output, promise: nil)
-    case is ChannelFailureEvent where !started:
+    case is ChannelFailureEvent where !started && !closing:
       fail(.channelRequestRejected("exec"), context: context)
     case let event as SSHChannelRequestEvent.ExitStatus:
       result.exitStatus = event.exitStatus
     case let event as SSHChannelRequestEvent.ExitSignal:
       result.exitSignal = String(event.signalName.prefix(64))
-    default:
-      context.fireUserInboundEventTriggered(event)
+    default: context.fireUserInboundEventTriggered(event)
     }
   }
 
   func channelRead(context: ChannelHandlerContext, data: NIOAny) {
     let message = unwrapInboundIn(data)
-    guard failure == nil, case let .byteBuffer(buffer) = message.data else {
-      return
-    }
+    guard !closing, failure == nil, case let .byteBuffer(buffer) = message.data
+    else { return }
     switch message.type {
     case .channel:
       guard result.stdout.count + buffer.readableBytes <= limits.maxStdoutBytes
@@ -127,8 +135,7 @@ final class ExecChannelHandler: ChannelInboundHandler {
       let room = max(0, limits.maxStderrBytes - result.stderr.count)
       if buffer.readableBytes > room { result.stderrTruncated = true }
       result.stderr += buffer.readableBytesView.prefix(room)
-    default:
-      break
+    default: break
     }
   }
 
@@ -137,6 +144,7 @@ final class ExecChannelHandler: ChannelInboundHandler {
   }
 
   func channelInactive(context: ChannelHandlerContext) {
+    closing = true
     timer?.cancel()
     if let failure {
       promise.fail(failure)
@@ -150,7 +158,23 @@ final class ExecChannelHandler: ChannelInboundHandler {
 
   private func fail(_ error: SSHClientError, context: ChannelHandlerContext) {
     if failure == nil { failure = error }
+    closing = true
+    timer?.cancel()
     context.close(promise: nil)
+  }
+
+  func close(
+    context: ChannelHandlerContext,
+    mode: CloseMode,
+    promise: EventLoopPromise<Void>?
+  ) {
+    if mode == .all {
+      // Cancellation can close the channel before a queued exec reply arrives.
+      // A late success must not write stdin/EOF into the SDK's closing state.
+      closing = true
+      timer?.cancel()
+    }
+    context.close(mode: mode, promise: promise)
   }
 }
 
@@ -158,6 +182,10 @@ extension SSHConnection {
   /// Runs `command` on a no-PTY exec channel. `command` must be a fixed
   /// constant: never interpolate passwords, tokens, paths or session
   /// identifiers into it (spec §5.1); pass structured data via `stdin`.
+  /// The timeout includes channel acceptance. Aborting before acceptance
+  /// closes SSH. Once accepted, the exec channel closes; SSH also closes if
+  /// the peer does not acknowledge the close within five seconds.
+  /// A failed close on an activated channel also closes SSH.
   public func execute(
     command: String,
     stdin: [UInt8] = [],
@@ -165,21 +193,27 @@ extension SSHConnection {
   ) async throws -> SSHExecResult {
     let promise = channel.eventLoop.makePromise(of: SSHExecResult.self)
     do {
-      _ = try await openSessionChannel { child in
-        try child.pipeline.syncOperations.addHandler(
-          ExecChannelHandler(
-            command: command,
-            stdin: stdin,
-            limits: limits,
-            promise: promise
+      return try await withSessionChannel(
+        timeout: limits.timeout,
+        timeoutError: SSHClientError.execTimeout,
+        initialize: { child in
+          try child.pipeline.syncOperations.addHandler(
+            ExecChannelHandler(
+              command: command,
+              stdin: stdin,
+              limits: limits,
+              promise: promise
+            )
           )
-        )
-      }
+        },
+        operation: { _, attempt in
+          try await attempt.wait(for: promise.futureResult)
+        }
+      )
     } catch {
       promise.fail(error)
       throw error
     }
-    return try await promise.futureResult.get()
   }
 
   /// Bound on helper stderr retained for diagnostics.
@@ -197,9 +231,7 @@ extension SSHConnection {
     guard Self.isValidHelperPath(helperPath) else {
       throw SSHClientError.invalidHelperPath
     }
-    do {
-      try request.validate()
-    } catch {
+    do { try request.validate() } catch {
       throw SSHClientError.invalidConfiguration("bootstrap request")
     }
     let input = try BootstrapEnvelope.encode(request)
@@ -234,8 +266,7 @@ extension SSHConnection {
   public static func isValidHelperPath(_ path: String) -> Bool {
     guard path.hasPrefix("/"), path.utf8.count <= 1024 else { return false }
     let allowed = Set(
-      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-+"
-        .utf8
+      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-+".utf8
     )
     guard path.utf8.allSatisfy(allowed.contains) else { return false }
     return !path.split(separator: "/").contains("..")

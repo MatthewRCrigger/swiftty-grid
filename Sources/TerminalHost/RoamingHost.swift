@@ -15,10 +15,30 @@ import Synchronization
 /// control socket.
 public final class RoamingHost: Sendable {
   public let registry: SessionRegistry
+  // Listener callbacks can outlive stop; revoke their registry before teardown.
+  private final class RegistryTarget: Sendable {
+    let registry = Mutex<SessionRegistry?>(nil)
+
+    func accept(_ connection: any RSTConnection) {
+      if let registry = registry.withLock({ $0 }) {
+        registry.accept(connection)
+      } else {
+        connection.close()
+      }
+    }
+  }
+
+  private let target: RegistryTarget
   private let control: ControlSocketServer
   private let configuration: HostConfiguration
   private let transport: Mutex<Transport>
   private let renewal = Mutex<DispatchSourceTimer?>(nil)
+  private let renewing = Mutex(false)
+  typealias TransportFactory =
+    @Sendable (HostConfiguration, Date) throws -> (
+      any RSTListener, HostCertificate, Date
+    )
+  private let transportFactory: TransportFactory
 
   struct Transport {
     var listener: any RSTListener
@@ -30,17 +50,26 @@ public final class RoamingHost: Sendable {
 
   private init(
     registry: SessionRegistry,
+    target: RegistryTarget,
     control: ControlSocketServer,
     configuration: HostConfiguration,
-    transport: Transport
+    transport: Transport,
+    transportFactory: @escaping TransportFactory
   ) {
     self.registry = registry
+    self.target = target
     self.control = control
     self.configuration = configuration
     self.transport = Mutex(transport)
+    self.transportFactory = transportFactory
   }
 
-  deinit { renewal.withLock { $0?.cancel() } }
+  deinit {
+    target.registry.withLock { $0 = nil }
+    renewal.withLock { $0?.cancel() }
+    control.stop()
+    transport.withLock { $0.listener }.stop()
+  }
 
   /// Binds the listener first (grants advertise its actual port), then
   /// serves bootstrap requests, sweeps expired grants and renews the QUIC
@@ -52,58 +81,115 @@ public final class RoamingHost: Sendable {
     policy: RegistryPolicy = RegistryPolicy(),
     launch: @escaping @Sendable () -> LaunchSpec = RoamingHost.defaultLaunch
   ) async throws -> RoamingHost {
+    try await start(
+      service: service,
+      configuration: config,
+      policy: policy,
+      launch: launch,
+      transportFactory: makeTransport
+    )
+  }
+
+  static func start(
+    service: MuxService,
+    configuration config: HostConfiguration,
+    policy: RegistryPolicy = RegistryPolicy(),
+    launch: @escaping @Sendable () -> LaunchSpec = RoamingHost.defaultLaunch,
+    transportFactory: @escaping TransportFactory
+  ) async throws -> RoamingHost {
+    try Task.checkCancellation()
     try ControlDirectory.prepare(config.stateDirectoryURL)
-    let target = Mutex<SessionRegistry?>(nil)
+    let target = RegistryTarget()
     let (transport, identity) = try await startTransport(
       config: config,
-      now: Date()
-    ) { connection in target.withLock { $0 }?.accept(connection) }
-    let registry = SessionRegistry(
-      service: service,
-      identity: identity,
-      policy: policy,
-      launch: launch
-    )
-    target.withLock { $0 = registry }
-    let bootstrap = BootstrapService(registry: registry)
-    let control = try ControlSocketServer(
-      directory: config.stateDirectoryURL
-    ) { request in await bootstrap.respond(toEnvelope: request) }
-    try control.start()
-    registry.startSweeping()
-    let host = RoamingHost(
-      registry: registry,
-      control: control,
-      configuration: config,
-      transport: transport
-    )
-    host.startRenewing()
-    return host
+      now: Date(),
+      factory: transportFactory
+    ) { connection in target.accept(connection) }
+    var control: ControlSocketServer?
+    do {
+      try Task.checkCancellation()
+      let registry = SessionRegistry(
+        service: service,
+        identity: identity,
+        policy: policy,
+        launch: launch
+      )
+      let bootstrap = BootstrapService(registry: registry)
+      let server = try ControlSocketServer(directory: config.stateDirectoryURL)
+      { request in
+        guard target.registry.withLock({ $0 }) != nil else {
+          return
+            (try? BootstrapEnvelope.encode(
+              BootstrapResponse.failure(.agentUnavailable)
+            )) ?? []
+        }
+        return await bootstrap.respond(toEnvelope: request)
+      }
+      control = server
+      try server.start()
+      try Task.checkCancellation()
+      registry.startSweeping()
+      let host = RoamingHost(
+        registry: registry,
+        target: target,
+        control: server,
+        configuration: config,
+        transport: transport,
+        transportFactory: transportFactory
+      )
+      host.startRenewing()
+      target.registry.withLock { $0 = registry }
+      return host
+    } catch {
+      target.registry.withLock { $0 = nil }
+      control?.stop()
+      transport.listener.stop()
+      throw error
+    }
   }
 
   private static func startTransport(
     config: HostConfiguration,
     now: Date,
+    factory: TransportFactory,
     accept: @escaping @Sendable (any RSTConnection) -> Void
   ) async throws -> (Transport, HostIdentity) {
-    let (listener, certificate, notValidAfter) = try makeTransport(
-      config: config,
-      now: now
-    )
-    try await listener.start(onConnection: accept)
+    let (listener, certificate, notValidAfter) = try factory(config, now)
+    do {
+      try Task.checkCancellation()
+      try await listener.start(onConnection: accept)
+      try Task.checkCancellation()
+    } catch {
+      listener.stop()
+      throw error
+    }
     let identity = HostIdentity(
-      endpoint: BootstrapEndpoint(host: config.advertisedHost, port: listener.port),
+      endpoint: BootstrapEndpoint(
+        host: config.advertisedHost,
+        port: listener.port
+      ),
       certificate: certificate
     )
-    return (Transport(listener: listener, notValidAfter: notValidAfter), identity)
+    return (
+      Transport(listener: listener, notValidAfter: notValidAfter), identity
+    )
   }
 
   /// When the certificate is within its renewal margin, replaces the
   /// listener with one presenting a renewed certificate and advertises it
   /// in new grants. Attached clients are disconnected once; they reattach
   /// with a fresh grant over SSH. Returns whether it renewed.
+  /// Calls overlapping an active renewal return false without replacing it.
   @discardableResult
   func renewIfNeeded(now: Date = Date()) async -> Bool {
+    guard !Task.isCancelled else { return false }
+    let acquired = renewing.withLock { active in
+      guard !active else { return false }
+      active = true
+      return true
+    }
+    guard acquired else { return false }
+    defer { renewing.withLock { $0 = false } }
     let current = transport.withLock { $0 }
     guard
       current.notValidAfter.timeIntervalSince(now)
@@ -112,12 +198,13 @@ public final class RoamingHost: Sendable {
     // The new listener binds the same configured port, so the old one
     // goes first.
     current.listener.stop()
-    let registry = registry
+    let target = target
     do {
       let (next, identity) = try await Self.startTransport(
         config: configuration,
-        now: now
-      ) { connection in registry.accept(connection) }
+        now: now,
+        factory: transportFactory
+      ) { connection in target.accept(connection) }
       transport.withLock { $0 = next }
       registry.replaceIdentity(identity)
       return true

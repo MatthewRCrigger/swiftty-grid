@@ -6,7 +6,7 @@ import NIOSSH
 import Synchronization
 
 #if canImport(Network)
-  import NIOTransportServices
+import NIOTransportServices
 #endif
 
 /// Explicit host, port and username profile (spec §2). No OpenSSH
@@ -68,18 +68,25 @@ final class CredentialOfferDelegate: NIOSSHClientUserAuthenticationDelegate,
   let username: String
   /// `nil` offers nothing: host-key verification only.
   let credential: SSHCredential?
+  let attempt: ConnectionAttempt
   let offered = Mutex(false)
   let exhausted = Mutex(false)
 
-  init(username: String, credential: SSHCredential?) {
+  init(username: String, credential: SSHCredential?, attempt: ConnectionAttempt)
+  {
     self.username = username
     self.credential = credential
+    self.attempt = attempt
   }
 
   func nextAuthenticationType(
     availableMethods: NIOSSHAvailableUserAuthenticationMethods,
     nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>
   ) {
+    if let error = attempt.failure {
+      nextChallengePromise.fail(error)
+      return
+    }
     let first = offered.withLock { wasOffered in
       defer { wasOffered = true }
       return !wasOffered
@@ -112,12 +119,20 @@ final class CredentialOfferDelegate: NIOSSHClientUserAuthenticationDelegate,
 final class ConnectionEventsHandler: ChannelInboundHandler {
   typealias InboundIn = Any
 
-  private let authenticated: EventLoopPromise<Void>
+  let authenticated: EventLoopPromise<Void>
+  let verifier: HostKeyVerifier
+  let auth: CredentialOfferDelegate
   private var completed = false
   private var firstError: (any Error)?
 
-  init(authenticated: EventLoopPromise<Void>) {
+  init(
+    authenticated: EventLoopPromise<Void>,
+    verifier: HostKeyVerifier,
+    auth: CredentialOfferDelegate
+  ) {
     self.authenticated = authenticated
+    self.verifier = verifier
+    self.auth = auth
   }
 
   func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
@@ -136,12 +151,12 @@ final class ConnectionEventsHandler: ChannelInboundHandler {
   func handlerAdded(context: ChannelHandlerContext) {
     // NIOSSHHandler does not forward channelInactive, so observe the
     // close future instead.
-    context.channel.closeFuture.assumeIsolated().whenComplete { _ in
-      self.connectionClosed()
-    }
+    context.channel.closeFuture.assumeIsolated()
+      .whenComplete { _ in self.connectionClosed() }
   }
 
   private func connectionClosed() {
+    verifier.connectionClosed()
     if !completed {
       completed = true
       authenticated.fail(firstError ?? SSHClientError.connectionClosed)
@@ -175,9 +190,9 @@ public final class SSHConnection: Sendable {
   /// The default client group: Network.framework on Apple platforms.
   public static var defaultEventLoopGroup: any EventLoopGroup {
     #if canImport(Network)
-      NIOTSEventLoopGroup.singleton
+    NIOTSEventLoopGroup.singleton
     #else
-      MultiThreadedEventLoopGroup.singleton
+    MultiThreadedEventLoopGroup.singleton
     #endif
   }
 
@@ -229,8 +244,7 @@ public final class SSHConnection: Sendable {
       eventLoopGroup: eventLoopGroup
     )
     switch outcome {
-    case let .verified(fingerprint):
-      return fingerprint
+    case let .verified(fingerprint): return fingerprint
     case let .connected(connection):
       // A server that accepts "none" authentication.
       await connection.close()
@@ -257,22 +271,70 @@ public final class SSHConnection: Sendable {
     guard configuration.isValidUsername else {
       throw SSHClientError.invalidConfiguration("username")
     }
-    let verifier = HostKeyVerifier(
-      host: identity,
-      store: trustStore,
-      decider: trustDecider
-    )
-    let auth = CredentialOfferDelegate(
-      username: configuration.username,
-      credential: credential
-    )
+    try Task.checkCancellation()
     let loop = (eventLoopGroup ?? defaultEventLoopGroup).next()
-    let authenticated = loop.makePromise(of: Void.self)
-    let timeout = TimeAmount(configuration.connectTimeout)
+    let timeout = TimeAmount(clamping: configuration.connectTimeout)
+    let attempt = ConnectionAttempt(deadline: .now() + timeout)
+    let timer = loop.scheduleTask(deadline: attempt.deadline) {
+      attempt.abort(SSHClientError.connectTimeout)
+    }
+    defer { timer.cancel() }
+    return try await withTaskCancellationHandler {
+      do {
+        let outcome = try await performEstablishment(
+          configuration: configuration,
+          identity: identity,
+          credential: credential,
+          trustStore: trustStore,
+          trustDecider: trustDecider,
+          loop: loop,
+          timeout: timeout,
+          attempt: attempt
+        )
+        try Task.checkCancellation()
+        if case let .connected(connection) = outcome {
+          try attempt.finish(keeping: connection.channel)
+        } else {
+          try attempt.finish(keeping: nil)
+        }
+        return outcome
+      } catch {
+        attempt.abort(error)
+        if Task.isCancelled { throw CancellationError() }
+        throw attempt.failure ?? error
+      }
+    } onCancel: {
+      attempt.abort(CancellationError())
+    }
+  }
 
+  private static func performEstablishment(
+    configuration: SSHClientConfiguration,
+    identity: HostIdentity,
+    credential: SSHCredential?,
+    trustStore: any HostTrustStore,
+    trustDecider: any HostTrustDecider,
+    loop: any EventLoop,
+    timeout: TimeAmount,
+    attempt: ConnectionAttempt
+  ) async throws -> Outcome {
+    try Task.checkCancellation()
     let initializer: @Sendable (any Channel) -> EventLoopFuture<Void> = {
       channel in
       channel.eventLoop.makeCompletedFuture {
+        try attempt.register(channel)
+        let verifier = HostKeyVerifier(
+          host: identity,
+          store: trustStore,
+          decider: trustDecider
+        )
+        let auth = CredentialOfferDelegate(
+          username: configuration.username,
+          credential: credential,
+          attempt: attempt
+        )
+        let authenticated = channel.eventLoop.makePromise(of: Void.self)
+
         var client = NIOSSH.SSHClientConfiguration(
           userAuthDelegate: auth,
           serverAuthDelegate: verifier
@@ -285,41 +347,59 @@ public final class SSHConnection: Sendable {
           allocator: channel.allocator,
           inboundChildChannelInitializer: nil
         )
-        try channel.pipeline.syncOperations.addHandler(ssh)
-        try channel.pipeline.syncOperations.addHandler(
-          ConnectionEventsHandler(authenticated: authenticated)
-        )
+        do {
+          try channel.pipeline.syncOperations.addHandler(ssh)
+          try channel.pipeline.syncOperations.addHandler(
+            ConnectionEventsHandler(
+              authenticated: authenticated,
+              verifier: verifier,
+              auth: auth
+            )
+          )
+        } catch {
+          authenticated.fail(error)
+          throw error
+        }
       }
     }
 
     let channel: any Channel
     do {
-      channel = try await connectChannel(
+      let connecting = try connectChannel(
         loop: loop,
         host: configuration.host,
         port: configuration.port,
         timeout: timeout,
         initializer: initializer
       )
+      channel = try await attempt.wait(for: connecting) {
+        $0.close(promise: nil)
+      }
     } catch {
-      authenticated.fail(error)
+      if Task.isCancelled { throw CancellationError() }
       if case ChannelError.connectTimeout = error {
         throw SSHClientError.connectTimeout
       }
       throw error
     }
 
-    let timedOut = Mutex(false)
-    let timer = loop.scheduleTask(in: timeout) {
-      timedOut.withLock { $0 = true }
-      channel.close(promise: nil)
-    }
+    // A failed Happy Eyeballs candidate must not settle the winner's handshake.
+    let (authenticated, verifier, auth) = try await attempt.wait(
+      for: channel.eventLoop.submit {
+        let events = try channel.pipeline.syncOperations.handler(
+          type: ConnectionEventsHandler.self
+        )
+        return (events.authenticated, events.verifier, events.auth)
+      }
+    )
     do {
-      try await authenticated.futureResult.get()
-      timer.cancel()
+      try Task.checkCancellation()
+      try await attempt.wait(for: authenticated.futureResult)
+      try Task.checkCancellation()
     } catch {
-      timer.cancel()
       channel.close(promise: nil)
+      if let error = attempt.failure { throw error }
+      if Task.isCancelled { throw CancellationError() }
       if let trust = verifier.failure.withLock({ $0 }) { throw trust }
       if credential == nil, let line = verifier.accepted.withLock({ $0 }),
         let fingerprint = SSHPublicKeyFormat.fingerprint(openSSHPublicKey: line)
@@ -329,13 +409,11 @@ public final class SSHConnection: Sendable {
       if auth.exhausted.withLock({ $0 }) {
         throw SSHClientError.authenticationFailed
       }
-      if timedOut.withLock({ $0 }) { throw SSHClientError.connectTimeout }
       throw error
     }
 
-    let fingerprint = verifier.accepted.withLock { $0 }.flatMap {
-      SSHPublicKeyFormat.fingerprint(openSSHPublicKey: $0)
-    }
+    let fingerprint = verifier.accepted.withLock { $0 }
+      .flatMap { SSHPublicKeyFormat.fingerprint(openSSHPublicKey: $0) }
     guard let fingerprint else {
       // Authentication cannot succeed without a verified host key.
       channel.close(promise: nil)
@@ -357,25 +435,19 @@ public final class SSHConnection: Sendable {
     port: Int,
     timeout: TimeAmount,
     initializer: @escaping @Sendable (any Channel) -> EventLoopFuture<Void>
-  ) async throws -> any Channel {
+  ) throws -> EventLoopFuture<any Channel> {
     #if canImport(Network)
-      if let bootstrap = NIOTSConnectionBootstrap(validatingGroup: loop) {
-        return try await bootstrap
-          .connectTimeout(timeout)
-          .channelInitializer(initializer)
-          .connect(host: host, port: port)
-          .get()
-      }
+    if let bootstrap = NIOTSConnectionBootstrap(validatingGroup: loop) {
+      return bootstrap.connectTimeout(timeout).channelInitializer(initializer)
+        .connect(host: host, port: port)
+    }
     #endif
     guard let bootstrap = ClientBootstrap(validatingGroup: loop) else {
       throw SSHClientError.invalidConfiguration("event loop group")
     }
-    return try await bootstrap
-      .connectTimeout(timeout)
+    return bootstrap.connectTimeout(timeout)
       .channelOption(.socketOption(.tcp_nodelay), value: 1)
-      .channelInitializer(initializer)
-      .connect(host: host, port: port)
-      .get()
+      .channelInitializer(initializer).connect(host: host, port: port)
   }
 
   public var isActive: Bool { channel.isActive }
@@ -389,43 +461,18 @@ public final class SSHConnection: Sendable {
     try? await channel.closeFuture.get()
   }
 
-  /// Opens a session channel. `initialize` runs on the event loop and
-  /// installs the channel's handlers.
-  func openSessionChannel(
-    _ initialize: @escaping @Sendable (any Channel) throws -> Void
-  ) async throws -> any Channel {
-    let channel = self.channel
-    let promise = channel.eventLoop.makePromise(of: (any Channel).self)
-    channel.eventLoop.execute {
-      do {
-        let ssh = try channel.pipeline.syncOperations.handler(
-          type: NIOSSHHandler.self
-        )
-        ssh.createChannel(promise, channelType: .session) { child, _ in
-          child.eventLoop.makeCompletedFuture { try initialize(child) }
-        }
-      } catch {
-        promise.fail(error)
-      }
-    }
-    do {
-      return try await promise.futureResult.get()
-    } catch let error as NIOSSHError where error.type == .channelSetupRejected {
-      throw SSHClientError.channelRequestRejected("session")
-    } catch let error as NIOSSHError
-      where error.type == .creatingChannelAfterClosure
-    {
-      throw SSHClientError.connectionClosed
-    }
-  }
 }
 
 extension TimeAmount {
-  init(_ duration: Duration) {
+  init(clamping duration: Duration) {
     let (seconds, attoseconds) = duration.components
     let nanos = seconds.multipliedReportingOverflow(by: 1_000_000_000)
+    let total = nanos.partialValue.addingReportingOverflow(
+      attoseconds / 1_000_000_000
+    )
     self = .nanoseconds(
-      nanos.overflow ? .max : nanos.partialValue + attoseconds / 1_000_000_000
+      nanos.overflow || total.overflow
+        ? (seconds < 0 ? .min : .max) : total.partialValue
     )
   }
 }

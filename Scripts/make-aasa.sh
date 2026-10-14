@@ -35,17 +35,29 @@ check() {
   /usr/bin/python3 -I -m json.tool "$file" >/dev/null
   plutil -convert xml1 -o /dev/null "$file" || { echo "plutil rejected $file" >&2; exit 65; }
   /usr/bin/python3 -I - "$file" "$@" <<'PY'
-import json, sys
+import json, re, sys
 path, args = sys.argv[1], sys.argv[2:]
 doc = json.load(open(path))
 def fail(why):
     sys.exit(f"{path}: {why}")
-details = doc.get("applinks", {}).get("details")
+if not isinstance(doc, dict) or set(doc) != {"applinks"}:
+    fail("unexpected top-level structure (only applinks is used)")
+applinks = doc["applinks"]
+if not isinstance(applinks, dict) or set(applinks) - {"details", "apps"}:
+    fail("applinks must hold details without matching defaults or substitutions")
+if "apps" in applinks and applinks["apps"] != []:
+    fail("legacy applinks.apps must be empty")
+details = applinks.get("details")
 if not isinstance(details, list) or len(details) != 1:
     fail("applinks.details must hold one entry")
 entry = details[0]
+if not isinstance(entry, dict) or set(entry) != {"appIDs", "components"}:
+    fail("details entry must hold appIDs and components without matching defaults")
 ids = entry.get("appIDs")
-if not ids or not all(isinstance(i, str) and i.count(".") >= 2 for i in ids):
+if not isinstance(ids, list) or not ids or not all(
+    isinstance(i, str) and re.fullmatch(r"[A-Z0-9]{10}\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", i)
+    for i in ids
+):
     fail("appIDs must list <team>.<bundle-id> strings")
 if args:
     expected = sorted(f"{args[0]}.{b}" for b in args[1:])
@@ -54,15 +66,35 @@ if args:
 components = entry.get("components")
 if not isinstance(components, list):
     fail("components must be a list")
-includes = [c for c in components if not c.get("exclude")]
-if [c.get("/") for c in includes] != ["/a/?*"]:
-    fail("the only included path must be /a/?*")
-excluded = {(c.get("/"), c.get("?"), c.get("#")) for c in components if c.get("exclude")}
-for need in [("/a/*/*", None, None), ("/a/*", "?*", None), ("/a/*", None, "?*")]:
-    if need not in excluded:
-        fail(f"missing exclusion {need}")
-if set(doc) != {"applinks"}:
-    fail("unexpected top-level keys (only applinks is used)")
+rules = []
+for component in components:
+    if not isinstance(component, dict) or set(component) - {"/", "?", "#", "exclude", "comment"}:
+        fail("component must be a supported matching dictionary")
+    if "exclude" in component and not isinstance(component["exclude"], bool):
+        fail("component exclude must be a Boolean")
+    for key in ["/", "#", "comment"]:
+        if key in component and not isinstance(component[key], str):
+            fail(f"component {key} must be a string")
+    if "?" in component:
+        query = component["?"]
+        if not isinstance(query, str) and not (
+            isinstance(query, dict) and all(isinstance(v, str) for v in query.values())
+        ):
+            fail("component query must be a string or string-valued dictionary")
+    rules.append({k: v for k, v in component.items() if k != "comment"})
+includes = [(index, rule) for index, rule in enumerate(rules) if not rule.get("exclude", False)]
+if len(includes) != 1 or {k: v for k, v in includes[0][1].items() if k != "exclude"} != {"/": "/a/?*"}:
+    fail("the only inclusion must be /a/?* without query or fragment conditions")
+# Apple evaluates components in order and the first match wins. Each
+# unconditional required exclusion must precede the overlapping inclusion.
+before = rules[:includes[0][0]]
+for need in [
+    {"/": "/a/*/*", "exclude": True},
+    {"/": "/a/*", "?": "?*", "exclude": True},
+    {"/": "/a/*", "#": "?*", "exclude": True},
+]:
+    if need not in before:
+        fail(f"required exclusion {need} must appear before the inclusion")
 PY
 }
 

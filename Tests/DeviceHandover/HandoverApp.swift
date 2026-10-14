@@ -1,11 +1,10 @@
 import Foundation
-import Network
 import Observation
 import ScreenProtocol
 import SessionCore
 import SSHClient
-import SwiftUI
 import SwifttyCore
+import SwiftUI
 import TerminalSurface
 
 /// Acceptance test A2 on a physical iPhone (Scripts/test-handover.sh).
@@ -13,11 +12,12 @@ import TerminalSurface
 /// Runs as a plain app, not under XCTest, so switching the phone's Wi-Fi
 /// off cannot cut a wireless debugging link. It keeps one roaming session
 /// open; after every Wi-Fi ↔ cellular switch it waits for recovery and runs
-/// `echo hop-N-$$ | tee -a <log>` in the retained shell on the Mac. The Mac
+/// `printf` with the shell PID in the retained shell on the Mac. The Mac
 /// log is the evidence: one line per switch, all from the same shell PID.
 @main
 struct HandoverApp: App {
-  @State private var runner = HandoverRunner()
+  @State
+  private var runner = HandoverRunner()
 
   var body: some Scene {
     WindowGroup {
@@ -25,21 +25,26 @@ struct HandoverApp: App {
         Text("Roaming handover (A2)").font(.headline)
         Text(runner.headline).font(.title3.monospaced())
         ScrollView {
-          Text(runner.lines.joined(separator: "\n"))
-            .font(.caption.monospaced())
+          Text(runner.lines.joined(separator: "\n")).font(.caption.monospaced())
             .frame(maxWidth: .infinity, alignment: .leading)
         }
       }
-      .padding()
-      .task { await runner.run() }
+      .padding().task { await runner.run() }
     }
   }
 }
 
-@MainActor @Observable
+@MainActor
+@Observable
 final class HandoverRunner {
   var headline = "starting"
   var lines: [String] = []
+  private let gate = HandoverRunGate()
+
+  private struct Failure: Error, CustomStringConvertible {
+    let description: String
+    init(_ description: String) { self.description = description }
+  }
 
   private func note(_ line: String) {
     lines.append(line)
@@ -47,6 +52,7 @@ final class HandoverRunner {
   }
 
   func run() async {
+    guard gate.begin() else { return }
     let env = ProcessInfo.processInfo.environment
     guard let host = env["RST_HANDOVER_HOST"],
       let port = env["RST_HANDOVER_PORT"].flatMap(Int.init),
@@ -58,7 +64,15 @@ final class HandoverRunner {
       headline = "missing configuration"
       return
     }
-    let switches = env["RST_HANDOVER_SWITCHES"].flatMap(Int.init) ?? 50
+    guard
+      let switches = HandoverExecution.switchCount(
+        env["RST_HANDOVER_SWITCHES"],
+      ), HandoverExecution.validLogPath(logPath)
+    else {
+      headline = "invalid switch count or log path"
+      return
+    }
+    let previousIdleSetting = UIApplication.shared.isIdleTimerDisabled
     UIApplication.shared.isIdleTimerDisabled = true
 
     let display = TerminalSession(presentationColumns: 80, rows: 24)
@@ -69,129 +83,151 @@ final class HandoverRunner {
             host: host,
             port: port,
             username: "rst",
-            connectTimeout: .seconds(20)
+            connectTimeout: .seconds(20),
           ),
           credential: .password(password),
-          trustStore: InMemoryHostTrustStore(keys: [identity: hostKey])
-        )
+          trustStore: InMemoryHostTrustStore(keys: [identity: hostKey]),
+        ),
       ),
       connector: QUICGrantConnector(),
-      sink: display
+      sink: display,
     )
-    let paths = PathWatcher()
-    // States seen since the last switch: a reattach passes through
-    // reconnecting/attaching; a migrated QUIC connection stays attached.
-    let seen = StateLog()
-    await client.setStatusHandler { status in seen.record(status.state) }
-    func screen() -> String { display.snapshot().text.joined(separator: "\n") }
-    func run(_ command: String) async {
-      _ = await client.submit(.text(command))
-      _ = await client.submit(.key(SemanticKey(.enter)))
-    }
-
+    let paths = HandoverPathWatcher()
     do {
-      try await client.start(.create(GridSize(columns: 80, rows: 24)))
+      try await HandoverExecution.withCleanup {
+        try await perform(
+          client,
+          display: display,
+          paths: paths,
+          switches: switches,
+          logPath: logPath,
+        )
+      } cleanup: {
+        paths.stop()
+        await client.setStatusHandler(nil)
+        await client.close()
+        UIApplication.shared.isIdleTimerDisabled = previousIdleSetting
+      }
     } catch {
-      headline = "start failed: \(error)"
-      return
+      headline =
+        Task.isCancelled || error is CancellationError
+        ? "canceled" : "failed: \(error)"
     }
-    guard await wait(seconds: 60, { await client.state == .active }) else {
-      headline = "attach failed"
-      return
-    }
-    try? await Task.sleep(for: .seconds(2))  // let the prompt draw
-    await run("echo ready-$$ | tee -a \(logPath)")
-    guard await wait(seconds: 30, { screen().contains("ready-") }) else {
-      headline = "shell did not answer"
-      return
-    }
-    headline = "toggle Wi-Fi: 0/\(switches)"
-    note("ready on \(paths.current)")
+  }
 
-    var last = paths.current
+  private func perform(
+    _ client: RoamingClient,
+    display: TerminalSession,
+    paths: HandoverPathWatcher,
+    switches: Int,
+    logPath: String,
+  ) async throws {
+    let seen = HandoverStateLog()
+    await client.setStatusHandler { status in seen.record(status.state) }
+    let quotedLog = HandoverExecution.shellQuote(logPath)
+    func lines() -> [String] { display.snapshot().text }
+    func command(_ command: String) async throws {
+      try Task.checkCancellation()
+      guard await client.submit(.text(command)).isAccepted else {
+        throw Failure("command refused")
+      }
+      try Task.checkCancellation()
+      guard await client.submit(.key(SemanticKey(.enter))).isAccepted else {
+        throw Failure("Enter refused")
+      }
+    }
+    func output(_ format: String) async throws {
+      try await command("printf '\(format)\\n' \"$$\" | tee -a -- \(quotedLog)")
+    }
+    try await client.start(.create(GridSize(columns: 80, rows: 24)))
+    guard
+      try await HandoverExecution.wait(
+        timeout: .seconds(60),
+        { await client.state == .active },
+      )
+    else { throw Failure("attach failed") }
+    try await output("ready-%s")
+    guard
+      try await HandoverExecution.wait(
+        timeout: .seconds(30),
+        { HandoverExecution.pid(in: lines(), prefix: "ready-") != nil },
+      ), let shellPID = HandoverExecution.pid(in: lines(), prefix: "ready-")
+    else { throw Failure("shell did not answer") }
+    var initialPath: String?
+    guard
+      try await HandoverExecution.wait(
+        timeout: .seconds(30),
+        {
+          let now = paths.current
+          guard now == "wifi" || now == "cellular" else { return false }
+          initialPath = now
+          return true
+        },
+      ), let initialPath
+    else { throw Failure("no Wi-Fi or cellular path") }
+    var last = initialPath
+    note("ready on \(last)")
+    headline = "toggle Wi-Fi: 0/\(switches)"
     for hop in 1 ... switches {
-      guard await wait(seconds: 900, {
-        let now = paths.current
-        return now != last && (now == "wifi" || now == "cellular")
-      }) else {
-        headline = "no switch within 15 min"
-        return
-      }
-      let started = Date()
       seen.reset()
-      last = paths.current
+      var nextPath: String?
+      guard
+        try await HandoverExecution.wait(
+          timeout: .seconds(900),
+          {
+            let now = paths.current
+            guard now != last, now == "wifi" || now == "cellular" else {
+              return false
+            }
+            nextPath = now
+            return true
+          },
+        ), let nextPath
+      else { throw Failure("no switch within 15 min") }
+      let clock = ContinuousClock()
+      let started = clock.now
+      last = nextPath
       await client.pathChanged()
-      guard await wait(seconds: 180, { await client.state == .active }) else {
-        headline = "no recovery after switch \(hop)"
-        await run("echo FAILED-recovery-\(hop) | tee -a \(logPath)")
-        return
-      }
-      // Let a reattach, if any, show up before classifying the switch.
-      try? await Task.sleep(for: .seconds(1))
+      guard
+        try await HandoverExecution.wait(
+          timeout: .seconds(180),
+          { await client.state == .active },
+        )
+      else { throw Failure("no recovery after switch \(hop)") }
+      try await Task.sleep(for: .seconds(1))
       let mode = seen.reattached ? "reattached" : "migrated"
-      await run("echo hop-$((\(hop)*1))-$$-\(last)-\(mode) | tee -a \(logPath)")
-      guard await wait(seconds: 180, { screen().contains("hop-\(hop)-") }) else {
-        headline = "no output after switch \(hop)"
-        return
+      try await output("hop-\(hop)-%s-\(last)-\(mode)")
+      guard
+        try await HandoverExecution.wait(
+          timeout: .seconds(180),
+          {
+            HandoverExecution.pid(
+              in: lines(),
+              prefix: "hop-\(hop)-",
+              suffix: "-\(last)-\(mode)",
+            ) != nil
+          },
+        ),
+        HandoverExecution.pid(
+          in: lines(),
+          prefix: "hop-\(hop)-",
+          suffix: "-\(last)-\(mode)",
+        ) == shellPID
+      else {
+        throw Failure("missing output or changed shell after switch \(hop)")
       }
-      let seconds = Date().timeIntervalSince(started)
-      note(String(format: "switch %d to %@: %.2fs", hop, last, seconds))
+      let elapsed = started.duration(to: clock.now).components
+      let seconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+      note("switch \(hop) to \(last): " + String(format: "%.2fs", seconds))
       headline = "toggle Wi-Fi: \(hop)/\(switches)"
     }
-    await run("echo done-$$ | tee -a \(logPath)")
+    try await output("done-%s")
+    guard
+      try await HandoverExecution.wait(
+        timeout: .seconds(30),
+        { HandoverExecution.pid(in: lines(), prefix: "done-") == shellPID },
+      )
+    else { throw Failure("completion did not reach the shell") }
     headline = "done: \(switches) switches"
-  }
-
-  private func wait(
-    seconds: Double,
-    _ condition: () async -> Bool
-  ) async -> Bool {
-    let deadline = Date().addingTimeInterval(seconds)
-    while !(await condition()) {
-      if Date() > deadline { return false }
-      try? await Task.sleep(for: .milliseconds(100))
-    }
-    return true
-  }
-}
-
-final class StateLog: @unchecked Sendable {
-  private let lock = NSLock()
-  private var states: [ClientConnectionState] = []
-
-  func record(_ state: ClientConnectionState) {
-    lock.lock(); states.append(state); lock.unlock()
-  }
-
-  func reset() { lock.lock(); states = []; lock.unlock() }
-
-  var reattached: Bool {
-    lock.lock(); defer { lock.unlock() }
-    return states.contains { [.reconnecting, .attaching, .sshBootstrap].contains($0) }
-  }
-}
-
-/// The phone's current primary interface: "wifi", "cellular" or "none".
-final class PathWatcher: @unchecked Sendable {
-  private let monitor = NWPathMonitor()
-  private let lock = NSLock()
-  private var kind = "none"
-
-  init() {
-    monitor.pathUpdateHandler = { [weak self] path in
-      let kind: String =
-        path.status != .satisfied ? "none"
-        : path.usesInterfaceType(.wifi) ? "wifi"
-        : path.usesInterfaceType(.cellular) ? "cellular" : "other"
-      self?.lock.lock()
-      self?.kind = kind
-      self?.lock.unlock()
-    }
-    monitor.start(queue: DispatchQueue(label: "handover.path"))
-  }
-
-  var current: String {
-    lock.lock(); defer { lock.unlock() }
-    return kind
   }
 }

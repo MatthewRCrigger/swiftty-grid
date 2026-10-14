@@ -25,6 +25,8 @@ public struct LayoutSequencer: Sendable {
 
   /// The workspace this connection holds the lease for.
   public private(set) var attachedWorkspace: WorkspaceID?
+  /// Layout revisions still retained. Only the shown workspace is kept.
+  package var rememberedWorkspaceCount: Int { revisions.count }
   private var shownWorkspace: WorkspaceID?
   /// Highest layout revision shown per workspace.
   private var revisions: [WorkspaceID: UInt64] = [:]
@@ -53,22 +55,21 @@ public struct LayoutSequencer: Sendable {
   /// (another workspace, or older than the layout already shown).
   public mutating func layout(_ ws: WorkspaceSnapshot) -> Update? {
     guard ws.id == attachedWorkspace else {
-      if early?.id != ws.id
-        || ws.layoutRevision >= early?.layoutRevision ?? 0
-      {
+      if early?.id != ws.id || ws.layoutRevision >= early?.layoutRevision ?? 0 {
         early = ws
       }
       return nil
     }
-    guard ws.layoutRevision >= revisions[ws.id, default: 0] else {
-      return nil
-    }
+    guard ws.layoutRevision >= revisions[ws.id, default: 0] else { return nil }
     record(ws)
     return .show(ws, resync: false)
   }
 
   private mutating func record(_ ws: WorkspaceSnapshot) {
     shownWorkspace = ws.id
-    revisions[ws.id] = ws.layoutRevision
+    // Only this workspace's revision is read. Switching records the reply,
+    // or a newer early snapshot, and does not consult the previous entry.
+    // Retaining every visit would grow for the life of the connection.
+    revisions = [ws.id: ws.layoutRevision]
   }
 }

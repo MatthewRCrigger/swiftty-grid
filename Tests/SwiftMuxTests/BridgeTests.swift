@@ -4,8 +4,32 @@ import SwiftMuxProtocol
 import SwifttyCore
 import Testing
 
-@Suite
 struct BridgeTests {
+  @Test
+  func exportRejectsStyleIndexOverflowEvenWithUncheckedLimits() throws {
+    var screen = Self.session().withState { $0.captureOwnedScreen() }
+    screen.columns = 256
+    screen.rows = 257
+    screen.wrapped = Array(repeating: false, count: screen.rows)
+    let cell = screen.cells[0]
+    screen.cells = (0 ..< screen.columns * screen.rows)
+      .map { index in
+        var cell = cell
+        cell.attributes.foreground.rawValue = 0x0200_0000 | UInt32(index)
+        return cell
+      }
+    var limits = MuxLimits.standard
+    limits.maxRows = screen.rows
+    limits.maxStyles = Int.max
+    #expect(throws: MuxError.self) {
+      try FrameExporter.frame(
+        from: screen,
+        identity: Self.identity(),
+        limits: limits
+      )
+    }
+  }
+
   static let server = ServerInstanceID()
   static let attachment = AttachmentID()
   static let pane = PaneID()
@@ -55,13 +79,32 @@ struct BridgeTests {
     return f
   }
 
+  @Test(arguments: [4092, 4093, 4094, 4095, 4096])
+  func longMultibyteTitlesStayWithinTheFrameBudget(prefixLength: Int) throws {
+    let session = Self.session()
+    var screen = session.withState { $0.captureOwnedScreen() }
+    let prefix = String(repeating: "a", count: prefixLength)
+    screen.title = prefix + "🙂" + "tail"
+    let frame = try FrameExporter.frame(from: screen, identity: Self.identity())
+    #expect(frame.title == prefix + (prefixLength == 4092 ? "🙂" : ""))
+    try FrameValidator.validate(frame)
+  }
+
+  @Test
+  func keypadApplicationModeSurvivesImport() throws {
+    var frame = try Self.validFrame()
+    frame.modes.insert(.keypadApplication)
+    let screen = try FrameImporter.screen(from: frame)
+    #expect(screen.modes.contains(.keypadApplication))
+  }
+
   @Test
   func exportImportParity() throws {
     let session = Self.session()
     let screen = session.withState { $0.captureOwnedScreen() }
     let direct = session.snapshot()
     let frame = try Self.roundTrip(
-      try FrameExporter.frame(from: screen, identity: Self.identity())
+      FrameExporter.frame(from: screen, identity: Self.identity())
     )
     try FrameValidator.validate(frame)
     let imported = try FrameImporter.snapshot(from: frame, sequence: 1)

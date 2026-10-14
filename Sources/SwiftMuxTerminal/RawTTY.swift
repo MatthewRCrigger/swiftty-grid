@@ -7,6 +7,7 @@ public final class RawTTY {
   public let input: Int32
   public let output: Int32
   private var saved: termios?
+  private var savedFlags: Int32?
   private var modesEnabled = false
 
   public init(input: Int32 = STDIN_FILENO, output: Int32 = STDOUT_FILENO) {
@@ -29,15 +30,21 @@ public final class RawTTY {
     if saved == nil {
       var t = termios()
       guard tcgetattr(input, &t) == 0 else { throw POSIXFailure("tcgetattr") }
+      let flags = fcntl(input, F_GETFL)
+      guard flags >= 0 else { throw POSIXFailure("fcntl F_GETFL") }
       saved = t
+      savedFlags = flags
     }
     var raw = saved!
     cfmakeraw(&raw)
     guard tcsetattr(input, TCSAFLUSH, &raw) == 0 else {
       throw POSIXFailure("tcsetattr")
     }
-    let flags = fcntl(input, F_GETFL)
-    _ = fcntl(input, F_SETFL, flags | O_NONBLOCK)
+    guard fcntl(input, F_SETFL, savedFlags! | O_NONBLOCK) == 0 else {
+      let error = POSIXFailure("fcntl F_SETFL")
+      restore()
+      throw error
+    }
     write("\u{1B}[?1049h\u{1B}[?2004h\u{1B}[?25l")
     modesEnabled = true
   }
@@ -50,9 +57,10 @@ public final class RawTTY {
       )
       modesEnabled = false
     }
-    let flags = fcntl(input, F_GETFL)
-    _ = fcntl(input, F_SETFL, flags & ~O_NONBLOCK)
+    if let flags = savedFlags { _ = fcntl(input, F_SETFL, flags) }
     if var t = saved { tcsetattr(input, TCSAFLUSH, &t) }
+    savedFlags = nil
+    saved = nil
   }
 
   /// Writes everything, blocking through EAGAIN. A started update is

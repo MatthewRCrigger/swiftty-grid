@@ -63,7 +63,9 @@ extension SessionID {
     self.init(bytes: workspace.rawValue.uuidBytes)!
   }
 
-  public var workspace: WorkspaceID { WorkspaceID(rawValue: UUID(uuidBytes: bytes)) }
+  public var workspace: WorkspaceID {
+    WorkspaceID(rawValue: UUID(uuidBytes: bytes))
+  }
 }
 
 extension SessionCore.ServerInstanceID {

@@ -12,7 +12,7 @@ Requires Xcode 27 and the tools pinned in `mise.toml`:
 ```sh
 mise install
 mise run build      # debug build; `mise run release` for release
-mise run test       # unit tests and real PTY sessions: sh, vim, less, tmux, top
+mise run test-native # full unit suite and real PTY sessions: sh, vim, less, tmux, top
 mise run app        # launch the macOS terminal
 mise run bench      # Release microbenchmarks
 mise run lint
@@ -146,6 +146,22 @@ otherwise kills it at launch with a launch-constraint violation. The bundled
 agent can also be managed directly with
 `Swiftty.app/Contents/MacOS/swiftty --swiftmux-agent register|unregister|status`.
 
+Installation uses Python 3 to copy the new app into a private sibling directory,
+check its bundle/executables and verify its signature and expected signing team
+before publication. An
+atomic exchange replaces an existing app; a first install refuses a concurrently
+created destination. Copy, validation or publication failures keep the previous
+app in place. Filesystems that refuse the atomic operation stop installation.
+Registration and optional roaming setup run after publication; they are separate
+steps. Interrupted copy/verification workers are killed and collected, and
+temporary-directory cleanup failures report the retained directory.
+
+`uninstall.sh` requires Python 3 to limit each shutdown command to ten seconds.
+Failed or timed-out shutdown checks preserve installation files and state.
+Repeated signals cannot replace an interruption result or abandon command
+collection. Captured command output is limited to 64 KiB and is published only
+after the command exits within its budget.
+
 Acceptance evidence and measurements (`mise run bench-swiftmux`) are recorded
 in section 11 of [spec.multiplexer.md](spec.multiplexer.md).
 
@@ -206,10 +222,10 @@ https://<configured domain>/a/<locator>
   # 1. The association file each domain serves, with no redirects, as
   #    application/json at /.well-known/apple-app-site-association.
   #    It claims only /a/<locator> (one component, no query or fragment).
-  Scripts/make-aasa.sh -o apple-app-site-association TEAMID12345 \
+  Scripts/make-aasa.sh -o apple-app-site-association TEAMID1234 \
     com.chr33s.swiftty dev.swiftty.roaming.mobile dev.swiftty.roaming.mac \
     dev.swiftty.roaming.catalyst dev.swiftty.roaming.vision
-  Scripts/make-aasa.sh --check apple-app-site-association   # re-validate
+  Scripts/make-aasa.sh --check apple-app-site-association   # re-validate rule order
 
   # 2. Native macOS app: Info.plist SwifttyAssociatedDomains plus the
   #    signed com.apple.developer.associated-domains entitlement.
@@ -226,13 +242,26 @@ https://<configured domain>/a/<locator>
 
   `SWIFTTY_LINK_MODE=developer` signs `applinks:<domain>?mode=developer` so
   development builds fetch the association file directly instead of through
-  Apple's CDN. The macOS entitlement is honoured only with a provisioning
+  Apple's CDN. Both generators preserve that literal suffix regardless of
+  filenames in the working directory. Association-file validation requires
+  the path, query and fragment exclusions before the inclusion rule and
+  rejects matching defaults or conditions that change those rules.
+  The macOS entitlement is honoured only with a provisioning
   profile that has the Associated Domains capability; without
   `SWIFTTY_PROVISIONING_PROFILE` the script warns.
 - The watch shows redacted `AttentionSummary` values: category, app name,
   counts and time. Message text is hidden by default. The watch can offer a
   Handoff (`AttentionHandoffRequest`) to a paired device, but it never takes a
   lease or sends input.
+  Companion contexts and replies use wire version 3, so both paired apps
+  must support it. Versions 1 and 2 are rejected. The phone persists
+  publisher identity and publication sequence; status, attention and preview
+  remain in memory. Publication order is separate from the original observation
+  timestamps. Preview text is bound to an opaque selection id that changes
+  when the selected session changes. That id is not a host or session token.
+  The watch drops cached preview text when the id changes, when preview is
+  disabled, or when a status reply says no preview can be served. A NaN or
+  infinite refresh timeout uses the finite 15-second default.
 
 ### Attention inbox
 
@@ -298,7 +327,13 @@ app when a roaming configuration exists at
 `~/Library/Application Support/SwiftMux/roaming/config.json` (or
 `--roaming-config PATH`, or `$SWIFTMUX_ROAMING_CONFIG`) with an explicit
 `bindAddress`, `advertisedHost` and UDP `port` (51222 by default), plus an
-optional `stateDirectory`. `--no-roaming` ignores the file; `--idle-exit
+optional `stateDirectory`. A relative state directory is resolved against the
+directory of the selected configuration file, so the agent and SSH helper select
+the same control socket independently of their working directories. A missing
+default configuration disables roaming. A missing explicitly selected file, or
+an unreadable or invalid configuration, exits with status 78 before the agent
+starts its service. `--no-roaming` ignores the file; the last roaming option wins.
+`--idle-exit
 SECONDS|never` sets the local idle exit, which roaming disables.
 `Scripts/install.sh --roaming [--host H] [--bind A] [--port N]` writes this
 file (default `<LocalHostName>.local`, `0.0.0.0`, 51222) and installs the
@@ -449,6 +484,14 @@ Includes load in declaration order and override earlier settings; nested include
 join the end of the queue. Each file loads once. `config-file =` clears pending
 includes. Relative paths resolve against the declaring file; `?path` permits a
 missing include, while `"?path"` names a literal leading question mark.
+Theme files must be regular UTF-8 files of at most 64 KiB. Configuration files
+are limited to 1 MiB each and a shared 4 MiB read allowance across at most 128
+file attempts, including missing, repeated and invalid files. Size checks may
+read one extra byte per file to detect growth. Clearing pending includes keeps
+the work already charged. Rejected files leave earlier settings applied and
+report diagnostics; an optional include suppresses only missing-file errors.
+An unavailable theme uses the next lookup directory or built-in fallback;
+an unavailable explicit path uses the default palette plus configured colors.
 `palette =` clears indexed overrides and restores theme colors.
 
 `command` uses shell expansion, including quotes, variables and globs; `shell:`

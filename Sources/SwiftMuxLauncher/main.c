@@ -21,13 +21,26 @@
 
 extern char **environ;
 
-static void report(const char *kind, const char *stage, int err) {
+static int report(const char *kind, const char *stage, int err) {
   char line[128];
   int n = snprintf(line, sizeof line, "%s %s %d\n", kind, stage, err);
-  if (n > 0) {
-    ssize_t ignored = write(4, line, (size_t)n);
-    (void)ignored;
+  if (n <= 0 || (size_t)n >= sizeof line) {
+    errno = EOVERFLOW;
+    return -1;
   }
+  size_t offset = 0;
+  while (offset < (size_t)n) {
+    ssize_t written = write(4, line + offset, (size_t)n - offset);
+    if (written > 0) {
+      offset += (size_t)written;
+    } else if (written < 0 && errno == EINTR) {
+      continue;
+    } else {
+      if (written == 0) errno = EIO;
+      return -1;
+    }
+  }
+  return 0;
 }
 
 static void fail(const char *stage, int err) {
@@ -49,7 +62,7 @@ int main(int argc, char **argv) {
 
   const char *directory = argv[1];
   if (directory[0] != '\0' && chdir(directory) != 0) {
-    report("W", "chdir", errno);
+    if (report("W", "chdir", errno) != 0) _exit(127);
     const char *home = getenv("HOME");
     if (home == NULL || chdir(home) != 0) {
       if (chdir("/") != 0) fail("chdir", errno);
@@ -66,7 +79,8 @@ int main(int argc, char **argv) {
 
   const char *program = argv[2];
   char **child_argv = &argv[3];
-  report("S", "exec", 0);
+  // Never exec an operation whose complete success report could not be sent.
+  if (report("S", "exec", 0) != 0) _exit(127);
   execve(program, child_argv, environ);
   fail("exec", errno);
   return 127;

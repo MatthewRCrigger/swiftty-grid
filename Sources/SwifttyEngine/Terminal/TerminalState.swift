@@ -58,6 +58,9 @@ public struct TerminalState: ~Copyable {
 
   /// Bytes to send back to the application (DSR, DA, OSC queries).
   public var output: [UInt8] = []
+  /// Maximum bytes from one XTGETTCAP command or XTVERSION reply.
+  /// Oversized requests produce no response, never a partial reply.
+  public static let maxQueryReplyBytes = 64 << 10
   /// Drop replies to queries: set when another terminal (e.g. tmux) has
   /// already answered the application.
   public var discardsReplies = false
@@ -849,7 +852,11 @@ public struct TerminalState: ~Copyable {
       reply("\u{1B}[\(n);\(state)$y")
     case (0x3E, 0, 0x63): reply("\u{1B}[>1;10;0c")  // DA2
     // XTVERSION
-    case (0x3E, 0, 0x71): reply("\u{1B}P>|\(terminalVersion)\u{1B}\\")
+    case (0x3E, 0, 0x71):
+      guard !discardsReplies,
+        terminalVersion.utf8.count <= Self.maxQueryReplyBytes - 6
+      else { return }
+      reply("\u{1B}P>|\(terminalVersion)\u{1B}\\")
     case (0, 0x20, 0x71):  // DECSCUSR
       let p = csi.value(0)
       guard csi.count <= 1, (0 ... 6).contains(p) else { return }

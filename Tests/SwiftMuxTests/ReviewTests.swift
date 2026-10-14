@@ -11,6 +11,67 @@ import Testing
 /// paste outcomes and the frame budget.
 @Suite(.serialized, .timeLimit(.minutes(1)))
 struct ReviewTests {
+  @Test(arguments: [-1.0, -Double.infinity, Double.nan, Double.infinity])
+  func invalidIdleDelaysDoNotTriggerAnExit(delay: Double) async throws {
+    var configuration = MuxServiceConfiguration(launcherPath: "unused")
+    configuration.idleExitDelay = delay
+    let service = try MuxService(configuration: configuration)
+    let exits = Mutex(0)
+    service.setIdleHandler { exits.withLock { $0 += 1 } }
+    #expect(await service.isEmpty)
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(exits.withLock { $0 } == 0)
+  }
+
+  @Test
+  func oversizedInboxReplyFailsPromptlyAndCanBePaged() async throws {
+    var limits = MuxLimits.standard
+    limits.maxFrameBytes = 1
+    let h = try Harness(limits: limits)
+    let c = try await h.connect(.control)
+    let message = Data(String(repeating: "x", count: 2048).utf8)
+      .base64EncodedString()
+    var launch = shellLaunch()
+    launch.command = [
+      "/bin/sh", "-c",
+      "i=0; while [ $i -lt 40 ]; do printf '\\033]7501;id=item-%s:state=blocked:msg=\(message)\\007' \"$i\"; i=$((i+1)); done; exec sleep 30",
+    ]
+    let ws = try await create(c, launch: launch)
+    let deadline = ContinuousClock.now + .seconds(5)
+    var count = 0
+    while ContinuousClock.now < deadline {
+      guard
+        case let .inbox(page) = try await c.execute(
+          .inbox(InboxQuery(limit: 1))
+        )
+      else { throw MuxError(.invalidRequest, "inbox reply") }
+      count = page.counts.needsYou
+      if count == 40 { break }
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(count == 40)
+    do {
+      _ = try await withTimeout(.seconds(2)) {
+        try await c.execute(.inbox(InboxQuery()))
+      }
+      Issue.record("Oversized inbox reply was accepted")
+    } catch let error as MuxError {
+      #expect(error.code == .resourceLimit)
+    } catch {
+      Issue.record("Oversized reply did not return a service error: \(error)")
+    }
+    guard case .status = try await c.execute(.status) else {
+      throw MuxError(.invalidRequest, "status reply")
+    }
+    guard
+      case let .inbox(page) = try await c.execute(.inbox(InboxQuery(limit: 1)))
+    else { throw MuxError(.invalidRequest, "inbox reply") }
+    #expect(page.items.count == 1)
+    #expect(page.nextCursor != nil)
+    try await c.execute(.endWorkspace(.id(ws.id)))
+    await c.close()
+  }
+
   private func create(
     _ c: MuxConnection,
     _ name: String? = nil,
@@ -74,24 +135,56 @@ struct ReviewTests {
   /// overflowing page count instead of trapping.
   @Test
   func hugeScrollsAreRefusedNotFatal() async throws {
+    let progress = Mutex((stage: "fixture creation", finished: false))
+    let watchdog = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+    watchdog.setEventHandler {
+      let snapshot = progress.withLock { $0 }
+      if !snapshot.finished {
+        print("huge scroll observation at55s: pending stage=\(snapshot.stage)")
+      }
+    }
+    // Observe before the existing suite deadline without changing it.
+    watchdog.schedule(deadline: .now() + .seconds(55))
+    watchdog.resume()
+    var completed = false
+    defer {
+      let pending = progress.withLock { value in
+        value.finished = true
+        return value.stage
+      }
+      watchdog.cancel()
+      if !completed {
+        print(
+          "huge scroll interrupted: stage=\(pending),cancelled=\(Task.isCancelled)"
+        )
+      }
+    }
     let h = try Harness()
+    progress.withLock { $0.stage = "connect" }
     let c = try await h.connect()
+    progress.withLock { $0.stage = "create workspace" }
     let ws = try await create(c)
     let pane = ws.tabs[0].activePane
+    progress.withLock { $0.stage = "attach, geometry and subscriptions" }
     try await c.attachAndShow(.id(ws.id))
     for request in [
       ScrollRequest.pages(.max / 2), .pages(.min), .lines(.max), .lines(.min),
     ] {
+      progress.withLock { $0.stage = "reject scroll \(request)" }
       #expect(
         await code { try await c.execute(.scroll(pane: pane, request)) }
           == .invalidRequest
       )
     }
+    progress.withLock { $0.stage = "valid service page scroll" }
     try await c.execute(.scroll(pane: pane, .pages(-3)))
+    progress.withLock { $0.stage = "valid service line scroll" }
     try await c.execute(.scroll(pane: pane, .lines(5)))
     // Directly, past the service's bound.
+    progress.withLock { $0.stage = "lookup pane runtime" }
     let runtime = try #require(await h.service.runtime(pane))
     for n in [Int.max, Int.min, .max / 2] {
+      progress.withLock { $0.stage = "direct runtime page scroll \(n)" }
       await withCheckedContinuation { done in
         runtime.scroll(.pages(n)) { error in
           #expect(error == nil)
@@ -99,9 +192,11 @@ struct ReviewTests {
         }
       }
     }
+    progress.withLock { $0.stage = "final status" }
     guard case .status = try await c.execute(.status) else {
       throw MuxError(.invalidRequest)
     }
+    completed = true
   }
 
   /// End-all while a workspace's first pane is launching: the workspace
@@ -115,7 +210,7 @@ struct ReviewTests {
       started.signal()
       proceed.wait()
     }
-    let service = MuxService(configuration: config)
+    let service = try MuxService(configuration: config)
     let endpoint = service.listenAnonymously()
     let c = try await MuxConnection.connect(
       endpoint: endpoint,
@@ -138,7 +233,9 @@ struct ReviewTests {
     #expect(try await names(c).isEmpty)
     var panes = -1
     for _ in 0 ..< 200 {
-      guard case let .status(s) = try await c.execute(.status) else { return }
+      guard case let .status(s) = try await c.execute(.status) else {
+        throw MuxError(.invalidRequest, "unexpected reply")
+      }
       panes = s.panes
       if panes == 0 { break }
       try await Task.sleep(for: .milliseconds(25))

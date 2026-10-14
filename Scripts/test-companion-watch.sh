@@ -24,7 +24,9 @@ targets:
     type: application
     platform: watchOS
     sources: [{ path: "$repository_root/Apps/WatchCompanion" }]
-    dependencies: [{ package: Swiftty, product: CompanionModel }]
+    dependencies:
+      - { package: Swiftty, product: CompanionModel }
+      - { package: Swiftty, product: MuxNavigation }
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.companion-host
@@ -51,6 +53,10 @@ schemes:
 YML
 cd "$workspace"
 xcodegen generate --spec project.yml >/dev/null
+status=0
 xcodebuild -scheme CompanionWatch -destination "platform=watchOS Simulator,id=$udid" \
   -derivedDataPath "$workspace/build" -collect-test-diagnostics never test \
-  2>&1 | tee "$workspace/xcodebuild.log" | grep -E "passed after|failed after|Test run with|error:|TEST (SUCCEEDED|FAILED)" | tail -40
+  >"$workspace/xcodebuild.log" 2>&1 || status=$?
+grep -E "passed after|failed after|Test run with|error:|TEST (SUCCEEDED|FAILED)" \
+  "$workspace/xcodebuild.log" | tail -40 || true
+exit "$status"

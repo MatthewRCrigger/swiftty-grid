@@ -467,7 +467,7 @@ public final class TerminalView: MTKView, MTKViewDelegate {
         guard drawable.presentedTime == 0 else { return }
         DispatchQueue.main.async { self?.retryDraw(frame: frame) }
       }
-      renderer.draw(snapshot, in: self)
+      if !renderer.draw(snapshot, in: self) { retryDraw(frame: frame) }
     } else {
       retryDraw(frame: submittedFrame)
     }
@@ -730,15 +730,19 @@ public final class TerminalView: MTKView, MTKViewDelegate {
 
   public override func resignFirstResponder() -> Bool {
     clearHover()
+    releaseHeldKeys()
+    session.send(.focus(false))
+    needsDisplay = true
+    return true
+  }
+
+  func releaseHeldKeys() {
     // Key-up may go to the next responder after focus moves away.
     for var key in heldKeys.values {
       key.action = .release
       session.send(.key(key))
     }
     heldKeys.removeAll()
-    session.send(.focus(false))
-    needsDisplay = true
-    return true
   }
 
   /// Key bindings run before the menu's key equivalents.
@@ -765,6 +769,7 @@ public final class TerminalView: MTKView, MTKViewDelegate {
   }
 
   private func handleTerminalInput(_ event: NSEvent) {
+    guard capabilities.textInput else { return }
     clearSelection()
     // While composing, every key belongs to the input method.
     if !hasMarkedText(), sendKey(event) { return }
@@ -805,6 +810,7 @@ public final class TerminalView: MTKView, MTKViewDelegate {
   /// combinations); returns false for text, which goes through the
   /// input method.
   func sendKey(_ event: NSEvent) -> Bool {
+    guard capabilities.textInput else { return true }
     let flags =
       !event.modifierFlags.isDisjoint(with: [.command, .control])
       ? session.keyboardFlags : 0
@@ -816,6 +822,7 @@ public final class TerminalView: MTKView, MTKViewDelegate {
   }
 
   func sendHardwareKey(_ key: KeyEvent, event: NSEvent) {
+    guard capabilities.textInput else { return }
     var key = key
     key.action = event.isARepeat ? .repeat : .press
     heldKeys[event.keyCode] = key

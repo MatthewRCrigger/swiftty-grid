@@ -9,6 +9,108 @@ import UIKit
 
 extension ViewLifecycleTests {
   @Test(.enabled(if: hasMetal))
+  func overdueAccessibilityPostsStillCoalesceNewRequests() async throws {
+    let view = try TerminalUIView(
+      session: TerminalSession(columns: 20, rows: 3)
+    )
+    let window = makeWindow()
+    let controller = UIViewController()
+    window.rootViewController = controller
+    view.frame = CGRect(x: 0, y: 0, width: 320, height: 180)
+    controller.view.addSubview(view)
+    window.makeKeyAndVisible()
+    view.sceneDidActivate()
+    defer {
+      view.removeFromSuperview();
+      window.isHidden = true
+    }
+    try #require(view.isSurfaceVisible && !view.isRenderingPaused)
+    let posts = Mutex(0)
+    let request = {
+      view.requestAccessibilityPost(
+        isVoiceOverRunning: { true },
+        { posts.withLock { $0 += 1 } }
+      )
+    }
+    request()
+    request()
+    #expect(posts.withLock { $0 } == 1)
+    // Keep the main actor occupied past the existing timer's deadline.
+    func delayTimerDelivery() {
+      _ = DispatchSemaphore(value: 0).wait(timeout: .now() + .milliseconds(650))
+    }
+    delayTimerDelivery()
+    request()
+    #expect(posts.withLock { $0 } == 1)
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(posts.withLock { $0 } == 2)
+    request()
+    try await Task.sleep(for: .milliseconds(600))
+    #expect(posts.withLock { $0 } == 3)
+  }
+
+  @Test(
+    .enabled(if: hasMetal),
+    arguments: [
+      "view", "window", "detach", "background", "voiceOver", "active",
+    ]
+  )
+  func deferredAccessibilityPostsRecheckTheirCurrentLifecycle(
+    _ change: String
+  ) async throws {
+    let view = try TerminalUIView(
+      session: TerminalSession(columns: 20, rows: 3)
+    )
+    let window = makeWindow()
+    let controller = UIViewController()
+    window.rootViewController = controller
+    view.frame = CGRect(x: 0, y: 0, width: 320, height: 180)
+    controller.view.addSubview(view)
+    window.makeKeyAndVisible()
+    view.sceneDidActivate()
+    defer {
+      view.removeFromSuperview();
+      window.isHidden = true
+    }
+    try #require(view.isSurfaceVisible && !view.isRenderingPaused)
+    let voiceOver = Mutex(true)
+    let posts = Mutex(0)
+    let request = {
+      view.requestAccessibilityPost(
+        isVoiceOverRunning: { voiceOver.withLock { $0 } },
+        { posts.withLock { $0 += 1 } }
+      )
+    }
+    request()
+    #expect(posts.withLock { $0 } == 1)
+    request()
+    request()
+    #expect(posts.withLock { $0 } == 1)
+    switch change {
+    case "view": view.isHidden = true
+    case "window": window.isHidden = true
+    case "detach": view.removeFromSuperview()
+    case "background": view.sceneDidEnterBackground()
+    case "voiceOver": voiceOver.withLock { $0 = false }
+    default: break
+    }
+    try await Task.sleep(for: .milliseconds(600))
+    #expect(posts.withLock { $0 } == (change == "active" ? 2 : 1))
+    if change != "active" {
+      view.isHidden = false
+      window.makeKeyAndVisible()
+      if view.superview == nil { controller.view.addSubview(view) }
+      view.sceneDidActivate()
+      voiceOver.withLock { $0 = true }
+      request()
+      #expect(posts.withLock { $0 } == 2)
+    }
+    request()
+    try await Task.sleep(for: .milliseconds(600))
+    #expect(posts.withLock { $0 } == 3)
+  }
+
+  @Test(.enabled(if: hasMetal))
   func `retaining an accessibility element does not retain its terminal`()
     throws
   {

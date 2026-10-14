@@ -468,4 +468,117 @@ struct AttentionInboxTests {
     #expect(!update.resync)
     #expect(box.takeUpdate(at: t0) == nil)
   }
+  @Test(arguments: [256, 1024])
+  func `unflushed removal bursts require a bounded resync`(bytes: Int) throws {
+    var box = inbox {
+      $0.resolvedHistory = 0
+      $0.maxControlRecordBytes = bytes
+    }
+    for i in 0 ..< 100 { feed(&box, blocked(), state(.working), at: Double(i)) }
+    feed(&box, blocked("latest"), at: 101)
+    #expect(box.hasPendingUpdate)
+    #expect(box.itemCount == 1)
+    let taken = box.takeUpdate(at: t0)
+    let update = try #require(taken)
+    #expect(update.resync)
+    #expect(update.changed.isEmpty)
+    #expect(update.removed.isEmpty)
+    #expect(update.revision == box.revision)
+    #expect(update.counts == box.counts(at: t0))
+    #expect(!box.hasPendingUpdate)
+    #expect(box.takeUpdate(at: t0) == nil)
+    let latest = try #require(all(box).first)
+    #expect(latest.source.recordPath == "latest")
+    // Refetch returns the live state; subsequent ordinary deltas resume.
+    feed(&box, state(.working, "latest"), at: 102)
+    let nextTaken = box.takeUpdate(at: t0)
+    let next = try #require(nextTaken)
+    #expect(!next.resync)
+    #expect(next.removed == [latest.occurrence])
+    #expect(next.counts.needsYou == 0)
+  }
+
+  @Test
+  func `changed and removed items share the pending metadata budget`() throws {
+    var box = inbox {
+      $0.resolvedHistory = 0
+      $0.maxControlRecordBytes = 2 * AttentionInbox.itemOverhead
+    }
+    feed(&box, blocked("a"), blocked("b"), state(.working, "a"))
+    #expect(box.hasPendingUpdate)
+    feed(&box, blocked("c"))
+    let taken = box.takeUpdate(at: t0)
+    let update = try #require(taken)
+    #expect(update.resync)
+    #expect(update.changed.isEmpty && update.removed.isEmpty)
+    #expect(update.counts.needsYou == 2)
+    #expect(try all(box).map(\.source.recordPath).sorted() == ["b", "c"])
+  }
+
+  @Test
+  func `inherited app text remains charged after its ancestor is removed`() {
+    var box = inbox()
+    let app = "工具"
+    let path = "任务"
+    feed(&box, .report(StatusRecord(state: .working, app: app)))
+    feed(&box, state(.working, path))
+    #expect(box.textBytes == 2 * app.utf8.count + path.utf8.count)
+    feed(&box, .removed([""]))
+    #expect(box.currentStatus(of: pane).first?.app == app)
+    #expect(box.textBytes == app.utf8.count + path.utf8.count)
+    // A replacement without an ancestor no longer inherits the app.
+    feed(&box, state(.working, path))
+    #expect(box.currentStatus(of: pane).first?.app == nil)
+    #expect(box.textBytes == path.utf8.count)
+    feed(&box, .removed([path]))
+    #expect(box.textBytes == 0)
+  }
+
+  @Test
+  func `record paths are charged in current and retained status`() throws {
+    var box = inbox { $0.resolvedHistory = 0 }
+    let path = String(repeating: "路", count: 10)
+    feed(&box, state(.done, path, message: "done"))
+    #expect(
+      box.textBytes == AttentionInbox.itemOverhead + 2 * (path.utf8.count + 4)
+    )
+    feed(&box, state(.done, path, message: "ok"))
+    #expect(
+      box.textBytes == AttentionInbox.itemOverhead + 2 * (path.utf8.count + 2)
+    )
+    let item = try #require(all(box).first)
+    feed(&box, .removed([path]))
+    #expect(box.textBytes == AttentionInbox.itemOverhead + path.utf8.count + 2)
+    _ = try box.markReviewed(ref(item), at: t0)
+    #expect(box.textBytes == 0)
+    #expect(box.itemCount == 0)
+  }
+
+  @Test(arguments: [false, true])
+  func `snapshot text budget includes inherited names and record paths`(
+    inherited: Bool
+  ) throws {
+    var box = inbox { $0.statusTextBytes = inherited ? 500 : 850 }
+    if inherited {
+      feed(
+        &box,
+        .report(
+          StatusRecord(state: .working, app: String(repeating: "a", count: 100))
+        )
+      )
+      feed(&box, state(.done, "child"))
+      #expect(box.itemCount == 0)
+      #expect(box.textBytes == 205)
+      #expect(box.currentStatus(of: pane).count == 2)
+    } else {
+      let a = String(repeating: "a", count: 100)
+      let b = String(repeating: "b", count: 100)
+      feed(&box, state(.done, a), state(.done, b))
+      #expect(try all(box).map(\.source.recordPath) == [b])
+      #expect(box.textBytes == 556)
+      #expect(box.currentStatus(of: pane).count == 2)
+    }
+    #expect(box.textBytes <= box.limits.statusTextBytes)
+  }
+
 }

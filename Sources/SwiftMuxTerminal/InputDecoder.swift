@@ -97,13 +97,7 @@ public struct InputDecoder {
         continue
       }
       // UTF-8: hold an incomplete trailing sequence.
-      let need = Self.utf8Length(b)
-      if i + need > buffer.count {
-        if final {
-          text.append(contentsOf: buffer[i...])
-          i = buffer.count
-          break
-        }
+      guard let need = utf8PrefixLength(at: i, final: final) else {
         flushText()
         buffer.removeFirst(i)
         return out
@@ -155,12 +149,21 @@ public struct InputDecoder {
     case UInt8(ascii: "["):
       // CSI: parameters 0x30–0x3F, intermediates 0x20–0x2F, final 0x40–0x7E.
       var j = i + 2
-      while j < buffer.count, (0x20 ... 0x3F).contains(buffer[j]) { j += 1 }
+      while j < buffer.count, j - i <= 32, (0x20 ... 0x3F).contains(buffer[j]) {
+        j += 1
+      }
+      // Bound the prefix even when its final byte arrived in this read.
+      guard j - i <= 32 else {
+        return .event(.key(.character(UInt32(UInt8(ascii: "["))), .alt), 2)
+      }
       guard j < buffer.count else {
-        if final || j - i > 32 {
+        if final {
           return .event(.key(.character(UInt32(UInt8(ascii: "["))), .alt), 2)
         }
         return .incomplete
+      }
+      guard (0x40 ... 0x7E).contains(buffer[j]) else {
+        return .event(.key(.character(UInt32(UInt8(ascii: "["))), .alt), 2)
       }
       let params = String(decoding: buffer[(i + 2) ..< j], as: UTF8.self)
       let finalByte = buffer[j]
@@ -172,6 +175,9 @@ public struct InputDecoder {
         return final
           ? .event(.key(.character(UInt32(UInt8(ascii: "O"))), .alt), 2)
           : .incomplete
+      }
+      guard (0x40 ... 0x7E).contains(buffer[i + 2]) else {
+        return .event(.key(.character(UInt32(UInt8(ascii: "O"))), .alt), 2)
       }
       let key: MuxKey? =
         switch buffer[i + 2] {
@@ -200,8 +206,7 @@ public struct InputDecoder {
         }
         return .event(.key(k, m.union(.alt)), 2)
       }
-      let need = Self.utf8Length(next)
-      guard rest >= 1 + need else {
+      guard let need = utf8PrefixLength(at: i + 1, final: false) else {
         return final ? .event(.key(.escape, []), 1) : .incomplete
       }
       let scalars = String(
@@ -262,7 +267,8 @@ public struct InputDecoder {
 
   /// xterm modifier parameter: 1 + (shift 1 | alt 2 | ctrl 4).
   static func modifiers(_ parameter: Int) -> MuxKeyModifiers {
-    let bits = max(0, parameter - 1)
+    guard parameter > 1 else { return [] }
+    let bits = parameter - 1
     var m: MuxKeyModifiers = []
     if bits & 1 != 0 { m.insert(.shift) }
     if bits & 2 != 0 { m.insert(.alt) }
@@ -283,12 +289,34 @@ public struct InputDecoder {
     }
   }
 
-  static func utf8Length(_ lead: UInt8) -> Int {
+  /// Consume a scalar or its malformed prefix, leaving the first unrelated
+  /// byte for normal key decoding. Only a still-valid partial scalar waits.
+  private func utf8PrefixLength(at start: Int, final: Bool) -> Int? {
+    let lead = buffer[start]
+    let length: Int
     switch lead {
-    case 0xF0...: 4
-    case 0xE0...: 3
-    case 0xC0...: 2
-    default: 1
+    case 0xC2 ... 0xDF: length = 2
+    case 0xE0 ... 0xEF: length = 3
+    case 0xF0 ... 0xF4: length = 4
+    default: return 1
     }
+    for offset in 1 ..< length {
+      guard start + offset < buffer.count else { return final ? offset : nil }
+      let range: ClosedRange<UInt8>
+      if offset == 1 {
+        range =
+          switch lead {
+          case 0xE0: 0xA0 ... 0xBF
+          case 0xED: 0x80 ... 0x9F
+          case 0xF0: 0x90 ... 0xBF
+          case 0xF4: 0x80 ... 0x8F
+          default: 0x80 ... 0xBF
+          }
+      } else {
+        range = 0x80 ... 0xBF
+      }
+      guard range.contains(buffer[start + offset]) else { return offset }
+    }
+    return length
   }
 }

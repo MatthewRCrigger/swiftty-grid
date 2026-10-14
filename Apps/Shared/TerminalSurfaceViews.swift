@@ -179,6 +179,16 @@ struct SSHSurfaceView: View {
       .padding(.vertical, 6)
       .frame(maxWidth: .infinity, alignment: .leading)
       .glassPanel(cornerRadius: 0, tint: .yellow.opacity(0.2))
+      if let notice = controller.inputNotice {
+        HStack {
+          Label(notice, systemImage: "exclamationmark.triangle")
+          Spacer()
+          Button("Dismiss", systemImage: "xmark") { controller.dismissInputNotice() }
+        }
+        .font(.caption)
+        .padding(8)
+        .glassPanel(cornerRadius: 0, tint: .yellow.opacity(0.2))
+      }
       TerminalDisplayView(session: controller.session, capabilities: controller.model.capabilities)
         .uiTestingScreenProbe(controller.model)
         .glassSurface()
@@ -224,15 +234,27 @@ struct SSHSurfaceView: View {
     let controller: LocalShellController
 
     var body: some View {
-      TerminalDisplayView(
-        session: controller.backend.session,
-        capabilities: controller.model.capabilities,
-        prepare: { controller.attach($0) }
-      )
-      .glassSurface()
-      .overlay {
-        if case .failed(let problem) = controller.phase {
-          ProblemCard(problem: problem) { _ in }
+      VStack(spacing: 0) {
+        if let notice = controller.inputNotice {
+          HStack {
+            Label(notice, systemImage: "exclamationmark.triangle")
+            Spacer()
+            Button("Dismiss", systemImage: "xmark") { controller.dismissInputNotice() }
+          }
+          .font(.caption)
+          .padding(8)
+          .glassPanel(cornerRadius: 0, tint: .yellow.opacity(0.2))
+        }
+        TerminalDisplayView(
+          session: controller.backend.session,
+          capabilities: controller.model.capabilities,
+          prepare: { controller.attach($0) }
+        )
+        .glassSurface()
+        .overlay {
+          if case .failed(let problem) = controller.phase {
+            ProblemCard(problem: problem) { _ in }
+          }
         }
       }
     }
@@ -329,7 +351,7 @@ struct ProblemCard: View {
   struct TerminalDisplayView: NSViewRepresentable {
     let session: TerminalSession
     let capabilities: SurfaceCapabilities
-    var prepare: ((TerminalView) -> Void)? = nil
+    var prepare: ((TerminalView) -> Void)?
 
     func makeNSView(context: Context) -> NSView {
       do {

@@ -25,7 +25,7 @@ extension RendererTests {
       Array("\u{1B}[?2027h\u{1B}[?25lffi aำ\r\n\u{1B}[1mA漢 👩‍💻\u{1B}[0m".utf8)
     )
     var snapshot = session.snapshot()
-    _ = render(
+    _ = try render(
       renderer,
       snapshot,
       width: Int(renderer.cellSize.width) * 16 + 16,
@@ -48,8 +48,8 @@ extension RendererTests {
       #expect(renderer.cellSize == fresh.cellSize)
       let width = Int(fresh.cellSize.width) * 16 + 16
       let height = Int(fresh.cellSize.height) * 2 + 16
-      let actual = render(renderer, snapshot, width: width, height: height)
-      let expected = render(fresh, snapshot, width: width, height: height)
+      let actual = try render(renderer, snapshot, width: width, height: height)
+      let expected = try render(fresh, snapshot, width: width, height: height)
       #expect(actual.pixels == expected.pixels)
     }
   }

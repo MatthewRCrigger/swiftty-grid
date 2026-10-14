@@ -10,7 +10,11 @@ import Testing
 struct FrameTimeTests {
   static let device = MTLCreateSystemDefaultDevice()
   /// Budgets are for optimized code: `swift test -c release`.
-  #if DEBUG
+  /// The iPad wrapper sets `SWIFTTY_REQUIRE_FRAME_BENCHMARK` so a missing
+  /// device or a debug build fails the run instead of skipping both bodies.
+  #if SWIFTTY_REQUIRE_FRAME_BENCHMARK
+  static let measurable = true
+  #elseif DEBUG
   static let measurable = false
   #else
   static let measurable = device != nil
@@ -48,7 +52,7 @@ struct FrameTimeTests {
     var times: [Double] = []
     for _ in 0 ..< 40 {
       let start = DispatchTime.now().uptimeNanoseconds
-      let command = renderer.render(snapshot, to: texture)
+      let command = try renderer.render(snapshot, to: texture)
       command.waitUntilCompleted()
       try #require(
         command.status == .completed,
@@ -91,7 +95,7 @@ struct FrameTimeTests {
       }
       session.feed(Array(line.utf8))
       let start = DispatchTime.now().uptimeNanoseconds
-      let command = renderer.render(session.snapshot(), to: texture)
+      let command = try renderer.render(session.snapshot(), to: texture)
       command.waitUntilCompleted()
       try #require(
         command.status == .completed,

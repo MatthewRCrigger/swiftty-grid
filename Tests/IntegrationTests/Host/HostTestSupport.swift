@@ -26,7 +26,9 @@ func hostEventually<T>(
   let deadline = ContinuousClock.now + timeout
   while true {
     if let value = try body() { return value }
-    guard ContinuousClock.now < deadline else { throw HostTestTimeout(what: what) }
+    guard ContinuousClock.now < deadline else {
+      throw HostTestTimeout(what: what)
+    }
     try await Task.sleep(for: .milliseconds(20))
   }
 }
@@ -41,7 +43,9 @@ func hostEventuallyAsync<T>(
   let deadline = ContinuousClock.now + timeout
   while true {
     if let value = try await body() { return value }
-    guard ContinuousClock.now < deadline else { throw HostTestTimeout(what: what) }
+    guard ContinuousClock.now < deadline else {
+      throw HostTestTimeout(what: what)
+    }
     try await Task.sleep(for: .milliseconds(20))
   }
 }
@@ -49,12 +53,9 @@ func hostEventuallyAsync<T>(
 /// A real self-signed certificate so grants carry an SPKI pin.
 private let testCertificateDER: Data = {
   do {
-    return try AppleTransport.HostIdentity.generate(
-      ipAddresses: ["127.0.0.1"]
-    ).certificateDER
-  } catch {
-    fatalError("test certificate: \(error)")
-  }
+    return try AppleTransport.HostIdentity.generate(ipAddresses: ["127.0.0.1"])
+      .certificateDER
+  } catch { fatalError("test certificate: \(error)") }
 }()
 
 func testIdentity() -> TerminalHost.HostIdentity {
@@ -78,8 +79,9 @@ func makeTemporaryDirectory() throws -> URL {
       )
     )
   }
-  let url = FileManager.default.temporaryDirectory
-    .appendingPathComponent("rsth-\(UUID().uuidString.prefix(8))")
+  let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+    "rsth-\(UUID().uuidString.prefix(8))"
+  )
   try FileManager.default.createDirectory(
     at: url,
     withIntermediateDirectories: false,
@@ -89,55 +91,46 @@ func makeTemporaryDirectory() throws -> URL {
 }
 
 /// `/bin/sh`, interactive by default, or running `script` with `-c`.
-func shellLaunch(_ script: String? = nil, in directory: URL? = nil) -> LaunchSpec {
+func shellLaunch(
+  _ script: String? = nil,
+  in directory: URL? = nil
+) -> LaunchSpec {
   let home = directory?.path ?? NSTemporaryDirectory()
   return LaunchSpec(
     command: script.map { ["/bin/sh", "-c", $0] } ?? ["/bin/sh"],
     workingDirectory: home,
     environment: [
-      "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-      "TERM": "xterm-256color",
-      "HOME": home,
-      "PS1": "$ ",
-      "LANG": "en_US.UTF-8",
+      "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "TERM": "xterm-256color",
+      "HOME": home, "PS1": "$ ", "LANG": "en_US.UTF-8",
     ]
   )
 }
 
 /// The pane launcher built alongside the tests (`swift build` builds it).
-func launcherPath() throws -> String {
-  var dir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-  while dir.path != "/" {
-    for config in ["debug", "release"] {
-      let candidate = dir.appending(path: ".build/\(config)/swmux-launcher").path
-      if FileManager.default.isExecutableFile(atPath: candidate) {
-        return candidate
-      }
-    }
-    dir = dir.deletingLastPathComponent()
-  }
-  throw HostTestTimeout(what: "swmux-launcher (run swift build first)")
-}
+func launcherPath() throws -> String { try NativeTestProducts.launcherPath() }
 
 /// A private SwiftMux service: the PTY owner behind every registry.
 func makeService() throws -> MuxService {
-  MuxService(configuration: MuxServiceConfiguration(launcherPath: try launcherPath()))
+  try MuxService(
+    configuration: MuxServiceConfiguration(launcherPath: try launcherPath())
+  )
 }
 
 /// The shell PID of a session's active pane.
-func shellPID(_ registry: SessionRegistry, _ session: RoamingSession) async -> pid_t? {
+func shellPID(
+  _ registry: SessionRegistry,
+  _ session: RoamingSession
+) async -> pid_t? {
   guard let pane = session.diagnostics.activePane,
     let pid = await registry.service.panePID(pane), pid > 0
   else { return nil }
   return pid
 }
 
-func isAlive(_ pid: pid_t) -> Bool {
-  kill(pid, 0) == 0 || errno == EPERM
-}
+func isAlive(_ pid: pid_t) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
 
 /// Builds a registry over a fresh service, runs `body`, then ends every
-/// workspace.
+/// workspace and awaits the owned service's process barrier on every outcome.
 func withRegistry(
   policy: RegistryPolicy = RegistryPolicy(),
   launch: @escaping @Sendable () -> LaunchSpec = { shellLaunch() },
@@ -149,17 +142,15 @@ func withRegistry(
     policy: policy,
     launch: launch
   )
-  do {
-    try await body(registry)
-  } catch {
-    for summary in await registry.list() {
-      await registry.terminate(summary.sessionID)
+  try await RuntimeFixture.withCleanup(
+    { try await body(registry) },
+    cleanup: {
+      registry.stopSweeping()
+      await withCheckedContinuation { continuation in
+        registry.service.prepareToExit { continuation.resume() }
+      }
     }
-    throw error
-  }
-  for summary in await registry.list() {
-    await registry.terminate(summary.sessionID)
-  }
+  )
 }
 
 /// The client end of an in-memory RST/1 connection served by a registry.
@@ -260,7 +251,8 @@ final class TestClient: @unchecked Sendable {
   }
 
   /// Attaches and returns `Attached`.
-  func attached(_ grant: BootstrapGrant) async throws -> ControlMessage.Attached {
+  func attached(_ grant: BootstrapGrant) async throws -> ControlMessage.Attached
+  {
     try await attach(grant)
     let reply = try await message("Attached or Error") {
       if case .attached = $0 { return true }

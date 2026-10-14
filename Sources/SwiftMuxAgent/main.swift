@@ -32,11 +32,11 @@ var machService =
   ProcessInfo.processInfo.environment["SWMUX_SERVICE"] ?? SMX.defaultMachService
 var launcherPath: String?
 var idleExit: TimeInterval? = 30
-/// Explicit path, or the default location when that file exists.
-var roamingConfig: URL? = {
-  let url = HostConfiguration.resolvedConfigurationURL()
-  return FileManager.default.fileExists(atPath: url.path) ? url : nil
-}()
+/// Explicit paths are required; only a missing default disables roaming.
+var roamingConfig: URL? = HostConfiguration.resolvedConfigurationURL()
+var requiredRoamingConfig =
+  !(ProcessInfo.processInfo.environment[HostConfiguration.environmentKey] ?? "")
+  .isEmpty
 var args = CommandLine.arguments.dropFirst()
 while let arg = args.popFirst() {
   switch arg {
@@ -51,15 +51,34 @@ while let arg = args.popFirst() {
     if value == "never" {
       idleExit = nil
     } else {
-      guard let seconds = TimeInterval(value) else { usage() }
+      guard let seconds = TimeInterval(value), seconds.isFinite, seconds >= 0
+      else { usage() }
       idleExit = seconds
     }
   case "--roaming-config":
     guard let value = args.popFirst() else { usage() }
     roamingConfig = URL(fileURLWithPath: value)
+    requiredRoamingConfig = true
   case "--no-roaming": roamingConfig = nil
   default: usage()
   }
+}
+
+// Validate before launcher, terminfo, signing or service initialization.
+let hostConfiguration: HostConfiguration?
+do {
+  hostConfiguration = try HostConfiguration.loadForStartup(
+    from: roamingConfig,
+    required: requiredRoamingConfig
+  )
+} catch {
+  FileHandle.standardError.write(
+    Data(
+      "swiftmux-agent: cannot read roaming configuration at \(roamingConfig?.path ?? ""); bindAddress and advertisedHost must be set explicitly\n"
+        .utf8
+    )
+  )
+  exit(78)
 }
 
 /// The launcher ships beside the agent (Contents/MacOS in the app bundle).
@@ -110,31 +129,29 @@ if InnerTerminfo.install(into: terminfo) {
 }
 configuration.peerRequirement = peerRequirement()
 // Remote clients need the listener up while no local client is around.
-configuration.idleExitDelay = roamingConfig == nil ? idleExit : nil
+configuration.idleExitDelay = hostConfiguration == nil ? idleExit : nil
 
 // Never let SIGPIPE from a closed peer or PTY kill the service.
 signal(SIGPIPE, SIG_IGN)
-let service = MuxService(configuration: configuration)
+let service = try MuxService(configuration: configuration)
+// launchd bootout sends SIGTERM. Closing PTYs alone cannot retire a pane
+// that ignores SIGHUP, so keep the agent alive through its process barrier.
+let terminationSources = [SIGTERM, SIGINT]
+  .map { sig in
+    signal(sig, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+    source.setEventHandler { @Sendable [service] in
+      service.prepareToExit { exit(0) }
+    }
+    return source
+  }
+terminationSources.forEach { $0.resume() }
 service.listen(machService: machService)
 service.setIdleHandler { exit(0) }
 
-enum Roaming {
-  nonisolated(unsafe) static var host: RoamingHost?
-}
+enum Roaming { nonisolated(unsafe) static var host: RoamingHost? }
 
-if let roamingConfig {
-  let config: HostConfiguration
-  do {
-    config = try HostConfiguration.load(from: roamingConfig)
-  } catch {
-    FileHandle.standardError.write(
-      Data(
-        "swiftmux-agent: cannot read roaming configuration at \(roamingConfig.path); bindAddress and advertisedHost must be set explicitly\n"
-          .utf8
-      )
-    )
-    exit(78)
-  }
+if let config = hostConfiguration {
   Task {
     do {
       Roaming.host = try await RoamingHost.start(
@@ -149,4 +166,4 @@ if let roamingConfig {
     }
   }
 }
-dispatchMain()
+withExtendedLifetime(terminationSources) { dispatchMain() }

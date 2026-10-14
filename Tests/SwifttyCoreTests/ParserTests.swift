@@ -863,10 +863,8 @@ struct ParserTests {
     #expect(vt.cell(3, 0).attributes.foreground == .rgb(10, 20, 30))
     #expect(vt.cell(4, 0).flags.isSuperset(of: [.underline, .strikethrough]))
     let f = vt.cell(5, 0).attributes
-    #expect(
-      f.foreground == .default && f.background == .rgb(1, 2, 3)
-        || f.background == .default
-    )
+    #expect(f.foreground == .default)
+    #expect(f.background == .default)
     #expect(f.flags.isEmpty)
     #expect(vt.cell(6, 0).attributes.foreground == .palette(13))
     #expect(vt.cell(6, 0).attributes.background == .palette(12))

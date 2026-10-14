@@ -9,7 +9,9 @@ public struct CompanionRequestID: Hashable, Sendable, Codable,
   public init?(rawValue: String) {
     guard !rawValue.isEmpty,
       rawValue.utf8.count <= CompanionLimits.maxRequestIDBytes,
-      rawValue.unicodeScalars.allSatisfy({ $0.isASCII && !CompanionText.isDisallowed($0) })
+      rawValue.unicodeScalars.allSatisfy({
+        $0.isASCII && !CompanionText.isDisallowed($0)
+      })
     else { return nil }
     self.rawValue = rawValue
   }
@@ -70,16 +72,48 @@ public enum CompanionReply: Hashable, Sendable {
   case status(
     CompanionRequestID,
     CompanionStatus,
-    previewUnavailable: CompanionPreviewUnavailable?
+    previewUnavailable: CompanionPreviewUnavailable?,
+    revision: UInt64 = 0,
+    publisherID: UUID
   )
-  case preview(CompanionRequestID, CompanionStatus, CompanionPreview)
+  case preview(
+    CompanionRequestID,
+    CompanionStatus,
+    CompanionPreview,
+    revision: UInt64 = 0,
+    publisherID: UUID
+  )
   /// Companion sharing is turned off on the iPhone; the watch must clear
   /// everything it cached.
-  case disabled(CompanionRequestID, clearedAt: Date)
+  case disabled(
+    CompanionRequestID,
+    clearedAt: Date,
+    revision: UInt64 = 0,
+    publisherID: UUID
+  )
+
+  /// Publication order, independent of observation/capture time.
+  public var revision: UInt64 {
+    switch self {
+    case .status(_, _, _, let revision, _), .preview(_, _, _, let revision, _),
+      .disabled(_, _, let revision, _):
+      revision
+    }
+  }
+
+  public var publisherID: UUID {
+    switch self {
+    case .status(_, _, _, _, let publisher),
+      .preview(_, _, _, _, let publisher), .disabled(_, _, _, let publisher):
+      publisher
+    }
+  }
 
   public var requestID: CompanionRequestID {
     switch self {
-    case .status(let id, _, _), .preview(let id, _, _), .disabled(let id, _): id
+    case .status(let id, _, _, _, _), .preview(let id, _, _, _, _),
+      .disabled(let id, _, _, _):
+      id
     }
   }
 }
@@ -90,9 +124,22 @@ public enum CompanionReply: Hashable, Sendable {
 /// or encoding that carries preview text, so preview content can never be
 /// queued for background delivery.
 public enum CompanionApplicationContext: Hashable, Sendable {
-  case status(CompanionStatus)
+  case status(CompanionStatus, revision: UInt64 = 0, publisherID: UUID)
   /// Companion sharing was turned off; clear cached companion data.
-  case cleared(at: Date)
+  case cleared(at: Date, revision: UInt64 = 0, publisherID: UUID)
+
+  /// Publication order, shared with immediate replies and attention batches.
+  public var revision: UInt64 {
+    switch self {
+    case .status(_, let revision, _), .cleared(_, let revision, _): revision
+    }
+  }
+
+  public var publisherID: UUID {
+    switch self {
+    case .status(_, _, let publisher), .cleared(_, _, let publisher): publisher
+    }
+  }
 
   /// The single key under which the encoded context is stored.
   public static let dictionaryKey = "swiftty.companion.context"
@@ -119,7 +166,8 @@ enum WireType: String, Codable {
 }
 
 enum EnvelopeKeys: String, CodingKey, CaseIterable {
-  case v, type, id, status, preview, previewUnavailable, clearedAt
+  case v, type, id, status, preview, previewUnavailable, clearedAt, revision,
+    publisher
 }
 
 extension KeyedDecodingContainer where K == EnvelopeKeys {
@@ -155,7 +203,10 @@ extension CompanionRequest: Codable {
       case .preview: .preview
       default: throw CompanionCodecError.invalid("not a request")
       }
-    self.init(id: try c.decode(CompanionRequestID.self, forKey: .id), kind: kind)
+    self.init(
+      id: try c.decode(CompanionRequestID.self, forKey: .id),
+      kind: kind
+    )
   }
 
   public func encode(to encoder: any Encoder) throws {
@@ -171,47 +222,68 @@ extension CompanionReply: Codable {
     let c = try decoder.container(keyedBy: EnvelopeKeys.self)
     let type = try c.header()
     let id = try c.decode(CompanionRequestID.self, forKey: .id)
+    let revision = try c.decode(UInt64.self, forKey: .revision)
+    let publisher = try c.decode(UUID.self, forKey: .publisher)
     switch type {
     case .status:
-      try checkOnly(decoder, [.v, .type, .id, .status, .previewUnavailable])
+      try checkOnly(
+        decoder,
+        [.v, .type, .id, .status, .previewUnavailable, .revision, .publisher]
+      )
       self = .status(
         id,
         try c.decode(CompanionStatus.self, forKey: .status),
         previewUnavailable: try c.decodeIfPresent(
           CompanionPreviewUnavailable.self,
           forKey: .previewUnavailable
-        )
+        ),
+        revision: revision,
+        publisherID: publisher
       )
     case .preview:
-      try checkOnly(decoder, [.v, .type, .id, .status, .preview])
+      try checkOnly(
+        decoder,
+        [.v, .type, .id, .status, .preview, .revision, .publisher]
+      )
       self = .preview(
         id,
         try c.decode(CompanionStatus.self, forKey: .status),
-        try c.decode(CompanionPreview.self, forKey: .preview)
+        try c.decode(CompanionPreview.self, forKey: .preview),
+        revision: revision,
+        publisherID: publisher
       )
     case .disabled:
-      try checkOnly(decoder, [.v, .type, .id, .clearedAt])
-      self = .disabled(id, clearedAt: try CompanionTime.decode(c, .clearedAt))
-    default:
-      throw CompanionCodecError.invalid("not a reply")
+      try checkOnly(
+        decoder,
+        [.v, .type, .id, .clearedAt, .revision, .publisher]
+      )
+      self = .disabled(
+        id,
+        clearedAt: try CompanionTime.decode(c, .clearedAt),
+        revision: revision,
+        publisherID: publisher
+      )
+    default: throw CompanionCodecError.invalid("not a reply")
     }
   }
 
   public func encode(to encoder: any Encoder) throws {
     var c = encoder.container(keyedBy: EnvelopeKeys.self)
     try c.encode(CompanionLimits.version, forKey: .v)
+    try c.encode(revision, forKey: .revision)
+    try c.encode(publisherID, forKey: .publisher)
     switch self {
-    case .status(let id, let status, let reason):
+    case .status(let id, let status, let reason, _, _):
       try c.encode(WireType.status, forKey: .type)
       try c.encode(id, forKey: .id)
       try c.encode(status, forKey: .status)
       try c.encodeIfPresent(reason, forKey: .previewUnavailable)
-    case .preview(let id, let status, let preview):
+    case .preview(let id, let status, let preview, _, _):
       try c.encode(WireType.preview, forKey: .type)
       try c.encode(id, forKey: .id)
       try c.encode(status, forKey: .status)
       try c.encode(preview, forKey: .preview)
-    case .disabled(let id, let clearedAt):
+    case .disabled(let id, let clearedAt, _, _):
       try c.encode(WireType.disabled, forKey: .type)
       try c.encode(id, forKey: .id)
       try c.encode(CompanionTime.wire(clearedAt), forKey: .clearedAt)
@@ -222,26 +294,38 @@ extension CompanionReply: Codable {
 extension CompanionApplicationContext: Codable {
   public init(from decoder: any Decoder) throws {
     let c = try decoder.container(keyedBy: EnvelopeKeys.self)
-    switch try c.header() {
+    let type = try c.header()
+    let revision = try c.decode(UInt64.self, forKey: .revision)
+    let publisher = try c.decode(UUID.self, forKey: .publisher)
+    switch type {
     case .status:
-      try checkOnly(decoder, [.v, .type, .status])
-      self = .status(try c.decode(CompanionStatus.self, forKey: .status))
+      try checkOnly(decoder, [.v, .type, .status, .revision, .publisher])
+      self = .status(
+        try c.decode(CompanionStatus.self, forKey: .status),
+        revision: revision,
+        publisherID: publisher
+      )
     case .cleared:
-      try checkOnly(decoder, [.v, .type, .clearedAt])
-      self = .cleared(at: try CompanionTime.decode(c, .clearedAt))
-    default:
-      throw CompanionCodecError.invalid("not an application context")
+      try checkOnly(decoder, [.v, .type, .clearedAt, .revision, .publisher])
+      self = .cleared(
+        at: try CompanionTime.decode(c, .clearedAt),
+        revision: revision,
+        publisherID: publisher
+      )
+    default: throw CompanionCodecError.invalid("not an application context")
     }
   }
 
   public func encode(to encoder: any Encoder) throws {
     var c = encoder.container(keyedBy: EnvelopeKeys.self)
     try c.encode(CompanionLimits.version, forKey: .v)
+    try c.encode(revision, forKey: .revision)
+    try c.encode(publisherID, forKey: .publisher)
     switch self {
-    case .status(let status):
+    case .status(let status, _, _):
       try c.encode(WireType.status, forKey: .type)
       try c.encode(status, forKey: .status)
-    case .cleared(let date):
+    case .cleared(let date, _, _):
       try c.encode(WireType.cleared, forKey: .type)
       try c.encode(CompanionTime.wire(date), forKey: .clearedAt)
     }

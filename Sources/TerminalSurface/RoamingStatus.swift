@@ -94,6 +94,8 @@ public enum RoamingFailure: Hashable, Sendable {
   case connectionLost
   case stale
   case snapshotRejected
+  /// The session's resize revision cannot advance; its current grid remains usable.
+  case resizeUnavailable
   /// Retained operations were abandoned because the host issued a new
   /// writer identity; they are not replayed.
   case pendingInputAbandoned(count: Int)
@@ -143,6 +145,8 @@ public struct RoamingStatus: Hashable, Sendable {
 }
 
 public enum RoamingClientError: Error, Hashable, Sendable {
+  /// The caller cancelled, or the client closed/backgrounded during bootstrap.
+  case cancelled
   /// `start` was called in a state that does not allow it.
   case invalidState(ClientConnectionState)
   case unreachable

@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import TestSupport
 
 @testable import SSHClient
 
@@ -21,29 +22,38 @@ struct SFTPCodecTests {
     .initialize(version: 3, extensions: []),
     .version(
       version: 3,
-      extensions: [SFTPExtensionPair(name: "posix-rename@openssh.com", data: Array("1".utf8))]
+      extensions: [
+        SFTPExtensionPair(
+          name: "posix-rename@openssh.com",
+          data: Array("1".utf8)
+        )
+      ]
     ),
     .open(
       id: 1,
       path: "/tmp/ü file",
       flags: [.write, .create, .exclusive],
       SFTPAttributes(permissions: 0o600)
-    ),
-    .close(id: 2, handle: [1, 2, 3, 4]),
+    ), .close(id: 2, handle: [1, 2, 3, 4]),
     .read(id: 3, handle: [9], offset: 1 << 40, length: 32768),
-    .write(id: 4, handle: [9], offset: 7, data: Array(repeating: 0xAB, count: 1000)),
-    .lstat(id: 5, path: "a"),
-    .fstat(id: 6, handle: [1]),
-    .opendir(id: 7, path: "/"),
-    .readdir(id: 8, handle: [2]),
-    .remove(id: 9, path: "/x"),
-    .realpath(id: 10, path: "."),
-    .stat(id: 11, path: "/y"),
-    .rename(id: 12, oldPath: "/a", newPath: "/b"),
-    .extended(id: 13, name: "posix-rename@openssh.com", data: [0, 0, 0, 1, 0x61]),
-    .status(id: 14, SFTPStatus(code: .eof, message: "End of file", language: "en")),
-    .handle(id: 15, [0xFF, 0]),
-    .data(id: 16, Array(0 ..< 255)),
+    .write(
+      id: 4,
+      handle: [9],
+      offset: 7,
+      data: Array(repeating: 0xAB, count: 1000)
+    ), .lstat(id: 5, path: "a"), .fstat(id: 6, handle: [1]),
+    .opendir(id: 7, path: "/"), .readdir(id: 8, handle: [2]),
+    .remove(id: 9, path: "/x"), .realpath(id: 10, path: "."),
+    .stat(id: 11, path: "/y"), .rename(id: 12, oldPath: "/a", newPath: "/b"),
+    .extended(
+      id: 13,
+      name: "posix-rename@openssh.com",
+      data: [0, 0, 0, 1, 0x61]
+    ),
+    .status(
+      id: 14,
+      SFTPStatus(code: .eof, message: "End of file", language: "en")
+    ), .handle(id: 15, [0xFF, 0]), .data(id: 16, Array(0 ..< 255)),
     .name(
       id: 17,
       [
@@ -61,8 +71,7 @@ struct SFTPCodecTests {
           )
         )
       ]
-    ),
-    .attrs(id: 18, SFTPAttributes(size: 0, permissions: 0o040755)),
+    ), .attrs(id: 18, SFTPAttributes(size: 0, permissions: 0o040755)),
   ]
 
   @Test
@@ -70,14 +79,63 @@ struct SFTPCodecTests {
     var reader = SFTPPacketReader()
     for message in Self.samples {
       // Feed one byte at a time to exercise partial packets.
-      for byte in message.encoded() {
+      for byte in try message.encoded() {
         reader.append([byte])
-        if let decoded = try reader.next() {
-          #expect(decoded == message)
-        }
+        if let decoded = try reader.next() { #expect(decoded == message) }
       }
     }
     #expect(reader.bufferedBytes == 0)
+  }
+
+  @Test(arguments: 0 ..< 4, 0 ..< 4)
+  func rejectedPacketBodyIsNeverRead(_ prefixBytes: Int, _ mode: Int) throws {
+    let empty = mode & 1 != 0
+    let sequence = mode & 2 != 0
+    let header: [UInt8] = empty ? [0, 0, 0, 0] : [0x7F, 0xFF, 0xFF, 0xFF]
+    let input = ReadCountingBytes(
+      prefix: Array(header.dropFirst(prefixBytes)),
+      count: 1024 * 1024
+    )
+    var reader = SFTPPacketReader()
+    reader.append(header.prefix(prefixBytes))
+    if sequence {
+      reader.append(AnySequence(input))
+    } else {
+      reader.append(input)
+    }
+    #expect(input.elementReads == 4 - prefixBytes)
+    #expect(reader.bufferedBytes == 4)
+    #expect(
+      throws: empty ? SFTPCodecError.emptyPacket : .packetTooLarge(0x7FFF_FFFF)
+    ) { _ = try reader.next() }
+    let more = ReadCountingBytes(prefix: [], count: 1024 * 1024)
+    if sequence {
+      reader.append(AnySequence(more))
+    } else {
+      reader.append(more)
+    }
+    #expect(more.elementReads == 0)
+    #expect(reader.bufferedBytes == 4)
+  }
+
+  @Test(arguments: [false, true])
+  func coalescedGoodPacketsPrecedeRejectedPrefix(_ sequence: Bool) throws {
+    let first = SFTPMessage.version(version: 3, extensions: [])
+    let second = SFTPMessage.data(id: 1, [1, 2, 3])
+    var reader = SFTPPacketReader()
+    let bytes =
+      try first.encoded() + second.encoded() + [0x7F, 0xFF, 0xFF, 0xFF, 99]
+    if sequence {
+      reader.append(AnySequence(bytes))
+    } else {
+      reader.append(bytes)
+    }
+    #expect(try reader.next() == first)
+    #expect(try reader.next() == second)
+    #expect(throws: SFTPCodecError.packetTooLarge(0x7FFF_FFFF)) {
+      _ = try reader.next()
+    }
+    #expect(reader.bufferedBytes == 4)
   }
 
   @Test
@@ -95,7 +153,7 @@ struct SFTPCodecTests {
   }
 
   @Test
-  func `malformed bodies are rejected`() {
+  func `malformed bodies are rejected`() throws {
     func decode(_ body: [UInt8]) throws(SFTPCodecError) -> SFTPMessage {
       try SFTPMessage.decode(body: body[...])
     }
@@ -103,14 +161,16 @@ struct SFTPCodecTests {
     #expect(throws: SFTPCodecError.truncated) { try decode([102, 0, 0]) }
     // Handle longer than 256 bytes.
     #expect(throws: SFTPCodecError.stringTooLong) {
-      try decode([102, 0, 0, 0, 1, 0, 0, 1, 1] + [UInt8](repeating: 0, count: 257))
+      try decode(
+        [102, 0, 0, 0, 1, 0, 0, 1, 1] + [UInt8](repeating: 0, count: 257)
+      )
     }
     // String length pointing past the end.
     #expect(throws: SFTPCodecError.truncated) {
       try decode([102, 0, 0, 0, 1, 0, 0, 0, 9, 1])
     }
     // Trailing bytes after a complete STATUS.
-    var status = SFTPMessage.status(id: 1, SFTPStatus(code: .ok)).encoded()
+    var status = try SFTPMessage.status(id: 1, SFTPStatus(code: .ok)).encoded()
     status.append(0)
     #expect(throws: SFTPCodecError.trailingBytes) {
       try decode(Array(status.dropFirst(4)))
@@ -120,7 +180,9 @@ struct SFTPCodecTests {
       try decode([104, 0, 0, 0, 1, 0xFF, 0xFF, 0xFF, 0xFF])
     }
     #expect(throws: SFTPCodecError.tooManyEntries) {
-      try decode([104, 0, 0, 0, 1, 0, 0, 0x10, 0] + [UInt8](repeating: 0, count: 64))
+      try decode(
+        [104, 0, 0, 0, 1, 0, 0, 0x10, 0] + [UInt8](repeating: 0, count: 64)
+      )
     }
     // Invalid UTF-8 path.
     #expect(throws: SFTPCodecError.invalidUTF8) {
@@ -137,22 +199,22 @@ struct SFTPCodecTests {
     var rng = SplitMix64(seed: 0x5F7F_0001)
     for _ in 0 ..< 5000 {
       let count = Int.random(in: 0 ... 96, using: &rng)
-      var bytes = (0 ..< count).map { _ in UInt8.random(in: 0 ... 255, using: &rng) }
+      var bytes = (0 ..< count)
+        .map { _ in UInt8.random(in: 0 ... 255, using: &rng) }
       if !bytes.isEmpty, Bool.random(using: &rng) {
         // Bias toward known packet types.
-        bytes[0] = [1, 2, 3, 4, 5, 6, 101, 102, 103, 104, 105, 200].randomElement(
-          using: &rng
-        )!
+        bytes[0] = [1, 2, 3, 4, 5, 6, 101, 102, 103, 104, 105, 200]
+          .randomElement(using: &rng)!
       }
       _ = try? SFTPMessage.decode(body: bytes[...])
     }
   }
 
   @Test
-  func `mutated valid packets never crash the reader`() {
+  func `mutated valid packets never crash the reader`() throws {
     var rng = SplitMix64(seed: 0xC0DE)
     for _ in 0 ..< 400 {
-      var packet = Self.samples.randomElement(using: &rng)!.encoded()
+      var packet = try Self.samples.randomElement(using: &rng)!.encoded()
       for _ in 0 ..< Int.random(in: 1 ... 4, using: &rng) {
         let index = Int.random(in: 0 ..< packet.count, using: &rng)
         packet[index] = UInt8.random(in: 0 ... 255, using: &rng)

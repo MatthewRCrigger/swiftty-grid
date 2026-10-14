@@ -22,7 +22,8 @@ public struct AttentionInbox: Sendable {
   public let limits: MuxLimits
   /// Advances with every item change.
   public private(set) var revision: UInt64 = 0
-  /// Decoded status and item text, plus `itemOverhead` per item.
+  /// Decoded current-status and item text, including record paths and
+  /// inherited app names, plus `itemOverhead` per retained item.
   public private(set) var textBytes = 0
 
   /// Bytes charged per retained item on top of its text, so text-free
@@ -62,6 +63,7 @@ public struct AttentionInbox: Sendable {
   private var pendingChanged: [OccurrenceID] = []
   private var pendingChangedSet: Set<OccurrenceID> = []
   private var pendingRemoved: Set<OccurrenceID> = []
+  private var pendingResync = false
 
   public init(serviceEpoch: ServerInstanceID, limits: MuxLimits = .standard) {
     self.serviceEpoch = serviceEpoch
@@ -235,6 +237,7 @@ public struct AttentionInbox: Sendable {
       }
       before = s
     }
+    guard limit > 0 else { throw MuxError(.resourceLimit, "inbox page budget") }
     let matching = entries.values
       .filter { $0.sequence < before && Self.matches($0.item, query.section) }
       .sorted { $0.sequence > $1.sequence }
@@ -250,24 +253,28 @@ public struct AttentionInbox: Sendable {
 
   /// Whether `takeUpdate` has anything to send.
   public var hasPendingUpdate: Bool {
-    !pendingChanged.isEmpty || !pendingRemoved.isEmpty
+    pendingResync || !pendingChanged.isEmpty || !pendingRemoved.isEmpty
   }
 
   /// Every item changed or removed since the last take, coalesced: an
-  /// item appears once, in its latest state.
+  /// item appears once, in its latest state. An oversized change list
+  /// becomes a resync notification; the retained inbox is unaffected.
   public mutating func takeUpdate(at now: Date) -> InboxUpdate? {
     guard hasPendingUpdate else { return nil }
     let changed = pendingChanged.compactMap { entries[$0] }
       .sorted { $0.sequence < $1.sequence }.map(\.item)
     let removed = pendingRemoved.sorted { $0.description < $1.description }
+    let resync = pendingResync
     pendingChanged = []
     pendingChangedSet = []
     pendingRemoved = []
+    pendingResync = false
     return InboxUpdate(
       revision: revision,
       counts: counts(at: now),
       changed: changed,
-      removed: removed
+      removed: removed,
+      resync: resync
     )
   }
 
@@ -330,8 +337,8 @@ public struct AttentionInbox: Sendable {
       default: break  // done → working keeps the unreviewed result
       }
     }
-    if let previous { textBytes -= previous.record.textBytes }
-    textBytes += record.textBytes
+    if let previous { textBytes -= previous.status.textBytes }
+    textBytes += status.textBytes
     ps.records[record.path] = Current(
       incarnation: incarnation,
       record: record,
@@ -376,7 +383,7 @@ public struct AttentionInbox: Sendable {
   ) {
     guard let current = ps.records.removeValue(forKey: path) else { return }
     ps.order.removeAll { $0 == path }
-    textBytes -= current.record.textBytes
+    textBytes -= current.status.textBytes
     if let id = current.request { close(id, as: resolution, at: now) }
   }
 
@@ -453,7 +460,10 @@ public struct AttentionInbox: Sendable {
     if pendingChangedSet.remove(id) != nil {
       pendingChanged.removeAll { $0 == id }
     }
-    pendingRemoved.insert(id)
+    if !pendingResync {
+      pendingRemoved.insert(id)
+      limitPendingChanges()
+    }
   }
 
   /// Evicts history oldest first, then the oldest unreviewed results,
@@ -472,7 +482,23 @@ public struct AttentionInbox: Sendable {
   }
 
   private mutating func noteChanged(_ id: OccurrenceID) {
-    if pendingChangedSet.insert(id).inserted { pendingChanged.append(id) }
+    guard !pendingResync else { return }
+    if pendingChangedSet.insert(id).inserted {
+      pendingChanged.append(id)
+      limitPendingChanges()
+    }
+  }
+
+  /// Charge pending IDs conservatively against the control-record
+  /// budget. After overflow, keep only the need to refetch rather than
+  /// accumulating tombstones until the owner gets a chance to flush.
+  private mutating func limitPendingChanges() {
+    let limit = max(1, limits.maxControlRecordBytes / Self.itemOverhead)
+    guard pendingChanged.count + pendingRemoved.count > limit else { return }
+    pendingResync = true
+    pendingChanged = []
+    pendingChangedSet = []
+    pendingRemoved = []
   }
 
   // MARK: Helpers
@@ -530,7 +556,7 @@ public struct AttentionInbox: Sendable {
 
 extension AttentionStatus {
   var textBytes: Int {
-    (app?.utf8.count ?? 0) + (title?.utf8.count ?? 0)
-      + (message?.utf8.count ?? 0)
+    source.recordPath.utf8.count + (app?.utf8.count ?? 0)
+      + (title?.utf8.count ?? 0) + (message?.utf8.count ?? 0)
   }
 }

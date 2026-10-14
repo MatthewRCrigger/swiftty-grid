@@ -49,6 +49,9 @@ public actor RoamingClient {
   // Session.
   private var lifecycle = ClientLifecycle()
   private var grant: BootstrapGrant?
+  private var limits: NegotiatedLimits {
+    grant?.limits.effective ?? NegotiatedLimits()
+  }
   private var queue: ClientInputQueue?
   private var store: RemoteScreenStore?
   private var needsFreshGrant = false
@@ -66,6 +69,10 @@ public actor RoamingClient {
   // Attachment attempts: at most one at a time.
   private var connectTask: Task<Void, Never>?
   private var connectTaskID: UInt64 = 0
+  private var attachDeadline: Instant?
+  private let bootstrapOperations = ProviderOperationSlot()
+  private let connectorOperations = ProviderOperationSlot()
+  private var bootstrapAttempt: DeadlineOperation<BootstrapResponse>?
   private var attachWaiter: CheckedContinuation<AttachOutcome, Never>?
   private var attachTimeoutTask: Task<Void, Never>?
   private var backoff: ReconnectBackoff
@@ -92,7 +99,8 @@ public actor RoamingClient {
   private var requestedGrid: GridSize?
 
   // Detach / terminate.
-  private var closeWaiter: CheckedContinuation<Void, Never>?
+  private var closeWaiters: [CheckedContinuation<Void, Never>] = []
+  private var closeWaitGeneration: UInt64 = 0
   private var closeTimeoutTask: Task<Void, Never>?
 
   // Status.
@@ -117,7 +125,9 @@ public actor RoamingClient {
     backoff = ReconnectBackoff(jitter: configuration.backoffJitter)
     // The view's latest grid: a resume asks for it rather than adopting
     // whatever grid the session last had.
-    if configuration.initialGrid.isValid { desiredGrid = configuration.initialGrid }
+    if configuration.initialGrid.isValid {
+      desiredGrid = configuration.initialGrid
+    }
     let now = timing.now()
     lastHeardAt = now
     lastSentAt = now
@@ -131,7 +141,8 @@ public actor RoamingClient {
   public var state: ClientConnectionState { lifecycle.state }
 
   /// Called on this actor after every status change. Must not block.
-  public func setStatusHandler(_ handler: (@Sendable (RoamingStatus) -> Void)?) {
+  public func setStatusHandler(_ handler: (@Sendable (RoamingStatus) -> Void)?)
+  {
     statusHandler = handler
     handler?(currentStatus)
   }
@@ -142,9 +153,9 @@ public actor RoamingClient {
   /// first complete screen. May be called again after a failed bootstrap.
   public func start(_ target: RoamingTarget) async throws(RoamingClientError) {
     let state = lifecycle.state
-    guard state == .idle || (state == .sshBootstrap && grant == nil) else {
-      throw .invalidState(state)
-    }
+    guard bootstrapAttempt == nil,
+      state == .idle || (state == .sshBootstrap && grant == nil)
+    else { throw .invalidState(state) }
     move(to: .sshBootstrap)
     let request: BootstrapRequest
     switch target {
@@ -166,17 +177,31 @@ public actor RoamingClient {
         target: revealed
       )
     }
+    let attempt = DeadlineOperation<BootstrapResponse>()
+    bootstrapAttempt = attempt
+    defer { if bootstrapAttempt === attempt { bootstrapAttempt = nil } }
+    let bootstrapper = bootstrapper
+    let operations = bootstrapOperations
     let response: BootstrapResponse
     do {
-      response = try await bootstrapper.bootstrap(request)
+      response = try await attempt.run(timing: timing) {
+        try await operations.run { try await bootstrapper.bootstrap(request) }
+      }
     } catch {
+      guard bootstrapAttempt === attempt, !Task.isCancelled,
+        lifecycle.state == .sshBootstrap, grant == nil,
+        !(error is CancellationError)
+      else { throw .cancelled }
+      if error is ProviderOperationError {
+        throw .invalidState(lifecycle.state)
+      }
       let failure = Self.failure(for: error)
       noteFailure(failure)
       throw Self.clientError(for: failure)
     }
-    guard lifecycle.state == .sshBootstrap, grant == nil else {
-      throw .invalidState(lifecycle.state)
-    }
+    guard bootstrapAttempt === attempt, !Task.isCancelled,
+      lifecycle.state == .sshBootstrap, grant == nil
+    else { throw .cancelled }
     switch response {
     case let .granted(granted):
       guard Self.isUsable(granted),
@@ -186,9 +211,13 @@ public actor RoamingClient {
         throw .protocolViolation
       }
       grant = granted
-      queue = ClientInputQueue(writerID: granted.writerID)
+      queue = ClientInputQueue(
+        writerID: granted.writerID,
+        byteLimit: limits.maxPendingInputBytes
+      )
       store = RemoteScreenStore(sessionID: granted.sessionID)
       if desiredGrid == nil { desiredGrid = granted.initialGrid }
+      constrainDesiredGrid()
       publish()
     case .failure(.unknownSession):
       enterFinal(.sessionLost)
@@ -219,17 +248,16 @@ public actor RoamingClient {
     // The record must fit RST/1's control record limit once encoded
     // (escaped control characters grow a paste): an operation that could
     // never be sent would stall every later sequence behind it.
-    guard Self.fitsControlRecord(input.operation) else {
-      return .refused(.invalid)
-    }
+    guard limits.permits(input.operation),
+      Self.fitsControlRecord(
+        input.operation,
+        limit: limits.maxControlRecordBytes
+      )
+    else { return .refused(.invalid) }
     let entry: ClientInputQueue.Entry
-    do {
-      entry = try queue.enqueue(input.operation)
-    } catch .full {
+    do { entry = try queue.enqueue(input.operation) } catch .full {
       return .refused(.backpressure)
-    } catch {
-      return .refused(.invalid)
-    }
+    } catch { return .refused(.invalid) }
     self.queue = queue
     sendInput(entry, epoch: epoch)
     publish()
@@ -238,15 +266,14 @@ public actor RoamingClient {
 
   /// Whether `operation` encodes within the control record limit at the
   /// largest epoch and sequence numbers.
-  static func fitsControlRecord(_ operation: InputOperation) -> Bool {
-    switch operation {
-    case .key, .resize: return true
-    case .committedText, .paste:
-      let probe = ControlMessage.input(
-        .init(attachmentEpoch: .max, sequence: .max, operation: operation)
-      )
-      return (try? ControlRecord.encode(probe)) != nil
-    }
+  static func fitsControlRecord(
+    _ operation: InputOperation,
+    limit: Int = RSTLimits.maxControlRecordBytes
+  ) -> Bool {
+    let probe = ControlMessage.input(
+      .init(attachmentEpoch: .max, sequence: .max, operation: operation)
+    )
+    return (try? ControlRecord.encode(probe, limit: limit)) != nil
   }
 
   /// Requests a grid from local view geometry. Sent as a `.resize`
@@ -256,17 +283,27 @@ public actor RoamingClient {
     let grid = GridSize(columns: columns, rows: rows)
     guard grid.isValid else { return }
     desiredGrid = grid
+    constrainDesiredGrid()
     gridProposed = true
     maybeSendGrid()
     publish()
+  }
+
+  private func constrainDesiredGrid() {
+    guard let desiredGrid else { return }
+    self.desiredGrid = GridSize(
+      columns: min(desiredGrid.columns, limits.maxColumns),
+      rows: min(desiredGrid.rows, limits.maxRows)
+    )
   }
 
   /// Scene backgrounded or unavailable: stop input, attempt a bounded
   /// detach, then stop networking (spec §9).
   public func enterBackground() async {
     let state = lifecycle.state
-    guard !state.isTerminal, state != .idle, state != .backgroundDetached
-    else { return }
+    guard !state.isTerminal, state != .idle, state != .backgroundDetached else {
+      return
+    }
     cancelConnecting()
     let gen = connectionGeneration
     let attachedEpoch = connection != nil ? epoch : nil
@@ -297,8 +334,7 @@ public actor RoamingClient {
       ensureConnecting(delayFirst: false)
     case .sshBootstrap, .reconnecting, .attaching:
       if grant != nil { ensureConnecting(delayFirst: false) }
-    case .active, .suspect:
-      sendProbe()
+    case .active, .suspect: sendProbe()
     default: break
     }
     publish()
@@ -366,10 +402,14 @@ public actor RoamingClient {
     guard connectTask == nil, wantsConnection else { return }
     connectTaskID &+= 1
     let id = connectTaskID
-    connectTask = Task { await self.connectLoop(delayFirst: delayFirst, id: id) }
+    connectTask = Task {
+      await self.connectLoop(delayFirst: delayFirst, id: id)
+    }
   }
 
   private func cancelConnecting() {
+    bootstrapAttempt?.cancel()
+    bootstrapAttempt = nil
     connectTask?.cancel()
     connectTask = nil
     connectTaskID &+= 1
@@ -392,7 +432,7 @@ public actor RoamingClient {
       }
       delay = true
       if needsFreshGrant || tokenExpired {
-        switch await refreshGrant() {
+        switch await refreshGrant(id: id) {
         case .granted: break
         case .retry: continue
         case .stop: return
@@ -405,8 +445,7 @@ public actor RoamingClient {
       let outcome = await attachOnce(grant)
       guard connectTaskID == id else { return }
       switch outcome {
-      case .active, .cancelled:
-        return
+      case .active, .cancelled: return
       case let .rejected(code):
         dropConnection()
         switch code {
@@ -416,8 +455,7 @@ public actor RoamingClient {
         case .sessionExited:
           enterFinal(.sessionExited)
           return
-        case .expired, .unauthorized:
-          needsFreshGrant = true
+        case .expired, .unauthorized: needsFreshGrant = true
         default: break
         }
         attemptFailed(.attachRejected(code))
@@ -444,10 +482,23 @@ public actor RoamingClient {
     move(to: .attaching)
     guard lifecycle.state == .attaching else { return .cancelled }
     let gen = connectionGeneration
+    let timing = timing
+    let deadline = timing.now() + configuration.attachTimeout
+    let connector = connector
+    let operations = connectorOperations
     let conn: any RSTConnection
     do {
-      conn = try await connector.connect(to: grant)
-    } catch {
+      conn = try await DeadlineOperation<any RSTConnection>(discard: {
+        $0.close()
+      })
+      .run(timeout: configuration.attachTimeout, timing: timing) {
+        try await operations.run { try await connector.connect(to: grant) }
+      }
+    } catch is CancellationError {
+      return .cancelled
+    } catch DeadlineOperationError.timedOut {
+      return .timedOut
+    } catch ProviderOperationError.busy { return .timedOut } catch {
       return .unreachable
     }
     guard !Task.isCancelled, lifecycle.state == .attaching,
@@ -455,6 +506,11 @@ public actor RoamingClient {
     else {
       conn.close()
       return .cancelled
+    }
+    let timeout = deadline - timing.now()
+    guard timeout > .zero else {
+      conn.close()
+      return .timedOut
     }
     adopt(conn)
     // The connector returns only after the authenticated handshake, so
@@ -470,10 +526,9 @@ public actor RoamingClient {
       )
     )
     let attachGen = connectionGeneration
-    let timeout = configuration.attachTimeout
-    let timing = timing
     return await withCheckedContinuation { continuation in
       attachWaiter = continuation
+      attachDeadline = deadline
       attachTimeoutTask = Task { [weak self] in
         do { try await timing.sleep(timeout) } catch { return }
         await self?.attachTimedOut(generation: attachGen)
@@ -489,15 +544,33 @@ public actor RoamingClient {
   private func finishAttach(_ outcome: AttachOutcome) {
     attachTimeoutTask?.cancel()
     attachTimeoutTask = nil
+    attachDeadline = nil
     guard let waiter = attachWaiter else { return }
     attachWaiter = nil
+    switch outcome {
+    case .active, .cancelled: break
+    default:
+      // Fence queued callbacks before the failed attempt's worker resumes.
+      // Cancellation leaves teardown to its explicit detach/close operation.
+      dropConnection()
+    }
     waiter.resume(returning: outcome)
+  }
+
+  private func expireAttachmentIfNeeded() -> Bool {
+    guard attachWaiter != nil, let attachDeadline,
+      timing.now() >= attachDeadline
+    else { return false }
+    finishAttach(.timedOut)
+    return true
   }
 
   /// Fresh credentials through SSH `resume`, keeping the writer identity
   /// while this process still holds its input queue.
-  private func refreshGrant() async -> RefreshOutcome {
-    guard let sessionID = grant?.sessionID else { return .stop }
+  private func refreshGrant(id: UInt64) async -> RefreshOutcome {
+    guard connectTaskID == id, !Task.isCancelled, wantsConnection,
+      bootstrapAttempt == nil, let sessionID = grant?.sessionID
+    else { return .stop }
     move(to: .sshBootstrap)
     let request = BootstrapRequest(
       operation: .resume,
@@ -505,10 +578,21 @@ public actor RoamingClient {
       writerID: queue?.writerID,
       initialGrid: desiredGrid
     )
+    let attempt = DeadlineOperation<BootstrapResponse>()
+    bootstrapAttempt = attempt
+    defer { if bootstrapAttempt === attempt { bootstrapAttempt = nil } }
+    let bootstrapper = bootstrapper
+    let operations = bootstrapOperations
     let response: BootstrapResponse
     do {
-      response = try await bootstrapper.bootstrap(request)
+      response = try await attempt.run(timing: timing) {
+        try await operations.run { try await bootstrapper.bootstrap(request) }
+      }
     } catch {
+      guard connectTaskID == id, bootstrapAttempt === attempt,
+        !Task.isCancelled, wantsConnection, !(error is CancellationError)
+      else { return .stop }
+      if error is ProviderOperationError { return .retry }
       let failure = Self.failure(for: error)
       noteFailure(failure)
       switch failure {
@@ -517,7 +601,9 @@ public actor RoamingClient {
       default: return .retry
       }
     }
-    guard wantsConnection else { return .stop }
+    guard connectTaskID == id, bootstrapAttempt === attempt, !Task.isCancelled,
+      wantsConnection
+    else { return .stop }
     switch response {
     case let .granted(granted):
       guard Self.isUsable(granted), granted.sessionID == sessionID else {
@@ -528,9 +614,13 @@ public actor RoamingClient {
         let abandoned = queue.entries.count
         queue.resetWriter(granted.writerID)
         self.queue = queue
-        if abandoned > 0 { noteFailure(.pendingInputAbandoned(count: abandoned)) }
+        if abandoned > 0 {
+          noteFailure(.pendingInputAbandoned(count: abandoned))
+        }
       }
       grant = granted
+      queue?.updateByteLimit(limits.maxPendingInputBytes)
+      constrainDesiredGrid()
       needsFreshGrant = false
       return .granted
     case .failure(.unknownSession):
@@ -549,19 +639,15 @@ public actor RoamingClient {
   }
 
   private func terminateThroughSSH(_ sessionID: SessionID) async {
+    // Cleanup has separate capacity so a stalled refresh cannot block termination.
     let bootstrapper = bootstrapper
     let timing = timing
-    let deadline = configuration.detachDeadline
-    await withTaskGroup(of: Void.self) { group in
-      group.addTask {
+    _ = try? await DeadlineOperation<Void>()
+      .run(timeout: configuration.detachDeadline, timing: timing) {
         _ = try? await bootstrapper.bootstrap(
           BootstrapRequest(operation: .terminate, sessionID: sessionID)
         )
       }
-      group.addTask { try? await timing.sleep(deadline) }
-      await group.next()
-      group.cancelAll()
-    }
   }
 
   // MARK: Connection plumbing
@@ -570,7 +656,8 @@ public actor RoamingClient {
     connectionGeneration &+= 1
     let gen = connectionGeneration
     connection = conn
-    reader = ControlRecordReader()
+    let limits = limits
+    reader = ControlRecordReader(limit: limits.maxControlRecordBytes)
     outbox = []
     pumpGeneration = nil
     epoch = nil
@@ -589,7 +676,7 @@ public actor RoamingClient {
         },
         onSnapshot: { [weak self] bytes in
           // Decode, validate and map off the actor and the UI executor.
-          let decoded = Self.decode(bytes)
+          let decoded = Self.decode(bytes, limits: limits)
           await self?.handleSnapshot(decoded, generation: gen)
         },
         onClosed: { [weak self] _ in
@@ -612,7 +699,7 @@ public actor RoamingClient {
     ping = nil
     probeSentAt = nil
     inputAwaitingSince = nil
-    resumeCloseWaiter()
+    resumeCloseWaiters()
   }
 
   private func connectionClosed(generation: UInt64) {
@@ -621,7 +708,7 @@ public actor RoamingClient {
       finishAttach(.closed)
       return
     }
-    resumeCloseWaiter()
+    resumeCloseWaiters()
     switch lifecycle.state {
     case .active, .suspect: reconnect(after: .connectionLost)
     default: dropConnection()
@@ -639,7 +726,15 @@ public actor RoamingClient {
   /// Bounded, ordered control-record output: one pump per connection.
   private func send(_ message: ControlMessage) {
     guard let conn = connection else { return }
-    guard let record = try? ControlRecord.encode(message) else { return }
+    guard
+      let record = try? ControlRecord.encode(
+        message,
+        limit: limits.maxControlRecordBytes
+      )
+    else {
+      connectionFailed(.protocolViolation)
+      return
+    }
     guard outbox.count < configuration.maxOutboundRecords else {
       connectionFailed(.connectionLost)
       return
@@ -655,9 +750,7 @@ public actor RoamingClient {
   private func pump(_ conn: any RSTConnection, generation gen: UInt64) async {
     while gen == connectionGeneration, !outbox.isEmpty {
       let record = outbox.removeFirst()
-      do {
-        try await conn.sendControl(record)
-      } catch {
+      do { try await conn.sendControl(record) } catch {
         if pumpGeneration == gen { pumpGeneration = nil }
         connectionClosed(generation: gen)
         return
@@ -678,17 +771,24 @@ public actor RoamingClient {
 
   // MARK: Receiving
 
+  /// Observes teardown in the same actor turn as a control callback.
+  func handleControlForTesting(
+    _ bytes: [UInt8]
+  ) -> (waiting: Bool, closed: Bool) {
+    let waiting = attachWaiter != nil
+    let current = connection
+    handleControl(bytes, generation: connectionGeneration)
+    return (waiting, current?.isClosed == true)
+  }
+
   private func handleControl(_ bytes: [UInt8], generation: UInt64) {
     guard generation == connectionGeneration else { return }
     let messages: [ControlMessage]
-    do {
-      messages = try reader.append(bytes)
-    } catch {
+    do { messages = try reader.append(bytes) } catch {
       connectionFailed(.protocolViolation)
       publish()
       return
     }
-    heard()
     for message in messages {
       guard generation == connectionGeneration else { break }
       handle(message)
@@ -706,10 +806,14 @@ public actor RoamingClient {
 
   private func handle(_ message: ControlMessage) {
     switch message {
-    case let .attached(attached):
-      handleAttached(attached)
+    case let .attached(attached): handleAttached(attached)
     case let .inputAck(e, sequence):
       guard e == epoch, var queue else { return }
+      guard sequence < queue.nextSequence else {
+        connectionFailed(.protocolViolation)
+        return
+      }
+      heard()
       queue.acknowledge(through: sequence)
       self.queue = queue
       inputAwaitingSince = queue.isEmpty ? nil : timing.now()
@@ -717,21 +821,26 @@ public actor RoamingClient {
       maybeSendGrid()
     case let .pong(e, nonce):
       guard e == epoch, let ping, ping.nonce == nonce else { return }
+      heard()
       liveness.sample(timing.now() - ping.sentAt)
       self.ping = nil
       probeSentAt = nil
     case let .ping(e, nonce):
       guard e == epoch else { return }
+      heard()
       send(.pong(epoch: e, nonce: nonce))
     case let .sessionExited(e, status, _):
       guard e == epoch else { return }
+      heard()
       exitStatus = status
       // Keep the connection: the final screen may still arrive.
       enterFinal(.sessionExited, keepConnection: true)
     case let .detached(e), let .terminated(e):
       guard e == epoch else { return }
-      resumeCloseWaiter()
+      heard()
+      resumeCloseWaiters()
     case let .error(error):
+      heard()
       handleError(error)
     case .attach, .input, .screenAck, .detach, .terminate:
       // Client-to-server messages are never valid from the host.
@@ -740,6 +849,7 @@ public actor RoamingClient {
   }
 
   private func handleAttached(_ attached: ControlMessage.Attached) {
+    guard !expireAttachmentIfNeeded() else { return }
     guard attachWaiter != nil, epoch == nil, var queue, var store else {
       connectionFailed(.protocolViolation)
       return
@@ -751,13 +861,28 @@ public actor RoamingClient {
       return
     }
     epoch = attached.attachmentEpoch
+    heard()
     store.fence(epoch: attached.attachmentEpoch)
     self.store = store
     resizeRevision = max(resizeRevision, attached.resizeRevision)
     // Retry what the host has not applied: original identifiers, new
     // epoch. Admitted partial operations continue at the host.
-    let retry = queue.reconcile(serverApplied: attached.lastFullyAppliedInputSequence)
+    let retry = queue.reconcile(
+      serverApplied: attached.lastFullyAppliedInputSequence
+    )
     self.queue = queue
+    guard
+      retry.allSatisfy({
+        limits.permits($0.operation)
+          && Self.fitsControlRecord(
+            $0.operation,
+            limit: limits.maxControlRecordBytes
+          )
+      })
+    else {
+      finishAttach(.protocolViolation)
+      return
+    }
     // Another client may have resized the session since our last
     // request: compare with this attachment's screen, except for a
     // resize that is being retried.
@@ -783,10 +908,8 @@ public actor RoamingClient {
     case .inputBackpressure, .inputGap:
       let from = error.sequence ?? queue?.entries.first?.sequence
       if let from { resendFrom = min(resendFrom ?? from, from) }
-    case .unknownSession, .wrongInstance:
-      enterFinal(.sessionLost)
-    case .sessionExited:
-      enterFinal(.sessionExited, keepConnection: true)
+    case .unknownSession, .wrongInstance: enterFinal(.sessionLost)
+    case .sessionExited: enterFinal(.sessionExited, keepConnection: true)
     case .expired, .unauthorized:
       needsFreshGrant = true
       reconnect(after: .attachRejected(error.code))
@@ -798,14 +921,26 @@ public actor RoamingClient {
 
   private func handleSnapshot(_ decoded: DecodedScreen?, generation: UInt64) {
     guard generation == connectionGeneration else { return }
-    heard()
-    guard let decoded else {
+    guard !expireAttachmentIfNeeded() else {
+      publish()
+      return
+    }
+    guard let decoded, decoded.snapshot.sessionID == store?.sessionID else {
       noteFailure(.snapshotRejected)
       publish()
       return
     }
     if epoch == nil {
       // Snapshot stream overtook `Attached`; keep only the newest.
+      if let earlySnapshot {
+        let incoming = decoded.snapshot
+        let retained = earlySnapshot.snapshot
+        guard
+          incoming.attachmentEpoch > retained.attachmentEpoch
+            || (incoming.attachmentEpoch == retained.attachmentEpoch
+              && incoming.screenRevision > retained.screenRevision)
+        else { return }
+      }
       earlySnapshot = decoded
       return
     }
@@ -814,14 +949,37 @@ public actor RoamingClient {
   }
 
   private func install(_ decoded: DecodedScreen) {
+    guard !expireAttachmentIfNeeded() else { return }
     guard var store, let epoch else { return }
+    // A future epoch has no attachment on this connection. Reject before
+    // it can fence the store or reach presentation.
+    guard decoded.snapshot.attachmentEpoch <= epoch else {
+      noteFailure(.snapshotRejected)
+      return
+    }
     switch store.install(decoded.snapshot) {
     case .installed:
+      // Commit only after the configured presentation owner accepts the
+      // frame, so refusal neither acknowledges it nor fences a same-revision
+      // retry. A headless client owns the validated screen in its store.
+      let accepted = sink?.install(decoded.frame) ?? true
+      // A synchronous presentation owner can consume the remaining budget.
+      // Enforce the same absolute deadline before committing readiness.
+      guard !expireAttachmentIfNeeded() else { return }
+      guard accepted else {
+        noteFailure(.snapshotRejected)
+        return
+      }
       self.store = store
-      send(.screenAck(epoch: epoch, screenRevision: decoded.snapshot.screenRevision))
+      if decoded.snapshot.attachmentEpoch == epoch { heard() }
+      send(
+        .screenAck(
+          epoch: epoch,
+          screenRevision: decoded.snapshot.screenRevision
+        )
+      )
       resizeRevision = max(resizeRevision, decoded.snapshot.resizeRevision)
       lastScreenAt = Date(timeIntervalSince1970: timing.wallClock())
-      sink?.install(decoded.frame)
       if attachWaiter != nil, decoded.snapshot.attachmentEpoch == epoch {
         // A complete current screen: input may resume.
         move(to: .active)
@@ -831,16 +989,22 @@ public actor RoamingClient {
         finishAttach(.active)
         maybeSendGrid()
       }
-    case .stale:
-      break
-    case .rejected:
-      noteFailure(.snapshotRejected)
+    case .stale: break
+    case .rejected: noteFailure(.snapshotRejected)
     }
   }
 
-  nonisolated static func decode(_ bytes: [UInt8]) -> DecodedScreen? {
-    guard let snapshot = try? SnapshotFrame.decode(bytes) else { return nil }
-    return DecodedScreen(snapshot: snapshot, frame: PresentationMapper.map(snapshot))
+  nonisolated static func decode(
+    _ bytes: [UInt8],
+    limits: NegotiatedLimits = NegotiatedLimits()
+  ) -> DecodedScreen? {
+    guard let snapshot = try? SnapshotFrame.decode(bytes, limits: limits) else {
+      return nil
+    }
+    return DecodedScreen(
+      snapshot: snapshot,
+      frame: PresentationMapper.map(snapshot)
+    )
   }
 
   // MARK: Input
@@ -874,12 +1038,19 @@ public actor RoamingClient {
     let reference =
       requestedGrid ?? GridSize(columns: screen.columns, rows: screen.rows)
     guard desired != reference else { return }
-    let revision = max(resizeRevision, screen.resizeRevision) + 1
+    let (revision, overflow) = max(resizeRevision, screen.resizeRevision)
+      .addingReportingOverflow(1)
+    guard !overflow else {
+      noteFailure(.resizeUnavailable)
+      return
+    }
     let operation = InputOperation.resize(
       columns: desired.columns,
       rows: desired.rows,
       resizeRevision: revision
     )
+    guard Self.fitsControlRecord(operation, limit: limits.maxControlRecordBytes)
+    else { return }
     // When full, retried after the next acknowledgment.
     guard let entry = try? queue.enqueue(operation) else { return }
     self.queue = queue
@@ -917,7 +1088,9 @@ public actor RoamingClient {
     switch state {
     case .active:
       let start = [inputAwaitingSince, probeSentAt].compactMap { $0 }.min()
-      if let start, liveness.isStale(awaitingResponseFor: now - max(start, lastHeardAt)) {
+      if let start,
+        liveness.isStale(awaitingResponseFor: now - max(start, lastHeardAt))
+      {
         noteFailure(.stale)
         move(to: .suspect)
         sendProbe()
@@ -962,20 +1135,31 @@ public actor RoamingClient {
     let deadline = configuration.detachDeadline
     let timing = timing
     await withCheckedContinuation { continuation in
-      closeWaiter = continuation
+      closeWaiters.append(continuation)
+      // Background detach and explicit close can overlap across this
+      // suspension. They share the same connection and earliest deadline.
+      guard closeTimeoutTask == nil else { return }
+      closeWaitGeneration &+= 1
+      let generation = closeWaitGeneration
       closeTimeoutTask = Task { [weak self] in
-        try? await timing.sleep(deadline)
-        await self?.resumeCloseWaiter()
+        do { try await timing.sleep(deadline) } catch { return }
+        await self?.closeTimedOut(generation: generation)
       }
     }
   }
 
-  private func resumeCloseWaiter() {
+  private func closeTimedOut(generation: UInt64) {
+    guard generation == closeWaitGeneration else { return }
+    resumeCloseWaiters()
+  }
+
+  private func resumeCloseWaiters() {
+    closeWaitGeneration &+= 1
     closeTimeoutTask?.cancel()
     closeTimeoutTask = nil
-    guard let waiter = closeWaiter else { return }
-    closeWaiter = nil
-    waiter.resume()
+    let waiters = closeWaiters
+    closeWaiters = []
+    for waiter in waiters { waiter.resume() }
   }
 
   private func enterFinal(
@@ -993,11 +1177,7 @@ public actor RoamingClient {
 
   @discardableResult
   private func move(to next: ClientConnectionState) -> Bool {
-    do {
-      try lifecycle.transition(to: next)
-    } catch {
-      return false
-    }
+    do { try lifecycle.transition(to: next) } catch { return false }
     publish()
     return true
   }
@@ -1026,7 +1206,22 @@ public actor RoamingClient {
   }
 
   private static func isUsable(_ grant: BootstrapGrant) -> Bool {
-    grant.protocol == RSTLimits.protocolName && grant.initialGrid.isValid
+    guard grant.protocol == RSTLimits.protocolName, grant.limits.isValid,
+      grant.limits.effective.contains(grant.initialGrid)
+    else { return false }
+    let attach = ControlMessage.attach(
+      .init(
+        sessionID: grant.sessionID,
+        serverInstanceID: grant.serverInstanceID,
+        writerID: grant.writerID,
+        applicationToken: grant.applicationToken
+      )
+    )
+    return
+      (try? ControlRecord.encode(
+        attach,
+        limit: grant.limits.effective.maxControlRecordBytes
+      )) != nil
   }
 
   private static func failure(for error: any Error) -> RoamingFailure {
@@ -1038,7 +1233,9 @@ public actor RoamingClient {
     }
   }
 
-  private static func clientError(for failure: RoamingFailure) -> RoamingClientError {
+  private static func clientError(
+    for failure: RoamingFailure
+  ) -> RoamingClientError {
     switch failure {
     case .hostKeyRejected: .hostKeyRejected
     case .authenticationFailed: .authenticationFailed

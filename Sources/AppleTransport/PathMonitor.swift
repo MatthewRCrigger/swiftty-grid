@@ -30,12 +30,10 @@ public struct NetworkPathStatus: Equatable, Sendable {
   init(_ path: NWPath) {
     var interfaces: Set<Interface> = []
     for kind in [
-      (NWInterface.InterfaceType.wifi, Interface.wifi),
-      (.cellular, .cellular), (.wiredEthernet, .wiredEthernet),
-      (.loopback, .loopback), (.other, .other),
-    ] where path.usesInterfaceType(kind.0) {
-      interfaces.insert(kind.1)
-    }
+      (NWInterface.InterfaceType.wifi, Interface.wifi), (.cellular, .cellular),
+      (.wiredEthernet, .wiredEthernet), (.loopback, .loopback),
+      (.other, .other),
+    ] where path.usesInterfaceType(kind.0) { interfaces.insert(kind.1) }
     self.init(
       isSatisfied: path.status == .satisfied,
       isExpensive: path.isExpensive,

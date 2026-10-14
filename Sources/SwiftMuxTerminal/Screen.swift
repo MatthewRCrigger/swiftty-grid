@@ -162,8 +162,13 @@ public struct ScreenBuffer: Equatable, Sendable {
   }
 
   public mutating func fill(_ rect: LayoutRect, style: OuterStyle = .plain) {
-    for y in max(0, rect.y) ..< min(rows, rect.maxY) {
-      for x in max(0, rect.x) ..< min(columns, rect.maxX) {
+    let firstY = max(0, rect.y)
+    let lastY = min(rows, rect.maxY)
+    let firstX = max(0, rect.x)
+    let lastX = min(columns, rect.maxX)
+    guard firstY < lastY, firstX < lastX else { return }
+    for y in firstY ..< lastY {
+      for x in firstX ..< lastX {
         cells[y * columns + x] = ScreenCell(text: " ", style: style)
       }
     }

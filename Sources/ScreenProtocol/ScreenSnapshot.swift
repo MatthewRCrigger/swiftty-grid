@@ -57,7 +57,10 @@ public struct TextAttributes: OptionSet, Hashable, Sendable, Codable {
     let raw = try decoder.singleValueContainer().decode(UInt16.self)
     guard raw & ~Self.all.rawValue == 0 else {
       throw DecodingError.dataCorrupted(
-        .init(codingPath: decoder.codingPath, debugDescription: "bad attributes")
+        .init(
+          codingPath: decoder.codingPath,
+          debugDescription: "bad attributes"
+        )
       )
     }
     rawValue = raw
@@ -90,8 +93,10 @@ public struct CellStyle: Hashable, Sendable, Codable {
   public static let plain = CellStyle()
 
   enum CodingKeys: String, CodingKey {
-    case foreground = "fg", background = "bg", underlineColor = "ul",
-      attributes = "a"
+    case foreground = "fg"
+    case background = "bg"
+    case underlineColor = "ul"
+    case attributes = "a"
   }
 
   public init(from decoder: any Decoder) throws {
@@ -102,8 +107,8 @@ public struct CellStyle: Hashable, Sendable, Codable {
       RGBColor.self,
       forKey: .underlineColor
     )
-    attributes = try c.decodeIfPresent(TextAttributes.self, forKey: .attributes)
-      ?? []
+    attributes =
+      try c.decodeIfPresent(TextAttributes.self, forKey: .attributes) ?? []
   }
 
   public func encode(to encoder: any Encoder) throws {
@@ -287,10 +292,9 @@ public struct ScreenSnapshot: Hashable, Sendable, Codable {
     wrapped = try c.decode([Bool].self, forKey: .wrapped)
     styles = try c.decode([CellStyle].self, forKey: .styles)
     cells = try c.decode([[ScreenCell]].self, forKey: .cells)
-    lastFullyAppliedInputSequence = try c.decode(
-      WireUInt64.self,
-      forKey: .lastFullyAppliedInputSequence
-    ).value
+    lastFullyAppliedInputSequence =
+      try c.decode(WireUInt64.self, forKey: .lastFullyAppliedInputSequence)
+      .value
   }
 
   public func encode(to encoder: any Encoder) throws {
@@ -347,9 +351,10 @@ public enum SnapshotValidationError: Error, Equatable, Sendable {
 extension ScreenSnapshot {
   /// Validates bounds and cell structure before any rendering
   /// (spec §6, §12, §A.4.3).
-  public func validate() throws(SnapshotValidationError) {
-    guard (1 ... RSTLimits.maxColumns).contains(columns),
-      (1 ... RSTLimits.maxRows).contains(rows)
+  public func validate(
+    limits: NegotiatedLimits = NegotiatedLimits()
+  ) throws(SnapshotValidationError) {
+    guard limits.effective.contains(GridSize(columns: columns, rows: rows))
     else { throw .gridOutOfRange }
     guard cells.count == rows, wrapped.count == rows else {
       throw .rowCountMismatch
@@ -383,8 +388,7 @@ extension ScreenSnapshot {
         case 0: throw .orphanContinuation(row: y, column: x)
         case 1: x += 1
         case 2:
-          guard x + 1 < columns, row[x + 1].width == 0,
-            row[x + 1].text.isEmpty
+          guard x + 1 < columns, row[x + 1].width == 0, row[x + 1].text.isEmpty
           else { throw .missingContinuation(row: y, column: x) }
           guard row[x + 1].style >= 0, row[x + 1].style < styles.count else {
             throw .styleIndex(row: y, column: x + 1)

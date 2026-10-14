@@ -50,15 +50,15 @@ struct AllocationTests {
     descriptor.storageMode = .private
     let texture = try #require(device.makeTexture(descriptor: descriptor))
     for _ in 0 ..< 5 {
-      renderer.render(blankSnapshot, to: texture).waitUntilCompleted()
-      renderer.render(snapshot, to: texture).waitUntilCompleted()
+      try renderer.render(blankSnapshot, to: texture).waitUntilCompleted()
+      try renderer.render(snapshot, to: texture).waitUntilCompleted()
     }
     alloc_counter_start()
-    let blankCommand = renderer.render(blankSnapshot, to: texture)
+    let blankCommand = try renderer.render(blankSnapshot, to: texture)
     blankCommand.waitUntilCompleted()
     let baseline = alloc_counter_stop()
     alloc_counter_start()
-    let command = renderer.render(snapshot, to: texture)
+    let command = try renderer.render(snapshot, to: texture)
     command.waitUntilCompleted()
     let count = alloc_counter_stop()
     #expect(blankCommand.status == .completed && command.status == .completed)

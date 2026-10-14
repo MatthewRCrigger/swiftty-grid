@@ -23,7 +23,7 @@ set -eu
 destination=$1
 shift
 command -v xcodegen >/dev/null || { echo "xcodegen required" >&2; exit 1; }
-repository_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
+repository_root=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
 apps="$repository_root/Apps"
 team=${RST_UI_TEAM:-72KB9YQR7B}
 
@@ -41,7 +41,23 @@ esac
 
 env_file=$("$repository_root/Scripts/real-ssh-env.sh" start)
 workspace=$(dirname "$env_file")
-trap '"$repository_root/Scripts/real-ssh-env.sh" stop "$workspace"' EXIT INT TERM
+# Invoked indirectly by the EXIT trap.
+# shellcheck disable=SC2329
+cleanup_fixture() {
+  fixture_status=$?
+  trap - EXIT
+  trap '' INT TERM
+  if ! "$repository_root/Scripts/real-ssh-env.sh" stop "$workspace"; then
+    echo "fixture cleanup incomplete: $workspace" >&2
+    [ "$fixture_status" -ne 0 ] || fixture_status=1
+  fi
+  exit "$fixture_status"
+}
+trap cleanup_fixture EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# The fixture generates this private environment file at runtime.
+# shellcheck source=/dev/null
 . "$env_file"
 # A file for the SFTP browser to list.
 container exec "$(cat "$workspace/container.name")" \

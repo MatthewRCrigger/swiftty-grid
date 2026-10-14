@@ -25,7 +25,12 @@ public struct TrustPrompt: Hashable, Sendable, Identifiable {
   /// `SHA256:` base64 fingerprint, display only.
   public let fingerprint: String
 
-  public init(host: HostProfile, kind: Kind, keyAlgorithm: String, fingerprint: String) {
+  public init(
+    host: HostProfile,
+    kind: Kind,
+    keyAlgorithm: String,
+    fingerprint: String
+  ) {
     self.host = host
     self.kind = kind
     self.keyAlgorithm = keyAlgorithm
@@ -86,6 +91,9 @@ public final class TerminalScreenModel: Identifiable {
   public private(set) var connectionState: ClientConnectionState = .idle
   /// When `connectionState` was last observed to change.
   public private(set) var stateObservedAt: Date
+  /// Latest change to the status sent to the companion, including screen
+  /// and pending-input observations independent of connection state.
+  private var companionObservedAt: Date
   public private(set) var lastScreenAt: Date?
   public private(set) var pendingInputCount = 0
   /// Roaming session identity (non-secret), once granted.
@@ -100,11 +108,20 @@ public final class TerminalScreenModel: Identifiable {
   public private(set) var reconnectAttempt = 0
   /// Supplies the current visible rows for an opted-in companion preview.
   /// Set by the terminal integration; `nil` means no screen yet.
-  @ObservationIgnored public var previewLines: (@MainActor () -> [String])?
+  @ObservationIgnored
+  public var previewLines: (@MainActor () -> [String])?
+  /// The latest screen with its original observation time. Lifecycle,
+  /// input, and companion refreshes never make cached content fresher.
+  public var companionPreview: CompanionPreview? {
+    guard let lastScreenAt, let lines = previewLines?() else { return nil }
+    return CompanionPreview(lines: lines, capturedAt: lastScreenAt)
+  }
   /// Called after each observed change (companion bridge, diagnostics).
-  @ObservationIgnored var onChange: (@MainActor (TerminalScreenModel) -> Void)?
+  @ObservationIgnored
+  var onChange: (@MainActor (TerminalScreenModel) -> Void)?
   /// The live backend, created by the surface factory on first display.
-  @ObservationIgnored var controller: (any TerminalSurfaceController)?
+  @ObservationIgnored
+  var controller: (any TerminalSurfaceController)?
 
   public init(
     host: HostProfile,
@@ -122,6 +139,7 @@ public final class TerminalScreenModel: Identifiable {
       case .localShell: profile.localSurface ?? profile.sshSurface
       }
     self.stateObservedAt = now
+    self.companionObservedAt = now
   }
 
   /// Applies a lifecycle transition validated by SessionCore. Invalid
@@ -131,6 +149,7 @@ public final class TerminalScreenModel: Identifiable {
     guard connectionState.canTransition(to: next) else { return }
     connectionState = next
     stateObservedAt = now
+    companionObservedAt = now
     onChange?(self)
   }
 
@@ -166,7 +185,10 @@ public final class TerminalScreenModel: Identifiable {
     if status.reconnectAttempt != reconnectAttempt {
       reconnectAttempt = status.reconnectAttempt
     }
-    if changed { onChange?(self) }
+    if changed {
+      companionObservedAt = now
+      onChange?(self)
+    }
   }
 
   /// Mirrors a byte-stream backend (ordinary SSH, local PTY) onto the
@@ -184,20 +206,26 @@ public final class TerminalScreenModel: Identifiable {
     case .lost: next = .sessionLost
     case .closed: next = .userClosed
     }
-    guard next != connectionState, connectionState != .userClosed else { return }
+    guard next != connectionState, connectionState != .userClosed else {
+      return
+    }
     connectionState = next
     stateObservedAt = now
+    companionObservedAt = now
     onChange?(self)
   }
 
   /// A complete screen was installed.
   public func screenInstalled(at now: Date = .now) {
     lastScreenAt = now
+    companionObservedAt = now
     onChange?(self)
   }
 
-  public func setPendingInputCount(_ count: Int) {
-    pendingInputCount = max(0, count)
+  public func setPendingInputCount(_ count: Int, at now: Date = .now) {
+    let bounded = max(0, count)
+    if bounded != pendingInputCount { companionObservedAt = now }
+    pendingInputCount = bounded
     onChange?(self)
   }
 
@@ -212,7 +240,7 @@ public final class TerminalScreenModel: Identifiable {
       sessionToken: id,
       nickname: host.nickname,
       state: CompanionConnectionState(connectionState),
-      observedAt: stateObservedAt,
+      observedAt: companionObservedAt,
       lastScreenAt: lastScreenAt,
       pendingInputCount: pendingInputCount
     )
@@ -286,13 +314,15 @@ public final class RoamingAppModel {
 
   /// Receives every observation of the active session (iPhone bridge).
   @ObservationIgnored
-  public var onSessionObservation: (@MainActor (PhoneCompanionBridge.Observation) -> Void)?
+  public var onSessionObservation:
+    (@MainActor (PhoneCompanionBridge.Observation) -> Void)?
   /// Redacted inbox summaries after each refresh, for the watch bridge.
   @ObservationIgnored
   public var onAttentionSummaries: (@MainActor ([AttentionSummary]) -> Void)?
 
   @ObservationIgnored
-  public var onCompanionSettingsChange: (@MainActor (CompanionSettings) -> Void)?
+  public var onCompanionSettingsChange:
+    (@MainActor (CompanionSettings) -> Void)?
   /// Observes the user's answer to each `pendingTrust` (diagnostics).
   @ObservationIgnored
   public var onTrustDecision: (@MainActor (TrustPrompt, TrustDecision) -> Void)?
@@ -301,21 +331,46 @@ public final class RoamingAppModel {
   /// (spec §10) or the app is suspended.
   public let transferPolicy = TransferPausePolicy()
 
-  @ObservationIgnored private let store: HostProfileStore
-  @ObservationIgnored private let resumeStore: SessionResumeStore
+  @ObservationIgnored
+  private let store: HostProfileStore
+  /// A failed load must not be overwritten by a later save of the
+  /// in-memory list. Cleared only by a load that reads the file.
+  @ObservationIgnored
+  private var savedHostsReadable = true
+  @ObservationIgnored
+  private let resumeStore: SessionResumeStore
   /// Attention links waiting for their host's next roaming start.
-  @ObservationIgnored private var pendingReveals: [UUID: ResumeTarget] = [:]
-  @ObservationIgnored private var trustQueue:
-    [(prompt: TrustPrompt, continuation: CheckedContinuation<TrustDecision, Never>)] = []
-  @ObservationIgnored private var passwordQueue:
-    [(prompt: PasswordPrompt, continuation: CheckedContinuation<String?, Never>)] = []
+  @ObservationIgnored
+  private var pendingReveals: [UUID: ResumeTarget] = [:]
+  @ObservationIgnored
+  private var trustQueue:
+    [(
+      prompt: TrustPrompt,
+      continuation: CheckedContinuation<TrustDecision, Never>?
+    )] = []
+  /// Keep approvals invalidatable until the waiting caller consumes them.
+  @ObservationIgnored
+  private var trustRequests: [UUID: HostProfile] = [:]
+  @ObservationIgnored
+  private var passwordQueue:
+    [(
+      prompt: PasswordPrompt, continuation: CheckedContinuation<String?, Never>
+    )] = []
+  /// Includes answered continuations whose callers have not resumed yet.
+  /// Removing a request invalidates its answer without a growing epoch map.
+  @ObservationIgnored
+  private var passwordRequests: [UUID: HostProfile] = [:]
   /// Session passwords, in memory only, never logged or persisted.
-  @ObservationIgnored private var passwords: [UUID: String] = [:]
-  @ObservationIgnored private var sshAccess: SSHAccess?
+  @ObservationIgnored
+  private var passwords: [UUID: (host: HostProfile, value: String)] = [:]
+  @ObservationIgnored
+  private var sshAccess: SSHAccess?
 
   public init(
     profile: PlatformProfile = .current,
-    store: HostProfileStore = HostProfileStore(fileURL: HostProfileStore.defaultURL()),
+    store: HostProfileStore = HostProfileStore(
+      fileURL: HostProfileStore.defaultURL()
+    ),
     resumeStore: SessionResumeStore = SessionResumeStore(
       defaults: UITesting.defaults ?? .standard
     )
@@ -339,40 +394,69 @@ public final class RoamingAppModel {
 
   public func load() {
     do {
-      hosts = try store.load()
+      let loaded = try store.load()
+      let identities = Set(loaded)
+      let changed = hosts.filter { !identities.contains($0) }
+      hosts = loaded
+      for host in changed { invalidateConnectionPrompts(for: host) }
+      savedHostsReadable = true
       lastError = nil
     } catch {
+      savedHostsReadable = false
       lastError = "Saved hosts could not be read."
     }
   }
 
   /// Adds or replaces `host` (matched by id) after validation.
-  public func save(_ host: HostProfile) throws(HostProfile.ValidationError) {
+  /// Returns false if persistence failed; the saved list stays unchanged.
+  @discardableResult
+  public func save(
+    _ host: HostProfile
+  ) throws(HostProfile.ValidationError) -> Bool {
     try host.validate()
     var next = hosts
+    var changed = false
     if let index = next.firstIndex(where: { $0.id == host.id }) {
-      if next[index] != host { passwords[host.id] = nil }
+      changed = next[index] != host
       next[index] = host
     } else {
       next.append(host)
     }
-    persist(next)
+    guard persist(next) else { return false }
+    if changed { invalidateConnectionPrompts(for: host) }
+    return true
   }
 
   public func delete(_ host: HostProfile) {
+    guard persist(hosts.filter { $0.id != host.id }) else { return }
     if activeSession?.host.id == host.id { close() }
-    passwords[host.id] = nil
+    invalidateConnectionPrompts(for: host)
     forgetSession(for: host)
-    persist(hosts.filter { $0.id != host.id })
   }
 
-  private func persist(_ next: [HostProfile]) {
+  private func invalidateConnectionPrompts(for host: HostProfile) {
+    passwords[host.id] = nil
+    invalidatePasswordRequests { $0.id == host.id }
+    trustRequests = trustRequests.filter { $0.value.id != host.id }
+    let ids = trustQueue.filter { $0.prompt.host.id == host.id }
+      .map { $0.prompt.id }
+    for id in ids { cancelTrust(id) }
+  }
+
+  @discardableResult
+  private func persist(_ next: [HostProfile]) -> Bool {
+    guard savedHostsReadable else {
+      lastError = "Saved hosts could not be read."
+      return false
+    }
     do {
       try store.save(next)
       hosts = next
       lastError = nil
+      return true
     } catch {
       lastError = "Saved hosts could not be written."
+      return false
     }
   }
 
@@ -382,7 +466,9 @@ public final class RoamingAppModel {
   /// this app (one active roaming terminal per client). Replacing a
   /// roaming session detaches it; the host keeps the shell.
   public func open(_ host: HostProfile, kind: TerminalKind = .roaming) {
-    if let activeSession, activeSession.host.id == host.id, activeSession.kind == kind {
+    if let activeSession, activeSession.host.id == host.id,
+      activeSession.kind == kind
+    {
       return
     }
     if kind == .localShell, !profile.localPTY { return }
@@ -434,7 +520,8 @@ public final class RoamingAppModel {
   /// Bounded detach of the active session before the app quits; the
   /// helper also retains sessions whose detach never arrives (spec §9).
   public func detachForTermination() async {
-    guard let session = activeSession, let controller = session.controller else { return }
+    guard let session = activeSession, let controller = session.controller
+    else { return }
     session.controller = nil
     await controller.close(.detach)
   }
@@ -442,7 +529,11 @@ public final class RoamingAppModel {
   /// Opens `workspace` on `host` from an attention link: the next start
   /// resumes it, focuses `target.pane` and takes over only the lease the
   /// user confirmed (`target.expectedLease`). Replaces the active session.
-  public func reveal(_ host: HostProfile, workspace: SessionID, target: ResumeTarget) {
+  public func reveal(
+    _ host: HostProfile,
+    workspace: SessionID,
+    target: ResumeTarget
+  ) {
     if activeSession != nil { close() }
     rememberSession(workspace, for: host)
     pendingReveals[host.id] = target
@@ -474,21 +565,88 @@ public final class RoamingAppModel {
 
   // MARK: Trust prompts
 
+  /// Includes the visible prompt. Overflow is rejected without suspending.
+  static let maxPendingConnectionPrompts = 32
+
   /// Shows `prompt` (queued behind any other) and waits for the user. A
-  /// changed key is always answered `.reject`.
+  /// changed key is always answered `.reject`. Rejects overflow or an ID
+  /// already awaiting a decision.
   public func requestTrust(_ prompt: TrustPrompt) async -> TrustDecision {
-    await withCheckedContinuation { continuation in
-      trustQueue.append((prompt, continuation))
-      showNextTrustPrompt()
+    guard !Task.isCancelled,
+      trustRequests.count < Self.maxPendingConnectionPrompts,
+      trustRequests[prompt.id] == nil
+    else { return .reject }
+    trustRequests[prompt.id] = prompt.host
+    defer { trustRequests[prompt.id] = nil }
+    let decision = await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        if Task.isCancelled
+          || trustQueue.count >= Self.maxPendingConnectionPrompts
+          || trustQueue.contains(where: { $0.prompt.id == prompt.id })
+        {
+          continuation.resume(returning: TrustDecision.reject)
+        } else {
+          trustQueue.append((prompt, continuation))
+          showNextTrustPrompt()
+          // Cancellation can win before this append. The handler then
+          // finds nothing to resume, so re-check before waiting.
+          if Task.isCancelled { cancelTrust(prompt.id) }
+        }
+      }
+    } onCancel: {
+      self.resumePromptCancellation { self.cancelTrust(prompt.id) }
+    }
+    return Task.isCancelled || trustRequests[prompt.id] != prompt.host
+      ? .reject : decision
+  }
+
+  /// A changed key blocks sign-in already: its notice needs no waiting task.
+  /// Coalesce repeat notices while preserving the visible prompt and decisions.
+  func notifyChangedKey(_ prompt: TrustPrompt) {
+    guard prompt.kind == .changedKey,
+      trustQueue.count < Self.maxPendingConnectionPrompts,
+      !trustQueue.contains(where: {
+        $0.prompt.kind == .changedKey && $0.prompt.host == prompt.host
+          && $0.prompt.fingerprint == prompt.fingerprint
+      })
+    else { return }
+    trustQueue.append((prompt, nil))
+    showNextTrustPrompt()
+  }
+
+  /// Resumes the prompt on this turn when cancellation is already on the
+  /// main thread. A later unstructured hop misses the one-second wait
+  /// while the main actor is busy, and a hop that runs before enqueue
+  /// never resumes the continuation.
+  nonisolated private func resumePromptCancellation(
+    _ cancel: @escaping @MainActor () -> Void
+  ) {
+    if Thread.isMainThread {
+      MainActor.assumeIsolated(cancel)
+    } else {
+      Task { @MainActor in cancel() }
     }
   }
 
-  public func resolveTrust(_ decision: TrustDecision) {
-    guard let prompt = pendingTrust else { return }
+  private func cancelTrust(_ id: UUID) {
+    guard let index = trustQueue.firstIndex(where: { $0.prompt.id == id })
+    else { return }
+    let cancelled = trustQueue.remove(at: index)
+    if pendingTrust?.id == id { pendingTrust = nil }
+    cancelled.continuation?.resume(returning: .reject)
+    showNextTrustPrompt()
+  }
+
+  /// View callbacks pass their prompt id, so a stale sheet cannot
+  /// answer a different host's newly displayed prompt.
+  public func resolveTrust(_ decision: TrustDecision, for id: UUID? = nil) {
+    guard let prompt = pendingTrust, id == nil || id == prompt.id else {
+      return
+    }
     pendingTrust = nil
     let final = prompt.kind == .changedKey ? .reject : decision
     if let index = trustQueue.firstIndex(where: { $0.prompt.id == prompt.id }) {
-      trustQueue.remove(at: index).continuation.resume(returning: final)
+      trustQueue.remove(at: index).continuation?.resume(returning: final)
     }
     onTrustDecision?(prompt, final)
     showNextTrustPrompt()
@@ -503,31 +661,97 @@ public final class RoamingAppModel {
 
   /// The remembered password for `host`, or a prompt for one. Returns
   /// `nil` when the user cancels.
-  func password(for host: HostProfile, retry: Bool) async -> String? {
+  func password(
+    for host: HostProfile,
+    retry: Bool,
+    rejectedPassword: String? = nil
+  ) async -> String? {
+    guard !Task.isCancelled else { return nil }
     if retry {
-      passwords[host.id] = nil
-    } else if let known = passwords[host.id] {
-      return known
+      if let rejectedPassword {
+        forgetRejectedPassword(rejectedPassword, for: host)
+        if let known = passwords[host.id], known.host == host {
+          return known.value
+        }
+      } else {
+        forgetPassword(for: host)
+      }
+    } else if let known = passwords[host.id], known.host == host {
+      return known.value
+    }
+    guard passwordRequests.count < Self.maxPendingConnectionPrompts else {
+      return nil
     }
     let prompt = PasswordPrompt(host: host, isRetry: retry)
-    let answer = await withCheckedContinuation { continuation in
-      passwordQueue.append((prompt, continuation))
-      showNextPasswordPrompt()
+    passwordRequests[prompt.id] = host
+    defer { passwordRequests[prompt.id] = nil }
+    let answer: String? = await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        if Task.isCancelled
+          || passwordQueue.count >= Self.maxPendingConnectionPrompts
+        {
+          continuation.resume(returning: nil)
+        } else {
+          passwordQueue.append((prompt, continuation))
+          showNextPasswordPrompt()
+          if Task.isCancelled { cancelPassword(prompt.id) }
+        }
+      }
+    } onCancel: {
+      self.resumePromptCancellation { self.cancelPassword(prompt.id) }
     }
-    if let answer { passwords[host.id] = answer }
+    guard !Task.isCancelled, passwordRequests[prompt.id] == host else {
+      return nil
+    }
+    let current = hosts.first { $0.id == host.id }
+    if let answer, current == nil || current == host {
+      passwords[host.id] = (host, answer)
+    }
     return answer
   }
 
-  /// Drops a password the server rejected.
+  private func cancelPassword(_ id: UUID) {
+    guard let index = passwordQueue.firstIndex(where: { $0.prompt.id == id })
+    else { return }
+    let cancelled = passwordQueue.remove(at: index)
+    if pendingPassword?.id == id { pendingPassword = nil }
+    cancelled.continuation.resume(returning: nil)
+    showNextPasswordPrompt()
+  }
+
+  /// Invalidates remembered and pending passwords for this exact profile.
   func forgetPassword(for host: HostProfile) {
+    if passwords[host.id]?.host == host { passwords[host.id] = nil }
+    invalidatePasswordRequests { $0 == host }
+  }
+
+  /// An older attempt may reject a different password or profile. Its failure
+  /// must not cancel fresh consent or clear a newer remembered credential.
+  func forgetRejectedPassword(_ password: String, for host: HostProfile) {
+    guard let known = passwords[host.id], known.host == host,
+      known.value == password
+    else { return }
     passwords[host.id] = nil
   }
 
+  private func invalidatePasswordRequests(
+    matching matches: (HostProfile) -> Bool
+  ) {
+    passwordRequests = passwordRequests.filter { !matches($0.value) }
+    let ids = passwordQueue.filter { matches($0.prompt.host) }
+      .map { $0.prompt.id }
+    for id in ids { cancelPassword(id) }
+  }
+
   /// Answers `pendingPassword`; `nil` cancels.
-  public func resolvePassword(_ password: String?) {
-    guard let prompt = pendingPassword else { return }
+  /// View callbacks pass the prompt id to reject stale answers.
+  public func resolvePassword(_ password: String?, for id: UUID? = nil) {
+    guard let prompt = pendingPassword, id == nil || id == prompt.id else {
+      return
+    }
     pendingPassword = nil
-    if let index = passwordQueue.firstIndex(where: { $0.prompt.id == prompt.id }) {
+    if let index = passwordQueue.firstIndex(where: { $0.prompt.id == prompt.id }
+    ) {
       let value = password.flatMap { $0.isEmpty ? nil : $0 }
       passwordQueue.remove(at: index).continuation.resume(returning: value)
     }
@@ -545,7 +769,8 @@ public final class RoamingAppModel {
 
   private static func loadCompanionSettings() -> CompanionSettings {
     guard let data = UserDefaults.standard.data(forKey: settingsKey),
-      let settings = try? JSONDecoder().decode(CompanionSettings.self, from: data)
+      let settings = try? JSONDecoder()
+        .decode(CompanionSettings.self, from: data)
     else { return .default }
     return settings
   }
@@ -572,20 +797,31 @@ extension HostProfile {
 /// still needs fresh SSH authorization. Stored in `UserDefaults`.
 public struct SessionResumeStore: @unchecked Sendable {
   public static let key = "roaming.resume.v1"
+  // UserDefaults synchronizes individual operations, not read/modify/write.
+  // Share ownership across instances, including separate handles for one suite.
+  // Recursive locking permits synchronous defaults observers to read the store.
+  private static let access = NSRecursiveLock()
   let defaults: UserDefaults
   let key: String
 
-  public init(defaults: UserDefaults = .standard, key: String = SessionResumeStore.key) {
+  public init(
+    defaults: UserDefaults = .standard,
+    key: String = SessionResumeStore.key,
+  ) {
     self.defaults = defaults
     self.key = key
   }
 
   /// Host id to session id, skipping malformed entries.
   public func all() -> [UUID: SessionID] {
-    guard let raw = defaults.dictionary(forKey: key) as? [String: String] else { return [:] }
+    Self.access.lock()
+    defer { Self.access.unlock() }
+    guard let raw = defaults.dictionary(forKey: key) else { return [:] }
     var out: [UUID: SessionID] = [:]
     for (host, session) in raw {
-      if let host = UUID(uuidString: host), let session = SessionID(hex: session) {
+      if let session = session as? String, let host = UUID(uuidString: host),
+        let session = SessionID(hex: session)
+      {
         out[host] = session
       }
     }
@@ -595,7 +831,9 @@ public struct SessionResumeStore: @unchecked Sendable {
   public func sessionID(for host: UUID) -> SessionID? { all()[host] }
 
   public func set(_ session: SessionID?, for host: UUID) {
-    var raw = (defaults.dictionary(forKey: key) as? [String: String]) ?? [:]
+    Self.access.lock()
+    defer { Self.access.unlock() }
+    var raw = defaults.dictionary(forKey: key) ?? [:]
     raw[host.uuidString] = session?.hex
     defaults.set(raw, forKey: key)
   }
@@ -609,10 +847,13 @@ public final class TransferPausePolicy {
   public let gate = TransferPauseGate()
   /// Whether bulk transfers are currently held.
   public private(set) var isPaused = false
-  @ObservationIgnored private var pendingInput = false
-  @ObservationIgnored private var suspended = false
+  @ObservationIgnored
+  private var pendingInput = false
+  @ObservationIgnored
+  private var suspended = false
   /// Gate updates run in order, each after the previous one.
-  @ObservationIgnored private var lastUpdate: Task<Void, Never>?
+  @ObservationIgnored
+  private var lastUpdate: Task<Void, Never>?
 
   public init() {}
 

@@ -162,11 +162,12 @@ extension ProgramStatusCommand {
       // Malformed pairs (no `=`, a key outside `[a-z]+`, a value byte
       // outside `[A-Za-z0-9_.,+/=-]`) are skipped, except `id`, whose
       // grammar decides the whole report.
-      guard let eq = pair.firstIndex(of: 0x3D), eq != pair.startIndex,
-        pair[..<eq].allSatisfy({ $0 &- 0x61 < 26 })
-      else { continue }
-      let key = Substring(pair[..<eq])
-      let value = Substring(pair[pair.index(after: eq)...])
+      guard let eq = pair.firstIndex(of: 0x3D) else { continue }
+      let key = Self.trimWhitespace(Substring(pair[..<eq]))
+      let value = Self.trimWhitespace(Substring(pair[pair.index(after: eq)...]))
+      guard !key.isEmpty, key.utf8.allSatisfy({ $0 &- 0x61 < 26 }) else {
+        continue
+      }
       guard key.utf8.count <= Self.maxKeyBytes else { return nil }
       guard key == "id" || value.utf8.allSatisfy(Self.isValueByte) else {
         continue
@@ -246,6 +247,14 @@ extension ProgramStatusCommand {
   }
 
   /// `[A-Za-z0-9_.,+/=-]`: any value.
+  private static func trimWhitespace(_ value: Substring) -> Substring {
+    let trimmed = value.drop(while: { $0.isWhitespace })
+    guard let last = trimmed.lastIndex(where: { !$0.isWhitespace }) else {
+      return trimmed[trimmed.endIndex...]
+    }
+    return trimmed[...last]
+  }
+
   static func isValueByte(_ b: UInt8) -> Bool {
     isNameByte(b) || b == 0x2C || b == 0x2F || b == 0x3D
   }

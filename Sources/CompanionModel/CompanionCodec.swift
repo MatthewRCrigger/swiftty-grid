@@ -19,27 +19,25 @@ public enum CompanionCodecError: Error, Hashable, Sendable {
 /// size check precedes any parsing. Unknown versions and unexpected
 /// fields are rejected, and text is sanitized on the way in.
 public enum CompanionCodec {
-  public static func encode(_ request: CompanionRequest) throws(CompanionCodecError) -> Data {
-    try encodeValue(request)
-  }
+  public static func encode(
+    _ request: CompanionRequest
+  ) throws(CompanionCodecError) -> Data { try encodeValue(request) }
 
-  public static func encode(_ reply: CompanionReply) throws(CompanionCodecError) -> Data {
-    try encodeValue(reply)
-  }
+  public static func encode(
+    _ reply: CompanionReply
+  ) throws(CompanionCodecError) -> Data { try encodeValue(reply) }
 
   public static func encode(
     _ context: CompanionApplicationContext
-  ) throws(CompanionCodecError) -> Data {
-    try encodeValue(context)
-  }
+  ) throws(CompanionCodecError) -> Data { try encodeValue(context) }
 
-  public static func decodeRequest(_ data: Data) throws(CompanionCodecError) -> CompanionRequest {
-    try decodeValue(data)
-  }
+  public static func decodeRequest(
+    _ data: Data
+  ) throws(CompanionCodecError) -> CompanionRequest { try decodeValue(data) }
 
-  public static func decodeReply(_ data: Data) throws(CompanionCodecError) -> CompanionReply {
-    try decodeValue(data)
-  }
+  public static func decodeReply(
+    _ data: Data
+  ) throws(CompanionCodecError) -> CompanionReply { try decodeValue(data) }
 
   public static func decodeContext(
     _ data: Data
@@ -47,36 +45,31 @@ public enum CompanionCodec {
     try decodeValue(data)
   }
 
-  static func encodeValue<T: Encodable>(_ value: T) throws(CompanionCodecError) -> Data {
+  static func encodeValue<T: Encodable>(
+    _ value: T
+  ) throws(CompanionCodecError) -> Data {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]
     let data: Data
-    do {
-      data = try encoder.encode(value)
-    } catch {
-      throw .malformed
-    }
+    do { data = try encoder.encode(value) } catch { throw .malformed }
     guard data.count <= CompanionLimits.maxPayloadBytes else {
       throw .tooLarge(data.count)
     }
     return data
   }
 
-  static func decodeValue<T: Decodable>(_ data: Data) throws(CompanionCodecError) -> T {
+  static func decodeValue<T: Decodable>(
+    _ data: Data
+  ) throws(CompanionCodecError) -> T {
     guard data.count <= CompanionLimits.maxPayloadBytes else {
       throw .tooLarge(data.count)
     }
     // Every companion payload is a JSON object.
-    guard data.first(where: { !isJSONWhitespace($0) }) == UInt8(ascii: "{") else {
-      throw .malformed
-    }
-    do {
-      return try JSONDecoder().decode(T.self, from: data)
-    } catch let error as CompanionCodecError {
-      throw error
-    } catch {
-      throw .malformed
-    }
+    guard data.first(where: { !isJSONWhitespace($0) }) == UInt8(ascii: "{")
+    else { throw .malformed }
+    do { return try JSONDecoder().decode(T.self, from: data) } catch let error
+      as CompanionCodecError
+    { throw error } catch { throw .malformed }
   }
 
   private static func isJSONWhitespace(_ byte: UInt8) -> Bool {

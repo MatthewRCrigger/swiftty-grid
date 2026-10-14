@@ -10,9 +10,9 @@ enum RoamingStorage {
   static var directory: URL {
     if let override = UITesting.storageDirectory { return override }
     #if os(tvOS)
-      let base = URL.cachesDirectory
+    let base = URL.cachesDirectory
     #else
-      let base = URL.applicationSupportDirectory
+    let base = URL.applicationSupportDirectory
     #endif
     return base.appending(path: "RoamingSSH", directoryHint: .isDirectory)
   }
@@ -57,12 +57,15 @@ enum SSHAccessError: Error, Equatable, Sendable {
   var detail: String {
     switch self {
     case .cancelled: "No credentials were sent."
-    case .keyUnavailable: "The Keychain key for this host could not be read or created."
+    case .keyUnavailable:
+      "The Keychain key for this host could not be read or created."
     case .hostKeyChanged:
       "The key presented differs from the trusted key, so the connection was blocked. "
         + "Verify the Mac's key before removing the old one."
-    case .hostKeyRejected: "The connection was closed before any credentials were sent."
-    case .trustStoreUnavailable: "The list of trusted host keys could not be read or written."
+    case .hostKeyRejected:
+      "The connection was closed before any credentials were sent."
+    case .trustStoreUnavailable:
+      "The list of trusted host keys could not be read or written."
     case .authenticationFailed(let line?):
       "Add this public key to ~/.ssh/authorized_keys on the Mac:\n\(line)"
     case .authenticationFailed(nil): "The server rejected the credentials."
@@ -86,31 +89,37 @@ final class SSHAccess {
 
   init(app: RoamingAppModel, trustStore: FileHostTrustStore? = nil) {
     self.app = app
-    self.trustStore = trustStore ?? FileHostTrustStore(fileURL: RoamingStorage.knownHostsURL)
+    self.trustStore =
+      trustStore ?? FileHostTrustStore(fileURL: RoamingStorage.knownHostsURL)
   }
 
-  func configuration(for host: HostProfile) -> SSHClient.SSHClientConfiguration {
-    SSHClient.SSHClientConfiguration(host: host.host, port: host.port, username: host.username)
+  func configuration(for host: HostProfile) -> SSHClient.SSHClientConfiguration
+  {
+    SSHClient.SSHClientConfiguration(
+      host: host.host,
+      port: host.port,
+      username: host.username
+    )
   }
 
   /// The credential for `host`: a password from memory or a prompt, or
   /// the Keychain key named by the profile (created on first use).
   func credential(
     for host: HostProfile,
-    retry: Bool = false
+    retry: Bool = false,
+    rejectedPassword: String? = nil
   ) async throws(SSHAccessError) -> SSHCredential {
     switch host.auth {
     case .password:
-      guard let app, let password = await app.password(for: host, retry: retry) else {
-        throw .cancelled
-      }
+      guard let app, let password = await app.password(
+        for: host, retry: retry, rejectedPassword: rejectedPassword
+      )
+      else { throw .cancelled }
       return .password(password)
     case .keychainKey(let label):
       do {
         return .ed25519(try await keyStore.loadOrCreateKey(label: label))
-      } catch {
-        throw .keyUnavailable
-      }
+      } catch { throw .keyUnavailable }
     }
   }
 
@@ -119,23 +128,38 @@ final class SSHAccess {
     guard case .keychainKey(let label) = host.auth,
       let key = try? await keyStore.loadOrCreateKey(label: label)
     else { return nil }
-    return SSHEd25519Key.authorizedKeysLine(for: key.publicKey, comment: "roaming-ssh")
+    return SSHEd25519Key.authorizedKeysLine(
+      for: key.publicKey,
+      comment: "roaming-ssh"
+    )
   }
 
   /// A connection after host-key verification (prompting for an unknown
   /// key) and authentication. A rejected password is asked for once more.
-  func connect(_ host: HostProfile) async throws(SSHAccessError) -> SSHConnection {
-    try await settleTrust(for: host)
+  func connect(
+    _ host: HostProfile,
+    interactive: Bool = true
+  ) async throws(SSHAccessError) -> SSHConnection {
+    if !interactive, case .password = host.auth { throw .cancelled }
+    try await settleTrust(for: host, interactive: interactive)
     var retry = false
+    var rejectedPassword: String?
     while true {
-      let credential = try await credential(for: host, retry: retry)
+      let credential = try await credential(
+        for: host, retry: retry, rejectedPassword: rejectedPassword
+      )
       do {
-        return try await connect(host, credential: credential)
+        return try await connect(
+          host,
+          credential: credential,
+          interactive: interactive
+        )
       } catch .authenticationFailed(let line) {
         guard case .password = host.auth, !retry else {
           throw .authenticationFailed(publicKeyLine: line)
         }
         retry = true
+        if case let .password(password) = credential { rejectedPassword = password }
       }
     }
   }
@@ -143,15 +167,17 @@ final class SSHAccess {
   /// Settles an unknown host key before any credential is asked for, so
   /// the user never types a password for a server they have not trusted
   /// (spec §5.1). The probe connection offers no credential.
-  private func settleTrust(for host: HostProfile) async throws(SSHAccessError) {
+  private func settleTrust(
+    for host: HostProfile,
+    interactive: Bool
+  ) async throws(SSHAccessError) {
     guard let identity = configuration(for: host).hostIdentity else { return }
     let known: String?
-    do {
-      known = try await trustStore.trustedKey(for: identity)
-    } catch {
+    do { known = try await trustStore.trustedKey(for: identity) } catch {
       throw .trustStoreUnavailable
     }
     guard known == nil else { return }
+    guard interactive else { throw .hostKeyRejected }
     do {
       _ = try await SSHConnection.verifyHostKey(
         configuration: configuration(for: host),
@@ -160,9 +186,9 @@ final class SSHAccess {
       )
     } catch let error as SSHClientError {
       throw await map(error, host: host)
-    } catch {
-      throw .unreachable
-    }
+    } catch is CancellationError {
+      throw .cancelled
+    } catch { throw .unreachable }
   }
 
   /// Asks the user about an unknown key for `host`.
@@ -175,16 +201,19 @@ final class SSHAccess {
         keyAlgorithm: request.keyType,
         fingerprint: request.fingerprint
       )
-      return await app.requestTrust(prompt) == .trust ? .trustAndRemember : .reject
+      return await app.requestTrust(prompt) == .trust
+        ? .trustAndRemember : .reject
     }
   }
 
   /// Connects with `credential`, asking the user about an unknown key.
   func connect(
     _ host: HostProfile,
-    credential: SSHCredential
+    credential: SSHCredential,
+    interactive: Bool = true
   ) async throws(SSHAccessError) -> SSHConnection {
-    let decider = trustDecider(for: host)
+    let decider: any HostTrustDecider =
+      interactive ? trustDecider(for: host) : RejectUnknownHostKeys()
     do {
       return try await SSHConnection.connect(
         configuration: configuration(for: host),
@@ -193,15 +222,16 @@ final class SSHAccess {
         trustDecider: decider
       )
     } catch let error as SSHClientError {
-      throw await map(error, host: host)
-    } catch {
-      throw .unreachable
-    }
+      throw await map(error, host: host, interactive: interactive, credential: credential)
+    } catch is CancellationError {
+      throw .cancelled
+    } catch { throw .unreachable }
   }
 
   /// The bootstrap endpoint for automatic roaming (re)connects. The host
   /// key must already be trusted: reconnects never prompt.
-  func endpoint(for host: HostProfile, credential: SSHCredential) -> SSHEndpoint {
+  func endpoint(for host: HostProfile, credential: SSHCredential) -> SSHEndpoint
+  {
     SSHEndpoint(
       configuration: configuration(for: host),
       credential: credential,
@@ -210,25 +240,34 @@ final class SSHAccess {
     )
   }
 
-  private func map(_ error: SSHClientError, host: HostProfile) async -> SSHAccessError {
+  private func map(
+    _ error: SSHClientError,
+    host: HostProfile,
+    interactive: Bool = true,
+    credential: SSHCredential? = nil
+  ) async -> SSHAccessError {
     switch error {
     case let .hostKeyChanged(_, _, presented):
       // Shown, never accepted: a changed key always blocks.
-      if let app {
+      if interactive, let app {
         let prompt = TrustPrompt(
           host: host,
           kind: .changedKey,
           keyAlgorithm: "Presented key",
           fingerprint: presented
         )
-        Task { _ = await app.requestTrust(prompt) }
+        app.notifyChangedKey(prompt)
       }
       return .hostKeyChanged
     case .hostKeyRejected: return .hostKeyRejected
     case .trustStoreUnavailable: return .trustStoreUnavailable
     case .authenticationFailed:
-      if case .password = host.auth { app?.forgetPassword(for: host) }
-      return .authenticationFailed(publicKeyLine: await publicKeyLine(for: host))
+      if let credential, case let .password(password) = credential {
+        app?.forgetRejectedPassword(password, for: host)
+      }
+      return .authenticationFailed(
+        publicKeyLine: await publicKeyLine(for: host)
+      )
     default: return .unreachable
     }
   }

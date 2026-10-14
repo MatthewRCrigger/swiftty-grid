@@ -21,6 +21,7 @@ package final class Shaper {
   }
 
   private var cache: [Key: [Glyph]] = [:]
+  private var cachedFont: ResolvedFont?
   static let cacheLimit = 4096
   private let memoryLimit: Int
   private(set) var cachedMemoryCost = 0
@@ -36,6 +37,11 @@ package final class Shaper {
     style: FontStyle,
     font: ResolvedFont
   ) -> [Glyph] {
+    if cachedFont !== font {
+      cache.removeAll(keepingCapacity: true)
+      cachedMemoryCost = 0
+      cachedFont = font
+    }
     let key = Key(scalars: scalars, style: style.rawValue)
     if let hit = cache[key] { return hit }
     var text = String.UnicodeScalarView()

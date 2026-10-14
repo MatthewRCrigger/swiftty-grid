@@ -49,7 +49,7 @@ let exe = URL(fileURLWithPath: CommandLine.arguments[0])
 let launcher = exe.deletingLastPathComponent().appending(path: "swmux-launcher")
   .path
 var config = MuxServiceConfiguration(launcherPath: launcher)
-let service = MuxService(configuration: config)
+let service = try MuxService(configuration: config)
 let endpoint = service.listenAnonymously()
 let env = [
   "PATH": "/usr/bin:/bin", "PS1": "$ ", "HOME": NSTemporaryDirectory(),
@@ -80,7 +80,7 @@ func create(
         NewWorkspaceRequest(columns: columns, rows: rows, launch: launch)
       )
     )
-  else { fatalError("create") }
+  else { throw MuxError(.invalidRequest, "benchmark create reply") }
   return ws
 }
 
@@ -92,7 +92,7 @@ func show(
   rows: Int = 50
 ) async throws {
   guard case let .attached(_, snap) = try await c.execute(.attach(.id(ws.id)))
-  else { fatalError() }
+  else { throw MuxError(.invalidRequest, "unexpected benchmark reply") }
   try await c.execute(
     .setGeometry(
       GeometryBatch(
@@ -108,8 +108,10 @@ func show(
 // MARK: Corpus
 
 let corpusURL = URL(fileURLWithPath: NSTemporaryDirectory())
-  .appending(path: "swiftmux-bench.txt")
-let corpusBytes: Int = {
+  .appending(path: "swiftmux-bench-\(UUID().uuidString).txt")
+let corpusShellPath =
+  "'" + corpusURL.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+let corpusResult: Result<Int, any Error> = Result {
   var line = ""
   for i in 0 ..< 400 {
     line += i % 7 == 0 ? "\u{1B}[3\(i % 8)m" : ""
@@ -121,21 +123,24 @@ let corpusBytes: Int = {
   let data = Data(block.utf8)
   var out = Data()
   while out.count < 32 << 20 { out.append(data) }
-  do { try out.write(to: corpusURL) } catch { fatalError("corpus: \(error)") }
+  try out.write(to: corpusURL)
   return out.count
-}()
+}
+let corpusBytes = (try? corpusResult.get()) ?? 0
 
 // MARK: Throughput
 
 func throughput(attached: Bool) async throws -> (mbps: Double, frames: Int) {
   let c = try await connect()
   let start = now()
-  let ws = try await create(c, spec("cat \(corpusURL.path)"))
+  let ws = try await create(c, spec("cat \(corpusShellPath)"))
   let pane = ws.tabs[0].activePane
   var frames = 0
+  let deadline = ContinuousClock.now + .seconds(30)
   if attached {
     try await show(c, ws, panes: [pane])
-    loop: while let event = try await c.nextEvent() {
+    loop: while true {
+      let event = try await benchmarkEvent(c, until: deadline)
       switch event {
       case .frame: frames += 1
       case .paneExited: break loop
@@ -144,7 +149,15 @@ func throughput(attached: Bool) async throws -> (mbps: Double, frames: Int) {
     }
   } else {
     while true {
-      guard case let .status(s) = try await c.execute(.status) else { break }
+      guard ContinuousClock.now < deadline else {
+        throw MuxConnection.EventWaitError.timedOut
+      }
+      guard
+        case let .status(s) = try await c.execute(
+          .status,
+          timeout: deadline - ContinuousClock.now
+        )
+      else { throw MuxError(.invalidRequest, "benchmark status reply") }
       if s.panes == 0 { break }
       try await Task.sleep(for: .milliseconds(2))
     }
@@ -170,8 +183,9 @@ func latency(samples: Int) async throws -> [Double] {
   var lastX = -1
   var lastY = -1
   // The first complete frame is the baseline.
+  let ready = ContinuousClock.now + .seconds(30)
   while true {
-    if case let .frame(f)? = try await c.nextEvent() {
+    if case let .frame(f) = try await benchmarkEvent(c, until: ready) {
       lastX = f.cursor.x
       lastY = f.cursor.y
       break
@@ -182,8 +196,10 @@ func latency(samples: Int) async throws -> [Double] {
   for i in 0 ..< samples {
     let t0 = now()
     try await c.send(.text(i % 100 == 99 ? "\r" : "x"), to: pane)
+    let deadline = ContinuousClock.now + .seconds(5)
     while true {
-      guard case let .frame(f)? = try await c.nextEvent() else { continue }
+      guard case let .frame(f) = try await benchmarkEvent(c, until: deadline)
+      else { continue }
       if f.cursor.x != lastX || f.cursor.y != lastY {
         lastX = f.cursor.x
         lastY = f.cursor.y
@@ -256,7 +272,7 @@ func exportImport(
         from: data,
         limit: 32 << 20
       )
-    else { fatalError() }
+    else { throw MuxError(.invalidRequest, "unexpected benchmark reply") }
     _ = try FrameImporter.snapshot(from: decoded, sequence: 1)
     importTimes.append((now() - t1) * 1000)
     frame = decoded
@@ -276,15 +292,16 @@ func exportImport(
     )
     d.usage = [.renderTarget, .shaderRead]
     d.storageMode = .private
-    let texture = device.makeTexture(descriptor: d)!
+    guard let texture = device.makeTexture(descriptor: d) else {
+      throw RendererError.resourceUnavailable("benchmark target texture")
+    }
     for i in 0 ..< 45 {
       let snapshot = try FrameImporter.snapshot(
         from: frame,
         sequence: UInt64(i + 1)
       )
       let t0 = now()
-      let command = renderer.render(snapshot, to: texture)
-      command.waitUntilCompleted()
+      try checkedRender(renderer, snapshot, to: texture)
       if i >= 5 { gpu.append((now() - t0) * 1000) }
     }
   }
@@ -301,7 +318,7 @@ func load(
 ) async throws -> (cpu: Double, mb: Double, framesPerSecond: Double) {
   let limits = MuxLimits.standard
   let c = try await connect()
-  let noisy = spec("while :; do cat \(corpusURL.path); done")
+  let noisy = spec("while :; do cat \(corpusShellPath); done")
   var workspaces: [WorkspaceSnapshot] = []
   for _ in 0 ..< limits.maxPanes {
     workspaces.append(try await create(c, noisy, columns: 120, rows: 40))
@@ -323,8 +340,15 @@ func load(
   let cpu0 = cpuSeconds()
   let t0 = now()
   if visible > 0 {
-    while now() - t0 < seconds {
-      if case .frame? = try await c.nextEvent() { frames += 1 }
+    let deadline = ContinuousClock.now + .seconds(seconds)
+    while ContinuousClock.now < deadline {
+      do {
+        if case .frame = try await benchmarkEvent(c, until: deadline) {
+          frames += 1
+        }
+      } catch MuxConnection.EventWaitError.timedOut
+        where ContinuousClock.now >= deadline
+      { break }
     }
   } else {
     try await Task.sleep(for: .seconds(seconds))
@@ -335,9 +359,7 @@ func load(
   if visible > 0 { try await c.execute(.detach) }
   try await c.execute(.endAllWorkspaces)
   try await c.execute(.quiesce(false))
-  while case let .status(s) = try await c.execute(.status), s.panes > 0 {
-    try await Task.sleep(for: .milliseconds(50))
-  }
+  try await awaitPaneCleanup(c)
   await c.close()
   return (cpu, mb, Double(frames) / elapsed)
 }
@@ -360,7 +382,9 @@ func pasteLimit() async throws -> Double {
   let t0 = now()
   let state = try await c.paste(String(text.prefix(1 << 20)), to: pane)
   let elapsed = (now() - t0) * 1000
-  precondition(state == .completed)
+  guard state == .completed else {
+    throw MuxError(.invalidRequest, "benchmark paste incomplete")
+  }
   _ = try? await c.execute(.endWorkspace(.id(ws.id)))
   await c.close()
   return elapsed
@@ -380,8 +404,9 @@ func historySearch() async throws -> (rows: Int, ms: Double) {
   let pane = ws.tabs[0].activePane
   try await show(c, ws, panes: [pane], columns: 80, rows: 24)
   var rows = 0
+  let deadline = ContinuousClock.now + .seconds(30)
   while rows < MuxLimits.standard.historyRowsPerPane {
-    if case let .frame(f)? = try await c.nextEvent() {
+    if case let .frame(f) = try await benchmarkEvent(c, until: deadline) {
       rows = f.history.scrollbackRows
     }
   }
@@ -391,9 +416,11 @@ func historySearch() async throws -> (rows: Int, ms: Double) {
     case let .search(result) = try await c.execute(
       .search(pane: pane, query: "history-row-1999")
     )
-  else { fatalError() }
+  else { throw MuxError(.invalidRequest, "unexpected benchmark reply") }
   let elapsed = (now() - t0) * 1000
-  precondition(result.matchCount >= 1)
+  guard result.matchCount >= 1 else {
+    throw MuxError(.invalidRequest, "benchmark search found no match")
+  }
   _ = try? await c.execute(.endWorkspace(.id(ws.id)))
   await c.close()
   return (rows, elapsed)
@@ -404,10 +431,10 @@ func visibleLimit(
   seconds: Double
 ) async throws -> (cpu: Double, mb: Double, fps: Double, panes: Int) {
   let c = try await connect()
-  let noisy = spec("while :; do cat \(corpusURL.path); done")
+  let noisy = spec("while :; do cat \(corpusShellPath); done")
   var ws = try await create(c, noisy, columns: 512, rows: 255)
   guard case let .attached(_, snap) = try await c.execute(.attach(.id(ws.id)))
-  else { fatalError() }
+  else { throw MuxError(.invalidRequest, "unexpected benchmark reply") }
   ws = snap
   var panes = ws.tabs[0].layout.panes
   var axis = SplitAxis.leftRight
@@ -419,7 +446,7 @@ func visibleLimit(
         case let .layout(l) = try await c.execute(
           .split(pane: pane, axis: axis, launch: noisy)
         )
-      else { fatalError() }
+      else { throw MuxError(.invalidRequest, "unexpected benchmark reply") }
       ws = l
       next.append(l.tabs[0].activePane)
     }
@@ -451,8 +478,15 @@ func visibleLimit(
   let cpu0 = cpuSeconds()
   let t0 = now()
   var count = 0
-  while now() - t0 < seconds {
-    if case .frame? = try await c.nextEvent() { count += 1 }
+  let deadline = ContinuousClock.now + .seconds(seconds)
+  while ContinuousClock.now < deadline {
+    do {
+      if case .frame = try await benchmarkEvent(c, until: deadline) {
+        count += 1
+      }
+    } catch MuxConnection.EventWaitError.timedOut
+      where ContinuousClock.now >= deadline
+    { break }
   }
   let elapsed = now() - t0
   let result = (
@@ -462,9 +496,7 @@ func visibleLimit(
   try await c.execute(.detach)
   try await c.execute(.endAllWorkspaces)
   try await c.execute(.quiesce(false))
-  while case let .status(s) = try await c.execute(.status), s.panes > 0 {
-    try await Task.sleep(for: .milliseconds(50))
-  }
+  try await awaitPaneCleanup(c)
   await c.close()
   return result
 }
@@ -475,7 +507,11 @@ func visibleLimit(
 /// back-to-back 512x256 frames (a busy neighbouring pane or app).
 func noisyGPU() throws -> (quiet: [Double], noisy: [Double])? {
   guard let device = MTLCreateSystemDefaultDevice() else { return nil }
-  func target(_ r: MetalRenderer, _ columns: Int, _ rows: Int) -> MTLTexture {
+  func target(
+    _ r: MetalRenderer,
+    _ columns: Int,
+    _ rows: Int
+  ) throws -> MTLTexture {
     let d = MTLTextureDescriptor.texture2DDescriptor(
       pixelFormat: .bgra8Unorm,
       width: Int(r.cellSize.width) * columns + 16,
@@ -484,7 +520,10 @@ func noisyGPU() throws -> (quiet: [Double], noisy: [Double])? {
     )
     d.usage = [.renderTarget, .shaderRead]
     d.storageMode = .private
-    return device.makeTexture(descriptor: d)!
+    guard let texture = device.makeTexture(descriptor: d) else {
+      throw RendererError.resourceUnavailable("benchmark target texture")
+    }
+    return texture
   }
   func snapshot(_ columns: Int, _ rows: Int) throws -> RenderSnapshot {
     let session = filledState(columns: columns, rows: rows)
@@ -516,129 +555,212 @@ func noisyGPU() throws -> (quiet: [Double], noisy: [Double])? {
   )
   let small = try snapshot(200, 50)
   let large = try snapshot(512, 256)
-  let paneTexture = target(pane, 200, 50)
-  let noiseTexture = noise.withLock { target($0, 512, 256) }
-  func measure() -> [Double] {
+  let paneTexture = try target(pane, 200, 50)
+  let noiseTexture = try noise.withLock { try target($0, 512, 256) }
+  func measure() throws -> [Double] {
     var times: [Double] = []
     for i in 0 ..< 65 {
       let t0 = now()
-      pane.render(small, to: paneTexture).waitUntilCompleted()
+      try checkedRender(pane, small, to: paneTexture)
       if i >= 5 { times.append((now() - t0) * 1000) }
     }
     return times
   }
-  let quiet = measure()
+  let quiet = try measure()
   let stop = Atomic(false)
   let finished = DispatchSemaphore(value: 0)
+  let noiseError = Mutex<(any Error)?>(nil)
   let noiseThread = Thread {
     defer { finished.signal() }
-    noise.withLock { renderer in
-      while !stop.load(ordering: .relaxed) {
-        renderer.render(large, to: noiseTexture).waitUntilCompleted()
+    do {
+      try noise.withLock { renderer in
+        while !stop.load(ordering: .relaxed) {
+          try checkedRender(renderer, large, to: noiseTexture)
+        }
       }
-    }
+    } catch { noiseError.withLock { $0 = error } }
   }
   noiseThread.start()
   Thread.sleep(forTimeInterval: 0.2)
-  let noisy = measure()
+  let noisy: Result<[Double], any Error>
+  do { noisy = .success(try measure()) } catch { noisy = .failure(error) }
   stop.store(true, ordering: .relaxed)
-  finished.wait()
-  return (quiet, noisy)
+  guard finished.wait(timeout: .now() + .seconds(35)) == .success else {
+    throw RendererError.resourceUnavailable("benchmark noise thread timeout")
+  }
+  if let error = noiseError.withLock({ $0 }) { throw error }
+  return (quiet, try noisy.get())
 }
 
 // MARK: Run
 
-signal(SIGPIPE, SIG_IGN)
-setvbuf(stdout, nil, _IOLBF, 0)
-print("swiftmux-bench (\(SMX.build)); host \(ProcessInfo.processInfo.hostName)")
-print(
-  "  \(ProcessInfo.processInfo.operatingSystemVersionString), \(ProcessInfo.processInfo.activeProcessorCount) cores"
-)
-#if DEBUG
-print("  WARNING: debug build; use swift run -c release swiftmux-bench")
-#endif
-print("corpus: \(corpusBytes / 1_048_576) MiB of SGR/UTF-8/wide text")
-let idleMB = footprint()
-let detached = try await throughput(attached: false)
-print(
-  String(
-    format: "throughput, detached pane:            %7.1f MiB/s",
-    detached.mbps
-  )
-)
-let attached = try await throughput(attached: true)
-print(
-  String(
-    format: "throughput, attached 200x50 client:   %7.1f MiB/s (%d frames)",
-    attached.mbps,
-    attached.frames
-  )
-)
-let lat = try await latency(samples: 200)
-print(
-  "input-to-frame latency (XPC, PTY echo, export, decode): p50 \(ms(percentile(lat, 0.5))) p95 \(ms(percentile(lat, 0.95))) p99 \(ms(percentile(lat, 0.99)))"
-)
-for (cols, rows) in [(200, 50), (512, 256)] {
-  let r = try exportImport(columns: cols, rows: rows)
+do {
+  _ = try corpusResult.get()
+  signal(SIGPIPE, SIG_IGN)
+  setvbuf(stdout, nil, _IOLBF, 0)
   print(
-    "frame \(cols)x\(rows): \(r.bytes / 1024) KiB; "
-      + "export+encode p50 \(ms(percentile(r.export, 0.5))) "
-      + "p95 \(ms(percentile(r.export, 0.95))); "
-      + "decode+validate+import p50 \(ms(percentile(r.importing, 0.5))) "
-      + "p95 \(ms(percentile(r.importing, 0.95)))"
-      + (r.gpu.isEmpty
-        ? ""
-        : "; GPU render p50 \(ms(percentile(r.gpu, 0.5))) p95 \(ms(percentile(r.gpu, 0.95)))")
+    "swiftmux-bench (\(SMX.build)); host \(ProcessInfo.processInfo.hostName)"
   )
-}
-let noClient = try await load(seconds: 5, visible: 0)
-print(
-  String(
-    format:
-      "32 noisy panes, no client:   service CPU %6.1f%%, footprint %6.1f MiB",
-    noClient.cpu,
-    noClient.mb
-  )
-)
-let withClient = try await load(seconds: 5, visible: 1)
-print(
-  String(
-    format:
-      "32 noisy panes, 1 visible:   service CPU %6.1f%%, footprint %6.1f MiB, %.1f frames/s",
-    withClient.cpu,
-    withClient.mb,
-    withClient.framesPerSecond
-  )
-)
-if let gpu = try noisyGPU() {
   print(
-    "200x50 GPU render, quiet p50 \(ms(percentile(gpu.quiet, 0.5))) p95 \(ms(percentile(gpu.quiet, 0.95))); "
-      + "with a saturating 512x256 renderer p50 \(ms(percentile(gpu.noisy, 0.5))) p95 \(ms(percentile(gpu.noisy, 0.95)))"
+    "  \(ProcessInfo.processInfo.operatingSystemVersionString), \(ProcessInfo.processInfo.activeProcessorCount) cores"
   )
+  #if DEBUG
+  print("  WARNING: debug build; use swift run -c release swiftmux-bench")
+  #endif
+  print("corpus: \(corpusBytes / 1_048_576) MiB of SGR/UTF-8/wide text")
+  let idleMB = footprint()
+  let detached = try await throughput(attached: false)
+  print(
+    String(
+      format: "throughput, detached pane:            %7.1f MiB/s",
+      detached.mbps
+    )
+  )
+  let attached = try await throughput(attached: true)
+  print(
+    String(
+      format: "throughput, attached 200x50 client:   %7.1f MiB/s (%d frames)",
+      attached.mbps,
+      attached.frames
+    )
+  )
+  let lat = try await latency(samples: 200)
+  print(
+    "input-to-frame latency (XPC, PTY echo, export, decode): p50 \(ms(percentile(lat, 0.5))) p95 \(ms(percentile(lat, 0.95))) p99 \(ms(percentile(lat, 0.99)))"
+  )
+  for (cols, rows) in [(200, 50), (512, 256)] {
+    let r = try exportImport(columns: cols, rows: rows)
+    print(
+      "frame \(cols)x\(rows): \(r.bytes / 1024) KiB; "
+        + "export+encode p50 \(ms(percentile(r.export, 0.5))) "
+        + "p95 \(ms(percentile(r.export, 0.95))); "
+        + "decode+validate+import p50 \(ms(percentile(r.importing, 0.5))) "
+        + "p95 \(ms(percentile(r.importing, 0.95)))"
+        + (r.gpu.isEmpty
+          ? ""
+          : "; GPU render p50 \(ms(percentile(r.gpu, 0.5))) p95 \(ms(percentile(r.gpu, 0.95)))")
+    )
+  }
+  let noClient = try await load(seconds: 5, visible: 0)
+  print(
+    String(
+      format:
+        "32 noisy panes, no client:   service CPU %6.1f%%, footprint %6.1f MiB",
+      noClient.cpu,
+      noClient.mb
+    )
+  )
+  let withClient = try await load(seconds: 5, visible: 1)
+  print(
+    String(
+      format:
+        "32 noisy panes, 1 visible:   service CPU %6.1f%%, footprint %6.1f MiB, %.1f frames/s",
+      withClient.cpu,
+      withClient.mb,
+      withClient.framesPerSecond
+    )
+  )
+  if let gpu = try noisyGPU() {
+    print(
+      "200x50 GPU render, quiet p50 \(ms(percentile(gpu.quiet, 0.5))) p95 \(ms(percentile(gpu.quiet, 0.95))); "
+        + "with a saturating 512x256 renderer p50 \(ms(percentile(gpu.noisy, 0.5))) p95 \(ms(percentile(gpu.noisy, 0.95)))"
+    )
+  }
+  let pasteMs = try await pasteLimit()
+  print(
+    String(
+      format: "1 MiB paste (32 KiB chunks, acknowledged): %.1f ms",
+      pasteMs
+    )
+  )
+  let search = try await historySearch()
+  print(
+    String(
+      format: "literal search over %d history rows: %.2f ms",
+      search.rows,
+      search.ms
+    )
+  )
+  let visible = try await visibleLimit(seconds: 5)
+  print(
+    String(
+      format:
+        "%d visible noisy panes (512x255 area): service+client CPU %.1f%%, footprint %.1f MiB, %.1f frames/s",
+      visible.panes,
+      visible.cpu,
+      visible.mb,
+      visible.fps
+    )
+  )
+  print(String(format: "idle footprint before load: %.1f MiB", idleMB))
+  guard await finishBenchmark() else {
+    try? FileManager.default.removeItem(at: corpusURL)
+    exit(1)
+  }
+  try? FileManager.default.removeItem(at: corpusURL)
+  exit(0)
+
+} catch {
+  fputs("swiftmux-bench failed: \(error)\n", stderr)
+  _ = await finishBenchmark()
+  try? FileManager.default.removeItem(at: corpusURL)
+  exit(1)
 }
-let pasteMs = try await pasteLimit()
-print(
-  String(format: "1 MiB paste (32 KiB chunks, acknowledged): %.1f ms", pasteMs)
-)
-let search = try await historySearch()
-print(
-  String(
-    format: "literal search over %d history rows: %.2f ms",
-    search.rows,
-    search.ms
-  )
-)
-let visible = try await visibleLimit(seconds: 5)
-print(
-  String(
-    format:
-      "%d visible noisy panes (512x255 area): service+client CPU %.1f%%, footprint %.1f MiB, %.1f frames/s",
-    visible.panes,
-    visible.cpu,
-    visible.mb,
-    visible.fps
-  )
-)
-print(String(format: "idle footprint before load: %.1f MiB", idleMB))
-try? FileManager.default.removeItem(at: corpusURL)
-exit(0)
+
+private func checkedRender(
+  _ renderer: MetalRenderer,
+  _ snapshot: RenderSnapshot,
+  to texture: MTLTexture
+) throws {
+  let command = try renderer.render(snapshot, to: texture)
+  guard renderer.waitUntilIdle(timeout: .now() + .seconds(30)) else {
+    throw RendererError.resourceUnavailable("benchmark GPU timeout")
+  }
+  guard command.status == .completed else {
+    throw RendererError.resourceUnavailable(
+      "benchmark GPU command failed: \(command.status.rawValue): \(String(describing: command.error))"
+    )
+  }
+}
+
+private func benchmarkEvent(
+  _ connection: MuxConnection,
+  until deadline: ContinuousClock.Instant
+) async throws -> MuxEvent {
+  let remaining = deadline - ContinuousClock.now
+  guard remaining > .zero else { throw MuxConnection.EventWaitError.timedOut }
+  guard let event = try await connection.nextEvent(timeout: remaining) else {
+    throw MuxError(.connectionLost, "benchmark event EOF")
+  }
+  return event
+}
+
+private func awaitPaneCleanup(_ connection: MuxConnection) async throws {
+  let deadline = ContinuousClock.now + .seconds(30)
+  while true {
+    let remaining = deadline - ContinuousClock.now
+    guard remaining > .zero else { throw MuxConnection.EventWaitError.timedOut }
+    guard
+      case let .status(status) = try await connection.execute(
+        .status,
+        timeout: remaining
+      )
+    else { throw MuxError(.invalidRequest, "benchmark cleanup status reply") }
+    if status.panes == 0 { return }
+    try await Task.sleep(for: .milliseconds(50))
+  }
+}
+
+private func finishBenchmark() async -> Bool {
+  let ready = Atomic(false)
+  service.prepareToExit { ready.store(true, ordering: .releasing) }
+  let deadline = ContinuousClock.now + .seconds(30)
+  while !ready.load(ordering: .acquiring), ContinuousClock.now < deadline {
+    do { try await Task.sleep(for: .milliseconds(20)) } catch { break }
+  }
+  guard ready.load(ordering: .acquiring) else {
+    fputs("swiftmux-bench child cleanup timed out\n", stderr)
+    return false
+  }
+  return true
+}

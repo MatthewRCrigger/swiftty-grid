@@ -124,10 +124,17 @@ public final class TerminalSession: @unchecked Sendable {
   #if os(macOS)
   private var process: PTYProcess?
   private var readSource: DispatchSourceRead?
+  private var readSourceActive = false
+  private var processingRead = false
+  private var bufferedRead = 0 ..< 0
+  private var replyExitPoll: DispatchSourceTimer?
+  private var childIsExiting = false
   private var writeSource: DispatchSourceWrite?
   private var exitSource: DispatchSourceProcess?
+  private var exitPoll: DispatchSourceTimer?
   // Advancing a slice avoids moving the remaining paste on every partial write.
   private var pendingWrite: ArraySlice<UInt8> = []
+  private var pendingReplies = PTYReplyLedger()
   private var writeSourceActive = false
   #endif
   private var encodeBuffer: [UInt8] = []
@@ -206,7 +213,7 @@ public final class TerminalSession: @unchecked Sendable {
     #if os(macOS)
     if let process {
       process.hangUp()
-      Self.reap(process.pid)
+      PTYProcessShutdown.start(process.pid)
     }
     teardown()
     #endif
@@ -217,8 +224,17 @@ public final class TerminalSession: @unchecked Sendable {
 
   #if os(macOS)
   public func start(_ configuration: SessionConfiguration) throws {
+    try start(configuration, if: { true })
+  }
+
+  /// Checks transport ownership on the session queue before spawning.
+  package func start(
+    _ configuration: SessionConfiguration,
+    if shouldStart: @Sendable () -> Bool
+  ) throws {
     precondition(!isPresentation, "a presentation session has no process")
     try queue.sync {
+      guard shouldStart() else { throw CancellationError() }
       precondition(process == nil, "session already started")
       let process = try PTYProcess.spawn(
         configuration,
@@ -228,6 +244,7 @@ public final class TerminalSession: @unchecked Sendable {
         retainingSlaveForDrain: true,
       )
       self.process = process
+      childIsExiting = false
       let fd = process.master.rawValue
 
       let read = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
@@ -237,6 +254,7 @@ public final class TerminalSession: @unchecked Sendable {
       read.setCancelHandler { withExtendedLifetime(process) {} }
       read.resume()
       readSource = read
+      readSourceActive = true
 
       let write = DispatchSource.makeWriteSource(
         fileDescriptor: fd,
@@ -261,40 +279,10 @@ public final class TerminalSession: @unchecked Sendable {
     queue.sync {
       guard let process else { return }
       process.hangUp()
-      Self.reap(process.pid)
+      PTYProcessShutdown.start(process.pid)
       teardown()
       finishProgram()
     }
-  }
-
-  /// Collects the exit status of a child whose exit source is being
-  /// torn down, so it does not linger as a zombie.
-  private static func reap(_ pid: pid_t) {
-    let source = DispatchSource.makeProcessSource(
-      identifier: pid,
-      eventMask: .exit,
-      queue: .global(qos: .utility)
-    )
-    // The handler retains the source until it cancels itself.
-    source.setEventHandler { [source] in
-      _ = waitForChild(pid, options: 0)
-      source.cancel()
-    }
-    source.resume()
-    // Already exited (the source may never fire for a zombie).
-    if waitForChild(pid, options: WNOHANG).result == pid { source.cancel() }
-  }
-
-  private static func waitForChild(
-    _ pid: pid_t,
-    options: Int32
-  ) -> (result: pid_t, status: Int32) {
-    var status: Int32 = 0
-    var result: pid_t
-    repeat {
-      result = waitpid(pid, &status, options)
-    } while result < 0 && errno == EINTR
-    return (result, status)
   }
 
   public var isRunning: Bool {
@@ -339,13 +327,26 @@ public final class TerminalSession: @unchecked Sendable {
   /// only proposes the grid to `gridProposalHandler`; the displayed frame
   /// keeps its size until the remote terminal sends one at the new size.
   public func resize(columns: Int, rows: Int) {
+    resize(columns: columns, rows: rows, if: { true })
+  }
+
+  /// Checks transport ownership when the queued geometry change runs.
+  package func resize(
+    columns: Int,
+    rows: Int,
+    if shouldResize: @escaping @Sendable () -> Bool
+  ) {
     if isPresentation {
       let columns = max(1, columns)
       let rows = max(1, rows)
-      queue.async { [self] in callbacks.gridProposal?(columns, rows) }
+      queue.async { [self] in
+        guard shouldResize() else { return }
+        callbacks.gridProposal?(columns, rows)
+      }
       return
     }
     queue.async { [self] in
+      guard shouldResize() else { return }
       state.resize(columns: columns, rows: rows)
       #if os(macOS)
       process?
@@ -384,7 +385,59 @@ public final class TerminalSession: @unchecked Sendable {
   /// Encodes input with the current modes and writes it to the program.
   /// In presentation mode routes `.text`, `.key` and `.paste` to
   /// `semanticInputHandler` instead and never reaches `onWrite`.
+  /// Standalone PTY input has no admission limit. Frontends needing bounded
+  /// input and refusal feedback should use `TerminalSurface.LocalPTYBackend`.
   public func send(_ input: TerminalInput) {
+    if !isPresentation, let handler = callbacks.inputHandler {
+      switch input {
+      case let .text(text) where text.isEmpty: return
+      case let .bytes(bytes) where bytes.isEmpty: return
+      default: handler(input)
+      }
+      return
+    }
+    sendInput(input, encoded: nil)
+  }
+
+  /// An external transport can admit input synchronously before any
+  /// encoding is queued. Its accepted inputs use `send(_:encoded:)`.
+  package var inputHandler: (@Sendable (TerminalInput) -> Void)? {
+    get { callbacks.inputHandler }
+    set { callbacks.inputHandler = newValue }
+  }
+
+  package var ptyInputAdmission: PTYInputAdmission? {
+    callbacks.ptyInputAdmission
+  }
+
+  package func installPTYInputAdmission(
+    _ admission: PTYInputAdmission,
+    handler: @escaping @Sendable (TerminalInput) -> Void
+  ) { callbacks.installPTYInputAdmission(admission, handler: handler) }
+
+  /// Queues already admitted native input without entering its handler again.
+  package func sendToPTY(_ input: TerminalInput, reservation: Int) {
+    precondition(!isPresentation)
+    sendInput(input) { [self] bytes in
+      writeToChild(bytes, reservation: reservation)
+    }
+  }
+
+  /// Delivers this input's encoding to an external transport instead of
+  /// `onWrite`. Called once on the session queue, including empty encodings,
+  /// so the transport can replace admission reservations with actual bytes.
+  package func send(
+    _ input: TerminalInput,
+    encoded: @escaping @Sendable ([UInt8]) -> Void
+  ) {
+    precondition(!isPresentation)
+    sendInput(input, encoded: encoded)
+  }
+
+  private func sendInput(
+    _ input: TerminalInput,
+    encoded: (@Sendable ([UInt8]) -> Void)?
+  ) {
     if isPresentation {
       switch input {
       case let .key(event) where event.action == .release: return
@@ -403,7 +456,10 @@ public final class TerminalSession: @unchecked Sendable {
           keyboardFlags: state.keyboardFlags,
           into: &encodeBuffer
         )
-      else { return }
+      else {
+        encoded?([])
+        return
+      }
       switch input {
       case let .key(event) where event.action == .release: break
       case .text, .key, .paste:
@@ -413,7 +469,11 @@ public final class TerminalSession: @unchecked Sendable {
         }
       default: break
       }
-      writeToChild(encodeBuffer)
+      if let encoded {
+        encoded(encodeBuffer)
+      } else {
+        writeToChild(encodeBuffer)
+      }
     }
   }
 
@@ -543,14 +603,16 @@ public final class TerminalSession: @unchecked Sendable {
 
   public func feed(_ bytes: [UInt8]) { feed(bytes.span) }
 
-  /// Runs `body` on the queue with mutable state, then publishes changes.
+  /// Runs `body` on the queue with mutable state, then publishes changes,
+  /// including any made before the body throws.
   public func mutate<R>(_ body: (inout TerminalState) throws -> R) rethrows -> R
   {
     try queue.sync {
-      let result = try body(&state)
-      state.markSearchDirty()
-      publish()
-      return result
+      defer {
+        state.markSearchDirty()
+        publish()
+      }
+      return try body(&state)
     }
   }
 
@@ -611,25 +673,49 @@ public final class TerminalSession: @unchecked Sendable {
 
   #if os(macOS)
   private func readAvailable() {
-    guard let process else { return }
+    guard let process, !processingRead else { return }
+    processingRead = true
+    defer { processingRead = false }
     var budget = Self.readBudget
     while budget > 0 {
-      let n = process.master.read(into: readBuffer)
-      if n > 0 {
-        let chunk = UnsafeBufferPointer(
-          start: readBuffer.baseAddress!.assumingMemoryBound(to: UInt8.self),
-          count: n
+      if updateReadPressure() { break }
+      if bufferedRead.isEmpty {
+        let target = UnsafeMutableRawBufferPointer(
+          start: readBuffer.baseAddress,
+          count: min(budget, readBuffer.count)
         )
-        parse(chunk)
-        budget -= n
-        continue
+        let n = process.master.read(into: target)
+        if n > 0 {
+          bufferedRead = 0 ..< n
+          let chunk = UnsafeBufferPointer(
+            start: readBuffer.baseAddress!.assumingMemoryBound(to: UInt8.self),
+            count: n
+          )
+          // Record each physical chunk once, before parsing any of it.
+          onProgramOutput?(Array(chunk))
+        } else {
+          if n < 0, errno == EINTR { continue }
+          if n < 0, errno == EAGAIN { break }
+          // EOF or EIO: the slave side is gone.
+          setReadSourceActive(true)
+          readSource?.cancel()
+          readSource = nil
+          readSourceActive = false
+          break
+        }
       }
-      if n < 0, errno == EINTR { continue }
-      if n < 0, errno == EAGAIN { break }
-      // EOF or EIO: the slave side is gone.
-      readSource?.cancel()
-      readSource = nil
-      break
+      let chunk = UnsafeBufferPointer(
+        start: readBuffer.baseAddress!.assumingMemoryBound(to: UInt8.self)
+          .advanced(by: bufferedRead.lowerBound),
+        count: bufferedRead.count
+      )
+      let consumed = parser.consumePrefix(chunk, into: &state, replyLimit: 1)
+      bufferedRead =
+        (bufferedRead.lowerBound + consumed) ..< bufferedRead.upperBound
+      budget -= consumed
+      // Check actual writer pressure after each complete reply, keeping
+      // frontend notifications batched at the read-turn boundary.
+      flushReplies()
     }
     publish()
   }
@@ -643,10 +729,7 @@ public final class TerminalSession: @unchecked Sendable {
     }
     state.refreshSearchIfNeeded()
     onStateChange?(state)
-    if !state.output.isEmpty {
-      writeReply(state.output)
-      state.output.removeAll(keepingCapacity: true)
-    }
+    flushReplies()
     if let status = state.takeProgramStatusChange() {
       onProgramStatusChange?(status)
     }
@@ -703,36 +786,71 @@ public final class TerminalSession: @unchecked Sendable {
     handler()
   }
 
+  private func flushReplies() {
+    guard !state.output.isEmpty else { return }
+    writeReply(state.output)
+    state.output.removeAll(keepingCapacity: true)
+  }
+
   /// Terminal-generated replies: to the PTY, else `onTerminalReply`,
   /// else `onWrite`.
   private func writeReply(_ bytes: [UInt8]) {
     #if os(macOS)
     if process != nil {
-      writeToChild(bytes)
+      // NOTE_EXIT may precede the final controlling-terminal drain. Keep
+      // parsing that output, but the departing child cannot use replies.
+      if childIsExiting { return }
+      writeToChild(bytes, isReply: true)
       return
     }
     #endif
     if let onTerminalReply { onTerminalReply(bytes) } else { onWrite?(bytes) }
   }
 
-  private func writeToChild(_ bytes: [UInt8]) {
-    guard !bytes.isEmpty else { return }
+  private func writeToChild(
+    _ bytes: [UInt8],
+    reservation: Int = 0,
+    isReply: Bool = false
+  ) {
+    let admission = callbacks.ptyInputAdmission
+    if let admission, !admission.encoded(bytes.count, reservation: reservation)
+    {
+      return
+    }
+    guard !bytes.isEmpty else {
+      #if os(macOS)
+      updateReadPressure()
+      #endif
+      return
+    }
     #if os(macOS)
     guard let process else {
+      admission?.consumed(bytes.count)
       onWrite?(bytes);
       return
     }
     if !pendingWrite.isEmpty {
+      // An advancing slice otherwise retains every consumed prefix while
+      // sustained input keeps the live suffix nonempty.
+      if pendingWrite.startIndex >= Self.readBufferSize {
+        pendingWrite = ArraySlice(Array(pendingWrite))
+      }
       pendingWrite.append(contentsOf: bytes)
+      pendingReplies.append(count: bytes.count, isReply: isReply)
+      updateReadPressure()
       return
     }
     let written =
       bytes.withUnsafeBytes { process.master.writeAvailable($0) } ?? bytes.count
+    admission?.consumed(written)
     if written < bytes.count {
       pendingWrite.append(contentsOf: bytes[written...])
+      pendingReplies.append(count: bytes.count - written, isReply: isReply)
       setWriteSourceActive(true)
     }
+    updateReadPressure()
     #else
+    admission?.consumed(bytes.count)
     onWrite?(bytes)
     #endif
   }
@@ -744,10 +862,60 @@ public final class TerminalSession: @unchecked Sendable {
       pendingWrite.withUnsafeBytes { process.master.writeAvailable($0) }
       ?? pendingWrite.count
     pendingWrite.removeFirst(written)
+    pendingReplies.consumed(written)
+    callbacks.ptyInputAdmission?.consumed(written)
     if pendingWrite.isEmpty {
       pendingWrite = []  // Release the consumed slice's backing storage.
       setWriteSourceActive(false)
     }
+    if !updateReadPressure(), !bufferedRead.isEmpty { readAvailable() }
+  }
+
+  /// One complete command's reply can cross the threshold. Pause only for
+  /// reply bytes: user input ahead of or behind a small reply must still
+  /// allow the child to print output before it reads stdin. Standalone
+  /// sessions use a 64 KiB threshold; backends supply their write limit.
+  @discardableResult
+  private func updateReadPressure() -> Bool {
+    let admission = callbacks.ptyInputAdmission
+    let limit = admission?.limit ?? Self.readBufferSize
+    let paused = !childIsExiting && pendingReplies.byteCount > limit
+    setReadSourceActive(!paused)
+    return paused
+  }
+
+  private func setReadSourceActive(_ active: Bool) {
+    if active {
+      replyExitPoll?.cancel()
+      replyExitPoll = nil
+    }
+    guard let readSource, active != readSourceActive else { return }
+    readSourceActive = active
+    if active {
+      readSource.resume()
+    } else {
+      readSource.suspend()
+      pollPausedExit()
+    }
+  }
+
+  /// Release pressure when the child is departing, even if NOTE_EXIT
+  /// waits for the controlling terminal to drain.
+  private func pollPausedExit() {
+    guard replyExitPoll == nil else { return }
+    let poll = DispatchSource.makeTimerSource(queue: queue)
+    poll.schedule(
+      deadline: .now() + .milliseconds(25),
+      repeating: .milliseconds(25)
+    )
+    poll.setEventHandler { [weak self] in
+      guard let self, !self.readSourceActive, let process = self.process,
+        PTYProcessExit.hasStartedExiting(process.pid)
+      else { return }
+      self.childExited()
+    }
+    replyExitPoll = poll
+    poll.resume()
   }
 
   private func setWriteSourceActive(_ active: Bool) {
@@ -758,33 +926,69 @@ public final class TerminalSession: @unchecked Sendable {
 
   private func childExited() {
     guard let process else { return }
+    childIsExiting = true
+    callbacks.ptyInputAdmission?.close()
     readAvailable()  // exit can wait for the controlling terminal to drain
-    // Darwin posts NOTE_EXIT before the child becomes waitable.
-    // Wait for that final transition instead of decoding an untouched
-    // zero status from WNOHANG as a successful exit.
-    let waited = Self.waitForChild(process.pid, options: 0)
+    // NOTE_EXIT can precede waitability. Keep draining on later queue
+    // turns rather than block every input, resize and disposal operation.
+    var info = siginfo_t()
+    var peek: Int32
+    repeat {
+      peek = waitid(
+        P_PID,
+        id_t(process.pid),
+        &info,
+        WEXITED | WNOHANG | WNOWAIT
+      )
+    } while peek < 0 && errno == EINTR
+    if peek == 0, info.si_pid != process.pid {
+      if exitPoll == nil {
+        let poll = DispatchSource.makeTimerSource(queue: queue)
+        poll.schedule(
+          deadline: .now() + .milliseconds(50),
+          repeating: .milliseconds(50)
+        )
+        poll.setEventHandler { [weak self] in self?.childExited() }
+        exitPoll = poll
+        poll.resume()
+      }
+      return
+    }
     readAvailable()  // the retained slave preserves output through exit
-    let status = waited.status
     let code: Int32 =
-      waited.result == process.pid
-      ? ((status & 0x7F) == 0 ? (status >> 8) & 0xFF : 128 + (status & 0x7F))
+      peek == 0
+      ? (info.si_code == CLD_EXITED ? info.si_status : 128 + info.si_status)
       : -1
+    if peek == 0 {
+      // Preserve the owned leader's PID until remaining group members
+      // have retired. The reaper holds no terminal or PTY descriptors.
+      process.hangUp()
+      PTYProcessShutdown.start(process.pid)
+    }
     teardown()
     finishProgram()
     onEvent?(.exited(code))
   }
 
   private func teardown() {
+    callbacks.ptyInputAdmission?.close()
+    setReadSourceActive(true)  // a suspended source must not be released
     readSource?.cancel()
     readSource = nil
+    readSourceActive = false
     setWriteSourceActive(true)  // a suspended source must not be released
     writeSource?.cancel()
     writeSource = nil
     writeSourceActive = false
     pendingWrite.removeAll()
+    pendingReplies = PTYReplyLedger()
+    bufferedRead = 0 ..< 0
     exitSource?.cancel()
     exitSource = nil
+    exitPoll?.cancel()
+    exitPoll = nil
     process = nil
+    childIsExiting = false
   }
   #endif
 }

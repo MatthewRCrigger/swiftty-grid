@@ -158,14 +158,16 @@ public struct Compositor {
         )
       }
     }
-    if let search = frame.search {
+    if h > 0, let search = frame.search {
       for (n, span) in search.visible.enumerated() {
         let style = OuterStyle(
           foreground: .palette(0),
           background: .palette(n == search.selectedVisible ? 3 : 11)
         )
-        for row in max(0, span.startRow) ... min(h - 1, span.endRow) where h > 0
-        {
+        let firstRow = max(0, span.startRow)
+        let lastRow = min(h - 1, span.endRow)
+        guard firstRow <= lastRow else { continue }
+        for row in firstRow ... lastRow {
           let from = row == span.startRow ? span.startColumn : 0
           let to = row == span.endRow ? span.endColumn : g.columns - 1
           guard from <= to else { continue }

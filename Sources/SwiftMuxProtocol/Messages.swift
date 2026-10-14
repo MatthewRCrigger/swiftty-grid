@@ -247,6 +247,8 @@ public struct ServiceStatus: Codable, Sendable, Equatable {
   public var pid: Int32
   public var startedAt: Date
   public var workspaces: Int
+  /// Includes admitted launches and panes retained through teardown, so
+  /// zero is meaningful at the ordered update barrier.
   public var panes: Int
   public var attached: Bool
   public var quiescing: Bool
@@ -387,6 +389,9 @@ public enum MuxCommand: Codable, Sendable, Equatable {
   /// Quiesce, then end every workspace and report the empty barrier.
   case endAllWorkspaces
   /// Stops (or resumes) admitting new workspaces and panes, for updates.
+  /// An update freeze belongs to the connection that began it. Only that
+  /// owner may repeat or release it; losing the owner restores admission
+  /// unless the service has begun terminal shutdown.
   case quiesce(Bool)
   /// Default colours and light/dark scheme reported by every pane's
   /// engine (OSC 10/11/4 queries, mode 2031); also used for new panes.
@@ -443,8 +448,8 @@ public enum MuxCommand: Codable, Sendable, Equatable {
     case .status, .listWorkspaces, .detachActive, .detach, .endWorkspace,
       .endAllWorkspaces, .quiesce, .endPane, .endTab, .setGeometry,
       .setSubscriptions, .scroll, .searchStep, .endSearch, .setTheme,
-      .observeWorkspaces, .subscribeInbox, .inbox, .locateAttention,
-      .markSeen, .snooze, .markReviewed:
+      .observeWorkspaces, .subscribeInbox, .inbox, .locateAttention, .markSeen,
+      .snooze, .markReviewed:
       true
     default: false
     }
@@ -472,12 +477,7 @@ public struct MuxTheme: Codable, Sendable, Equatable {
     self.dark = dark
   }
 
-  public var isValid: Bool {
-    palette.colors.count == 256
-      && ([palette.foreground, palette.background, palette.cursor]
-        + palette.colors)
-        .allSatisfy { $0 <= 0xFF_FFFF }
-  }
+  public var isValid: Bool { palette.isValid }
 }
 
 public struct SearchResult: Codable, Sendable, Equatable {

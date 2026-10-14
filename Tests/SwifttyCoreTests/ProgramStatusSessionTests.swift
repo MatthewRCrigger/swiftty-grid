@@ -196,6 +196,7 @@ struct ProgramStatusSessionTests {
       if case .exited = event { exited.withLock { $0 = true } }
     }
     try session.start(configuration)
+    defer { session.stop() }
     for _ in 0 ..< 500 where !exited.withLock({ $0 }) {
       try await Task.sleep(for: .milliseconds(10))
     }

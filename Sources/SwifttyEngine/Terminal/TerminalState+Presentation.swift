@@ -68,6 +68,7 @@ extension TerminalState {
     modes.update(.cursorVisible, frame.cursorVisible)
     modes.update(.cursorBlink, frame.cursorBlinking)
     modes.update(.reverseVideo, frame.reverseVideo)
+    modes.update(.alternateScreen, frame.alternateScreen)
     if title != frame.title {
       titleBytes = Array(frame.title.utf8)
       titleChanged = true

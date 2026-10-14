@@ -16,6 +16,7 @@ import Synchronization
 /// first application data and travels under 1-RTT keys.
 public struct QUICRSTConnector: Sendable {
   public var alpn: String
+  /// Total budget for TLS negotiation, control setup and connection handoff.
   public var handshakeTimeout: Duration
   /// QUIC idle timeout; keep above the 20 s application heartbeat.
   public var idleTimeout: Duration
@@ -35,61 +36,102 @@ public struct QUICRSTConnector: Sendable {
   public func connect(
     host: String,
     port: UInt16,
-    pin: CertificatePin
+    pin: CertificatePin,
+    limits: NegotiatedLimits = NegotiatedLimits()
   ) async throws -> any RSTConnection {
-    try await connectQUIC(host: host, port: port, pin: pin)
+    try await connectQUIC(host: host, port: port, pin: pin, limits: limits)
   }
 
   /// Same as `connect`, returning the concrete connection type.
   public func connectQUIC(
     host: String,
     port: UInt16,
-    pin: CertificatePin
+    pin: CertificatePin,
+    limits: NegotiatedLimits = NegotiatedLimits()
   ) async throws -> QUICRSTConnection {
+    try await connectQUIC(
+      host: host,
+      port: port,
+      pin: pin,
+      limits: limits,
+      beforeReturnForTesting: nil
+    )
+  }
+
+  func connectQUIC(
+    host: String,
+    port: UInt16,
+    pin: CertificatePin,
+    limits: NegotiatedLimits = NegotiatedLimits(),
+    beforeControlForTesting: (@Sendable (QUICRSTConnection) async -> Void)? =
+      nil,
+    beforeReturnForTesting: (@Sendable (QUICRSTConnection) async -> Void)?
+  ) async throws -> QUICRSTConnection {
+    guard !Task.isCancelled else { throw RSTTransportError.canceled }
+    guard limits.isValid else { throw RSTTransportError.resourceLimit }
+    guard handshakeTimeout > .zero else {
+      throw RSTTransportError.handshake("timed out")
+    }
+    let deadline = ContinuousClock.now + handshakeTimeout
+    func remainingHandshakeBudget() throws -> Duration {
+      guard !Task.isCancelled else { throw RSTTransportError.canceled }
+      let remaining = deadline - ContinuousClock.now
+      guard remaining > .zero else {
+        throw RSTTransportError.handshake("timed out")
+      }
+      return remaining
+    }
     guard let nwPort = NWEndpoint.Port(rawValue: port), port != 0 else {
       throw RSTTransportError.handshake("invalid port")
     }
     let queue = DispatchQueue(label: "rst.quic.client")
     let waiter = OneShot()
-    let verdict = PinVerdict {
-      waiter.resolve(RSTTransportError.pinMismatch)
-    }
-    let quic = QUICOptions.client(
-      pin: pin, alpn: alpn, idleTimeout: idleTimeout,
-      verdict: verdict, queue: queue
+    let verdict = PinVerdict { waiter.resolve(RSTTransportError.pinMismatch) }
+    let quic = try QUICOptions.client(
+      pin: pin,
+      alpn: alpn,
+      idleTimeout: idleTimeout,
+      verdict: verdict,
+      queue: queue
     )
-    let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: nwPort)
+    let endpoint = NWEndpoint.hostPort(
+      host: NWEndpoint.Host(host),
+      port: nwPort
+    )
     let group = NWConnectionGroup(
       with: NWMultiplexGroup(to: endpoint),
       using: QUICOptions.parameters(quic, migration: true)
     )
-    let connection = QUICRSTConnection(role: .client, group: group, queue: queue)
+    let connection = QUICRSTConnection(
+      role: .client,
+      group: group,
+      queue: queue,
+      limits: limits
+    )
     connection.attachGroupHandlers()
 
     group.stateUpdateHandler = { [weak connection] newState in
       switch newState {
-      case .ready:
-        waiter.resolve(nil)
+      case .ready: waiter.resolve(nil)
       case let .waiting(error):
         // Retrying cannot fix a TLS failure (pin, ALPN, version).
         if case .tls = error { waiter.resolve(error) }
-      case let .failed(error):
-        waiter.resolve(error)
-      case .cancelled:
-        waiter.resolve(RSTTransportError.canceled)
-      case .setup:
-        break
-      @unknown default:
-        break
+      case let .failed(error): waiter.resolve(error)
+      case .cancelled: waiter.resolve(RSTTransportError.canceled)
+      case .setup: break
+      @unknown default: break
       }
       connection?.groupStateChanged(newState)
     }
 
     do {
-      try await waiter.wait(timeout: handshakeTimeout) { group.start(queue: queue) }
+      try await waiter.wait(timeout: remainingHandshakeBudget()) {
+        group.start(queue: queue)
+      }
       // Fail closed: "ready" counts only if our verify block approved it.
       guard verdict.accepted else { throw RSTTransportError.pinMismatch }
-      let metadata = group.metadata(definition: NWProtocolQUIC.definition)
+      let metadata =
+        group.metadata(definition: NWProtocolQUIC.definition)
         as? NWProtocolQUIC.Metadata
       guard let metadata, metadata.negotiatedALPN == alpn else {
         throw RSTTransportError.handshake("ALPN not negotiated")
@@ -100,6 +142,8 @@ public struct QUICRSTConnector: Sendable {
         )
       else { throw RSTTransportError.handshake("early data accepted") }
 
+      await beforeControlForTesting?(connection)
+      _ = try remainingHandshakeBudget()
       guard let control = NWConnection(from: group) else {
         throw RSTTransportError.handshake("no control stream")
       }
@@ -112,11 +156,13 @@ public struct QUICRSTConnector: Sendable {
         default: break
         }
       }
-      try await streamWaiter.wait(timeout: handshakeTimeout) {
+      try await streamWaiter.wait(timeout: remainingHandshakeBudget()) {
         control.start(queue: queue)
       }
       connection.setClientControl(control)
-      if case .ready = control.state {} else {
+      await beforeReturnForTesting?(connection)
+      _ = try remainingHandshakeBudget()
+      guard !connection.isClosed, case .ready = control.state else {
         throw RSTTransportError.handshake("control stream closed")
       }
       return connection
@@ -142,7 +188,8 @@ final class OneShot: Sendable {
 
   /// Resolves once; nil means success. Later calls are ignored.
   func resolve(_ error: (any Error)?) {
-    let continuation = state.withLock { s -> CheckedContinuation<Void, any Error>? in
+    let continuation = state.withLock {
+      s -> CheckedContinuation<Void, any Error>? in
       guard s.result == nil else { return nil }
       s.result = error.map { .failure($0) } ?? .success(())
       defer { s.continuation = nil }
@@ -158,13 +205,18 @@ final class OneShot: Sendable {
   /// Runs `begin`, then waits for resolution or the deadline.
   func wait(
     timeout: Duration,
+    beforeTimeoutForTesting: (@Sendable () async -> Void)? = nil,
     begin: () -> Void
   ) async throws {
+    guard !Task.isCancelled else { throw RSTTransportError.canceled }
+    guard timeout > .zero else {
+      throw RSTTransportError.handshake("timed out")
+    }
+    let deadline = ContinuousClock.now + timeout
     let timer = Task { [self] in
-      try? await Task.sleep(for: timeout)
-      if !Task.isCancelled {
-        resolve(RSTTransportError.handshake("timed out"))
-      }
+      try? await Task.sleep(until: deadline, clock: .continuous)
+      await beforeTimeoutForTesting?()
+      if !Task.isCancelled { resolve(RSTTransportError.handshake("timed out")) }
     }
     defer { timer.cancel() }
     begin()
@@ -180,6 +232,12 @@ final class OneShot: Sendable {
       }
     } onCancel: { [self] in
       resolve(RSTTransportError.canceled)
+    }
+    // A successful callback may have won the latch before cancellation.
+    guard !Task.isCancelled else { throw RSTTransportError.canceled }
+    // A late callback can also beat a timer delayed by executor scheduling.
+    guard ContinuousClock.now < deadline else {
+      throw RSTTransportError.handshake("timed out")
     }
   }
 }

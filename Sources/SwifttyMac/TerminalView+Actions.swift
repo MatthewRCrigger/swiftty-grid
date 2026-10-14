@@ -162,16 +162,20 @@ extension TerminalView {
   /// Applies a capability change: closes search, returns to the live
   /// screen and re-derives the routing modes.
   func capabilitiesChanged() {
+    if !capabilities.textInput {
+      releaseHeldKeys()
+      discardComposition()
+    }
     if !capabilities.search, searchBar != nil { closeSearch() }
     if !capabilities.scrollback {
       session.mutateAsync { state in
         if state.viewportOffset != 0 { state.scrollViewportToBottom() }
       }
     }
-    if !capabilities.openURLs { hoveredLink = nil }
     lastModes = capabilities.effectiveModes(
       lastSnapshot?.modes ?? session.modes
     )
+    refreshHover()
     needsDisplay = true
   }
 

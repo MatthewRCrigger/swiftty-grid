@@ -390,6 +390,25 @@ struct GhosttyTerminal4Tests {
         Comment(rawValue: escapedTestText("op \(op) \(cols)x\(rows)"))
       )
       if c1.x != c2.x || c1.y != c2.y || p1 != p2 || l1 != l2 { return }
+      for y in 0 ..< rows {
+        let w1 = t1.state.grid.isWrapped(y)
+        let w2 = t2.state.grid.isWrapped(y)
+        #expect(w1 == w2, Comment(rawValue: "op \(op), row \(y) wrap"))
+        if w1 != w2 { return }
+        for x in 0 ..< cols {
+          let a = t1.cell(x, y)
+          let b = t2.cell(x, y)
+          // Resolve grapheme IDs independently; trimmed text conceals explicit
+          // spaces, cell widths, styling, links, and protection flags.
+          let same =
+            a.width == b.width && a.attributes == b.attributes
+            && t1.state.scalars(of: a) == t2.state.scalars(of: b)
+          if !same {
+            #expect(same, Comment(rawValue: "op \(op), cell \(x),\(y)"))
+            return
+          }
+        }
+      }
     }
   }
 

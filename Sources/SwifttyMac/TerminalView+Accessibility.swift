@@ -6,13 +6,19 @@ import SwifttyCore
 extension TerminalView {
   public override func isAccessibilityElement() -> Bool { true }
 
-  public override func accessibilityRole() -> NSAccessibility.Role? { .textArea }
+  public override func accessibilityRole() -> NSAccessibility.Role? {
+    .textArea
+  }
 
   public override func accessibilityRoleDescription() -> String? { "terminal" }
 
-  public override func accessibilityLabel() -> String? { window?.title ?? "Terminal" }
+  public override func accessibilityLabel() -> String? {
+    window?.title ?? "Terminal"
+  }
 
-  public override func accessibilityValue() -> Any? { accessibilityText?.string ?? "" }
+  public override func accessibilityValue() -> Any? {
+    accessibilityText?.string ?? ""
+  }
 
   public override func accessibilityNumberOfCharacters() -> Int {
     accessibilityText?.string.utf16.count ?? 0

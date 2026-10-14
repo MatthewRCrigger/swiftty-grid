@@ -1,10 +1,12 @@
 import Darwin
 import Dispatch
 import Foundation
+import SwiftMuxBridge
 import SwiftMuxClient
 import SwiftMuxProtocol
-import SwiftMuxTerminal
+@testable import SwiftMuxTerminal
 import SwifttyCore
+import SwifttyEngine
 import Testing
 
 @Suite
@@ -18,6 +20,167 @@ struct InputDecoderTests {
         .text("é"), .key(.character(0x63), .control), .key(.enter, []),
       ]
     )
+  }
+
+  @Test(arguments: [
+    [UInt8(0xC2)], [0xE2, 0x82], [0xF0, 0x9F, 0x92], [0xC0], [0xFF],
+    [0xED, 0xA0], [0xF4, 0x90],
+  ])
+  func malformedUTF8PreservesFollowingKeys(_ prefix: [UInt8]) {
+    for split in 0 ... prefix.count {
+      var decoder = InputDecoder()
+      var events = decoder.feed(prefix.prefix(split))
+      events += decoder.feed(
+        prefix.dropFirst(split) + [0x0D, 0x03, 0x1B, 0x5B, 0x41]
+      )
+      let text =
+        events.compactMap { event -> String? in
+          if case let .text(value) = event { return value }
+          return nil
+        }
+        .joined()
+      let keys = events.filter {
+        if case .key = $0 { return true };
+        return false
+      }
+      #expect(text == String(decoding: prefix, as: UTF8.self))
+      #expect(
+        keys == [
+          .key(.enter, []), .key(.character(0x63), .control), .key(.up, []),
+        ]
+      )
+      #expect(!decoder.hasPending)
+    }
+  }
+
+  @Test(arguments: [[UInt8(0xC2)], [0xE2, 0x82], [0xF0, 0x9F, 0x92]])
+  func malformedAltUTF8PreservesFollowingKeys(_ prefix: [UInt8]) {
+    for split in 0 ... prefix.count {
+      var decoder = InputDecoder()
+      var events = decoder.feed([0x1B] + prefix.prefix(split))
+      events += decoder.feed(
+        prefix.dropFirst(split) + [0x0D, 0x1B, 0x5B, 0x41]
+      )
+      #expect(
+        events == [
+          .key(.character(0xFFFD), .alt), .key(.enter, []), .key(.up, []),
+        ]
+      )
+      #expect(!decoder.hasPending)
+    }
+  }
+
+  @Test
+  func validUTF8BoundariesAndAltKeysSurviveEverySplit() {
+    let text = "\u{80}\u{7FF}\u{800}\u{D7FF}\u{E000}\u{FFFF}\u{10000}\u{10FFFF}"
+    let bytes = Array((text + "\u{1B}漢\r").utf8)
+    for split in 0 ... bytes.count {
+      var decoder = InputDecoder()
+      var events = decoder.feed(bytes.prefix(split))
+      events += decoder.feed(bytes.dropFirst(split))
+      let decodedText =
+        events.compactMap { event -> String? in
+          if case let .text(value) = event { return value }
+          return nil
+        }
+        .joined()
+      let keys = events.filter {
+        if case .key = $0 { return true };
+        return false
+      }
+      #expect(decodedText == text)
+      #expect(keys == [.key(.character(0x6F22), .alt), .key(.enter, [])])
+      #expect(!decoder.hasPending)
+    }
+  }
+
+  @Test(
+    arguments: [
+      [UInt8(0x1B), 0x5B], [0x1B, 0x5B, 0x31, 0x3B], [0x1B, 0x4F],
+    ],
+    0 ..< 4
+  )
+  func malformedEscapePrefixesPreserveFollowingKeys(
+    _ prefix: [UInt8],
+    _ mode: Int
+  ) {
+    let suffix: [UInt8]
+    let suffixText: String
+    let suffixKeys: [DecodedInput]
+    switch mode {
+    case 0:
+      suffix = [0x0D, 0x03, 0x1B, 0x5B, 0x41]
+      suffixText = ""
+      suffixKeys = [
+        .key(.enter, []), .key(.character(0x63), .control), .key(.up, []),
+      ]
+    case 1:
+      suffix = [0x1B, 0x5B, 0x41]
+      suffixText = ""
+      suffixKeys = [.key(.up, [])]
+    case 2:
+      suffix = Array("漢\r".utf8)
+      suffixText = "漢"
+      suffixKeys = [.key(.enter, [])]
+    default:
+      suffix = [0x7F, 0x1B, 0x5B, 0x41]
+      suffixText = ""
+      suffixKeys = [.key(.backspace, []), .key(.up, [])]
+    }
+    let bytes = prefix + suffix
+    for split in 0 ... bytes.count {
+      var decoder = InputDecoder()
+      var events = decoder.feed(bytes.prefix(split))
+      events += decoder.feed(bytes.dropFirst(split))
+      let text =
+        events.compactMap { event -> String? in
+          if case let .text(value) = event { return value }
+          return nil
+        }
+        .joined()
+      let keys = events.filter {
+        if case .key = $0 { return true };
+        return false
+      }
+      #expect(
+        text == String(decoding: prefix.dropFirst(2), as: UTF8.self)
+          + suffixText
+      )
+      #expect(keys == [.key(.character(UInt32(prefix[1])), .alt)] + suffixKeys)
+      #expect(!decoder.hasPending)
+    }
+  }
+
+  @Test(arguments: [29, 30, 31, 32, 4096])
+  func overlongCSIIsIndependentOfReadBoundaries(_ parameterCount: Int) {
+    let parameters = String(repeating: "1", count: parameterCount)
+    let bytes = Array(("\u{1B}[" + parameters + "A\r").utf8)
+    let splits = Set(
+      Array(0 ... min(40, bytes.count)) + [bytes.count - 1, bytes.count]
+    )
+    for split in splits.sorted() {
+      var decoder = InputDecoder()
+      var events = decoder.feed(bytes.prefix(split))
+      events += decoder.feed(bytes.dropFirst(split))
+      let text =
+        events.compactMap { event -> String? in
+          if case let .text(value) = event { return value }
+          return nil
+        }
+        .joined()
+      let keys = events.filter {
+        if case .key = $0 { return true };
+        return false
+      }
+      #expect(text == (parameterCount <= 30 ? "" : parameters + "A"))
+      #expect(
+        keys == [
+          parameterCount <= 30 ? .key(.up, []) : .key(.character(0x5B), .alt),
+          .key(.enter, []),
+        ]
+      )
+      #expect(!decoder.hasPending)
+    }
   }
 
   @Test
@@ -68,10 +231,85 @@ struct InputDecoderTests {
       ]
     )
   }
+
+  @Test(arguments: [Int.min, -1, 0, 1, Int.max])
+  func extremeModifierParametersDoNotOverflow(parameter: Int) {
+    var decoder = InputDecoder()
+    let events = decoder.feed(Array("\u{1B}[1;\(parameter)A".utf8))
+    #expect(events == [.key(.up, parameter <= 1 ? [] : [.alt, .control])])
+  }
+}
+
+@Suite
+struct RawTTYTests {
+  @Test(arguments: [false, true])
+  func restoresOriginalDescriptorFlags(nonblocking: Bool) throws {
+    var master: Int32 = -1
+    var slave: Int32 = -1
+    try PTYAllocation.open(master: &master, slave: &slave)
+    defer {
+      close(master);
+      close(slave)
+    }
+    let output = open("/dev/null", O_WRONLY)
+    try #require(output >= 0)
+    defer { close(output) }
+    let initial = fcntl(slave, F_GETFL)
+    let flags = nonblocking ? initial | O_NONBLOCK : initial & ~O_NONBLOCK
+    try #require(fcntl(slave, F_SETFL, flags) == 0)
+    let tty = RawTTY(input: slave, output: output)
+    // Cleanup before entry must leave the inherited descriptor alone.
+    tty.restore()
+    #expect(fcntl(slave, F_GETFL) == flags)
+    try tty.enter()
+    #expect(fcntl(slave, F_GETFL) & O_NONBLOCK != 0)
+    tty.restore()
+    #expect(fcntl(slave, F_GETFL) == flags)
+    tty.restore()
+    #expect(fcntl(slave, F_GETFL) == flags)
+  }
 }
 
 @Suite
 struct DiffRendererTests {
+  @Test(arguments: [
+    LayoutRect(x: 10, y: 0, width: 2, height: 2),
+    LayoutRect(x: 0, y: 10, width: 2, height: 2),
+    LayoutRect(x: -10, y: 0, width: 2, height: 2),
+    LayoutRect(x: 0, y: -10, width: 2, height: 2),
+  ])
+  func fillingAnOffscreenRectangleDoesNothing(rect: LayoutRect) {
+    var screen = ScreenBuffer(columns: 4, rows: 2)
+    let original = screen
+    screen.fill(rect, style: OuterStyle(background: .palette(1)))
+    #expect(screen == original)
+  }
+
+  @Test(arguments: [0, 1, 2])
+  func searchHighlightsAreClippedWhenPaneHeightShrinks(height: Int) throws {
+    var frame = try BridgeTests.validFrame()
+    frame.search = FrameSearch(
+      matchCount: 1,
+      selected: 0,
+      visible: [
+        FrameSpan(startRow: 1, startColumn: 0, endRow: 1, endColumn: 0)
+      ],
+      selectedVisible: 0
+    )
+    try FrameValidator.validate(frame)
+    var screen = ScreenBuffer(columns: 4, rows: 2)
+    Compositor(columns: 4, rows: 2)
+      .draw(
+        frame,
+        in: LayoutRect(x: 0, y: 0, width: 4, height: height),
+        overlay: nil,
+        into: &screen
+      )
+    #expect(
+      screen[0, 1].style.background == (height == 2 ? .palette(3) : .default)
+    )
+  }
+
   @Test
   func onlyChangedCellsAreRedrawn() {
     var r = DiffRenderer()
@@ -115,11 +353,11 @@ struct TerminalClientTests {
     let host = TerminalSession(columns: 80, rows: 24)
     private let source: DispatchSourceRead
 
-    init() {
+    init() throws {
       var m: Int32 = -1
       var s: Int32 = -1
       var size = winsize(ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0)
-      openpty(&m, &s, nil, nil, &size)
+      try PTYAllocation.open(master: &m, slave: &s, size: &size)
       master = m
       slave = s
       _ = fcntl(m, F_SETFL, fcntl(m, F_GETFL) | O_NONBLOCK)
@@ -160,6 +398,179 @@ struct TerminalClientTests {
   }
 
   @Test
+  func copyModeLineEndUsesDisplayColumns() async throws {
+    let h = try Harness()
+    let connection = try await h.connect(.terminal)
+    guard
+      case let .created(ws) = try await connection.execute(
+        .newWorkspace(NewWorkspaceRequest(name: "demo", launch: shellLaunch()))
+      ),
+      case let .attached(attachment, workspace) = try await connection.execute(
+        .attach(.id(ws.id))
+      )
+    else {
+      Issue.record("setup")
+      return
+    }
+    let outer = try Outer()
+    let client = TerminalClient(
+      connection: connection,
+      attachment: attachment,
+      workspace: workspace,
+      limits: .standard,
+      tty: RawTTY(input: outer.slave, output: outer.slave)
+    )
+    let session = TerminalSession(columns: 8, rows: 2)
+    session.feed(Array("e\u{301} a漢\r".utf8))
+    var identity = BridgeTests.identity()
+    identity.attachment = attachment
+    identity.pane = try #require(workspace.activeTabSnapshot?.activePane)
+    let frame = try FrameExporter.frame(
+      from: session.withState { $0.captureOwnedScreen() },
+      identity: identity
+    )
+    client.handle(.frame(frame))
+    client.feed(Array("\u{02}[$".utf8))
+    #expect(client.compose()[3, 0].style.flags & OuterStyle.inverse != 0)
+    // Moving to the next word stays within the display grid.
+    client.feed(Array("w".utf8))
+    #expect(client.compose()[7, 0].style.flags & OuterStyle.inverse != 0)
+    await connection.close()
+  }
+
+  @Test(arguments: [false, true])
+  func cancellationRestoresTerminalAndSignalDisposition(
+    beforeStart: Bool
+  ) async throws {
+    let h = try Harness()
+    let control = try await h.connect(.control)
+    let connection = try await h.connect(.terminal)
+    var original = sigaction()
+    try #require(sigaction(SIGWINCH, nil, &original) == 0)
+    defer { _ = sigaction(SIGWINCH, &original, nil) }
+    var expected = sigaction()
+    expected.__sigaction_u.__sa_handler = SIG_IGN
+    expected.sa_flags = SA_RESTART
+    sigemptyset(&expected.sa_mask)
+    sigaddset(&expected.sa_mask, SIGUSR1)
+    try #require(sigaction(SIGWINCH, &expected, nil) == 0)
+    do {
+      guard
+        case let .created(ws) = try await connection.execute(
+          .newWorkspace(
+            NewWorkspaceRequest(name: "cancel", launch: shellLaunch())
+          )
+        ),
+        case let .attached(attachment, workspace) =
+          try await connection.execute(.attach(.id(ws.id)))
+      else { throw MuxError(.invalidRequest, "setup") }
+      let outer = try Outer()
+      var saved = termios()
+      try #require(tcgetattr(outer.slave, &saved) == 0)
+      let savedFlags = fcntl(outer.slave, F_GETFL)
+      let client = TerminalClient(
+        connection: connection,
+        attachment: attachment,
+        workspace: workspace,
+        limits: .standard,
+        tty: RawTTY(input: outer.slave, output: outer.slave)
+      )
+      let run = Task { await client.run() }
+      defer { run.cancel() }
+      if !beforeStart {
+        try #require(
+          await outer.wait { $0.last?.hasPrefix("[cancel] 0:1*") == true }
+        )
+        #expect(
+          await client.run() == .failed("terminal client is already running")
+        )
+      }
+      run.cancel()
+      // Give the old implementation a bounded escape without concealing its
+      // lack of cancellation: that escape returns a different outcome.
+      let fallback = Task {
+        try? await Task.sleep(for: .milliseconds(500))
+        if !Task.isCancelled {
+          client.handle(.detached(reason: "cancel timeout"))
+        }
+      }
+      defer { fallback.cancel() }
+      #expect(await run.value == .detached("cancelled"))
+      #expect(await client.run() == .detached("cancelled"))
+      var restored = termios()
+      try #require(tcgetattr(outer.slave, &restored) == 0)
+      #expect(restored.c_lflag == saved.c_lflag)
+      #expect(restored.c_iflag == saved.c_iflag)
+      #expect(restored.c_oflag == saved.c_oflag)
+      #expect(restored.c_cflag == saved.c_cflag)
+      // Darwin records an internal written bit after output; F_SETFL cannot
+      // clear it. Compare the caller-controlled status flags instead.
+      let mutableFlags = O_NONBLOCK | O_APPEND | O_ASYNC
+      #expect(
+        fcntl(outer.slave, F_GETFL) & mutableFlags == savedFlags & mutableFlags
+      )
+      var actual = sigaction()
+      try #require(sigaction(SIGWINCH, nil, &actual) == 0)
+      #expect(actual.sa_flags == expected.sa_flags)
+      #expect(actual.sa_mask == expected.sa_mask)
+      #expect(
+        unsafeBitCast(actual.__sigaction_u.__sa_handler, to: UInt.self)
+          == unsafeBitCast(expected.__sigaction_u.__sa_handler, to: UInt.self)
+      )
+      guard
+        case let .workspaces(list) = try await control.execute(.listWorkspaces)
+      else { throw MuxError(.invalidRequest, "workspaces reply") }
+      #expect(list.first?.isAttached == false)
+      try await control.execute(.endAllWorkspaces)
+      await connection.close()
+      await control.close()
+    } catch {
+      await connection.close()
+      _ = try? await control.execute(.endAllWorkspaces)
+      await control.close()
+      throw error
+    }
+  }
+
+  @Test
+  func closingTheConnectionEndsTheTerminalRun() async throws {
+    let h = try Harness()
+    let connection = try await h.connect(.terminal)
+    guard
+      case let .created(ws) = try await connection.execute(
+        .newWorkspace(NewWorkspaceRequest(name: "demo", launch: shellLaunch()))
+      ),
+      case let .attached(attachment, workspace) = try await connection.execute(
+        .attach(.id(ws.id))
+      )
+    else {
+      Issue.record("setup")
+      return
+    }
+    let outer = try Outer()
+    let client = TerminalClient(
+      connection: connection,
+      attachment: attachment,
+      workspace: workspace,
+      limits: .standard,
+      tty: RawTTY(input: outer.slave, output: outer.slave)
+    )
+    let run = Task { await client.run() }
+    #expect(await outer.wait { $0.last?.hasPrefix("[demo] 0:1*") == true })
+    await connection.close()
+    // Bound the regression even if EOF leaves run waiting forever.
+    let fallback = Task {
+      try? await Task.sleep(for: .milliseconds(500))
+      if !Task.isCancelled { client.handle(.detached(reason: "EOF timeout")) }
+    }
+    defer { fallback.cancel() }
+    #expect(await run.value == .lost("connection closed"))
+    var restored = termios()
+    try #require(tcgetattr(outer.slave, &restored) == 0)
+    #expect(restored.c_lflag & UInt(ICANON) != 0)
+  }
+
+  @Test
   func attachTypeSplitAndDetach() async throws {
     let h = try Harness()
     let connection = try await h.connect(.terminal)
@@ -174,7 +585,7 @@ struct TerminalClientTests {
       Issue.record("setup");
       return
     }
-    let outer = Outer()
+    let outer = try Outer()
     let client = TerminalClient(
       connection: connection,
       attachment: attachment,
@@ -235,7 +646,7 @@ struct TerminalClientTests {
       Issue.record("setup")
       return
     }
-    let outer = Outer()
+    let outer = try Outer()
     let client = TerminalClient(
       connection: connection,
       attachment: attachment,
@@ -279,7 +690,7 @@ struct TerminalClientTests {
       Issue.record("setup")
       return
     }
-    let outer = Outer()
+    let outer = try Outer()
     let client = TerminalClient(
       connection: connection,
       attachment: attachment,

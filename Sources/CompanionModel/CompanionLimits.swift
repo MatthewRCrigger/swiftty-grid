@@ -8,7 +8,7 @@ import Foundation
 /// already observed.
 public enum CompanionLimits {
   /// The only companion wire version this build understands.
-  public static let version = 1
+  public static let version = 3
   /// Maximum decoded companion payload (status, preview, or request).
   public static let maxPayloadBytes = 16 * 1024
   /// User-chosen session nickname, in characters (grapheme clusters).

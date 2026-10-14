@@ -11,33 +11,69 @@ final class FrameMailbox: PresentationSink {
     var frame: SurfaceFrame?
     var generation: UInt64 = 0
     var notified = false
+    var notificationRevision: UInt64 = 0
     var onInvalidate: (@Sendable () -> Void)?
   }
 
   let state = Mutex(State())
   let forward: (any PresentationSink)?
 
+  private struct Notification {
+    let revision: UInt64
+    let handler: @Sendable () -> Void
+  }
+
   init(forward: (any PresentationSink)?) { self.forward = forward }
 
   @discardableResult
   func install(_ frame: PresentationFrame) -> Bool {
-    let notify = state.withLock { s -> (@Sendable () -> Void)? in
+    let notification = state.withLock { s in
       s.generation &+= 1
       s.frame = SurfaceFrame(generation: s.generation, frame: frame)
-      guard !s.notified, let handler = s.onInvalidate else { return nil }
-      s.notified = true
-      return handler
+      return claimNotification(&s)
     }
+    // This mailbox owns the frame. Forwarding is an additional consumer,
+    // whose refusal does not remove the view-readable frame.
     _ = forward?.install(frame)
-    notify?()
+    deliver(notification)
     return true
   }
 
   func take() -> SurfaceFrame? {
     state.withLock { s in
       s.notified = false
+      s.notificationRevision &+= 1
       return s.frame
     }
+  }
+
+  func setHandler(_ handler: (@Sendable () -> Void)?) {
+    let (previous, notification) = state.withLock { s in
+      let previous = s.onInvalidate
+      s.onInvalidate = handler
+      s.notified = false
+      s.notificationRevision &+= 1
+      return (previous, claimNotification(&s))
+    }
+    withExtendedLifetime(previous) {}
+    deliver(notification)
+  }
+
+  private func claimNotification(_ s: inout State) -> Notification? {
+    guard s.frame != nil, !s.notified, let handler = s.onInvalidate else {
+      return nil
+    }
+    s.notified = true
+    s.notificationRevision &+= 1
+    return Notification(revision: s.notificationRevision, handler: handler)
+  }
+
+  private func deliver(_ notification: Notification?) {
+    guard let notification else { return }
+    let current = state.withLock { s in
+      s.notified && s.notificationRevision == notification.revision
+    }
+    if current { notification.handler() }
   }
 }
 
@@ -57,8 +93,13 @@ public final class RoamingScreenBackend: TerminalSurfaceBackend {
   private let mailbox: FrameMailbox
   private let state = Mutex(State())
 
-  /// - Parameter sink: Also receives every installed frame, for example a
-  ///   presentation-mode `TerminalSession` the view renders.
+  /// - Parameters:
+  ///   - bootstrapper: Supplies authenticated bootstrap grants for the host.
+  ///   - connector: Opens the transport used to attach to the roaming session.
+  ///   - sink: Also receives every installed frame, for example a
+  ///     presentation-mode `TerminalSession` the view renders.
+  ///   - configuration: Client limits and connection settings.
+  ///   - timing: Clock and sleep operations used by the client.
   public init(
     bootstrapper: any RemoteBootstrapper,
     connector: any RSTConnector,
@@ -79,25 +120,31 @@ public final class RoamingScreenBackend: TerminalSurfaceBackend {
   /// Observes nonsecret status (UI chrome, companion bridge).
   public var onStatus: (@Sendable (RoamingStatus) -> Void)? {
     get { state.withLock { $0.onStatus } }
-    set { state.withLock { $0.onStatus = newValue } }
+    set {
+      let previous = state.withLock { s in
+        let previous = s.onStatus
+        s.onStatus = newValue
+        return previous
+      }
+      withExtendedLifetime(previous) {}
+    }
   }
 
   /// Starts observing the client, then bootstraps and attaches.
   public func start(_ target: RoamingTarget) async throws(RoamingClientError) {
-    await client.setStatusHandler { [weak self] status in
-      self?.observe(status)
+    await client.setStatusHandler { [weak self] status in self?.observe(status)
     }
     try await client.start(target)
   }
 
   private func observe(_ status: RoamingStatus) {
     let (changed, lifecycleHandler, statusHandler) = state.withLock {
-      s -> (SurfaceLifecycle?, (@Sendable (SurfaceLifecycle) -> Void)?, (@Sendable (RoamingStatus) -> Void)?) in
+      s -> (
+        SurfaceLifecycle?, (@Sendable (SurfaceLifecycle) -> Void)?,
+        (@Sendable (RoamingStatus) -> Void)?
+      ) in
       if status.state == .active { s.hasBeenActive = true }
-      let next = Self.lifecycle(
-        for: status,
-        hasBeenActive: s.hasBeenActive
-      )
+      let next = Self.lifecycle(for: status, hasBeenActive: s.hasBeenActive)
       guard next != s.lifecycle else { return (nil, nil, s.onStatus) }
       s.lifecycle = next
       return (next, s.onLifecycleChange, s.onStatus)
@@ -128,16 +175,25 @@ public final class RoamingScreenBackend: TerminalSurfaceBackend {
 
   public func currentFrame() -> SurfaceFrame? { mailbox.take() }
 
+  /// A newly installed handler is notified of any cached frame. Each
+  /// binding coalesces further notifications until `currentFrame()`.
   public var onInvalidate: (@Sendable () -> Void)? {
     get { mailbox.state.withLock { $0.onInvalidate } }
-    set { mailbox.state.withLock { $0.onInvalidate = newValue } }
+    set { mailbox.setHandler(newValue) }
   }
 
   public var lifecycle: SurfaceLifecycle { state.withLock { $0.lifecycle } }
 
   public var onLifecycleChange: (@Sendable (SurfaceLifecycle) -> Void)? {
     get { state.withLock { $0.onLifecycleChange } }
-    set { state.withLock { $0.onLifecycleChange = newValue } }
+    set {
+      let previous = state.withLock { s in
+        let previous = s.onLifecycleChange
+        s.onLifecycleChange = newValue
+        return previous
+      }
+      withExtendedLifetime(previous) {}
+    }
   }
 
   public func submit(_ input: SurfaceInput) async -> SurfaceInputResult {

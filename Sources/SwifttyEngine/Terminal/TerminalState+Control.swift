@@ -100,6 +100,9 @@ extension TerminalState {
 
   /// XTGETTCAP: names are hex-encoded and `;`-separated.
   private mutating func replyTermcap() {
+    guard !discardsReplies else { return }
+    var answers = ""
+    var replyBytes = 0
     for hexName in String(decoding: dcsBuffer, as: UTF8.self)
       .split(separator: ";")
     {
@@ -120,13 +123,26 @@ extension TerminalState {
         case "Pst" where programStatusEnabled: #"\E]7501;%p1%s\E\\"#
         default: nil
         }
-      if let value {
-        let encoded = value.isEmpty ? "" : "=" + Self.hex(value)
-        reply("\u{1B}P1+r\(hexName)\(encoded)\u{1B}\\")
+      // Account for the whole command before publishing any reply. The
+      // identity is configurable; check its encoded size before allocating.
+      let available =
+        Self.maxQueryReplyBytes - replyBytes - 7 - hexName.utf8.count
+      guard available >= 0 else { return }
+      let encoded: String
+      if let value, !value.isEmpty {
+        guard available >= 1, value.utf8.count <= (available - 1) / 2 else {
+          return
+        }
+        encoded = "=" + Self.hex(value)
       } else {
-        reply("\u{1B}P0+r\(hexName)\u{1B}\\")
+        encoded = ""
       }
+      let answer =
+        "\u{1B}P\(value == nil ? "0" : "1")+r\(hexName)\(encoded)\u{1B}\\"
+      replyBytes += answer.utf8.count
+      answers += answer
     }
+    reply(answers)
   }
 
   /// DECRQSS for the settings applications query in practice.

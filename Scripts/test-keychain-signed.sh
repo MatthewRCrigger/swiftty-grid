@@ -66,7 +66,10 @@ targets:
   KeychainTests:
     type: bundle.unit-test
     platform: $platform
-    sources: [{ path: "$repository_root/Tests/KeychainRuntime/KeychainRuntimeTests.swift" }]
+    sources:
+      - { path: "$repository_root/Tests/KeychainRuntime/KeychainRuntimeTests.swift" }
+      - { path: "$repository_root/Tests/Support/RuntimeFixture.swift" }
+      - { path: "$repository_root/Tests/Support/KeychainRuntimeCleanup.swift" }
     dependencies:
       - { target: KeychainHost }
       - { package: Swiftty, product: SSHClient }
@@ -84,6 +87,10 @@ schemes:
 YML
 cd "$workspace"
 xcodegen generate --spec project.yml >/dev/null
+status=0
 xcodebuild -scheme KeychainRuntime -destination "$destination" $extra \
   -derivedDataPath "$workspace/build" -collect-test-diagnostics never test \
-  2>&1 | tee "$workspace/xcodebuild.log" | grep -E "Test Case|error:|TEST (SUCCEEDED|FAILED)|Signing Identity"
+  >"$workspace/xcodebuild.log" 2>&1 || status=$?
+grep -E "Test Case|error:|TEST (SUCCEEDED|FAILED)|Signing Identity" \
+  "$workspace/xcodebuild.log" || true
+exit "$status"

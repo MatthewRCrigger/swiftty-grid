@@ -21,9 +21,12 @@ func makeEncoder() -> JSONEncoder {
 
 /// Control records: `UInt32BE(length)` + UTF-8 JSON object (spec §7.2).
 public enum ControlRecord {
-  public static func encode(_ message: ControlMessage) throws -> [UInt8] {
+  public static func encode(
+    _ message: ControlMessage,
+    limit: Int = RSTLimits.maxControlRecordBytes
+  ) throws -> [UInt8] {
     let json = try makeEncoder().encode(message)
-    guard json.count <= RSTLimits.maxControlRecordBytes else {
+    guard json.count <= min(limit, RSTLimits.maxControlRecordBytes) else {
       throw FramingError.recordTooLarge(json.count)
     }
     var out = [UInt8]()
@@ -33,14 +36,21 @@ public enum ControlRecord {
     return out
   }
 
-  public static func decodeBody(_ body: some Collection<UInt8>) throws(FramingError)
-    -> ControlMessage
-  {
+  public static func decodeBody(
+    _ body: some Collection<UInt8>
+  ) throws(FramingError) -> ControlMessage {
+    try decodeBody(body, limit: RSTLimits.maxControlRecordBytes)
+  }
+
+  fileprivate static func decodeBody(
+    _ body: some Collection<UInt8>,
+    limit: Int
+  ) throws(FramingError) -> ControlMessage {
+    let count = body.count
+    guard count <= limit else { throw .recordTooLarge(count) }
     do {
       return try JSONDecoder().decode(ControlMessage.self, from: Data(body))
-    } catch {
-      throw .malformedJSON
-    }
+    } catch { throw .malformedJSON }
   }
 }
 
@@ -60,18 +70,34 @@ public struct ControlRecordReader: Sendable {
   public mutating func append(
     _ bytes: some Collection<UInt8>
   ) throws(FramingError) -> [ControlMessage] {
-    buffer.append(contentsOf: bytes)
     var messages: [ControlMessage] = []
-    var start = 0
-    while buffer.count - start >= 4 {
-      let length = Int(readUInt32(buffer, at: start))
+    var index = bytes.startIndex
+    while !buffer.isEmpty || index != bytes.endIndex {
+      if buffer.count < 4 {
+        let next =
+          bytes.index(
+            index,
+            offsetBy: 4 - buffer.count,
+            limitedBy: bytes.endIndex
+          ) ?? bytes.endIndex
+        buffer.append(contentsOf: bytes[index ..< next])
+        index = next
+        guard buffer.count == 4 else { break }
+      }
+      let length = Int(readUInt32(buffer, at: 0))
       guard length <= limit else { throw .recordTooLarge(length) }
-      guard buffer.count - start - 4 >= length else { break }
-      let body = buffer[(start + 4) ..< (start + 4 + length)]
-      messages.append(try ControlRecord.decodeBody(body))
-      start += 4 + length
+      let missing = length - (buffer.count - 4)
+      let next =
+        bytes.index(index, offsetBy: missing, limitedBy: bytes.endIndex)
+        ?? bytes.endIndex
+      buffer.append(contentsOf: bytes[index ..< next])
+      index = next
+      guard buffer.count - 4 == length else { break }
+      messages.append(
+        try ControlRecord.decodeBody(buffer.dropFirst(4), limit: limit)
+      )
+      buffer.removeAll(keepingCapacity: true)
     }
-    if start > 0 { buffer.removeFirst(start) }
     return messages
   }
 }
@@ -83,7 +109,10 @@ public struct ControlRecordReader: Sendable {
 ///     UInt32BE  encodedLength
 ///     Byte[]    encoded snapshot JSON
 public enum SnapshotFrame {
-  public enum Encoding: UInt8, Sendable { case plain = 0, zlib = 1 }
+  public enum Encoding: UInt8, Sendable {
+    case plain = 0
+    case zlib = 1
+  }
   public static let headerLength = 9
 
   public static func encode(
@@ -114,7 +143,8 @@ public enum SnapshotFrame {
   }
 
   public static func header(
-    _ bytes: some Collection<UInt8>
+    _ bytes: some Collection<UInt8>,
+    limits: NegotiatedLimits = NegotiatedLimits()
   ) throws(FramingError) -> Header? {
     guard bytes.count >= headerLength else { return nil }
     let b = Array(bytes.prefix(headerLength))
@@ -123,19 +153,27 @@ public enum SnapshotFrame {
     }
     let decoded = Int(readUInt32(b, at: 1))
     let encoded = Int(readUInt32(b, at: 5))
-    guard decoded <= RSTLimits.maxSnapshotDecodedBytes,
-      encoded <= RSTLimits.maxSnapshotEncodedBytes
+    let limits = limits.effective
+    guard decoded <= limits.maxSnapshotDecodedBytes,
+      encoded <= limits.maxSnapshotEncodedBytes
     else { throw .snapshotTooLarge }
     if encoding == .plain, decoded != encoded { throw .lengthMismatch }
-    return Header(encoding: encoding, decodedLength: decoded, encodedLength: encoded)
+    return Header(
+      encoding: encoding,
+      decodedLength: decoded,
+      encodedLength: encoded
+    )
   }
 
   /// Decodes and validates a complete stream payload. Only a fully
   /// decoded, validated snapshot is ever returned.
   public static func decode(
-    _ bytes: [UInt8]
+    _ bytes: [UInt8],
+    limits: NegotiatedLimits = NegotiatedLimits()
   ) throws(FramingError) -> ScreenSnapshot {
-    guard let header = try header(bytes) else { throw .truncated }
+    guard let header = try header(bytes, limits: limits) else {
+      throw .truncated
+    }
     let total = headerLength + header.encodedLength
     guard bytes.count >= total else { throw .truncated }
     guard bytes.count == total else { throw .trailingData }
@@ -144,20 +182,17 @@ public enum SnapshotFrame {
     switch header.encoding {
     case .plain: json = body
     case .zlib:
-      do {
-        json = try Zlib.decompress(body, limit: header.decodedLength)
-      } catch {
-        throw .decompression(error)
-      }
+      do { json = try Zlib.decompress(body, limit: header.decodedLength) } catch
+      { throw .decompression(error) }
     }
     guard json.count == header.decodedLength else { throw .lengthMismatch }
     let snapshot: ScreenSnapshot
     do {
       snapshot = try JSONDecoder().decode(ScreenSnapshot.self, from: Data(json))
-    } catch {
-      throw .malformedJSON
+    } catch { throw .malformedJSON }
+    do { try snapshot.validate(limits: limits) } catch {
+      throw .invalidSnapshot(error)
     }
-    do { try snapshot.validate() } catch { throw .invalidSnapshot(error) }
     return snapshot
   }
 }
@@ -165,6 +200,7 @@ public enum SnapshotFrame {
 /// Accumulates one snapshot stream, enforcing the header's bounds while
 /// bytes arrive.
 public struct SnapshotStreamReader: Sendable {
+  public var bufferedBytes: Int { buffer.count }
   private var buffer: [UInt8] = []
   private var header: SnapshotFrame.Header?
 
@@ -173,11 +209,18 @@ public struct SnapshotStreamReader: Sendable {
   public mutating func append(
     _ bytes: some Collection<UInt8>
   ) throws(FramingError) {
-    buffer.append(contentsOf: bytes)
-    if header == nil { header = try SnapshotFrame.header(buffer) }
-    let cap = SnapshotFrame.headerLength
-      + (header?.encodedLength ?? RSTLimits.maxSnapshotEncodedBytes)
-    guard buffer.count <= cap else { throw .trailingData }
+    let incoming = bytes.count
+    var consumed = 0
+    if header == nil {
+      consumed = min(incoming, SnapshotFrame.headerLength - buffer.count)
+      buffer.append(contentsOf: bytes.prefix(consumed))
+      header = try SnapshotFrame.header(buffer)
+      guard header != nil else { return }
+    }
+    guard let header else { return }
+    let cap = SnapshotFrame.headerLength + header.encodedLength
+    guard incoming - consumed <= cap - buffer.count else { throw .trailingData }
+    buffer.append(contentsOf: bytes.dropFirst(consumed))
   }
 
   /// Call at FIN.
@@ -196,6 +239,6 @@ func appendUInt32(_ value: UInt32, to out: inout [UInt8]) {
 
 @inline(__always)
 func readUInt32(_ bytes: [UInt8], at i: Int) -> UInt32 {
-  UInt32(bytes[i]) << 24 | UInt32(bytes[i + 1]) << 16
-    | UInt32(bytes[i + 2]) << 8 | UInt32(bytes[i + 3])
+  UInt32(bytes[i]) << 24 | UInt32(bytes[i + 1]) << 16 | UInt32(bytes[i + 2])
+    << 8 | UInt32(bytes[i + 3])
 }

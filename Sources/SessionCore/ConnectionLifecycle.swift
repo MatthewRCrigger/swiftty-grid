@@ -26,25 +26,17 @@ public enum ClientConnectionState: String, Hashable, Sendable, Codable {
     // any -> session-exited / session-lost / user-closed
     if next.isTerminal { return !isTerminal }
     return switch (self, next) {
-    case (.idle, .sshBootstrap),
-      (.sshBootstrap, .attaching),
-      (.attaching, .active),
-      (.active, .suspect),
-      (.suspect, .active),
-      (.suspect, .reconnecting),
-      (.active, .reconnecting),
+    case (.idle, .sshBootstrap), (.sshBootstrap, .attaching),
+      (.attaching, .active), (.active, .suspect), (.suspect, .active),
+      (.suspect, .reconnecting), (.active, .reconnecting),
       (.reconnecting, .attaching),
       // A cold reconnect after token expiry reauthenticates with SSH.
       (.reconnecting, .sshBootstrap),
       // A failed SSH resume falls back to network recovery.
-      (.sshBootstrap, .reconnecting),
-      (.sshBootstrap, .backgroundDetached),
-      (.attaching, .reconnecting),
-      (.active, .backgroundDetached),
-      (.suspect, .backgroundDetached),
-      (.reconnecting, .backgroundDetached),
-      (.attaching, .backgroundDetached),
-      (.backgroundDetached, .attaching),
+      (.sshBootstrap, .reconnecting), (.sshBootstrap, .backgroundDetached),
+      (.attaching, .reconnecting), (.active, .backgroundDetached),
+      (.suspect, .backgroundDetached), (.reconnecting, .backgroundDetached),
+      (.attaching, .backgroundDetached), (.backgroundDetached, .attaching),
       (.backgroundDetached, .sshBootstrap):
       true
     default: false
@@ -82,7 +74,11 @@ public struct ReconnectBackoff: Sendable {
   public private(set) var attempt = 0
   public let jitter: Double
 
-  public init(jitter: Double = 0.2) { self.jitter = jitter }
+  /// Jitter is a fraction in 0...1. Clamp finite values to that range;
+  /// nonfinite values disable jitter rather than creating an invalid range.
+  public init(jitter: Double = 0.2) {
+    self.jitter = jitter.isFinite ? min(max(jitter, 0), 1) : 0
+  }
 
   /// Delay before the next attempt, in seconds; never above 15.
   public mutating func nextDelay(

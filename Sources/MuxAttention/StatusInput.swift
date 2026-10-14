@@ -31,11 +31,6 @@ public struct StatusRecord: Sendable, Equatable {
     self.message = message
   }
 
-  /// Decoded text bytes counted against `statusTextBytes`.
-  var textBytes: Int {
-    (app?.utf8.count ?? 0) + (title?.utf8.count ?? 0)
-      + (message?.utf8.count ?? 0)
-  }
 }
 
 /// One change to a pane's records, in terminal stream order. A terminal

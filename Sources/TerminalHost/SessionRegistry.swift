@@ -59,7 +59,8 @@ public struct RegistryPolicy: Sendable {
   public var reservationLifetime = RSTLimits.reservationLifetime
   public var detachedRetention = RSTLimits.detachedRetention
   public var exitedRetention = RSTLimits.exitedRetention
-  /// Clamped to `RSTLimits.maxTokenLifetime`.
+  /// Must be positive to issue create/resume grants. Nonpositive values
+  /// fail with `internalError`; positive values are clamped to the wire limit.
   public var tokenLifetime = RSTLimits.maxTokenLifetime
   /// Failed attachment attempts allowed per window before every attempt
   /// is refused until the window passes.
@@ -75,6 +76,9 @@ public struct RegistryPolicy: Sendable {
 /// shells; RST/1 session identifiers are workspace identities and the
 /// grant's server instance is the SwiftMux service epoch.
 public final class SessionRegistry: @unchecked Sendable {
+  /// Includes transport-closed requests until their owner work finishes.
+  private static let maxPendingAttachments = 32
+
   private struct Credential {
     var token: ApplicationToken
     var writer: WriterID
@@ -95,6 +99,26 @@ public final class SessionRegistry: @unchecked Sendable {
   private struct State {
     var entries: [SessionID: Entry] = [:]
     var failures: [ContinuousClock.Instant] = []
+    var pendingAttachments = 0
+    /// Creates own a quota slot before asking the service to allocate.
+    var pendingCreates = 0
+    /// Keep admission closed until every queued workspace-end command replies.
+    var ending: [SessionID: Int] = [:]
+    var workspaceEndGeneration: UInt64 = 0
+
+    mutating func beginEnding(_ id: SessionID) {
+      workspaceEndGeneration += 1
+      ending[id, default: 0] += 1
+    }
+
+    mutating func finishEnding(_ id: SessionID) {
+      guard let count = ending[id] else { return }
+      if count > 1 {
+        ending[id] = count - 1
+      } else {
+        ending.removeValue(forKey: id)
+      }
+    }
     /// Revision floors of removed entries whose workspace may be resumed
     /// again (bounded, oldest dropped first).
     var floors: [SessionID: RoamingSession.Floor] = [:]
@@ -119,13 +143,37 @@ public final class SessionRegistry: @unchecked Sendable {
   private let makeLaunch: @Sendable () -> LaunchSpec
   private let control: MuxLocalSession
   private let state = Mutex(State())
-  private let timer = Mutex<DispatchSourceTimer?>(nil)
+  private struct SweepTimerState {
+    var source: DispatchSourceTimer?
+    var generation = UUID()
+    var inFlight = false
+  }
+  private let timer = Mutex(SweepTimerState())
 
-  public init(
+  public convenience init(
     service: MuxService,
     identity: HostIdentity,
     policy: RegistryPolicy = RegistryPolicy(),
     launch: @escaping @Sendable () -> LaunchSpec = { LaunchSpec() }
+  ) {
+    self.init(
+      service: service,
+      identity: identity,
+      policy: policy,
+      launch: launch,
+      control: MuxLocalSession(
+        queue: DispatchQueue(label: "swiftmux.roaming.registry")
+      )
+    )
+  }
+
+  /// The same control frontend, supplied explicitly for connection-lifetime tests.
+  init(
+    service: MuxService,
+    identity: HostIdentity,
+    policy: RegistryPolicy = RegistryPolicy(),
+    launch: @escaping @Sendable () -> LaunchSpec = { LaunchSpec() },
+    control: MuxLocalSession
   ) {
     self.service = service
     serverInstanceID = SessionCore.ServerInstanceID(service.instance)
@@ -134,15 +182,14 @@ public final class SessionRegistry: @unchecked Sendable {
     policy.tokenLifetime = min(policy.tokenLifetime, RSTLimits.maxTokenLifetime)
     self.policy = policy
     makeLaunch = launch
-    let queue = DispatchQueue(label: "swiftmux.roaming.registry")
-    control = MuxLocalSession(queue: queue)
-    queue.sync {
+    self.control = control
+    control.queue.sync {
       control.connect(to: service, frontend: .control, remote: true)
     }
   }
 
   deinit {
-    timer.withLock { $0?.cancel() }
+    timer.withLock { $0.source?.cancel() }
     let control = control
     control.queue.async { control.close() }
   }
@@ -155,8 +202,17 @@ public final class SessionRegistry: @unchecked Sendable {
     grid: GridSize
   ) async throws(BootstrapErrorCode) -> BootstrapGrant {
     guard grid.isValid else { throw .malformed }
-    let full = state.withLock { $0.entries.count >= policy.maxSessions }
-    guard !full else { throw .sessionLimit }
+    guard policy.tokenLifetime > .zero else { throw .internalError }
+    let reserved = state.withLock { s -> Bool in
+      guard s.entries.count + s.pendingCreates < policy.maxSessions else {
+        return false
+      }
+      s.pendingCreates += 1
+      return true
+    }
+    guard reserved else { throw .sessionLimit }
+    var reservationHeld = true
+    defer { if reservationHeld { state.withLock { $0.pendingCreates -= 1 } } }
     let result = await control.request(
       .newWorkspace(
         NewWorkspaceRequest(
@@ -176,27 +232,35 @@ public final class SessionRegistry: @unchecked Sendable {
     let id = SessionID(ws.id)
     let session = makeSession(id, grid: grid)
     let writerID = WriterID.random()
-    do {
-      try session.authorize(writer: writerID)
-    } catch {
-      throw .internalError
-    }
     let now = ContinuousClock.now
     let credential = issue(writer: writerID, takeover: false, now: now)
+    let authorized: Bool
+    do {
+      authorized = try session.authorize(
+        writer: writerID,
+        token: credential.token
+      )
+    } catch { throw .internalError }
+    guard authorized else { throw .internalError }
     let admitted = state.withLock { s -> Bool in
-      guard s.entries.count < policy.maxSessions else { return false }
+      // A concurrent resume may have authorized the service workspace
+      // before this create's reply reached us. Preserve that owner and grant.
+      guard s.entries[id] == nil else {
+        s.entries[id]?.createdHere = true
+        return false
+      }
       s.entries[id] = Entry(
         session: session,
         credential: credential,
         createdAt: now,
         createdHere: true
       )
+      // Transfer the reservation to its entry on one state turn.
+      s.pendingCreates -= 1
       return true
     }
-    guard admitted else {
-      _ = await control.request(.endWorkspace(.id(ws.id)))
-      throw .sessionLimit
-    }
+    guard admitted else { throw .internalError }
+    reservationHeld = false
     return grant(id, credential: credential, grid: grid)
   }
 
@@ -212,15 +276,68 @@ public final class SessionRegistry: @unchecked Sendable {
     target: ResumeTarget? = nil,
     grid: GridSize? = nil
   ) async throws(BootstrapErrorCode) -> BootstrapGrant {
-    var session = state.withLock { $0.entries[id]?.session }
-    if session == nil {
-      guard await workspaces().contains(where: { $0.id == id.workspace }) else {
-        throw .unknownSession
+    guard policy.tokenLifetime > .zero else { throw .internalError }
+    let retained = try state.withLock {
+      s throws(BootstrapErrorCode) -> RoamingSession? in
+      guard s.ending[id] == nil else { throw .unknownSession }
+      return s.entries[id]?.session
+    }
+    let retainedCredential: Credential?
+    if let retained {
+      retainedCredential = try authorizeResume(
+        id,
+        session: retained,
+        writerID: writerID,
+        takeover: takeover,
+        target: target
+      )
+    } else {
+      retainedCredential = nil
+    }
+    // Retained authorization does not prove the workspace still exists:
+    // a detached owner receives no service layout/lease notifications.
+    var session: RoamingSession?
+    while session == nil {
+      let listedGeneration = try state.withLock {
+        s throws(BootstrapErrorCode) -> UInt64 in
+        guard s.ending[id] == nil else { throw .unknownSession }
+        return s.workspaceEndGeneration
       }
-      let candidate = makeSession(id, grid: grid ?? GridSize(columns: 80, rows: 24))
-      session = state.withLock { s -> RoamingSession? in
+      guard let workspaces = await listWorkspaces() else {
+        throw .internalError
+      }
+      let exists = workspaces.contains { $0.id == id.workspace }
+      var listInvalidated = false
+      session = try state.withLock {
+        s throws(BootstrapErrorCode) -> RoamingSession? in
+        // The workspace list may precede a concurrent termination.
+        guard s.ending[id] == nil else { throw .unknownSession }
+        // Even a completed end invalidates a list captured before it.
+        // Refresh instead of installing credentials from that snapshot.
+        guard s.workspaceEndGeneration == listedGeneration else {
+          listInvalidated = true
+          return nil
+        }
+        guard exists else {
+          if let entry = s.entries[id] {
+            if let retired = entry.session.retire(when: { _ in true }) {
+              s.retire(id, retired.floor)
+            }
+            s.entries.removeValue(forKey: id)
+          }
+          throw .unknownSession
+        }
         if let existing = s.entries[id] { return existing.session }
-        guard s.entries.count < policy.maxSessions else { return nil }
+        guard s.entries.count + s.pendingCreates < policy.maxSessions else {
+          return nil
+        }
+        // Select the floor and construct only the entry being installed.
+        // Another resume/retirement cannot advance it between these steps.
+        let candidate = makeSession(
+          id,
+          grid: grid ?? GridSize(columns: 80, rows: 24),
+          floor: s.floors[id] ?? RoamingSession.Floor()
+        )
         s.entries[id] = Entry(
           session: candidate,
           credential: nil,
@@ -229,28 +346,26 @@ public final class SessionRegistry: @unchecked Sendable {
         )
         return candidate
       }
+      if listInvalidated { continue }
       guard session != nil else { throw .sessionLimit }
     }
     guard let session else { throw .unknownSession }
-    let writer: WriterID
-    if let requested = writerID, requested == session.writerID {
-      writer = requested
+    let credential: Credential
+    if session === retained, let retainedCredential {
+      credential = try finalizeResumeCredential(
+        id,
+        session: session,
+        credential: retainedCredential
+      )
     } else {
-      writer = WriterID.random()
-      do {
-        try session.authorize(writer: writer)
-      } catch {
-        throw .writerBusy
-      }
+      credential = try authorizeResume(
+        id,
+        session: session,
+        writerID: writerID,
+        takeover: takeover,
+        target: target
+      )
     }
-    var credential = issue(writer: writer, takeover: takeover, now: .now)
-    credential.target = target
-    let found = state.withLock { s -> Bool in
-      guard s.entries[id] != nil else { return false }
-      s.entries[id]?.credential = credential
-      return true
-    }
-    guard found else { throw .unknownSession }
     let status = session.status
     return grant(
       id,
@@ -262,10 +377,73 @@ public final class SessionRegistry: @unchecked Sendable {
     )
   }
 
+  /// The retained token is rotated before verification but not disclosed
+  /// until now. Start its advertised lifetime after that service wait.
+  private func finalizeResumeCredential(
+    _ id: SessionID,
+    session: RoamingSession,
+    credential: Credential
+  ) throws(BootstrapErrorCode) -> Credential {
+    try state.withLock { s throws(BootstrapErrorCode) -> Credential in
+      guard s.ending[id] == nil, s.entries[id]?.session === session,
+        session.status.state != .terminated
+      else { throw .unknownSession }
+      let now = ContinuousClock.now
+      guard s.entries[id]?.credential?.token == credential.token else {
+        // A concurrent resume may already have superseded this grant.
+        // Never revive an expired token or overwrite its newer credential.
+        guard credential.expiresAt > now else { throw .internalError }
+        return credential
+      }
+      var refreshed = credential
+      refreshed.expiresAt = now + policy.tokenLifetime
+      guard refreshed.expiresAt > now else { throw .internalError }
+      s.entries[id]?.credential?.expiresAt = refreshed.expiresAt
+      return refreshed
+    }
+  }
+
+  /// Keep credential rotation and owner authorization atomic before any
+  /// service wait, so an old pending lease cannot commit during verification.
+  private func authorizeResume(
+    _ id: SessionID,
+    session: RoamingSession,
+    writerID: WriterID?,
+    takeover: Bool,
+    target: ResumeTarget?
+  ) throws(BootstrapErrorCode) -> Credential {
+    return try state.withLock { s throws(BootstrapErrorCode) -> Credential in
+      // Writer authorization and token publication belong to the same
+      // entry and operation. A captured session may have been retired or
+      // replaced before this turn.
+      guard s.ending[id] == nil, s.entries[id]?.session === session else {
+        throw .unknownSession
+      }
+      let writer: WriterID
+      if let requested = writerID, requested == session.writerID {
+        writer = requested
+      } else {
+        writer = WriterID.random()
+      }
+      var credential = issue(writer: writer, takeover: takeover, now: .now)
+      credential.target = target
+      let authorized: Bool
+      do {
+        authorized = try session.authorize(
+          writer: writer,
+          token: credential.token
+        )
+      } catch { throw .writerBusy }
+      guard authorized else { throw .unknownSession }
+      s.entries[id]?.credential = credential
+      return credential
+    }
+  }
+
   /// The service's workspaces, most recently active first (bounded by
-  /// the wire limit).
-  public func list() async -> [SessionSummary] {
-    let summaries = await workspaces()
+  /// the wire limit). A failed control query is never an empty success.
+  public func list() async throws(BootstrapErrorCode) -> [SessionSummary] {
+    let summaries = try await workspaces()
     let entries = state.withLock { $0.entries }
     let list = summaries.map { ws -> SessionSummary in
       let id = SessionID(ws.id)
@@ -304,8 +482,16 @@ public final class SessionRegistry: @unchecked Sendable {
   /// request). Returns false when it does not exist.
   @discardableResult
   public func terminate(_ id: SessionID) async -> Bool {
-    let entry = state.withLock { $0.entries.removeValue(forKey: id) }
-    entry?.session.markTerminated()
+    let entry = state.withLock { s -> Entry? in
+      s.beginEnding(id)
+      let entry = s.entries[id]
+      if let retired = entry?.session.retire(when: { _ in true }) {
+        s.retire(id, retired.floor)
+      }
+      s.entries.removeValue(forKey: id)
+      return entry
+    }
+    defer { state.withLock { $0.finishEnding(id) } }
     let result = await control.request(.endWorkspace(.id(id.workspace)))
     if case .success = result { return true }
     return entry != nil
@@ -313,9 +499,7 @@ public final class SessionRegistry: @unchecked Sendable {
 
   /// Answers one validated bootstrap request (spec §5.1).
   public func handle(_ request: BootstrapRequest) async -> BootstrapResponse {
-    do {
-      try request.validate()
-    } catch {
+    do { try request.validate() } catch {
       switch error {
       case .unsupportedProtocol, .tooManyProtocols:
         return .failure(.unsupportedVersion)
@@ -339,8 +523,7 @@ public final class SessionRegistry: @unchecked Sendable {
             grid: request.initialGrid
           )
         )
-      case .list:
-        return .sessions(await list())
+      case .list: return .sessions(try await list())
       case .terminate:
         guard let id = request.sessionID else { throw .malformed }
         guard await terminate(id) else { throw .unknownSession }
@@ -349,9 +532,7 @@ public final class SessionRegistry: @unchecked Sendable {
         guard let attention = request.attention else { throw .malformed }
         return .metadata(try await metadata(attention))
       }
-    } catch {
-      return .failure(error)
-    }
+    } catch { return .failure(error) }
   }
 
   /// Answers lease-free metadata through the control client, which never
@@ -361,17 +542,16 @@ public final class SessionRegistry: @unchecked Sendable {
   ) async throws(BootstrapErrorCode) -> HostMetadata {
     var metadata = HostMetadata(serviceEpoch: service.instance)
     switch request {
-    case .workspaces:
-      metadata.workspaces = await workspaces()
-    case let .inbox(query):
-      metadata.inbox = try await inboxPage(query)
+    case .workspaces: metadata.workspaces = try await workspaces()
+    case let .inbox(query): metadata.inbox = try await inboxPage(query)
     case let .locate(reference):
-      guard case let .success(.attention(location)) = await control.request(
-        .locateAttention(reference)
-      ) else { throw .internalError }
+      guard
+        case let .success(.attention(location)) = await control.request(
+          .locateAttention(reference)
+        )
+      else { throw .internalError }
       metadata.location = location
-    case let .markSeen(reference):
-      try await acknowledge(.markSeen(reference))
+    case let .markSeen(reference): try await acknowledge(.markSeen(reference))
     case let .snooze(reference, until):
       try await acknowledge(.snooze(reference, until: until))
     case let .markReviewed(reference):
@@ -380,7 +560,9 @@ public final class SessionRegistry: @unchecked Sendable {
     return metadata
   }
 
-  private func acknowledge(_ command: MuxCommand) async throws(BootstrapErrorCode) {
+  private func acknowledge(
+    _ command: MuxCommand
+  ) async throws(BootstrapErrorCode) {
     switch await control.request(command) {
     case .success: return
     case let .failure(error) where error.code == .notFound:
@@ -399,9 +581,9 @@ public final class SessionRegistry: @unchecked Sendable {
     var query = query
     query.limit = min(max(query.limit, 1), 100)
     while true {
-      guard case let .success(.inbox(page)) = await control.request(
-        .inbox(query)
-      ) else { throw .internalError }
+      guard
+        case let .success(.inbox(page)) = await control.request(.inbox(query))
+      else { throw .internalError }
       let response = BootstrapResponse.metadata(
         HostMetadata(serviceEpoch: service.instance, inbox: page)
       )
@@ -411,14 +593,33 @@ public final class SessionRegistry: @unchecked Sendable {
     }
   }
 
+  /// Create operations holding quota before publishing their entry.
+  var pendingCreationCount: Int { state.withLock { $0.pendingCreates } }
+
+  /// Control requests still awaiting a service reply.
+  var pendingControlRequestCount: Int {
+    control.queue.sync { control.pendingRequestCount }
+  }
+
+  /// Attachment operations still awaiting their owner result.
+  var pendingAttachmentCount: Int { state.withLock { $0.pendingAttachments } }
+
   /// The roaming session for `id`, if retained (diagnostics and tests).
   public func session(_ id: SessionID) -> RoamingSession? {
     state.withLock { $0.entries[id]?.session }
   }
 
-  private func makeSession(_ id: SessionID, grid: GridSize) -> RoamingSession {
-    let floor = state.withLock { $0.floors[id] } ?? RoamingSession.Floor()
-    let session = RoamingSession(id: id, service: service, grid: grid, floor: floor)
+  private func makeSession(
+    _ id: SessionID,
+    grid: GridSize,
+    floor: RoamingSession.Floor = RoamingSession.Floor()
+  ) -> RoamingSession {
+    let session = RoamingSession(
+      id: id,
+      service: service,
+      grid: grid,
+      floor: floor
+    )
     session.onTerminateRequested = { [weak self] id in
       guard let self else { return }
       Task { _ = await self.terminate(id) }
@@ -426,16 +627,21 @@ public final class SessionRegistry: @unchecked Sendable {
     return session
   }
 
-  /// The service's workspaces, as the control client sees them.
-  package func workspaces() async -> [WorkspaceSummary] {
-    await listWorkspaces() ?? []
+  /// The service's workspaces; failure says nothing about their existence.
+  package func workspaces() async throws(BootstrapErrorCode)
+    -> [WorkspaceSummary]
+  {
+    guard let list = await listWorkspaces() else { throw .internalError }
+    return list
   }
 
   /// Nil when the service did not answer.
   private func listWorkspaces() async -> [WorkspaceSummary]? {
-    guard case let .success(.workspaces(list)) = await control.request(
-      .listWorkspaces
-    ) else { return nil }
+    guard
+      case let .success(.workspaces(list)) = await control.request(
+        .listWorkspaces
+      )
+    else { return nil }
     return list
   }
 
@@ -448,13 +654,16 @@ public final class SessionRegistry: @unchecked Sendable {
   }
 
   /// Validates an `Attach` (rate limit, instance, session, constant-time
-  /// token comparison, expiry, writer) and attaches on success.
+  /// token comparison, expiry, writer) and attaches on success. At most
+  /// 32 unfinished attachments are admitted across this registry; closed
+  /// transports retain their slot until the owner operation replies.
   func attach(
     _ request: ControlMessage.Attach,
     attachment: HostAttachment
   ) async -> AttachOutcome<RoamingSession> {
     let now = ContinuousClock.now
-    let checked = state.withLock { s -> AttachOutcome<(RoamingSession, Credential)> in
+    let checked = state.withLock {
+      s -> AttachOutcome<(RoamingSession, Credential)> in
       s.failures.removeAll { $0 + policy.attachFailureWindow <= now }
       guard s.failures.count < policy.attachFailureLimit else {
         return .failure(.limitExceeded)
@@ -466,15 +675,24 @@ public final class SessionRegistry: @unchecked Sendable {
         now: now
       )
       if case .failure = result { s.failures.append(now) }
+      if case .success = result {
+        guard s.pendingAttachments < Self.maxPendingAttachments else {
+          return .failure(.limitExceeded)
+        }
+        s.pendingAttachments += 1
+      }
       return result
     }
     guard case let .success((session, credential)) = checked else {
       if case let .failure(code) = checked { return .failure(code) }
       return .failure(.internalError)
     }
+    defer { state.withLock { $0.pendingAttachments -= 1 } }
     switch await session.attach(
       attachment,
       writer: request.writerID,
+      token: credential.token,
+      expiresAt: credential.expiresAt,
       takeover: credential.takeover,
       target: credential.target
     ) {
@@ -483,7 +701,8 @@ public final class SessionRegistry: @unchecked Sendable {
       // later reconnect with the same token neither displaces a newer
       // holder nor moves focus back.
       state.withLock { s in
-        guard s.entries[request.sessionID]?.credential?.token == credential.token
+        guard
+          s.entries[request.sessionID]?.credential?.token == credential.token
         else { return }
         s.entries[request.sessionID]?.credential?.takeover = false
         s.entries[request.sessionID]?.credential?.target = nil
@@ -534,72 +753,112 @@ public final class SessionRegistry: @unchecked Sendable {
       (listed ?? []).map { ($0.id, $0) },
       uniquingKeysWith: { first, _ in first }
     )
-    let (removed, end) = state.withLock { s -> ([SessionID], [SessionID]) in
+    let (removed, end) = state.withLock {
+      s -> ([SessionID], [(id: SessionID, onlyIfExited: Bool)]) in
       var removed: [SessionID] = []
-      var end: [SessionID] = []
+      var end: [(id: SessionID, onlyIfExited: Bool)] = []
       for (id, entry) in s.entries {
-        let status = entry.session.status
-        // An attached entry is never dropped: its session holds the lease.
-        if status.isAttached, status.state != .terminated { continue }
         let summary = workspaces[id.workspace]
         let gone = listed != nil && summary == nil && entry.createdAt < listedAt
-        let allExited =
-          status.allPanesExited
-          || (summary.map { $0.paneCount > 0 && $0.livePaneCount == 0 } ?? false)
-        let expire: Bool =
-          if gone {
-            // Ended elsewhere (the Mac app): nothing left to authorize.
-            true
-          } else {
-            switch status.state {
-            case .reserved:
-              now - entry.createdAt >= policy.reservationLifetime
-            case .detached where allExited:
-              now - status.lastActivity >= policy.exitedRetention
-            case .detached:
-              now - status.lastActivity >= policy.detachedRetention
-            case .exited:
-              now - (status.exitedAt ?? status.lastActivity)
-                >= policy.exitedRetention
-            case .terminated: true
-            case .attached: false
-            }
+        let retired = entry.session.retire { status in
+          // Check and close admission together on the owner queue. A lease
+          // confirmed before this turn keeps its entry; a later one fails.
+          if status.isAttached, status.state != .terminated { return false }
+          if gone { return true }
+          let allExited =
+            summary.map { $0.paneCount > 0 && $0.livePaneCount == 0 }
+            ?? status.allPanesExited
+          switch status.state {
+          case .reserved:
+            return now - entry.createdAt >= policy.reservationLifetime
+          case .detached where allExited:
+            return now - status.lastActivity >= policy.exitedRetention
+          case .detached:
+            return now - status.lastActivity >= policy.detachedRetention
+          case .exited:
+            return now - (status.exitedAt ?? status.lastActivity)
+              >= policy.exitedRetention
+          case .terminated: return true
+          case .attached: return false
           }
-        guard expire else { continue }
+        }
+        guard let retired else { continue }
+        let status = retired.status
+        let allExited =
+          summary.map { $0.paneCount > 0 && $0.livePaneCount == 0 }
+          ?? status.allPanesExited
         s.entries.removeValue(forKey: id)
-        s.retire(id, entry.session.floor)
+        s.retire(id, retired.floor)
         removed.append(id)
-        // Only a workspace this host created, and only when nothing in it
-        // still runs (a never-attached reservation, or every pane exited).
-        if entry.createdHere, !gone,
-          status.state == .reserved || allExited
-        {
-          end.append(id)
+        // Only host-created unused reservations or wholly exited
+        // workspaces may be ended. The service rechecks cleanup eligibility.
+        if entry.createdHere, !gone, status.state == .reserved || allExited {
+          s.beginEnding(id)
+          end.append((id, status.state != .reserved))
         }
       }
       return (removed, end)
     }
-    for id in end {
-      _ = await control.request(.endWorkspace(.id(id.workspace)))
+    for pending in end {
+      if pending.onlyIfExited {
+        // A native frontend may add a live pane after the list replied.
+        // Check again in service order, atomically with ending the workspace.
+        _ = await withCheckedContinuation { continuation in
+          service.endExitedWorkspace(pending.id.workspace) { ended in
+            continuation.resume(returning: ended)
+          }
+        }
+      } else {
+        // Local use outlives its lease. Expire remote authorization while
+        // preserving any workspace a native frontend has already used.
+        _ = await withCheckedContinuation { continuation in
+          service.endReservedWorkspace(pending.id.workspace) { ended in
+            continuation.resume(returning: ended)
+          }
+        }
+      }
+      state.withLock { $0.finishEnding(pending.id) }
     }
     return removed
   }
 
-  /// Sweeps periodically until the registry is released.
+  /// Sweeps periodically until stopped or released. Only one periodic
+  /// sweep may await the service, including across timer replacement.
   public func startSweeping() {
-    let source = DispatchSource.makeTimerSource(
-      queue: .global(qos: .utility)
-    )
-    let interval = policy.sweepInterval.dispatchInterval
+    let source = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+    let generation = UUID()
+    let interval = max(policy.sweepInterval, .milliseconds(1)).dispatchInterval
     source.schedule(deadline: .now() + interval, repeating: interval)
     source.setEventHandler { [weak self] in
       guard let self else { return }
-      Task { await self.sweep() }
+      let admitted = timer.withLock { state -> Bool in
+        guard state.generation == generation, !state.inFlight else {
+          return false
+        }
+        state.inFlight = true
+        return true
+      }
+      guard admitted else { return }
+      Task {
+        await self.sweep()
+        self.timer.withLock { $0.inFlight = false }
+      }
     }
-    source.resume()
-    timer.withLock { previous in
-      previous?.cancel()
-      previous = source
+    timer.withLock { state in
+      state.source?.cancel()
+      state.generation = generation
+      state.source = source
+      source.resume()
+    }
+  }
+
+  /// Stops future periodic sweeps. An admitted sweep finishes before any
+  /// new timer may start another one.
+  public func stopSweeping() {
+    timer.withLock { state in
+      state.source?.cancel()
+      state.source = nil
+      state.generation = UUID()
     }
   }
 
@@ -633,8 +892,9 @@ public final class SessionRegistry: @unchecked Sendable {
     let identity = identity
     let remaining = ContinuousClock.now.duration(to: credential.expiresAt)
     let seconds =
-      Double(remaining.components.seconds)
-      + Double(remaining.components.attoseconds) / 1e18
+      Double(remaining.components.seconds) + Double(
+        remaining.components.attoseconds
+      ) / 1e18
     return BootstrapGrant(
       serverInstanceID: serverInstanceID,
       sessionID: id,

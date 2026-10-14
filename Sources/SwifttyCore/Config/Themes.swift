@@ -4,6 +4,8 @@ import Foundation
 /// color keys. Looked up by name in the theme directories, then among the
 /// built-ins; a name with a `/` is a path.
 public enum Themes {
+  /// Maximum UTF-8 bytes read from one theme file.
+  public static let maxFileBytes = 64 * 1024
   /// Built-in themes, as theme-file text.
   public static let builtIn: [String: String] = [
     "Swiftty Dark": """
@@ -47,16 +49,17 @@ public enum Themes {
 
   static func text(named name: String, searching directories: [URL]) -> String?
   {
+    guard !name.unicodeScalars.contains("\0") else { return nil }
     if name.unicodeScalars.contains("/") {
-      return try? String(
-        contentsOfFile: (name as NSString).expandingTildeInPath,
-        encoding: .utf8
+      return try? ConfigurationFile.read(
+        URL(fileURLWithPath: (name as NSString).expandingTildeInPath),
+        maxBytes: maxFileBytes
       )
     }
     for directory in directories {
-      if let text = try? String(
-        contentsOf: directory.appendingPathComponent(name),
-        encoding: .utf8
+      if let text = try? ConfigurationFile.read(
+        directory.appendingPathComponent(name),
+        maxBytes: maxFileBytes
       ) {
         return text
       }

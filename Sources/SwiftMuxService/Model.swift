@@ -1,6 +1,25 @@
 import Foundation
 import SwiftMuxProtocol
 
+public struct MuxServiceConfiguration: Sendable {
+  /// Private fixture observation; production callers leave this nil.
+  var observePaneIO: (@Sendable (PaneID, PaneIOObservation) -> Void)?
+  public var launcherPath: String
+  public var limits = MuxLimits.standard
+  public var innerTerm = SMX.fallbackInnerTerm
+  public var terminfoDirectory: String?
+  /// Code-signing requirement every peer must satisfy (shipping builds).
+  public var peerRequirement: String?
+  /// Exit delay once the service reaches its empty-state barrier; nil
+  /// keeps the service running (tests, foreground use). Invalid delays
+  /// also keep it running rather than triggering an immediate exit.
+  public var idleExitDelay: TimeInterval?
+  /// Runs on the pane queue before each launch (tests hold a launch open).
+  package var beforeLaunch: (@Sendable () -> Void)?
+
+  public init(launcherPath: String) { self.launcherPath = launcherPath }
+}
+
 struct Tab {
   var id = TabID()
   var name: String
@@ -26,6 +45,9 @@ struct Workspace {
   var tabs: [Tab]
   var activeTab: TabID
   var remainOnExit: Bool
+  /// Local use survives detach; remote reservation expiry must not end
+  /// a workspace that another frontend has already used.
+  var wasAttachedLocally = false
   /// Environment snapshot taken at creation; new panes reuse it.
   var launch: LaunchSpec
   var layoutRevision: UInt64 = 1
@@ -104,6 +126,8 @@ final class Client {
 
 struct FrameSlot {
   var dirty = true
+  /// Output while the tab was hidden but its old subscription remained.
+  var hiddenActivity = false
   /// Token of the capture in progress; a completion carrying any other
   /// token belongs to an earlier subscription and is dropped.
   var capture: UInt64?

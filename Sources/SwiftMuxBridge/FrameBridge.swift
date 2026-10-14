@@ -50,6 +50,9 @@ public enum FrameImporter {
     if frame.modes.contains(.alternateScreen) { modes.insert(.alternateScreen) }
     if frame.modes.contains(.reverseVideo) { modes.insert(.reverseVideo) }
     if frame.modes.contains(.focusEvents) { modes.insert(.focusEvents) }
+    if frame.modes.contains(.keypadApplication) {
+      modes.insert(.keypadApplication)
+    }
     if frame.cursor.visible { modes.insert(.cursorVisible) }
     if frame.cursor.blinking { modes.insert(.cursorBlink) }
     modes.insert(.autowrap)

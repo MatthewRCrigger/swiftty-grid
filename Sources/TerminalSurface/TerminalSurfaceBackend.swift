@@ -25,7 +25,9 @@ public enum SurfaceInput: Hashable, Sendable {
     case let .text(text): .text(text)
     case let .paste(text): .paste(text)
     case let .key(key):
-      .key(KeyEvent(Self.key(key.name), modifiers: Self.modifiers(key.modifiers)))
+      .key(
+        KeyEvent(Self.key(key.name), modifiers: Self.modifiers(key.modifiers))
+      )
     }
   }
 

@@ -12,7 +12,9 @@ public struct QUICGrantConnector: RSTConnector {
     self.connector = connector
   }
 
-  public func connect(to grant: BootstrapGrant) async throws -> any RSTConnection {
+  public func connect(
+    to grant: BootstrapGrant
+  ) async throws -> any RSTConnection {
     let pin = try CertificatePin(
       certificateDER: grant.serverCertificateDER,
       sha256: grant.serverCertificateSHA256,
@@ -21,7 +23,8 @@ public struct QUICGrantConnector: RSTConnector {
     return try await connector.connect(
       host: grant.endpoint.host,
       port: grant.endpoint.port,
-      pin: pin
+      pin: pin,
+      limits: grant.limits
     )
   }
 }

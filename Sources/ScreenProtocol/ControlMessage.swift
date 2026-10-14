@@ -96,7 +96,11 @@ public enum ControlMessage: Hashable, Sendable {
     public var sequence: UInt64
     public var operation: InputOperation
 
-    public init(attachmentEpoch: UInt64, sequence: UInt64, operation: InputOperation) {
+    public init(
+      attachmentEpoch: UInt64,
+      sequence: UInt64,
+      operation: InputOperation
+    ) {
       self.attachmentEpoch = attachmentEpoch
       self.sequence = sequence
       self.operation = operation
@@ -110,7 +114,11 @@ public enum ControlMessage: Hashable, Sendable {
     /// Short fixed diagnostic; never user data.
     public var message: String?
 
-    public init(_ code: RSTErrorCode, sequence: UInt64? = nil, message: String? = nil) {
+    public init(
+      _ code: RSTErrorCode,
+      sequence: UInt64? = nil,
+      message: String? = nil
+    ) {
       self.code = code
       self.sequence = sequence
       self.message = message.map { String($0.prefix(200)) }
@@ -190,7 +198,8 @@ extension ControlMessage: Codable {
           partialInputSequence: try c.decodeIfPresent(
             WireUInt64.self,
             forKey: .partialInputSequence
-          )?.value,
+          )?
+          .value,
           resizeRevision: try u64(.resizeRevision)
         )
       )
@@ -203,7 +212,10 @@ extension ControlMessage: Codable {
         )
       )
     case "InputAck":
-      self = .inputAck(epoch: try u64(.attachmentEpoch), sequence: try u64(.sequence))
+      self = .inputAck(
+        epoch: try u64(.attachmentEpoch),
+        sequence: try u64(.sequence)
+      )
     case "ScreenAck":
       self = .screenAck(
         epoch: try u64(.attachmentEpoch),

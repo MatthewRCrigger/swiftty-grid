@@ -16,7 +16,7 @@ public struct ClientInputQueue: Sendable {
   public private(set) var entries: [Entry] = []
   public private(set) var nextSequence: UInt64 = 1
   public private(set) var pendingBytes = 0
-  public let byteLimit: Int
+  public private(set) var byteLimit: Int
 
   public init(
     writerID: WriterID,
@@ -27,6 +27,12 @@ public struct ClientInputQueue: Sendable {
   }
 
   public var isEmpty: Bool { entries.isEmpty }
+
+  /// A refreshed grant may lower the budget below retained input. Keep
+  /// accepted operations; refuse new input until acknowledgments free room.
+  public mutating func updateByteLimit(_ limit: Int) {
+    byteLimit = max(0, min(limit, RSTLimits.maxPendingInputBytes))
+  }
   /// Highest sequence acknowledged as applied by the host.
   public var acknowledged: UInt64 { nextSequence - 1 - UInt64(entries.count) }
 
@@ -129,9 +135,7 @@ public struct HostInputLedger: Sendable {
 
   /// Installs a writer. A different writer may take over only when no
   /// admitted operation remains; its sequence restarts at one.
-  public mutating func authorize(
-    _ writer: WriterID
-  ) throws(Rejection) {
+  public mutating func authorize(_ writer: WriterID) throws(Rejection) {
     if writerID == writer { return }
     guard admitted.isEmpty else { throw .wrongWriter }
     writerID = writer
@@ -155,7 +159,14 @@ public struct HostInputLedger: Sendable {
     // An empty ledger always admits one valid operation: a maximal
     // paste's bound (2 × 32 KiB + markers) exceeds the byte limit, and
     // refusing it would stall the writer forever.
-    guard admitted.isEmpty || pendingBytes + operation.expansionBound <= byteLimit
+    // Zero-byte effects still retain an operation. Bound their storage
+    // too, so resizes cannot accumulate without limit behind a blocked
+    // PTY write. Keep the single-operation exception for maximal pastes.
+    let retainedBytes = admitted.reduce(0) { $0 + $1.operation.retainedBytes }
+    guard
+      admitted.isEmpty
+        || (pendingBytes + operation.expansionBound <= byteLimit
+          && retainedBytes + operation.retainedBytes <= byteLimit)
     else { return .rejected(.backpressure) }
     return .admit
   }
@@ -168,7 +179,12 @@ public struct HostInputLedger: Sendable {
   ) {
     precondition(sequence == lastAdmitted + 1, "admission out of order")
     admitted.append(
-      Admitted(sequence: sequence, operation: operation, bytes: bytes, offset: 0)
+      Admitted(
+        sequence: sequence,
+        operation: operation,
+        bytes: bytes,
+        offset: 0
+      )
     )
   }
 
@@ -177,7 +193,12 @@ public struct HostInputLedger: Sendable {
   /// completes, so admission stays bounded.
   public mutating func reserve(_ sequence: UInt64, operation: InputOperation) {
     precondition(sequence == lastAdmitted + 1, "admission out of order")
-    var entry = Admitted(sequence: sequence, operation: operation, bytes: [], offset: 0)
+    var entry = Admitted(
+      sequence: sequence,
+      operation: operation,
+      bytes: [],
+      offset: 0
+    )
     entry.reserved = operation.expansionBound
     admitted.append(entry)
   }
@@ -185,9 +206,7 @@ public struct HostInputLedger: Sendable {
   /// Drops every admitted operation that was never handed to the writer,
   /// so a new writer can take over (a cold-started client never replays
   /// uncertain input). Only valid when none of them was sent.
-  public mutating func abandonUnsent() {
-    admitted.removeAll()
-  }
+  public mutating func abandonUnsent() { admitted.removeAll() }
 
   /// The next bytes to write: the unwritten suffix of the head operation.
   public var nextWrite: (sequence: UInt64, bytes: ArraySlice<UInt8>)? {

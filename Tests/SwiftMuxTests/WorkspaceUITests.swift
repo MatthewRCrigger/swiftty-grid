@@ -1,6 +1,7 @@
 import Foundation
 import SwiftMuxClient
 import SwiftMuxProtocol
+@testable import SwiftMuxService
 import Testing
 
 /// Pieces of the native workspace UI that live below AppKit: title
@@ -130,6 +131,178 @@ struct WorkspaceUITests {
     )
   }
 
+  @Test(.timeLimit(.minutes(1)), arguments: ["pane", "tab", "exit", "forced"])
+  func endedPanesDoNotAccumulateActivityMarkers(_ removal: String) async throws
+  {
+    var limits = MuxLimits.standard
+    limits.maxPanes = 3
+    let h = try Harness(limits: limits)
+    let c = try await h.connect()
+    defer { Task { await c.close() } }
+    guard
+      case let .created(ws) = try await c.execute(
+        .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
+      )
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
+    let anchorTab = ws.tabs[0].id
+    let anchor = ws.tabs[0].activePane
+    try await c.attachAndShow(.id(ws.id))
+    _ = try await c.frame(of: anchor) { $0.lines.first?.hasPrefix("$") == true }
+
+    func hiddenPane() async throws -> (PaneID, TabID) {
+      guard
+        case let .layout(after) = try await c.execute(
+          .newTab(name: nil, launch: shellLaunch())
+        ), let tab = after.activeTabSnapshot
+      else { throw MuxError(.invalidRequest, "unexpected reply") }
+      let pane = tab.activePane
+      try await c.execute(.setSubscriptions([pane]))
+      _ = try await c.frame(of: pane) { $0.lines.first?.hasPrefix("$") == true }
+      try await c.execute(.selectTab(anchorTab))
+      try await c.execute(.setSubscriptions([anchor]))
+      return (pane, tab.id)
+    }
+
+    func markActivity(_ pane: PaneID, ignoringHangup: Bool = false) async throws
+    {
+      let setup = ignoringHangup ? "trap '' HUP; " : ""
+      try await c.send(.text(setup + "echo unseen-$((6*7))\r"), to: pane)
+      let deadline = ContinuousClock.now + .seconds(2)
+      while ContinuousClock.now < deadline,
+        let event = try await c.nextEvent(
+          timeout: deadline - ContinuousClock.now
+        )
+      {
+        if case let .activity(id) = event, id == pane {
+          if !ignoringHangup { return }
+          // Input echo can report activity before the shell executes the
+          // trap. Its evaluated output proves the handler is installed.
+          while ContinuousClock.now < deadline {
+            if await h.service.screenLines(pane)?
+              .contains(where: { $0.contains("unseen-42") }) == true
+            {
+              return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+          }
+          throw TimeoutError()
+        }
+      }
+      throw TimeoutError()
+    }
+
+    let (keeper, _) = try await hiddenPane()
+    try await markActivity(keeper)
+    #expect(await h.service.activityMarkers(in: ws.id) == [keeper])
+    for _ in 0 ..< 4 {
+      let (pane, tab) = try await hiddenPane()
+      try await markActivity(pane, ignoringHangup: removal == "forced")
+      #expect(await h.service.activityMarkers(in: ws.id).contains(pane))
+      let endedAt = ContinuousClock.now
+      switch removal {
+      case "pane", "forced": try await c.execute(.endPane(pane))
+      case "tab": try await c.execute(.endTab(tab))
+      default: try await c.send(.text("exit\r"), to: pane)
+      }
+      // Two seconds is the escalation grace, not the reaping bound.
+      // Use the forced-termination fixture's bound and observe completion.
+      let deadline = ContinuousClock.now + .seconds(8)
+      var exited = false
+      do {
+        while ContinuousClock.now < deadline,
+          let event = try await c.nextEvent(
+            timeout: deadline - ContinuousClock.now
+          )
+        {
+          if case let .paneExited(id, _, truncated) = event, id == pane {
+            exited = true
+            if removal == "forced" {
+              #expect(truncated)
+              #expect(ContinuousClock.now - endedAt >= .seconds(2))
+            }
+            break
+          }
+        }
+      } catch {
+        let termination = await h.service.terminationState(of: pane)
+        Issue.record("Pane exit observation failed: \(termination)")
+        throw error
+      }
+      #expect(exited)
+      let remainingPID = await h.service.panePID(pane)
+      let termination =
+        remainingPID == nil
+        ? "retired" : await h.service.terminationState(of: pane)
+      #expect(remainingPID == nil, "\(termination)")
+      // Four retired IDs exceed the three-live-pane cap. The other hidden
+      // pane's existing marker must survive each targeted removal.
+      let retained = await h.service.activityMarkers(in: ws.id)
+      #expect(retained == [keeper])
+    }
+    try await c.execute(.endWorkspace(.id(ws.id)))
+    await c.close()
+  }
+
+  /// Output arriving during a tab's subscription transition remains unseen
+  /// when the former tab's subscription is removed.
+  @Test(.timeLimit(.minutes(1)))
+  func hiddenPaneTransitionOutputIsReportedAfterUnsubscription() async throws {
+    let h = try Harness()
+    let c = try await h.connect()
+    defer { Task { await c.close() } }
+    guard
+      case let .created(ws) = try await c.execute(
+        .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
+      )
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
+    let firstTab = ws.tabs[0].id
+    let pane = ws.tabs[0].activePane
+    try await c.attachAndShow(.id(ws.id))
+    _ = try await c.frame(of: pane) { $0.lines.first?.hasPrefix("$") == true }
+
+    func activityUntilMarker(
+      _ marker: String,
+      in target: PaneID
+    ) async throws -> [PaneID] {
+      let deadline = ContinuousClock.now + .seconds(2)
+      var reports: [PaneID] = []
+      while ContinuousClock.now < deadline,
+        let event = try await c.nextEvent(
+          timeout: deadline - ContinuousClock.now
+        )
+      {
+        if case let .activity(id) = event { reports.append(id) }
+        if case let .frame(frame) = event, frame.identity.pane == target,
+          frame.lines.contains(marker)
+        {
+          return reports
+        }
+      }
+      throw TimeoutError()
+    }
+
+    try await c.send(.text("echo transition-$((3*7))\r"), to: pane)
+    #expect(try await activityUntilMarker("transition-21", in: pane).isEmpty)
+    guard
+      case let .layout(after) = try await c.execute(
+        .newTab(name: nil, launch: shellLaunch())
+      )
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
+    #expect(after.activeTab != firstTab)
+    // Keep the former tab subscribed, as it is between layout delivery and
+    // the frontend's next setSubscriptions command. A frame proves that
+    // real hidden output has been processed, without a timing-only wait.
+    try await c.send(.text("echo transition-$((6*7))\r"), to: pane)
+    #expect(try await activityUntilMarker("transition-42", in: pane).isEmpty)
+    try await c.send(.text("echo transition-$((9*7))\r"), to: pane)
+    #expect(try await activityUntilMarker("transition-63", in: pane).isEmpty)
+    let shown = try #require(after.activeTabSnapshot?.activePane)
+    try await c.execute(.setSubscriptions([shown]))
+    try await c.send(.text("echo transition-$((12*7))\r"), to: shown)
+    let pending = try await activityUntilMarker("transition-84", in: shown)
+    #expect(pending == [pane])
+  }
+
   /// Output in a hidden tab is reported once, and again only after the
   /// pane has been shown.
   @Test(.timeLimit(.minutes(1)))
@@ -140,7 +313,7 @@ struct WorkspaceUITests {
       case let .created(ws) = try await c.execute(
         .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     let hidden = ws.tabs[0].activePane
     try await c.attachAndShow(.id(ws.id))
     _ = try await c.frame(of: hidden) { $0.lines.first?.hasPrefix("$") == true }
@@ -148,7 +321,7 @@ struct WorkspaceUITests {
       case let .layout(after) = try await c.execute(
         .newTab(name: nil, launch: shellLaunch())
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     let shown = try #require(after.activeTabSnapshot?.activePane)
     try await c.execute(.setSubscriptions([shown]))
     try await c.send(
@@ -180,5 +353,16 @@ struct WorkspaceUITests {
       if case let .activity(pane) = event { again = pane == hidden }
     }
     #expect(again)
+  }
+}
+
+extension MuxService {
+  fileprivate func terminationState(of pane: PaneID) -> String {
+    runtime(pane)?.terminationStateForTesting()
+      ?? "retired after deadline snapshot"
+  }
+
+  fileprivate func activityMarkers(in workspace: WorkspaceID) -> Set<PaneID> {
+    leases[workspace]?.reportedActivity ?? []
   }
 }

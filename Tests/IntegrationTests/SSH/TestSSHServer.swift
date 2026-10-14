@@ -17,25 +17,86 @@ struct SFTPFaultPlan: Sendable {
   /// Perform the next rename, then drop the connection without replying
   /// (one-shot).
   var dropRenameResponse = false
+  /// Close the next handle but report a server failure (one-shot).
+  var rejectNextClose = false
+  var holdNextReadResponse = false
+  var holdNextWriteResponse = false
+  var holdNextOpenResponse = false
+  var holdNextRealpathResponse = false
+  var holdAllReadResponses = false
+  var withholdVersionResponse = false
+  /// Finite scripted READDIR batches, then the ordinary directory contents.
+  var readDirectoryBatches: [[SFTPNameEntry]] = []
+  var rejectedDirectoryPaths: Set<String> = []
+  var rejectSessionChannel = false
+  var holdSessionChannelOpen = false
+  var withholdPTYReply = false
+  var withholdShellReply = false
+  var rejectPTY = false
+  var rejectShell = false
+  var dropAllServerWrites = false
+  var holdNextPasswordAuth = false
+  var reportedFileSize: UInt64?
 }
+
+enum SessionSetupReply: Sendable, Equatable { case exec, pty, shell, sftp }
 
 /// Observable server-side state shared with tests.
 final class TestServerState: Sendable {
+  struct Connections: Sendable {
+    var stopping = false
+    var channels: [ObjectIdentifier: any Channel] = [:]
+  }
+
+  struct SFTPDrop: Sendable {
+    enum Cause: Sendable { case requestLimit, rename }
+    enum Operation: Sendable {
+      case open, close, read, write, fstat, stat, rename, realpath, other
+    }
+    let operation: Operation
+    let id = UUID()
+    let cause: Cause
+    let requestID: UInt32
+    let parentPresent: Bool
+    var parentClosed = false
+    var childClosed = false
+  }
+
+  /// One bounded observation, without paths, contents or credentials.
+  let lastSFTPDrop = Mutex<SFTPDrop?>(nil)
+  let connections = Mutex(Connections())
   let authRequests = Mutex(0)
+  let heldPasswordAuth = Mutex<
+    EventLoopPromise<NIOSSHUserAuthenticationOutcome>?
+  >(nil)
   let sftpRequests = Mutex(0)
+  let sftpInitializations = Mutex(0)
   let renames = Mutex(0)
   let writes = Mutex(0)
+  let reads = Mutex(0)
+  let directoryReads = Mutex(0)
+  let heldSFTPResponse = Mutex<(@Sendable () -> Void)?>(nil)
+  let heldSFTPResponses = Mutex<[@Sendable () -> Void]>([])
+  let sftpOpenHandles = Mutex(0)
   let faults = Mutex(SFTPFaultPlan())
+  let heldSessionOpens = Mutex<[EventLoopPromise<Void>]>([])
+  let sessionChannels = Mutex<[ObjectIdentifier: any Channel]>([:])
+  let shellRequests = Mutex(0)
+  let lastExecCommand = Mutex<String?>(nil)
+  let execStdinFinished = Mutex(false)
+  let beforeSetupReply = Mutex<(@Sendable (SessionSetupReply) -> Void)?>(nil)
+  let droppedServerWrites = Mutex(0)
   let ptyRequest = Mutex<SSHChannelRequestEvent.PseudoTerminalRequest?>(nil)
   let windowSize = Mutex<(Int, Int)?>(nil)
+  /// Exit immediately after accepting a shell, without emitting output.
+  let shellExitStatus = Mutex<Int?>(nil)
   let bootstrapRequests = Mutex<[BootstrapRequest]>([])
   /// When set, `forwardHelperPath bootstrap --stdio` hands its stdin
   /// envelope to this responder (a real `BootstrapService`).
   let bootstrapForwarder = Mutex<(@Sendable ([UInt8]) async -> [UInt8])?>(nil)
 }
 
-final class TestAuthDelegate: NIOSSHServerUserAuthenticationDelegate, Sendable
-{
+final class TestAuthDelegate: NIOSSHServerUserAuthenticationDelegate, Sendable {
   let username: String
   let password: String
   let authorizedKeys: [NIOSSHPublicKey]
@@ -68,13 +129,26 @@ final class TestAuthDelegate: NIOSSHServerUserAuthenticationDelegate, Sendable
     }
     switch request.request {
     case let .password(offer):
+      let hold = state.faults.withLock { faults in
+        let hold = faults.holdNextPasswordAuth
+        faults.holdNextPasswordAuth = false
+        return hold
+      }
+      if hold {
+        let registered = state.connections.withLock { connections in
+          guard !connections.stopping else { return false }
+          state.heldPasswordAuth.withLock { $0 = responsePromise }
+          return true
+        }
+        if !registered { responsePromise.fail(SSHClientError.connectionClosed) }
+        return
+      }
       responsePromise.succeed(offer.password == password ? .success : .failure)
     case let .publicKey(offer):
       responsePromise.succeed(
         authorizedKeys.contains(offer.publicKey) ? .success : .failure
       )
-    default:
-      responsePromise.succeed(.failure)
+    default: responsePromise.succeed(.failure)
     }
   }
 }
@@ -116,8 +190,9 @@ final class TestSSHServer: Sendable {
     authorizedKeys: [NIOSSHPublicKey] = []
   ) async throws -> TestSSHServer {
     let state = TestServerState()
-    let root = FileManager.default.temporaryDirectory
-      .appendingPathComponent("sftp-root-" + UUID().uuidString)
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "sftp-root-" + UUID().uuidString
+    )
     try FileManager.default.createDirectory(
       at: root,
       withIntermediateDirectories: true
@@ -129,36 +204,70 @@ final class TestSSHServer: Sendable {
       state: state
     )
     let rootPath = root.path
-    let channel = try await ServerBootstrap(
-      group: MultiThreadedEventLoopGroup.singleton
-    )
-    .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
-    .childChannelInitializer { channel in
-      channel.eventLoop.makeCompletedFuture {
-        let ssh = NIOSSHHandler(
-          role: .server(
-            .init(hostKeys: [hostKey], userAuthDelegate: auth)
-          ),
-          allocator: channel.allocator,
-          inboundChildChannelInitializer: { child, type in
-            guard case .session = type else {
-              return child.eventLoop.makeFailedFuture(
-                SSHClientError.channelRequestRejected("type")
-              )
+    let channel: any Channel
+    do {
+      channel = try await ServerBootstrap(
+        group: MultiThreadedEventLoopGroup.singleton
+      )
+      .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
+      .childChannelInitializer { channel in
+        let id = ObjectIdentifier(channel)
+        let admitted = state.connections.withLock { connections in
+          guard !connections.stopping else { return false }
+          connections.channels[id] = channel
+          return true
+        }
+        guard admitted else { return channel.close() }
+        channel.closeFuture.whenComplete { _ in
+          _ = state.connections.withLock { $0.channels.removeValue(forKey: id) }
+        }
+        return channel.eventLoop.makeCompletedFuture {
+          let ssh = NIOSSHHandler(
+            role: .server(.init(hostKeys: [hostKey], userAuthDelegate: auth)),
+            allocator: channel.allocator,
+            inboundChildChannelInitializer: { child, type in
+              let id = ObjectIdentifier(child)
+              state.sessionChannels.withLock { $0[id] = child }
+              child.closeFuture.whenComplete { _ in
+                state.sessionChannels.withLock {
+                  _ = $0.removeValue(forKey: id)
+                }
+              }
+              if state.faults.withLock({ $0.rejectSessionChannel }) {
+                return child.eventLoop.makeFailedFuture(
+                  SSHClientError.channelRequestRejected("session")
+                )
+              }
+              guard case .session = type else {
+                return child.eventLoop.makeFailedFuture(
+                  SSHClientError.channelRequestRejected("type")
+                )
+              }
+              let gate = child.eventLoop.makePromise(of: Void.self)
+              if state.faults.withLock({ $0.holdSessionChannelOpen }) {
+                state.heldSessionOpens.withLock { $0.append(gate) }
+              } else {
+                gate.succeed()
+              }
+              return gate.futureResult.flatMapThrowing {
+                try child.pipeline.syncOperations.addHandler(
+                  TestSessionHandler(state: state, root: rootPath)
+                )
+              }
             }
-            return child.eventLoop.makeCompletedFuture {
-              try child.pipeline.syncOperations.addHandler(
-                TestSessionHandler(state: state, root: rootPath)
-              )
-            }
-          }
-        )
-        try channel.pipeline.syncOperations.addHandler(ssh)
-        try channel.pipeline.syncOperations.addHandler(CloseOnErrorHandler())
+          )
+          try channel.pipeline.syncOperations.addHandler(
+            DropServerWrites(state: state)
+          )
+          try channel.pipeline.syncOperations.addHandler(ssh)
+          try channel.pipeline.syncOperations.addHandler(CloseOnErrorHandler())
+        }
       }
+      .bind(host: "127.0.0.1", port: 0).get()
+    } catch {
+      try? FileManager.default.removeItem(at: root)
+      throw error
     }
-    .bind(host: "127.0.0.1", port: 0)
-    .get()
     return TestSSHServer(
       channel: channel,
       port: channel.localAddress!.port!,
@@ -169,7 +278,26 @@ final class TestSSHServer: Sendable {
   }
 
   func shutdown() async {
+    let accepted = state.connections.withLock { connections in
+      connections.stopping = true
+      return Array(connections.channels.values)
+    }
+    let authentication = state.heldPasswordAuth.withLock { value in
+      let held = value
+      value = nil
+      return held
+    }
+    authentication?.fail(SSHClientError.connectionClosed)
+    let held = state.heldSessionOpens.withLock { value in
+      let held = value
+      value.removeAll()
+      return held
+    }
+    for promise in held { promise.fail(SSHClientError.connectionClosed) }
     try? await channel.close()
+    for connection in accepted { try? await connection.close() }
+    state.heldSFTPResponse.withLock { $0 = nil }
+    state.heldSFTPResponses.withLock { $0.removeAll() }
     try? FileManager.default.removeItem(at: root)
   }
 
@@ -199,9 +327,7 @@ final class TestSSHServer: Sendable {
   }
 
   func url(_ path: String) -> URL {
-    root.appendingPathComponent(
-      String(path.drop(while: { $0 == "/" }))
-    )
+    root.appendingPathComponent(String(path.drop(while: { $0 == "/" })))
   }
 }
 
@@ -212,12 +338,37 @@ final class CloseOnErrorHandler: ChannelInboundHandler, Sendable {
   }
 }
 
+/// Blackholes encrypted replies only after a test enables the fault. Handshake
+/// and channel setup still use the actual SSH stack and loopback TCP sockets.
+final class DropServerWrites: ChannelOutboundHandler, Sendable {
+  typealias OutboundIn = ByteBuffer
+  let state: TestServerState
+  init(state: TestServerState) { self.state = state }
+
+  func write(
+    context: ChannelHandlerContext,
+    data: NIOAny,
+    promise: EventLoopPromise<Void>?
+  ) {
+    if state.faults.withLock({ $0.dropAllServerWrites }) {
+      state.droppedServerWrites.withLock { $0 += 1 }
+      promise?.succeed()
+    } else {
+      context.write(data, promise: promise)
+    }
+  }
+}
+
 /// Server side of one session channel: exec, shell (echo) or the SFTP
 /// subsystem.
 final class TestSessionHandler: ChannelInboundHandler {
   typealias InboundIn = SSHChannelData
 
-  enum Mode { case idle, exec(String), shell, sftp }
+  enum Mode {
+    case idle
+    case exec(String)
+    case shell, sftp
+  }
 
   let state: TestServerState
   let sftp: TestSFTPServer
@@ -236,18 +387,45 @@ final class TestSessionHandler: ChannelInboundHandler {
     )
   }
 
+  func channelInactive(context: ChannelHandlerContext) {
+    sftp.closeHandles()
+    context.fireChannelInactive()
+  }
+
+  func handlerRemoved(context: ChannelHandlerContext) { sftp.closeHandles() }
+
   func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
     switch event {
     case let request as SSHChannelRequestEvent.ExecRequest:
+      state.lastExecCommand.withLock { $0 = request.command }
       mode = .exec(request.command)
+      state.beforeSetupReply.withLock { $0 }?(.exec)
       reply(context, success: true, wantReply: request.wantReply)
       runExecIfImmediate(context, command: request.command)
     case let request as SSHChannelRequestEvent.PseudoTerminalRequest:
       state.ptyRequest.withLock { $0 = request }
-      reply(context, success: true, wantReply: request.wantReply)
+      if !state.faults.withLock({ $0.withholdPTYReply }) {
+        state.beforeSetupReply.withLock { $0 }?(.pty)
+        reply(
+          context,
+          success: !state.faults.withLock { $0.rejectPTY },
+          wantReply: request.wantReply
+        )
+      }
     case let request as SSHChannelRequestEvent.ShellRequest:
       mode = .shell
-      reply(context, success: true, wantReply: request.wantReply)
+      state.shellRequests.withLock { $0 += 1 }
+      if !state.faults.withLock({ $0.withholdShellReply }) {
+        state.beforeSetupReply.withLock { $0 }?(.shell)
+        reply(
+          context,
+          success: !state.faults.withLock { $0.rejectShell },
+          wantReply: request.wantReply
+        )
+      }
+      if let status = state.shellExitStatus.withLock({ $0 }) {
+        exit(context, status: status)
+      }
     case let request as SSHChannelRequestEvent.WindowChangeRequest:
       state.windowSize.withLock {
         $0 = (request.terminalCharacterWidth, request.terminalRowHeight)
@@ -262,13 +440,14 @@ final class TestSessionHandler: ChannelInboundHandler {
     case let request as SSHChannelRequestEvent.SubsystemRequest:
       let ok = request.subsystem == "sftp"
       if ok { mode = .sftp }
+      state.beforeSetupReply.withLock { $0 }?(.sftp)
       reply(context, success: ok, wantReply: request.wantReply)
     case let event as ChannelEvent where event == .inputClosed:
       if case let .exec(command) = mode {
+        state.execStdinFinished.withLock { $0 = true }
         finishExec(context, command: command)
       }
-    default:
-      context.fireUserInboundEventTriggered(event)
+    default: context.fireUserInboundEventTriggered(event)
     }
   }
 
@@ -345,6 +524,7 @@ final class TestSessionHandler: ChannelInboundHandler {
   private func finishExec(_ context: ChannelHandlerContext, command: String) {
     let suffix = " bootstrap --stdio"
     switch command {
+    case "wait-forever": send(context, Array("partial".utf8))
     case "echo-split":
       send(context, Array("out:".utf8) + stdin)
       send(context, Array("err".utf8), type: .stdErr)
@@ -377,19 +557,14 @@ final class TestSessionHandler: ChannelInboundHandler {
       exit(context, status: 0)
     case "/opt/noisy/swifttyd" + suffix:
       for _ in 0 ..< 8 {
-        send(
-          context,
-          [UInt8](repeating: 0x21, count: 16 * 1024),
-          type: .stdErr
-        )
+        send(context, [UInt8](repeating: 0x21, count: 16 * 1024), type: .stdErr)
       }
       send(context, bootstrapReply())
       exit(context, status: 0)
     case "/opt/silent/swifttyd" + suffix:
       send(context, Array("agent unavailable".utf8), type: .stdErr)
       exit(context, status: 1)
-    default:
-      exit(context, status: 127)
+    default: exit(context, status: 127)
     }
   }
 

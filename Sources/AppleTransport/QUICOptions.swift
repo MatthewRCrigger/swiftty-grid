@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import ScreenProtocol
 import Security
 import SessionCore
 import Synchronization
@@ -47,9 +48,16 @@ enum QUICOptions {
     return options
   }
 
-  static func idleMilliseconds(_ duration: Duration) -> Int {
-    Int(duration.components.seconds) * 1000
-      + Int(duration.components.attoseconds / 1_000_000_000_000_000)
+  static func idleMilliseconds(_ duration: Duration) throws -> Int {
+    guard duration >= .zero, duration <= .milliseconds(Int64(UInt32.max)) else {
+      throw RSTTransportError.handshake("invalid idle timeout")
+    }
+    let (seconds, attoseconds) = duration.components
+    let unit: Int64 = 1_000_000_000_000_000
+    // Round up so a positive fraction cannot become zero (idle disabled).
+    return Int(
+      seconds * 1000 + attoseconds / unit + (attoseconds % unit == 0 ? 0 : 1)
+    )
   }
 
   /// Client options whose TLS verify block accepts only the pinned leaf.
@@ -64,9 +72,10 @@ enum QUICOptions {
     idleTimeout: Duration,
     verdict: PinVerdict,
     queue: DispatchQueue
-  ) -> NWProtocolQUIC.Options {
+  ) throws -> NWProtocolQUIC.Options {
+    let milliseconds = try idleMilliseconds(idleTimeout)
     let quic = NWProtocolQUIC.Options(alpn: [alpn])
-    quic.idleTimeout = idleMilliseconds(idleTimeout)
+    quic.idleTimeout = milliseconds
     // Concurrent snapshot streams the server may open; `MAX_STREAMS`
     // credit returns as streams finish.
     quic.initialMaxStreamsUnidirectional = concurrentSnapshotStreams
@@ -95,24 +104,25 @@ enum QUICOptions {
   }
 
   #if os(macOS)
-    static func server(
-      identity: sec_identity_t,
-      alpn: String,
-      idleTimeout: Duration
-    ) -> NWProtocolQUIC.Options {
-      let quic = NWProtocolQUIC.Options(alpn: [alpn])
-      quic.idleTimeout = idleMilliseconds(idleTimeout)
-      // RST/1 needs one client bidirectional stream (control), but Network
-      // framework's multiplex group consumes stream 0 itself, so the
-      // control stream is typically ID 4. Keep a small concurrency cap;
-      // the connection rejects any bidirectional stream after the first.
-      quic.initialMaxStreamsBidirectional = 4
-      let security = quic.securityProtocolOptions
-      harden(security)
-      sec_protocol_options_set_local_identity(security, identity)
-      sec_protocol_options_set_peer_authentication_required(security, false)
-      return quic
-    }
+  static func server(
+    identity: sec_identity_t,
+    alpn: String,
+    idleTimeout: Duration
+  ) throws -> NWProtocolQUIC.Options {
+    let milliseconds = try idleMilliseconds(idleTimeout)
+    let quic = NWProtocolQUIC.Options(alpn: [alpn])
+    quic.idleTimeout = milliseconds
+    // RST/1 needs one client bidirectional stream (control), but Network
+    // framework's multiplex group consumes stream 0 itself, so the
+    // control stream is typically ID 4. Keep a small concurrency cap;
+    // the connection rejects any bidirectional stream after the first.
+    quic.initialMaxStreamsBidirectional = 4
+    let security = quic.securityProtocolOptions
+    harden(security)
+    sec_protocol_options_set_local_identity(security, identity)
+    sec_protocol_options_set_peer_authentication_required(security, false)
+    return quic
+  }
   #endif
 }
 
@@ -120,7 +130,10 @@ enum QUICOptions {
 /// failed handshake reports `pinMismatch` and a "ready" group whose verify
 /// block never approved the peer is still refused.
 final class PinVerdict: Sendable {
-  private enum Value { case pending, accepted, rejected(CertificatePinError) }
+  private enum Value {
+    case pending, accepted
+    case rejected(CertificatePinError)
+  }
   private let value = Mutex(Value.pending)
   private let onReject: @Sendable () -> Void
 

@@ -55,6 +55,10 @@ public struct CompanionStatus: Hashable, Sendable {
   public let pendingInputCount: Int
   /// Whether the phone currently allows an on-request text preview.
   public let previewAvailable: Bool
+  /// Opaque preview ownership. It changes when the selected session
+  /// changes and is not a host or session token. Cached preview text
+  /// belongs only to this id.
+  public let previewOwner: UInt64
 
   /// Builds a status, sanitizing and clamping every field.
   public init(
@@ -63,7 +67,8 @@ public struct CompanionStatus: Hashable, Sendable {
     capturedAt: Date,
     lastScreenAt: Date? = nil,
     pendingInputCount: Int = 0,
-    previewAvailable: Bool = false
+    previewAvailable: Bool = false,
+    previewOwner: UInt64 = 0
   ) {
     let nickname = sessionNickname.map {
       CompanionText.bounded(
@@ -81,6 +86,7 @@ public struct CompanionStatus: Hashable, Sendable {
       CompanionLimits.maxPendingInputCount
     )
     self.previewAvailable = previewAvailable
+    self.previewOwner = previewOwner
   }
 
   /// "Nothing to show" status captured at `date`.
@@ -97,18 +103,24 @@ extension CompanionStatus: Codable {
     case lastScreenAt
     case pendingInputCount = "pendingInput"
     case previewAvailable
+    case previewOwner
   }
 
   public init(from decoder: any Decoder) throws {
     try StrictKeys.check(decoder, allowed: CodingKeys.self)
     let c = try decoder.container(keyedBy: CodingKeys.self)
-    let rawNickname = try c.decodeIfPresent(String.self, forKey: .sessionNickname)
+    let rawNickname = try c.decodeIfPresent(
+      String.self,
+      forKey: .sessionNickname
+    )
     let nickname = rawNickname.map(CompanionText.stripControls)
-    if let nickname, !CompanionText.isValid(
-      nickname,
-      characters: CompanionLimits.maxNicknameCharacters,
-      bytes: CompanionLimits.maxNicknameBytes
-    ) {
+    if let nickname,
+      !CompanionText.isValid(
+        nickname,
+        characters: CompanionLimits.maxNicknameCharacters,
+        bytes: CompanionLimits.maxNicknameBytes
+      )
+    {
       throw CompanionCodecError.invalid("nickname exceeds bounds")
     }
     let state = try c.decode(CompanionConnectionState.self, forKey: .state)
@@ -118,7 +130,7 @@ extension CompanionStatus: Codable {
       throw CompanionCodecError.invalid("lastScreenAt after capturedAt")
     }
     let pending = try c.decode(Int.self, forKey: .pendingInputCount)
-    guard (0...CompanionLimits.maxPendingInputCount).contains(pending) else {
+    guard (0 ... CompanionLimits.maxPendingInputCount).contains(pending) else {
       throw CompanionCodecError.invalid("pendingInput out of range")
     }
     self.init(
@@ -127,7 +139,8 @@ extension CompanionStatus: Codable {
       capturedAt: capturedAt,
       lastScreenAt: lastScreenAt,
       pendingInputCount: pending,
-      previewAvailable: try c.decode(Bool.self, forKey: .previewAvailable)
+      previewAvailable: try c.decode(Bool.self, forKey: .previewAvailable),
+      previewOwner: try c.decode(UInt64.self, forKey: .previewOwner)
     )
   }
 
@@ -136,9 +149,13 @@ extension CompanionStatus: Codable {
     try c.encodeIfPresent(sessionNickname, forKey: .sessionNickname)
     try c.encode(state, forKey: .state)
     try c.encode(CompanionTime.wire(capturedAt), forKey: .capturedAt)
-    try c.encodeIfPresent(lastScreenAt.map(CompanionTime.wire), forKey: .lastScreenAt)
+    try c.encodeIfPresent(
+      lastScreenAt.map(CompanionTime.wire),
+      forKey: .lastScreenAt
+    )
     try c.encode(pendingInputCount, forKey: .pendingInputCount)
     try c.encode(previewAvailable, forKey: .previewAvailable)
+    try c.encode(previewOwner, forKey: .previewOwner)
   }
 }
 
@@ -150,18 +167,22 @@ public struct CompanionPreview: Hashable, Sendable {
   public let lines: [String]
   /// When the iPhone observed this screen content.
   public let capturedAt: Date
+  /// `CompanionStatus.previewOwner` for the selection these lines belong
+  /// to. It is not a host or session token.
+  public let owner: UInt64
 
   /// Builds a preview from raw screen rows: strips controls, truncates
   /// each row, keeps the bottom-most rows that fit the line and byte
   /// budgets, and drops trailing blank rows.
-  public init(lines raw: [String], capturedAt: Date) {
-    var rows = raw.suffix(CompanionLimits.maxPreviewLines * 4).map {
-      CompanionText.bounded(
-        $0,
-        characters: CompanionLimits.maxPreviewColumns,
-        bytes: CompanionLimits.maxPreviewLineBytes
-      )
-    }
+  public init(lines raw: [String], capturedAt: Date, owner: UInt64 = 0) {
+    var rows = raw.suffix(CompanionLimits.maxPreviewLines * 4)
+      .map {
+        CompanionText.bounded(
+          $0,
+          characters: CompanionLimits.maxPreviewColumns,
+          bytes: CompanionLimits.maxPreviewLineBytes
+        )
+      }
     while let last = rows.last, last.allSatisfy(\.isWhitespace) {
       rows.removeLast()
     }
@@ -176,6 +197,7 @@ public struct CompanionPreview: Hashable, Sendable {
     }
     self.lines = kept.reversed()
     self.capturedAt = capturedAt
+    self.owner = owner
   }
 }
 
@@ -183,14 +205,14 @@ extension CompanionPreview: Codable {
   enum CodingKeys: String, CodingKey, CaseIterable {
     case lines
     case capturedAt
+    case owner
   }
 
   public init(from decoder: any Decoder) throws {
     try StrictKeys.check(decoder, allowed: CodingKeys.self)
     let c = try decoder.container(keyedBy: CodingKeys.self)
     var linesContainer = try c.nestedUnkeyedContainer(forKey: .lines)
-    if let count = linesContainer.count,
-      count > CompanionLimits.maxPreviewLines
+    if let count = linesContainer.count, count > CompanionLimits.maxPreviewLines
     {
       throw CompanionCodecError.invalid("too many preview lines")
     }
@@ -218,19 +240,21 @@ extension CompanionPreview: Codable {
     }
     self.lines = lines
     self.capturedAt = try CompanionTime.decode(c, .capturedAt)
+    self.owner = try c.decode(UInt64.self, forKey: .owner)
   }
 
   public func encode(to encoder: any Encoder) throws {
     var c = encoder.container(keyedBy: CodingKeys.self)
     try c.encode(lines, forKey: .lines)
     try c.encode(CompanionTime.wire(capturedAt), forKey: .capturedAt)
+    try c.encode(owner, forKey: .owner)
   }
 }
 
 /// Wire timestamps: finite seconds since 1970 with millisecond precision.
 enum CompanionTime {
   /// 2000-01-01 ... 2200-01-01; anything else is malformed.
-  static let range: ClosedRange<Double> = 946_684_800...7_258_118_400
+  static let range: ClosedRange<Double> = 946_684_800 ... 7_258_118_400
 
   static func wire(_ date: Date) -> Double {
     (date.timeIntervalSince1970 * 1000).rounded(.down) / 1000

@@ -41,7 +41,8 @@ public final class SSHShellChannel: Sendable {
     channel.eventLoop.execute {
       (try? channel.pipeline.syncOperations.handler(
         type: ShellChannelHandler.self
-      ))?.grant(bytes)
+      ))?
+      .grant(bytes)
     }
   }
 
@@ -53,18 +54,20 @@ public final class SSHShellChannel: Sendable {
     }
     guard !bytes.isEmpty else { return }
     let channel = self.channel
-    try await channel.eventLoop.flatSubmit { () -> EventLoopFuture<Void> in
-      guard
-        let handler = try? channel.pipeline.syncOperations.handler(
-          type: ShellChannelHandler.self
-        )
-      else {
-        return channel.eventLoop.makeFailedFuture(
-          SSHClientError.connectionClosed
-        )
+    try await channel.eventLoop
+      .flatSubmit { () -> EventLoopFuture<Void> in
+        guard
+          let handler = try? channel.pipeline.syncOperations.handler(
+            type: ShellChannelHandler.self
+          )
+        else {
+          return channel.eventLoop.makeFailedFuture(
+            SSHClientError.connectionClosed
+          )
+        }
+        return handler.write(bytes)
       }
-      return handler.write(bytes)
-    }.get()
+      .get()
   }
 
   /// Sends an SSH `window-change` request.
@@ -78,22 +81,23 @@ public final class SSHShellChannel: Sendable {
       terminalPixelWidth: 0,
       terminalPixelHeight: 0
     )
-    do {
-      try await channel.triggerUserOutboundEvent(event).get()
-    } catch {
+    do { try await channel.triggerUserOutboundEvent(event).get() } catch {
       throw SSHClientError.connectionClosed
     }
   }
 
   /// Closes the channel. Idempotent.
+  /// If the peer does not acknowledge within five seconds, closes SSH too.
+  /// A failed close on an activated channel also closes SSH.
   public func close() async {
     channel.close(promise: nil)
     try? await channel.closeFuture.get()
   }
 }
 
-final class ShellChannelHandler: ChannelInboundHandler {
+final class ShellChannelHandler: ChannelDuplexHandler {
   typealias InboundIn = SSHChannelData
+  typealias OutboundIn = SSHChannelData
 
   static let maxWritabilityWaiters = 64
 
@@ -141,11 +145,13 @@ final class ShellChannelHandler: ChannelInboundHandler {
       }
   }
 
-  func handlerRemoved(context: ChannelHandlerContext) {
-    self.context = nil
-  }
+  func handlerRemoved(context: ChannelHandlerContext) { self.context = nil }
 
   func channelActive(context: ChannelHandlerContext) {
+    guard phase != .closed else {
+      context.fireChannelActive()
+      return
+    }
     let request = SSHChannelRequestEvent.PseudoTerminalRequest(
       wantReply: true,
       term: "xterm-256color",
@@ -191,14 +197,13 @@ final class ShellChannelHandler: ChannelInboundHandler {
       onEvent(.exitStatus(event.exitStatus))
     case let event as SSHChannelRequestEvent.ExitSignal:
       onEvent(.exitSignal(String(event.signalName.prefix(64))))
-    default:
-      context.fireUserInboundEventTriggered(event)
+    default: context.fireUserInboundEventTriggered(event)
     }
   }
 
   func channelRead(context: ChannelHandlerContext, data: NIOAny) {
     let message = unwrapInboundIn(data)
-    guard case let .byteBuffer(buffer) = message.data,
+    guard phase != .closed, case let .byteBuffer(buffer) = message.data,
       buffer.readableBytes > 0
     else { return }
     credit -= buffer.readableBytes
@@ -217,7 +222,20 @@ final class ShellChannelHandler: ChannelInboundHandler {
   }
 
   func errorCaught(context: ChannelHandlerContext, error: any Error) {
+    phase = .closed
     context.close(promise: nil)
+  }
+
+  func close(
+    context: ChannelHandlerContext,
+    mode: CloseMode,
+    promise: EventLoopPromise<Void>?
+  ) {
+    if mode == .all {
+      phase = .closed
+      releaseWaiters(error: SSHClientError.connectionClosed)
+    }
+    context.close(mode: mode, promise: promise)
   }
 
   func channelInactive(context: ChannelHandlerContext) {
@@ -290,37 +308,56 @@ extension SSHConnection {
   /// Opens an interactive shell with a PTY (`xterm-256color`).
   ///
   /// - Parameters:
-  ///   - initialReadCredit: bytes of output the caller is ready to
-  ///     accept before its first `grantReadCredit`.
-  ///   - onEvent: called on the event loop; must return quickly.
+  ///   - columns: Initial PTY width, within `SSHShellChannel.maxColumns`.
+  ///   - rows: Initial PTY height, within `SSHShellChannel.maxRows`.
+  ///   - initialReadCredit: nonnegative bytes of output the caller is ready to
+  ///     accept before its first `grantReadCredit`. Zero starts paused.
+  ///   - setupTimeout: Total bound on channel acceptance, PTY, and shell
+  ///     replies. Aborting before acceptance closes SSH. After acceptance
+  ///     the child closes. SSH also closes if its close acknowledgement
+  ///     takes more than five seconds
+  ///     (`ChannelCloseHandler.acknowledgementTimeout`).
+  ///   - onEvent: Called on the event loop; must return quickly.
+  /// - Returns: The accepted channel after PTY and shell setup succeed.
+  /// - Throws: An error for invalid dimensions, cancellation, setup timeout,
+  ///   or failed channel, PTY, or shell requests.
   public func openShell(
     columns: Int,
     rows: Int,
     initialReadCredit: Int = 64 * 1024,
+    setupTimeout: Duration = .seconds(30),
     onEvent: @escaping @Sendable (SSHShellEvent) -> Void
   ) async throws -> SSHShellChannel {
+    guard initialReadCredit >= 0 else {
+      throw SSHClientError.invalidConfiguration("negative shell read credit")
+    }
     guard (1 ... SSHShellChannel.maxColumns).contains(columns),
       (1 ... SSHShellChannel.maxRows).contains(rows)
     else { throw SSHClientError.invalidGridSize }
     let opened = channel.eventLoop.makePromise(of: Void.self)
-    let child: any Channel
     do {
-      child = try await openSessionChannel { child in
-        try child.pipeline.syncOperations.addHandler(
-          ShellChannelHandler(
-            columns: columns,
-            rows: rows,
-            initialCredit: initialReadCredit,
-            opened: opened,
-            onEvent: onEvent
+      return try await withSessionChannel(
+        timeout: setupTimeout,
+        timeoutError: SSHClientError.channelSetupTimeout,
+        initialize: { child in
+          try child.pipeline.syncOperations.addHandler(
+            ShellChannelHandler(
+              columns: columns,
+              rows: rows,
+              initialCredit: initialReadCredit,
+              opened: opened,
+              onEvent: onEvent
+            )
           )
-        )
-      }
+        },
+        operation: { child, attempt in
+          try await attempt.wait(for: opened.futureResult)
+          return SSHShellChannel(channel: child)
+        }
+      )
     } catch {
       opened.fail(error)
       throw error
     }
-    try await opened.futureResult.get()
-    return SSHShellChannel(channel: child)
   }
 }

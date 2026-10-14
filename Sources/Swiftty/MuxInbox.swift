@@ -10,9 +10,13 @@ struct MuxInboxModel: Equatable {
   private(set) var revision: UInt64 = 0
   /// Cursor for the next page of each section; nil when fully read.
   private(set) var cursors: [InboxQuery.Section: String] = [:]
+  private var pageRevisions: [InboxQuery.Section: UInt64] = [:]
   /// Inbox revision at which each recently removed occurrence left the
   /// inbox, so a page read before the removal cannot resurrect it.
   private var removedAt: [OccurrenceID: UInt64] = [:]
+  /// Pages and deltas through this revision are unsafe once their
+  /// individual removal records have been evicted.
+  private var removalHistoryFloor: UInt64?
   /// Bound on `removedAt`; the oldest removals are forgotten first.
   static let tombstoneLimit = 512
 
@@ -38,14 +42,24 @@ struct MuxInboxModel: Equatable {
   /// again with `append`.
   mutating func reset(_ pages: [InboxQuery.Section: InboxPage]) {
     guard let read = pages.values.map(\.revision).min() else { return }
+    if let floor = removalHistoryFloor, read <= floor { return }
+    guard
+      pages.allSatisfy({ section, page in
+        page.revision >= (pageRevisions[section] ?? 0)
+      })
+    else { return }
     let listed = Set(pages.values.flatMap(\.items).map(\.occurrence))
     items = items.filter { listed.contains($0.key) || $0.value.revision > read }
     cursors = pages.compactMapValues(\.nextCursor)
+    pageRevisions = pages.mapValues(\.revision)
     for page in pages.values { adopt(page) }
   }
 
   /// Adds a further page of `section` (read with its cursor).
   mutating func append(_ page: InboxPage, section: InboxQuery.Section) {
+    if let floor = removalHistoryFloor, page.revision <= floor { return }
+    guard page.revision >= (pageRevisions[section] ?? 0) else { return }
+    pageRevisions[section] = page.revision
     cursors[section] = page.nextCursor
     adopt(page)
   }
@@ -53,7 +67,7 @@ struct MuxInboxModel: Equatable {
   private mutating func adopt(_ page: InboxPage) {
     for item in page.items {
       // Removed by an update newer than this page: stay removed.
-      if let removed = removedAt[item.occurrence], removed > page.revision {
+      if let removed = removedAt[item.occurrence], removed >= page.revision {
         continue
       }
       merge(item)
@@ -70,12 +84,16 @@ struct MuxInboxModel: Equatable {
 
   /// Applies one update; true when the caller must refetch (`resync`).
   mutating func apply(_ update: InboxUpdate) -> Bool {
+    if let floor = removalHistoryFloor, update.revision <= floor {
+      return update.resync
+    }
     for id in update.removed {
+      if let known = items[id], known.revision > update.revision { continue }
       items[id] = nil
       tombstone(id, at: update.revision)
     }
     for item in update.changed {
-      if let removed = removedAt[item.occurrence], removed > update.revision {
+      if let removed = removedAt[item.occurrence], removed >= update.revision {
         continue  // removed by a newer update
       }
       merge(item)
@@ -97,7 +115,10 @@ struct MuxInboxModel: Equatable {
     guard removedAt.count > Self.tombstoneLimit else { return }
     let oldest = removedAt.sorted { $0.value < $1.value }
       .prefix(removedAt.count - Self.tombstoneLimit)
-    for (old, _) in oldest { removedAt[old] = nil }
+    for (old, removed) in oldest {
+      removalHistoryFloor = max(removalHistoryFloor ?? 0, removed)
+      removedAt[old] = nil
+    }
   }
 
   private mutating func merge(_ item: AttentionItem) {
@@ -155,6 +176,34 @@ struct MuxInboxModel: Equatable {
 
   // MARK: Snooze
 
+  enum SnoozeOption: CaseIterable {
+    case fifteenMinutes, oneHour, tomorrowMorning
+
+    var title: String {
+      switch self {
+      case .fifteenMinutes: "15 Minutes"
+      case .oneHour: "1 Hour"
+      case .tomorrowMorning: "Tomorrow at 9:00"
+      }
+    }
+
+    func until(at now: Date, calendar: Calendar = .current) -> Date? {
+      switch self {
+      case .fifteenMinutes: return now.addingTimeInterval(15 * 60)
+      case .oneHour: return now.addingTimeInterval(60 * 60)
+      case .tomorrowMorning:
+        guard let tomorrow = calendar.date(byAdding: .day, value: 1, to: now)
+        else { return nil }
+        return calendar.date(
+          bySettingHour: 9,
+          minute: 0,
+          second: 0,
+          of: tomorrow
+        )
+      }
+    }
+  }
+
   /// Only a waiting request can be snoozed: snoozing hides it from the
   /// badge until the time passes or the program moves on.
   static func canSnooze(_ item: AttentionItem) -> Bool {
@@ -167,21 +216,9 @@ struct MuxInboxModel: Equatable {
     at now: Date,
     calendar: Calendar = .current
   ) -> [(title: String, until: Date)] {
-    var choices: [(title: String, until: Date)] = [
-      ("15 Minutes", now.addingTimeInterval(15 * 60)),
-      ("1 Hour", now.addingTimeInterval(60 * 60)),
-    ]
-    if let tomorrow = calendar.date(byAdding: .day, value: 1, to: now),
-      let nine = calendar.date(
-        bySettingHour: 9,
-        minute: 0,
-        second: 0,
-        of: tomorrow
-      )
-    {
-      choices.append(("Tomorrow at 9:00", nine))
+    SnoozeOption.allCases.compactMap { option in
+      option.until(at: now, calendar: calendar).map { (option.title, $0) }
     }
-    return choices
   }
 
   /// "Snoozed until …" for a snoozed item, else nil.
@@ -258,6 +295,8 @@ final class MuxInboxViewController: NSViewController {
   /// The inline failure line, empty when there is none.
   let messageLabel = NSTextField(wrappingLabelWithString: "")
   private(set) var loadMoreButton: ActionButton?
+  /// Wall clock used when displaying or activating a snooze choice.
+  var snoozeNow: () -> Date = Date.init
 
   override func loadView() {
     stack.orientation = .vertical
@@ -312,7 +351,7 @@ final class MuxInboxViewController: NSViewController {
 
   func update(_ model: MuxInboxModel) {
     _ = view
-    let now = Date()
+    let now = snoozeNow()
     let items = model.sorted(at: now)
     shown = items
     for row in stack.arrangedSubviews { row.removeFromSuperview() }
@@ -359,7 +398,7 @@ final class MuxInboxViewController: NSViewController {
     }
     var buttons: [NSView] = [open]
     if MuxInboxModel.canSnooze(item) {
-      buttons.append(snoozeMenu(item, snoozed: snoozed != nil, at: now))
+      buttons.append(snoozeMenu(item, snoozed: snoozed != nil))
     }
     if item.category != .needsYou {
       buttons.append(
@@ -383,20 +422,19 @@ final class MuxInboxViewController: NSViewController {
   }
 
   /// A pull-down: the snooze choices, plus "Unsnooze" while snoozed.
-  private func snoozeMenu(
-    _ item: AttentionItem,
-    snoozed: Bool,
-    at now: Date
-  ) -> NSPopUpButton {
+  private func snoozeMenu(_ item: AttentionItem, snoozed: Bool) -> NSPopUpButton
+  {
     let button = NSPopUpButton(frame: .zero, pullsDown: true)
     button.controlSize = .small
     button.bezelStyle = .glass
     button.addItem(withTitle: snoozed ? "Snoozed" : "Snooze")
-    for choice in MuxInboxModel.snoozeChoices(at: now) {
+    for option in MuxInboxModel.SnoozeOption.allCases {
       button.menu?
         .addItem(
-          ActionMenuItem(title: choice.title) { [weak self] in
-            self?.onSnooze?(item, choice.until)
+          ActionMenuItem(title: option.title) { [weak self] in
+            guard let self, let until = option.until(at: self.snoozeNow())
+            else { return }
+            self.onSnooze?(item, until)
           }
         )
     }

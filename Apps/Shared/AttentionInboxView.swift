@@ -9,9 +9,11 @@ import SwiftUI
 /// navigator, so the exact occurrence is checked and a held workspace
 /// asks for explicit takeover.
 struct AttentionInboxView: View {
-  @Bindable var inbox: RoamingInboxModel
+  @Bindable
+  var inbox: RoamingInboxModel
   let model: RoamingAppModel
-  @Environment(\.openAttention) private var openAttention
+  @Environment(\.openAttention)
+  private var openAttention
 
   var body: some View {
     List {
@@ -23,11 +25,7 @@ struct AttentionInboxView: View {
       section("Results", inbox.entries.filter { $0.item.category == .result })
       hostProblems
     }
-    .glassListBackground()
-    .navigationTitle("Inbox")
-    #if !os(tvOS)
-      .refreshable { inbox.refresh() }
-    #endif
+    .glassListBackground().navigationTitle("Inbox").inboxRefreshable(inbox)
     .toolbar {
       ToolbarItem(placement: .automatic) {
         Button("Refresh", systemImage: "arrow.clockwise") { inbox.refresh() }
@@ -41,12 +39,13 @@ struct AttentionInboxView: View {
   }
 
   @ViewBuilder
-  private func section(_ title: String, _ entries: [RoamingInboxModel.Entry]) -> some View {
+  private func section(
+    _ title: String,
+    _ entries: [RoamingInboxModel.Entry]
+  ) -> some View {
     if !entries.isEmpty {
-      Section(title) {
-        ForEach(entries) { entry in row(entry) }
-      }
-      .listRowBackground(Color.clear)
+      Section(title) { ForEach(entries) { entry in row(entry) } }
+        .listRowBackground(Color.clear)
     }
   }
 
@@ -61,14 +60,20 @@ struct AttentionInboxView: View {
           Text(label(item)).font(.headline)
           if !item.seen { Image(systemName: "circle.fill").font(.caption2) }
           Spacer()
-          Text(item.updatedAt, style: .relative).font(.caption).foregroundStyle(.secondary)
+          Text(item.updatedAt, style: .relative).font(.caption)
+            .foregroundStyle(.secondary)
         }
         if let title = Self.plain(item.status.title ?? item.status.message) {
           Text(verbatim: title).lineLimit(2)
         }
-        Text(verbatim: [entry.host.name, Self.plain(item.status.app), snoozed ? "snoozed" : nil]
-          .compactMap { $0 }.joined(separator: " · "))
-          .font(.caption).foregroundStyle(.secondary)
+        Text(
+          verbatim: [
+            entry.host.name, Self.plain(item.status.app),
+            snoozed ? "snoozed" : nil,
+          ]
+          .compactMap { $0 }.joined(separator: " · ")
+        )
+        .font(.caption).foregroundStyle(.secondary)
       }
     }
     .contextMenu {
@@ -93,16 +98,17 @@ struct AttentionInboxView: View {
 
   @ViewBuilder
   private var hostProblems: some View {
-    let failures = model.hosts.compactMap { host -> (String, String)? in
+    let failures = model.hosts.compactMap {
+      host -> (id: UUID, name: String, reason: String)? in
       if case let .failed(reason) = inbox.hostStates[host.id] {
-        return (host.nickname, reason)
+        return (host.id, host.nickname, reason)
       }
       return nil
     }
     if !failures.isEmpty {
       Section("Unavailable") {
-        ForEach(failures, id: \.0) { name, reason in
-          Text(verbatim: "\(name): \(reason)").font(.caption)
+        ForEach(failures, id: \.id) { failure in
+          Text(verbatim: "\(failure.name): \(failure.reason)").font(.caption)
         }
       }
       .listRowBackground(Color.clear)
@@ -138,7 +144,19 @@ struct AttentionInboxView: View {
           }
         }
       )
-    ).trimmingCharacters(in: .whitespaces)
+    )
+    .trimmingCharacters(in: .whitespaces)
     return cleaned.isEmpty ? nil : String(cleaned.prefix(200))
+  }
+}
+
+extension View {
+  @ViewBuilder
+  fileprivate func inboxRefreshable(_ inbox: RoamingInboxModel) -> some View {
+    #if os(tvOS)
+    self
+    #else
+    refreshable { await inbox.refresh().value }
+    #endif
   }
 }

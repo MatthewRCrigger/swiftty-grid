@@ -173,9 +173,13 @@ extension TerminalUIView {
     repeated.action = .repeat
     let sent = repeated
     keyRepeat = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) {
-      [weak self] _ in
+      [weak self] timer in
+      let identity = ObjectIdentifier(timer)
       MainActor.assumeIsolated {
-        self?.keyRepeat = Timer.scheduledTimer(
+        guard let self, self.keyRepeat.map(ObjectIdentifier.init) == identity,
+          self.effectiveCapabilities.textInput
+        else { return }
+        self.keyRepeat = Timer.scheduledTimer(
           withTimeInterval: 1.0 / 30,
           repeats: true
         ) { [weak self] timer in
@@ -183,7 +187,13 @@ extension TerminalUIView {
             timer.invalidate();
             return
           }
-          MainActor.assumeIsolated { self.session.send(.key(sent)) }
+          let identity = ObjectIdentifier(timer)
+          MainActor.assumeIsolated {
+            guard self.keyRepeat.map(ObjectIdentifier.init) == identity,
+              self.effectiveCapabilities.textInput
+            else { return }
+            self.session.send(.key(sent))
+          }
         }
       }
     }
@@ -371,6 +381,7 @@ extension TerminalUIView {
       accessoryBar.update(sticky)
       return
     }
+    guard effectiveCapabilities.textInput else { return }
     clearSelection()
     send(key.inputs(modifiers: consumeSticky()))
   }
@@ -525,6 +536,7 @@ extension TerminalUIView: UITextInput {
   }
 
   public func deleteBackward() {
+    guard effectiveCapabilities.textInput else { return }
     clearSelection()
     if !markedText.isEmpty {
       let start = min(documentLength, max(0, markedSelection.location))
@@ -579,10 +591,19 @@ extension TerminalUIView: UITextInput {
   }
 
   public func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
+    guard effectiveCapabilities.textInput else {
+      discardComposition()
+      return
+    }
     stopKeyRepeat()
     stopMomentum()
     hardwareTextInput.cancel()
     setPreedit(markedText ?? "", selection: selectedRange)
+  }
+
+  internal func discardComposition() {
+    hardwareTextInput.cancel()
+    setPreedit("", selection: NSRange(location: 0, length: 0))
   }
 
   public func unmarkText() {

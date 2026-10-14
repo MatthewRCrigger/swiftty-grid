@@ -29,7 +29,7 @@ public struct AttentionLinkConfiguration: Sendable, Equatable {
   static func isPlausibleDomain(_ domain: String) -> Bool {
     !domain.isEmpty && domain.utf8.count <= 253
       && domain.utf8.allSatisfy {
-        (0x30...0x39).contains($0) || (0x61...0x7A).contains($0 | 0x20)
+        (0x30 ... 0x39).contains($0) || (0x61 ... 0x7A).contains($0 | 0x20)
           || $0 == 0x2E || $0 == 0x2D
       }
   }
@@ -78,7 +78,7 @@ public enum AttentionLink {
       throw .tooLong
     }
     // Printable ASCII only: no whitespace, controls or IDN tricks.
-    guard text.utf8.allSatisfy({ (0x21...0x7E).contains($0) }),
+    guard text.utf8.allSatisfy({ (0x21 ... 0x7E).contains($0) }),
       let components = URLComponents(string: text),
       let scheme = components.scheme?.lowercased()
     else { throw .malformedURL }
@@ -91,9 +91,7 @@ public enum AttentionLink {
     if let separator = text.range(of: "://") {
       let authority = text[separator.upperBound...]
         .prefix(while: { $0 != "/" && $0 != "?" && $0 != "#" })
-      guard authority.lowercased() == host else {
-        throw .unexpectedComponent
-      }
+      guard authority.lowercased() == host else { throw .unexpectedComponent }
     }
     let locator: String
     switch scheme {
@@ -103,8 +101,7 @@ public enum AttentionLink {
         throw .unexpectedPath
       }
       // Exactly one `ref`, no other parameters, nothing percent-encoded.
-      guard let query = components.percentEncodedQuery,
-        query.hasPrefix("ref="),
+      guard let query = components.percentEncodedQuery, query.hasPrefix("ref="),
         !query.dropFirst(4).contains(where: { $0 == "&" || $0 == "=" })
       else { throw .unexpectedQuery }
       locator = String(query.dropFirst(4))
@@ -120,12 +117,9 @@ public enum AttentionLink {
       let rest = path.dropFirst(3)
       guard !rest.contains("/") else { throw .unexpectedPath }
       locator = String(rest)
-    default:
-      throw .unsupportedScheme
+    default: throw .unsupportedScheme
     }
-    do {
-      return try AttentionLocator.decode(locator)
-    } catch {
+    do { return try AttentionLocator.decode(locator) } catch {
       throw .invalidLocator(error)
     }
   }
@@ -134,7 +128,10 @@ public enum AttentionLink {
   public static func customURL(for destination: AttentionDestination) -> URL {
     let locator = AttentionLocator.encode(destination)
     // The locator alphabet needs no percent-encoding.
-    return URL(string: "\(AttentionLinkConfiguration.scheme)://attention/open?ref=\(locator)")!
+    return URL(
+      string:
+        "\(AttentionLinkConfiguration.scheme)://attention/open?ref=\(locator)"
+    )!
   }
 
   /// `https://<domain>/a/<locator>`, or nil when `domain` is not one of
@@ -146,6 +143,8 @@ public enum AttentionLink {
   ) -> URL? {
     let domain = domain.lowercased()
     guard configuration.associatedDomains.contains(domain) else { return nil }
-    return URL(string: "https://\(domain)/a/\(AttentionLocator.encode(destination))")
+    return URL(
+      string: "https://\(domain)/a/\(AttentionLocator.encode(destination))"
+    )
   }
 }

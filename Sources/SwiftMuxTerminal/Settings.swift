@@ -23,11 +23,12 @@ public struct Settings: Codable, Equatable, Sendable {
     return base.appending(path: "swmux/settings.json")
   }
 
-  /// Loads and validates; missing keys keep defaults.
+  /// Loads and validates. A missing file keeps defaults. An existing
+  /// file that cannot be read, is a directory, or exceeds 64 KiB fails
+  /// before the whole file is loaded. Missing keys keep defaults.
   public static func load(from url: URL = defaultURL) throws -> Settings {
-    guard let data = try? Data(contentsOf: url) else { return Settings() }
-    guard data.count <= 64 << 10 else {
-      throw SettingsError("settings file too large")
+    guard let data = try readBounded(url, limit: 64 << 10) else {
+      return Settings()
     }
     let raw: [String: Any]
     do {
@@ -61,6 +62,31 @@ public struct Settings: Codable, Equatable, Sendable {
       }
     }
     return s
+  }
+
+  /// Reads at most `limit` bytes. A missing file is `nil`.
+  private static func readBounded(_ url: URL, limit: Int) throws -> Data? {
+    var isDirectory: ObjCBool = false
+    guard
+      FileManager.default.fileExists(
+        atPath: url.path,
+        isDirectory: &isDirectory
+      )
+    else { return nil }
+    guard !isDirectory.boolValue else {
+      throw SettingsError("settings path is a directory")
+    }
+    do {
+      let handle = try FileHandle(forReadingFrom: url)
+      defer { try? handle.close() }
+      let data = try handle.read(upToCount: limit + 1) ?? Data()
+      guard data.count <= limit else {
+        throw SettingsError("settings file too large")
+      }
+      return data
+    } catch let error as SettingsError { throw error } catch {
+      throw SettingsError("settings could not be read")
+    }
   }
 
   /// The control character for `C-<letter>`.

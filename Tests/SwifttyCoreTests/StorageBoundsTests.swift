@@ -1,13 +1,14 @@
 import Darwin
 import Foundation
 import Testing
+import TestSupport
 
 // Debug assertions print diagnostics; Release traps may omit them.
 #if DEBUG
 private final class StorageProbeBundle: NSObject {}
 
 struct StorageBoundsTests {
-  @Test(arguments: 0 ..< 12)
+  @Test(arguments: 0 ..< 14)
   func invalidStorageArgumentsTrap(_ operation: Int) throws {
     var directory = Bundle(for: StorageProbeBundle.self).bundleURL
     var executable: URL?
@@ -19,22 +20,39 @@ struct StorageBoundsTests {
       }
       directory.deleteLastPathComponent()
     }
-    let process = Process()
-    process.executableURL = try #require(executable)
-    process.arguments = [String(operation)]
-    process.standardOutput = FileHandle.nullDevice
-    let errors = Pipe()
-    process.standardError = errors
-    try process.run()
-    // Debugger hosts may hold a trap instead of letting the child exit.
-    var diagnostic = Data()
-    while diagnostic.last != 0x0A {
-      let chunk = errors.fileHandleForReading.availableData
-      if chunk.isEmpty { break }
-      diagnostic.append(chunk)
+    let command = try #require(executable)
+    let errorsURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("storage-probe-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: errorsURL) }
+    try Data().write(to: errorsURL)
+    let errors = try FileHandle(forWritingTo: errorsURL)
+    let reader = try FileHandle(forReadingFrom: errorsURL)
+    defer {
+      try? errors.close()
+      try? reader.close()
     }
-    if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-    process.waitUntilExit()
+    // Debugger hosts may hold a trap instead of letting the child exit.
+    // Read finite chunks from a regular file; stop once its diagnostic lands.
+    var diagnostic = Data()
+    _ = try TestCommand.run(
+      command.path,
+      arguments: [String(operation)],
+      timeout: .seconds(5),
+      stderr: errors.fileDescriptor,
+      maxOutputBytes: 16 << 10,
+      until: {
+        let remaining = (16 << 10) - diagnostic.count
+        if remaining > 0, let chunk = try reader.read(upToCount: remaining) {
+          diagnostic.append(chunk)
+        }
+        return diagnostic.contains(0x0A)
+      }
+    )
+    if diagnostic.count < 16 << 10,
+      let tail = try reader.read(upToCount: (16 << 10) - diagnostic.count)
+    {
+      diagnostic.append(tail)
+    }
     #expect(
       String(decoding: diagnostic, as: UTF8.self)
         .contains("Precondition failed")

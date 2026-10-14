@@ -60,7 +60,8 @@ public struct RenderOptions: Equatable, Sendable {
 /// Use from a single thread (normally the main thread).
 public final class MetalRenderer {
   struct CellInstance {
-    var grid: SIMD2<UInt16>
+    var gridX: UInt32
+    var gridY: UInt32
     var atlasPos: SIMD2<UInt16>
     var atlasSize: SIMD2<UInt16>
     var offset: SIMD2<Int16>
@@ -111,6 +112,14 @@ public final class MetalRenderer {
   private let decorationPipeline: MTLRenderPipelineState
   private var atlas: GlyphAtlas
   private var shaper = Shaper()
+
+  var makeInstanceBuffer: (Int) -> MTLBuffer?
+  var makeCommandBuffer: () -> MTLCommandBuffer?
+  var makeIntermediateTexture: (MTLTextureDescriptor) -> MTLTexture?
+  var makeRenderEncoder:
+    (MTLCommandBuffer, MTLRenderPassDescriptor) -> MTLRenderCommandEncoder? = {
+      $0.makeRenderCommandEncoder(descriptor: $1)
+    }
 
   private var instances: MTLBuffer?
   private var gridSize = (columns: 0, rows: 0)
@@ -171,12 +180,17 @@ public final class MetalRenderer {
     atlasMaximumSize: Int,
   ) throws {
     self.device = device
+    makeInstanceBuffer = {
+      device.makeBuffer(length: $0, options: .storageModeShared)
+    }
+    makeIntermediateTexture = { device.makeTexture(descriptor: $0) }
     self.fontManager = fontManager
     font = fontManager.resolve(descriptor)
     guard let queue = device.makeCommandQueue() else {
       throw RendererError.setup("command queue")
     }
     self.queue = queue
+    makeCommandBuffer = { queue.makeCommandBuffer() }
 
     guard
       let url = Bundle.module.url(
@@ -236,7 +250,7 @@ public final class MetalRenderer {
     func dimension(_ available: CGFloat, cell: CGFloat) -> Int {
       let count = available / cell
       guard count > 1 else { return 1 }
-      // Instances and PTY dimensions use 16-bit grid coordinates.
+      // PTY dimensions use 16-bit coordinates; snapshots may be larger.
       // Clamp before conversion, including a positive infinite size.
       return Int(min(count, CGFloat(UInt16.max)))
     }
@@ -248,18 +262,22 @@ public final class MetalRenderer {
 
   /// Renders into the view's current drawable and presents it.
   @MainActor
-  public func draw(_ snapshot: RenderSnapshot, in view: MTKView) {
+  @discardableResult
+  public func draw(_ snapshot: RenderSnapshot, in view: MTKView) -> Bool {
     guard let drawable = view.currentDrawable,
       let pass = view.currentRenderPassDescriptor
-    else { return }
-    let commandBuffer = encode(
-      snapshot,
-      options: options,
-      pass: pass,
-      size: view.drawableSize
-    )
+    else { return false }
+    guard
+      let commandBuffer = try? encode(
+        snapshot,
+        options: options,
+        pass: pass,
+        size: view.drawableSize
+      )
+    else { return false }
     commandBuffer.present(drawable)
     commandBuffer.commit()
+    return true
   }
 
   /// Outcome of a nonblocking submission.
@@ -268,11 +286,12 @@ public final class MetalRenderer {
     /// The previous frame's GPU work still owns the instance buffer.
     case busy
     case noDrawable
+    case resourceUnavailable
   }
 
   /// Like `draw(_:in:)` but never waits for in-flight GPU work. Only a
   /// `.submitted` result means the snapshot is being presented; on
-  /// `.busy` or `.noDrawable` keep it pending and retry later.
+  /// any other result keep it pending and retry later.
   @MainActor
   public func tryDraw(
     _ snapshot: RenderSnapshot,
@@ -285,20 +304,22 @@ public final class MetalRenderer {
       inFlight.signal()
       return .noDrawable
     }
-    let commandBuffer = encode(
-      snapshot,
-      options: options,
-      pass: pass,
-      size: view.drawableSize,
-      acquired: true
-    )
+    guard
+      let commandBuffer = try? encode(
+        snapshot,
+        options: options,
+        pass: pass,
+        size: view.drawableSize,
+        acquired: true
+      )
+    else { return .resourceUnavailable }
     commandBuffer.present(drawable)
     commandBuffer.commit()
     return .submitted
   }
 
   /// Renders into the layer's next drawable and presents it. Returns false
-  /// when no drawable was available.
+  /// when no drawable or rendering resources were available.
   @discardableResult
   public func draw(
     _ snapshot: RenderSnapshot,
@@ -313,12 +334,14 @@ public final class MetalRenderer {
       width: drawable.texture.width,
       height: drawable.texture.height
     )
-    let commandBuffer = encode(
-      snapshot,
-      options: options,
-      pass: pass,
-      size: size
-    )
+    guard
+      let commandBuffer = try? encode(
+        snapshot,
+        options: options,
+        pass: pass,
+        size: size
+      )
+    else { return false }
     commandBuffer.present(drawable)
     commandBuffer.commit()
     return true
@@ -331,17 +354,18 @@ public final class MetalRenderer {
     return true
   }
 
-  /// Renders into an arbitrary texture (offscreen, tests, benchmarks).
+  /// Renders into an arbitrary BGRA texture (offscreen, tests, benchmarks).
+  /// Throws when resources cannot be allocated; no GPU work is submitted.
   @discardableResult
   public func render(
     _ snapshot: RenderSnapshot,
     to texture: MTLTexture
-  ) -> MTLCommandBuffer {
+  ) throws -> MTLCommandBuffer {
     let pass = MTLRenderPassDescriptor()
     pass.colorAttachments[0].texture = texture
     pass.colorAttachments[0].loadAction = .clear
     pass.colorAttachments[0].storeAction = .store
-    let commandBuffer = encode(
+    let commandBuffer = try encode(
       snapshot,
       options: options,
       pass: pass,
@@ -357,9 +381,16 @@ public final class MetalRenderer {
     pass: MTLRenderPassDescriptor,
     size: CGSize,
     acquired: Bool = false,
-  ) -> MTLCommandBuffer {
+  ) throws -> MTLCommandBuffer {
     // The instance buffer is about to be mutated.
     if !acquired { inFlight.wait() }
+    var encoded = false
+    defer {
+      if !encoded {
+        needsFullRebuild = true
+        inFlight.signal()
+      }
+    }
     let palette = effectivePalette(snapshot)
     let bg = palette.background
     let alpha = Double(Self.backgroundAlpha(options.backgroundOpacity)) / 255
@@ -372,32 +403,49 @@ public final class MetalRenderer {
     )
     pass.colorAttachments[0].loadAction = .clear
 
-    updateInstances(snapshot, palette: palette, options: options)
+    try updateInstances(snapshot, palette: palette, options: options)
     if atlas.needsFrameRetry {
       // Previous GPU work has finished and this frame is not encoded yet.
       // Rebuild once with an empty atlas so old glyphs cannot hide new text
       // until a later draw. The retry stays bounded for oversized frames.
       atlas.reset()
       needsFullRebuild = true
-      updateInstances(snapshot, palette: palette, options: options)
+      try updateInstances(snapshot, palette: palette, options: options)
     }
     let cursorColor = options.cursorColor ?? palette.cursor
     let cursorAlpha: UInt32 =
       !options.preedit.isEmpty && options.preeditSelection != nil
       ? 255 : UInt32(max(0, min(1, options.cursorOpacity)) * 255)
 
-    let commandBuffer = queue.makeCommandBuffer()!
-    commandBuffer.addCompletedHandler { [inFlight] _ in inFlight.signal() }
+    guard let commandBuffer = makeCommandBuffer() else {
+      throw RendererError.resourceUnavailable("command buffer")
+    }
     // With a post-processing shader the grid is drawn offscreen first.
     let target = pass.colorAttachments[0].texture
-    let intermediate = target.flatMap {
-      postProcess?.intermediate(matching: $0, device: device)
+    let intermediate: MTLTexture?
+    if let target, let postProcess {
+      guard
+        let texture = postProcess.intermediate(
+          matching: target,
+          device: device,
+          allocate: makeIntermediateTexture
+        )
+      else { throw RendererError.resourceUnavailable("postprocess texture") }
+      intermediate = texture
+    } else {
+      intermediate = nil
+    }
+    defer {
+      if intermediate != nil { pass.colorAttachments[0].texture = target }
     }
     if let intermediate {
       pass.colorAttachments[0].texture = intermediate
       pass.colorAttachments[0].storeAction = .store
     }
-    let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass)!
+    guard let encoder = makeRenderEncoder(commandBuffer, pass) else {
+      if let target { pass.colorAttachments[0].texture = target }
+      throw RendererError.resourceUnavailable("render encoder")
+    }
     var uniforms = Uniforms(
       cellSize: SIMD2(Float(font.cellWidth), Float(font.cellHeight)),
       viewportSize: SIMD2(Float(size.width), Float(size.height)),
@@ -444,14 +492,16 @@ public final class MetalRenderer {
     }
     encoder.endEncoding()
     if let intermediate, let target, let postProcess {
-      postProcess.encode(
+      try postProcess.encode(
         from: intermediate,
         to: target,
         commandBuffer: commandBuffer,
         time: Float(CACurrentMediaTime() - startTime),
+        makeEncoder: makeRenderEncoder,
       )
-      pass.colorAttachments[0].texture = target
     }
+    commandBuffer.addCompletedHandler { [inFlight] _ in inFlight.signal() }
+    encoded = true
     return commandBuffer
   }
 
@@ -477,14 +527,40 @@ public final class MetalRenderer {
 
   // MARK: Instances
 
+  static func instanceBufferLength(
+    columns: Int,
+    rows: Int,
+    maximum: Int
+  ) throws -> Int {
+    guard columns > 0, rows > 0, columns - 1 <= Int(UInt32.max),
+      rows - 1 <= Int(UInt32.max)
+    else { throw RendererError.invalidDimensions }
+    let (count, countOverflow) = columns.multipliedReportingOverflow(by: rows)
+    guard !countOverflow, count <= Int(UInt32.max) / decorationSlots else {
+      throw RendererError.invalidDimensions
+    }
+    let (length, byteOverflow) = count.multipliedReportingOverflow(
+      by: MemoryLayout<CellInstance>.stride
+    )
+    guard !byteOverflow, length <= maximum else {
+      throw RendererError.resourceUnavailable("instance buffer size")
+    }
+    return length
+  }
+
   private func updateInstances(
     _ snapshot: RenderSnapshot,
     palette: Palette,
     options: RenderOptions
-  ) {
+  ) throws {
     atlas.prepareForFrame()
     let columns = snapshot.columns
     let rows = snapshot.rowCount
+    let length = try Self.instanceBufferLength(
+      columns: columns,
+      rows: rows,
+      maximum: device.maxBufferLength
+    )
     // Cursor opacity animates every frame; it only touches the cursor row.
     // The text blink phase is a uniform.
     var comparable = options
@@ -500,12 +576,11 @@ public final class MetalRenderer {
       || skipped || atlas.wasReset || lastSource !== snapshot.source
     atlas.wasReset = false
     if gridSize != (columns, rows) || instances == nil {
-      let length = max(1, columns * rows) * MemoryLayout<CellInstance>.stride
       if (instances?.length ?? 0) < length {
-        instances = device.makeBuffer(
-          length: length,
-          options: .storageModeShared
-        )
+        guard let replacement = makeInstanceBuffer(length) else {
+          throw RendererError.resourceUnavailable("instance buffer")
+        }
+        instances = replacement
       }
       gridSize = (columns, rows)
       full = true
@@ -703,28 +778,32 @@ public final class MetalRenderer {
       }
       var flags =
         attrs.flags.contains(.invisible) ? 0 : Self.decorationFlags(attrs.flags)
-      let underline = Self.underlineColor(attrs, snapshot: snapshot, palette: palette)
+      let underline = Self.underlineColor(
+        attrs,
+        snapshot: snapshot,
+        palette: palette
+      )
       blinks = blinks || attrs.flags.contains(.blink)
 
-      if !preedit.isEmpty, preedit[x] != nil { flags |= Flag.underline }
-      if options.hoveredLink != 0, attrs.link == options.hoveredLink {
-        flags |= Flag.underline
-      }
-      if let span = options.underlinedSpan, span.contains(row: y, column: x) {
-        flags |= Flag.underline
-      }
-      if let range = preeditSelection, range.isEmpty, options.isFocused {
-        let caret = min(cells.count, range.lowerBound)
-        if caret == x {
-          flags |= Flag.cursorBar
-        } else if caret == cells.count, x == cells.count - 1 {
-          flags |= Flag.cursorRight
-        }
-      }
+      Self.applyInteractionFlags(
+        attributes: attrs,
+        row: y,
+        column: x,
+        columns: cells.count,
+        isPreedit: preedit[x] != nil,
+        preeditSelection: preeditSelection,
+        options: options,
+        flags: &flags
+      )
       if cursor.isVisible, !hasPreedit, cursor.y == y, cursor.x == x {
         Self.applyCursor(
-          style: cursor.style, options: options, palette: palette,
-          foreground: &fg, background: &bg, alpha: &bgAlpha, flags: &flags
+          style: cursor.style,
+          options: options,
+          palette: palette,
+          foreground: &fg,
+          background: &bg,
+          alpha: &bgAlpha,
+          flags: &flags
         )
       }
 
@@ -736,7 +815,8 @@ public final class MetalRenderer {
       )
       if entry.isColor { flags |= Flag.colorGlyph }
       out[x] = CellInstance(
-        grid: SIMD2(UInt16(x), UInt16(y)),
+        gridX: UInt32(x),
+        gridY: UInt32(y),
         atlasPos: entry.position,
         atlasSize: entry.size,
         offset: entry.offset,
@@ -751,6 +831,35 @@ public final class MetalRenderer {
 }
 
 extension MetalRenderer {
+  private static func applyInteractionFlags(
+    attributes: CellAttributes,
+    row: Int,
+    column: Int,
+    columns: Int,
+    isPreedit: Bool,
+    preeditSelection: Range<Int>?,
+    options: RenderOptions,
+    flags: inout UInt32
+  ) {
+    if isPreedit { flags |= Flag.underline }
+    if options.hoveredLink != 0, attributes.link == options.hoveredLink {
+      flags |= Flag.underline
+    }
+    if let span = options.underlinedSpan,
+      span.contains(row: row, column: column)
+    {
+      flags |= Flag.underline
+    }
+    if let range = preeditSelection, range.isEmpty, options.isFocused {
+      let caret = min(columns, range.lowerBound)
+      if caret == column {
+        flags |= Flag.cursorBar
+      } else if caret == columns, column == columns - 1 {
+        flags |= Flag.cursorRight
+      }
+    }
+  }
+
   /// Resolve the row's glyph sources in presentation order. Shaped runs
   /// already contain positioned atlas entries; other cells use preedit,
   /// snapshot graphemes, or a single scalar.
@@ -1016,4 +1125,8 @@ extension MetalRenderer {
   }
 }
 
-public enum RendererError: Error { case setup(String) }
+public enum RendererError: Error, Equatable {
+  case setup(String)
+  case resourceUnavailable(String)
+  case invalidDimensions
+}

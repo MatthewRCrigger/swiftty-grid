@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import SwiftMuxProtocol
+import SwifttyEngine
 
 /// A spawned pane process: the PTY master, a retained slave (Darwin drops
 /// unread output once the last slave closes) and the shell's pid.
@@ -18,11 +19,13 @@ struct PaneLauncher: Sendable {
   var innerTerm: String
   /// Extra terminfo search directory for `innerTerm`, if installed there.
   var terminfoDirectory: String?
+  var launchTimeout: Duration = .seconds(10)
 
-  /// Resolves the program for `spec` using its environment snapshot.
+  /// Resolves the program using its environment snapshot and pane directory.
   static func resolve(
     _ spec: LaunchSpec,
-    environment: [String: String]
+    environment: [String: String],
+    directory: String
   ) throws(MuxError) -> (path: String, argv: [String]) {
     guard let command = spec.command, let program = command.first else {
       let shell = loginShell(environment)
@@ -38,8 +41,17 @@ struct PaneLauncher: Sendable {
     }
     if program.contains("/") { return (program, command) }
     let path = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-    for dir in path.split(separator: ":") {
-      let candidate = "\(dir)/\(program)"
+    let base = URL(fileURLWithPath: directory, isDirectory: true)
+    for dir in path.split(separator: ":", omittingEmptySubsequences: false) {
+      // An empty PATH entry names the pane's working directory. Resolve
+      // relative entries before the launcher changes directory, so the
+      // access check and exec refer to the same absolute executable.
+      let candidate = URL(
+        fileURLWithPath: dir.isEmpty ? "." : String(dir),
+        isDirectory: true,
+        relativeTo: base
+      )
+      .appendingPathComponent(program).path
       if access(candidate, X_OK) == 0 { return (candidate, command) }
     }
     throw MuxError(.launchFailed, "\(program): command not found")
@@ -97,10 +109,17 @@ struct PaneLauncher: Sendable {
     pane: PaneID,
     workspace: WorkspaceID,
     columns: Int,
-    rows: Int
+    rows: Int,
+    copyingCString: (String) -> UnsafeMutablePointer<CChar>? = { strdup($0) },
+    freeingCString: (UnsafeMutablePointer<CChar>) -> Void = { free($0) }
   ) throws(MuxError) -> LaunchedProcess {
+    guard launchTimeout > .zero, launchTimeout <= .seconds(30) else {
+      throw MuxError(
+        .invalidRequest,
+        "launcher timeout must be in (0, 30] seconds"
+      )
+    }
     let env = environment(for: spec, pane: pane, workspace: workspace)
-    let (program, argv) = try Self.resolve(spec, environment: env)
     let directory =
       spec.workingDirectory ?? env["HOME"]
       ?? FileManager.default.homeDirectoryForCurrentUser.path
@@ -111,6 +130,11 @@ struct PaneLauncher: Sendable {
     where k.isEmpty || k.utf8.contains(0) || k.contains("=")
       || v.utf8.contains(0)
     { throw MuxError(.invalidRequest, "invalid environment entry \(k)") }
+    let (program, argv) = try Self.resolve(
+      spec,
+      environment: env,
+      directory: directory
+    )
 
     var size = winsize(
       ws_row: UInt16(clamping: max(1, rows)),
@@ -121,100 +145,221 @@ struct PaneLauncher: Sendable {
     var attrs = Self.interactiveTermios()
     var master: Int32 = -1
     var slave: Int32 = -1
-    guard openpty(&master, &slave, nil, &attrs, &size) == 0 else {
-      throw MuxError(
-        .launchFailed,
-        "openpty: \(String(cString: strerror(errno)))"
+    do {
+      try PTYAllocation.open(
+        master: &master,
+        slave: &slave,
+        attributes: &attrs,
+        size: &size
       )
-    }
-    _ = fcntl(master, F_SETFD, FD_CLOEXEC)
-    _ = fcntl(slave, F_SETFD, FD_CLOEXEC)
-    let flags = fcntl(master, F_GETFL)
-    _ = fcntl(master, F_SETFL, flags | O_NONBLOCK)
-
+    } catch { throw MuxError(.launchFailed, error.description) }
     var pipeFDs: [Int32] = [-1, -1]
-    guard pipe(&pipeFDs) == 0 else {
-      close(master)
-      close(slave)
-      throw MuxError(.launchFailed, "pipe: \(String(cString: strerror(errno)))")
+    var ownsDescriptors = true
+    defer {
+      if ownsDescriptors {
+        close(master)
+        if slave >= 0 { close(slave) }
+        for fd in pipeFDs where fd >= 0 { close(fd) }
+      }
     }
-    _ = fcntl(pipeFDs[0], F_SETFD, FD_CLOEXEC)
-    _ = fcntl(pipeFDs[1], F_SETFD, FD_CLOEXEC)
+    try Self.checkFD(
+      fcntl(master, F_SETFD, FD_CLOEXEC),
+      "fcntl(master cloexec)"
+    )
+    try Self.checkFD(fcntl(slave, F_SETFD, FD_CLOEXEC), "fcntl(slave cloexec)")
+    let flags = fcntl(master, F_GETFL)
+    try Self.checkFD(flags, "fcntl(master flags)")
+    try Self.checkFD(
+      fcntl(master, F_SETFL, flags | O_NONBLOCK),
+      "fcntl(master nonblocking)"
+    )
+    try Self.checkFD(pipe(&pipeFDs), "pipe")
+    try Self.checkFD(
+      fcntl(pipeFDs[0], F_SETFD, FD_CLOEXEC),
+      "fcntl(report read cloexec)"
+    )
+    try Self.checkFD(
+      fcntl(pipeFDs[1], F_SETFD, FD_CLOEXEC),
+      "fcntl(report write cloexec)"
+    )
     // The child receives the slave as fd 3 and the pipe as fd 4. Sources
     // already at 3 or 4 would collide: `dup2(3, 3)` keeps close-on-exec,
     // and crossed duplicates overwrite each other. Move both above.
     slave = Self.aboveChildDescriptors(slave)
+    try Self.checkFD(slave, "fcntl(slave duplicate)")
     pipeFDs[1] = Self.aboveChildDescriptors(pipeFDs[1])
-    guard slave >= 0, pipeFDs[1] >= 0 else {
-      close(master)
-      if slave >= 0 { close(slave) }
-      close(pipeFDs[0])
-      if pipeFDs[1] >= 0 { close(pipeFDs[1]) }
-      throw MuxError(.launchFailed, "fcntl: \(String(cString: strerror(errno)))")
-    }
+    try Self.checkFD(pipeFDs[1], "fcntl(report duplicate)")
 
-    func cleanup() {
-      close(master)
-      close(slave)
-      close(pipeFDs[0])
-      if pipeFDs[1] >= 0 { close(pipeFDs[1]) }
-    }
+    let pid = try spawnLauncher(
+      arguments: [launcherPath, directory, program] + argv,
+      environment: env.map { "\($0.key)=\($0.value)" },
+      slave: slave,
+      reportFD: pipeFDs[1],
+      copyingCString: copyingCString,
+      freeingCString: freeingCString
+    )
+    close(pipeFDs[1])
+    pipeFDs[1] = -1
+    // The handshake now owns the child and remaining descriptors, including
+    // cleanup on failure. Do not close them again from this setup scope.
+    ownsDescriptors = false
+    return try Self.finishLaunch(
+      pid: pid,
+      master: master,
+      slave: slave,
+      reportFD: pipeFDs[0],
+      timeout: launchTimeout,
+      program: program
+    )
+  }
 
+  /// Descriptors stay caller-owned; only success returns an owned child PID.
+  private func spawnLauncher(
+    arguments: [String],
+    environment: [String],
+    slave: Int32,
+    reportFD: Int32,
+    copyingCString: (String) -> UnsafeMutablePointer<CChar>?,
+    freeingCString: (UnsafeMutablePointer<CChar>) -> Void
+  ) throws(MuxError) -> pid_t {
     var actions: posix_spawn_file_actions_t?
-    posix_spawn_file_actions_init(&actions)
+    try Self.checkSetup(
+      posix_spawn_file_actions_init(&actions),
+      "posix_spawn_file_actions_init"
+    )
     defer { posix_spawn_file_actions_destroy(&actions) }
-    posix_spawn_file_actions_adddup2(&actions, slave, 3)
-    posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], 4)
+    try Self.checkSetup(
+      posix_spawn_file_actions_adddup2(&actions, slave, 3),
+      "posix_spawn_file_actions_adddup2(slave)"
+    )
+    try Self.checkSetup(
+      posix_spawn_file_actions_adddup2(&actions, reportFD, 4),
+      "posix_spawn_file_actions_adddup2(report)"
+    )
     var attributes: posix_spawnattr_t?
-    posix_spawnattr_init(&attributes)
+    try Self.checkSetup(
+      posix_spawnattr_init(&attributes),
+      "posix_spawnattr_init"
+    )
     defer { posix_spawnattr_destroy(&attributes) }
     // No POSIX_SPAWN_SETSID: the launcher creates the one session itself.
     let spawnFlags =
       POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF
       | POSIX_SPAWN_SETSIGMASK
-    posix_spawnattr_setflags(&attributes, Int16(spawnFlags))
+    try Self.checkSetup(
+      posix_spawnattr_setflags(&attributes, Int16(spawnFlags)),
+      "posix_spawnattr_setflags"
+    )
     var all = sigset_t()
     sigfillset(&all)
-    posix_spawnattr_setsigdefault(&attributes, &all)
+    try Self.checkSetup(
+      posix_spawnattr_setsigdefault(&attributes, &all),
+      "posix_spawnattr_setsigdefault"
+    )
     var none = sigset_t()
     sigemptyset(&none)
-    posix_spawnattr_setsigmask(&attributes, &none)
+    try Self.checkSetup(
+      posix_spawnattr_setsigmask(&attributes, &none),
+      "posix_spawnattr_setsigmask"
+    )
 
-    let launcherArgv = [launcherPath, directory, program] + argv
-    let envStrings = env.map { "\($0.key)=\($0.value)" }
     var pid: pid_t = 0
-    let status = withCStrings(launcherArgv) { cArgv in
-      withCStrings(envStrings) { cEnv in
-        posix_spawn(&pid, launcherPath, &actions, &attributes, cArgv, cEnv)
+    let status: Int32
+    do {
+      status = try CStringVector.withStrings(
+        arguments,
+        copying: copyingCString,
+        freeing: freeingCString
+      ) { cArgv throws(SwifttyEngine.POSIXError) in
+        try CStringVector.withStrings(
+          environment,
+          copying: copyingCString,
+          freeing: freeingCString
+        ) { cEnv in
+          posix_spawn(&pid, launcherPath, &actions, &attributes, cArgv, cEnv)
+        }
       }
-    }
+    } catch { throw MuxError(.launchFailed, error.description) }
     guard status == 0 else {
-      cleanup()
       throw MuxError(
         .launchFailed,
         "spawn \(launcherPath): \(String(cString: strerror(status)))"
       )
     }
-    close(pipeFDs[1])
-    pipeFDs[1] = -1
+    return pid
+  }
 
-    // The launcher either reports and execs (closing the pipe on exec)
-    // or reports a failure and exits. EOF alone is not success.
-    let report = Self.readLaunchReport(from: pipeFDs[0])
-    close(pipeFDs[0])
-    let lines = String(decoding: report, as: UTF8.self).split(separator: "\n")
-    let failure = lines.first { $0.hasPrefix("E ") }
-    let ready = lines.contains { $0.hasPrefix("S ") }
-    if let failure = failure ?? (ready ? nil : "E launcher no-report 0") {
-      var st: Int32 = 0
-      while waitpid(pid, &st, 0) < 0, errno == EINTR {}
-      close(master)
-      close(slave)
-      let parts = failure.split(separator: " ")
-      let code = parts.count > 2 ? Int32(parts[2]) ?? 0 : 0
+  private static func checkFD(
+    _ result: Int32,
+    _ operation: String
+  ) throws(MuxError) {
+    guard result >= 0 else {
       throw MuxError(
         .launchFailed,
-        "\(parts.count > 1 ? parts[1] : "launch"): \(code == 0 ? "failed" : String(cString: strerror(code))) (\(program))"
+        "\(operation): \(String(cString: strerror(errno)))"
+      )
+    }
+  }
+
+  private static func checkSetup(
+    _ status: Int32,
+    _ operation: String
+  ) throws(MuxError) {
+    guard status == 0 else {
+      throw MuxError(
+        .launchFailed,
+        "\(operation): \(String(cString: strerror(status)))"
+      )
+    }
+  }
+
+  /// Verifies the launch handshake, closing the process and descriptors on
+  /// failure; a successful result transfers PTY ownership to the caller.
+  private static func finishLaunch(
+    pid: pid_t,
+    master: Int32,
+    slave: Int32,
+    reportFD: Int32,
+    timeout: Duration,
+    program: String
+  ) throws(MuxError) -> LaunchedProcess {
+    // The launcher either reports and execs (closing the pipe on exec)
+    // or reports a failure and exits. EOF alone is not success.
+    let report: Data
+    do {
+      report = try Self.readLaunchReport(from: reportFD, timeout: timeout)
+    } catch {
+      let cleanup = Self.stopFailedLauncher(pid)
+      close(master)
+      close(slave)
+      close(reportFD)
+      throw MuxError(error.code, "\(error.message); \(cleanup)")
+    }
+    close(reportFD)
+    let lines = String(decoding: report, as: UTF8.self).split(separator: "\n")
+    let failure = lines.first { $0.hasPrefix("E ") }
+    let ready =
+      report.last == 0x0A && lines.contains("S exec 0")
+      && lines.allSatisfy { $0 == "S exec 0" || $0.hasPrefix("W ") }
+    if failure != nil || !ready {
+      let cleanup = Self.stopFailedLauncher(pid)
+      close(master)
+      close(slave)
+      let reason: String
+      if let failure {
+        let parts = failure.split(separator: " ")
+        let code = parts.count > 2 ? Int32(parts[2]) ?? 0 : 0
+        reason =
+          "\(parts.count > 1 ? parts[1] : "launch"): \(code == 0 ? "failed" : String(cString: strerror(code)))"
+      } else {
+        reason = "launcher: missing complete success report"
+      }
+      // Hex keeps malformed/control bytes out of diagnostic output. Retain
+      // the total length while limiting the sample independently of the cap.
+      let hex = report.prefix(32).map { String(format: "%02x", $0) }.joined()
+      throw MuxError(
+        .launchFailed,
+        "\(reason) (\(program)); report bytes=\(report.count) hex=\(hex); \(cleanup)"
       )
     }
     let warnings = lines.filter { $0.hasPrefix("W ") }.map(String.init)
@@ -226,20 +371,92 @@ struct PaneLauncher: Sendable {
     )
   }
 
-  private static func readLaunchReport(from fd: Int32) -> Data {
+  /// Requires exclusive child ownership. Peek without collecting so the PID
+  /// stays reserved through group signaling; distinguish observed termination
+  /// from the status collected after our cleanup signal.
+  static func stopFailedLauncher(_ pid: pid_t) -> String {
+    var child = siginfo_t()
+    var peek: Int32
+    repeat {
+      peek = waitid(P_PID, id_t(pid), &child, WEXITED | WNOHANG | WNOWAIT)
+    } while peek < 0 && errno == EINTR
+    guard peek == 0 else {
+      let error = errno
+      // ECHILD includes a child already collected by someone else. Never
+      // signal its potentially reused PID or inherited process group.
+      return "pre-cleanup waitid errno=\(error); cleanup skipped"
+    }
+    let observed: String
+    if child.si_pid == pid {
+      let kind = child.si_code == CLD_EXITED ? "exit" : "signal"
+      observed = "\(kind)=\(child.si_status)"
+    } else {
+      observed = "not-waitable"
+    }
+    // Once login_tty created the pane's own process group, include any
+    // descendants. Never signal the service's inherited group.
+    if getpgid(pid) == pid { kill(-pid, SIGKILL) }
+    kill(pid, SIGKILL)
+    var status: Int32 = 0
+    var collected: pid_t
+    repeat {
+      collected = waitpid(pid, &status, 0)
+    } while collected < 0 && errno == EINTR
+    guard collected == pid else {
+      return "pre-cleanup child=\(observed); waitpid errno=\(errno)"
+    }
+    let terminal = status & 0x7F
+    let outcome =
+      terminal == 0 ? "exit=\((status >> 8) & 0xFF)" : "signal=\(terminal)"
+    return "pre-cleanup child=\(observed); collected \(outcome)"
+  }
+
+  private static func readLaunchReport(
+    from fd: Int32,
+    timeout: Duration
+  ) throws(MuxError) -> Data {
+    let deadline = ContinuousClock.now + timeout
     var report = Data()
     var buffer = [UInt8](repeating: 0, count: 256)
     while true {
+      let remaining = ContinuousClock.now.duration(to: deadline)
+      guard remaining > .zero else {
+        throw MuxError(.launchFailed, "launcher handshake timed out")
+      }
+      let parts = remaining.components
+      let milliseconds = max(
+        1,
+        parts.seconds * 1000 + parts.attoseconds / 1_000_000_000_000_000
+      )
+      var descriptor = pollfd(
+        fd: fd,
+        events: Int16(POLLIN | POLLHUP),
+        revents: 0
+      )
+      let ready = poll(&descriptor, 1, Int32(clamping: milliseconds))
+      if ready == 0 { continue }
+      if ready < 0 {
+        if errno == EINTR { continue }
+        throw MuxError(
+          .launchFailed,
+          "launcher poll: \(String(cString: strerror(errno)))"
+        )
+      }
       let n = read(fd, &buffer, buffer.count)
       if n > 0 {
+        guard n <= 4096 - report.count else {
+          throw MuxError(.launchFailed, "launcher report limit exceeded")
+        }
         report.append(contentsOf: buffer[0 ..< n])
-        if report.count > 4096 { break }
         continue
       }
-      if n < 0, errno == EINTR { continue }
-      break
+      if n == 0 { return report }
+      if errno == EINTR || errno == EAGAIN { continue }
+      throw MuxError(
+        .launchFailed,
+        "launcher read: \(String(cString: strerror(errno)))"
+      )
     }
-    return report
   }
 
   /// A close-on-exec duplicate of `fd` numbered 5 or higher (closing
@@ -247,7 +464,9 @@ struct PaneLauncher: Sendable {
   static func aboveChildDescriptors(_ fd: Int32) -> Int32 {
     guard fd < 5 else { return fd }
     let moved = fcntl(fd, F_DUPFD_CLOEXEC, 5)
+    let error = errno
     close(fd)
+    if moved < 0 { errno = error }
     return moved
   }
 
@@ -285,13 +504,4 @@ struct PaneLauncher: Sendable {
     cfsetospeed(&t, speed_t(B38400))
     return t
   }
-}
-
-func withCStrings<R>(
-  _ strings: [String],
-  _ body: (UnsafePointer<UnsafeMutablePointer<CChar>?>) -> R
-) -> R {
-  let pointers = strings.map { strdup($0) } + [nil]
-  defer { for p in pointers { free(p) } }
-  return pointers.withUnsafeBufferPointer { body($0.baseAddress!) }
 }

@@ -25,6 +25,28 @@ def check_output(output: str, name: str) -> None:
         raise RuntimeError(f"{name} contains terminal controls: {controls}")
 
 
+def check_suite_completion(output: str, name: str) -> None:
+    """Require a passing completion report for every Swift Testing run."""
+    pending = 0
+    started = 0
+    for line in SGR.sub("", output).splitlines():
+        if line == "◇ Test run started.":
+            pending += 1
+            started += 1
+        elif re.fullmatch(
+            r"✔ Test run with \d+ tests?(?: in \d+ suites?)? passed after .+\.",
+            line,
+        ):
+            if pending == 0:
+                raise RuntimeError(f"{name} reports completion without a run start")
+            pending -= 1
+    if started == 0 or pending:
+        raise RuntimeError(
+            f"{name} has {started} started Swift Testing runs and "
+            f"{started - pending} passing completion reports"
+        )
+
+
 def run(command: list[str], directory: Path, environment: dict[str, str],
         log: Path) -> subprocess.CompletedProcess[str]:
     capture = subprocess.run(command, cwd=directory, env=environment,
@@ -41,8 +63,18 @@ def run(command: list[str], directory: Path, environment: dict[str, str],
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--swift", default="swift")
-    parser.add_argument("--output-dir", type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--output-dir", type=Path)
+    mode.add_argument("--suite-log", type=Path,
+                      help="check an existing suite log without running tests")
     args = parser.parse_args()
+    if args.suite_log is not None:
+        # Preserve carriage returns for the same byte checks as live captures.
+        text = args.suite_log.read_bytes().decode("utf-8")
+        check_output(text, str(args.suite_log))
+        check_suite_completion(text, str(args.suite_log))
+        return
+
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ)
@@ -50,8 +82,9 @@ def main() -> None:
 
     suite = run([args.swift, "test", "--skip-build"], ROOT, environment,
                 output / "suite.log")
-    if suite.returncode != 0 or "Test run with" not in suite.stdout:
+    if suite.returncode != 0:
         raise RuntimeError("the built test suite did not pass")
+    check_suite_completion(suite.stdout, "suite.log")
 
     with tempfile.TemporaryDirectory(prefix="swiftty-output-probe-") as temporary:
         package = Path(temporary)
@@ -122,8 +155,9 @@ struct OutputProbeTests {
 """)
         passing = run([args.swift, "test"], package, environment,
                       output / "passing.log")
-        if passing.returncode != 0 or "Test run with" not in passing.stdout:
+        if passing.returncode != 0:
             raise RuntimeError("passing fixture probe did not pass")
+        check_suite_completion(passing.stdout, "passing.log")
         failing_environment = {**environment, "SWIFTTY_OUTPUT_PROBE_FAIL": "1"}
         failing = run([args.swift, "test", "--skip-build"], package,
                       failing_environment, output / "failing.log")
@@ -140,4 +174,7 @@ struct OutputProbeTests {
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, RuntimeError) as error:
+        raise SystemExit(str(error))

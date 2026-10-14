@@ -2,7 +2,7 @@ import Crypto
 import Foundation
 
 #if canImport(Security)
-  import Security
+import Security
 #endif
 
 /// App-managed Ed25519 client keys (spec §2, §5.3).
@@ -28,7 +28,8 @@ public enum SSHEd25519Key {
             && !(0x80 ... 0x9F).contains($0.value)
         }
       )
-    ).trimmingCharacters(in: .whitespaces)
+    )
+    .trimmingCharacters(in: .whitespaces)
     return cleaned.isEmpty ? line : line + " " + cleaned
   }
 
@@ -51,31 +52,22 @@ public enum SSHEd25519Key {
 
   /// OpenSSH `SHA256:` fingerprint of the public key.
   public static func fingerprint(of key: Curve25519.Signing.PublicKey) -> String
-  {
-    SSHPublicKeyFormat.fingerprint(
-      openSSHPublicKey: publicKeyLine(key)
-    ) ?? ""
-  }
+  { SSHPublicKeyFormat.fingerprint(openSSHPublicKey: publicKeyLine(key)) ?? "" }
 }
 
 /// Storage for app-managed Ed25519 private keys.
 public protocol Ed25519KeyStore: Sendable {
+  /// Loads or atomically creates one key for this label. Concurrent
+  /// callers must receive the same stored identity.
+  func loadOrCreateKey(
+    label: String
+  ) async throws -> Curve25519.Signing.PrivateKey
   func loadKey(label: String) async throws -> Curve25519.Signing.PrivateKey?
-  func storeKey(_ key: Curve25519.Signing.PrivateKey, label: String)
-    async throws
+  func storeKey(
+    _ key: Curve25519.Signing.PrivateKey,
+    label: String
+  ) async throws
   func deleteKey(label: String) async throws
-}
-
-extension Ed25519KeyStore {
-  /// Loads the key for `label`, generating and storing one if absent.
-  public func loadOrCreateKey(label: String) async throws
-    -> Curve25519.Signing.PrivateKey
-  {
-    if let key = try await loadKey(label: label) { return key }
-    let key = SSHEd25519Key.generate()
-    try await storeKey(key, label: label)
-    return key
-  }
 }
 
 /// Volatile key store for tests and previews.
@@ -84,8 +76,18 @@ public actor InMemoryEd25519KeyStore: Ed25519KeyStore {
 
   public init() {}
 
+  public func loadOrCreateKey(
+    label: String
+  ) throws -> Curve25519.Signing.PrivateKey {
+    if let key = try loadKey(label: label) { return key }
+    let key = SSHEd25519Key.generate()
+    storeKey(key, label: label)
+    return key
+  }
+
   public func loadKey(label: String) throws -> Curve25519.Signing.PrivateKey? {
-    try keys[label].map { try Curve25519.Signing.PrivateKey(rawRepresentation: $0) }
+    try keys[label]
+      .map { try Curve25519.Signing.PrivateKey(rawRepresentation: $0) }
   }
 
   public func storeKey(_ key: Curve25519.Signing.PrivateKey, label: String) {
@@ -96,74 +98,92 @@ public actor InMemoryEd25519KeyStore: Ed25519KeyStore {
 }
 
 #if canImport(Security)
-  /// Keychain generic-password items, readable after first unlock on this
-  /// device only and never synchronized.
-  public actor KeychainEd25519KeyStore: Ed25519KeyStore {
-    public enum KeychainError: Error, Equatable {
-      case status(Int32)
-      case malformedItem
+/// Keychain generic-password items, readable after first unlock on this
+/// device only and never synchronized.
+public actor KeychainEd25519KeyStore: Ed25519KeyStore {
+  public enum KeychainError: Error, Equatable {
+    case status(Int32)
+    case malformedItem
+  }
+
+  public let service: String
+
+  public init(service: String = "swiftty.ssh.ed25519") {
+    self.service = service
+  }
+
+  private func baseQuery(label: String) -> [String: Any] {
+    var query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service, kSecAttrAccount as String: label,
+      kSecAttrSynchronizable as String: false,
+    ]
+    #if os(macOS)
+    query[kSecUseDataProtectionKeychain as String] = true
+    #endif
+    return query
+  }
+
+  public func loadOrCreateKey(
+    label: String
+  ) throws -> Curve25519.Signing.PrivateKey {
+    if let key = try loadKey(label: label) { return key }
+    let key = SSHEd25519Key.generate()
+    var query = baseQuery(label: label)
+    query[kSecValueData as String] = key.rawRepresentation
+    query[kSecAttrAccessible as String] =
+      kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    let status = SecItemAdd(query as CFDictionary, nil)
+    if status == errSecSuccess { return key }
+    // Another store or process may have created it after the lookup.
+    // Read that identity instead of replacing it with our candidate.
+    if status == errSecDuplicateItem, let existing = try loadKey(label: label) {
+      return existing
     }
+    throw KeychainError.status(status)
+  }
 
-    public let service: String
+  public func loadKey(label: String) throws -> Curve25519.Signing.PrivateKey? {
+    var query = baseQuery(label: label)
+    query[kSecReturnData as String] = true
+    query[kSecMatchLimit as String] = kSecMatchLimitOne
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    if status == errSecItemNotFound { return nil }
+    guard status == errSecSuccess else { throw KeychainError.status(status) }
+    guard let data = result as? Data,
+      let key = try? Curve25519.Signing.PrivateKey(rawRepresentation: data)
+    else { throw KeychainError.malformedItem }
+    return key
+  }
 
-    public init(service: String = "swiftty.ssh.ed25519") {
-      self.service = service
+  public func storeKey(
+    _ key: Curve25519.Signing.PrivateKey,
+    label: String
+  ) throws {
+    let query = baseQuery(label: label)
+    let attributes: [String: Any] = [
+      kSecValueData as String: key.rawRepresentation,
+      kSecAttrAccessible as String:
+        kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+    ]
+    var status = SecItemUpdate(
+      query as CFDictionary,
+      attributes as CFDictionary
+    )
+    if status == errSecItemNotFound {
+      var add = query
+      add.merge(attributes) { $1 }
+      status = SecItemAdd(add as CFDictionary, nil)
     }
+    guard status == errSecSuccess else { throw KeychainError.status(status) }
+  }
 
-    private func baseQuery(label: String) -> [String: Any] {
-      var query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: service,
-        kSecAttrAccount as String: label,
-        kSecAttrSynchronizable as String: false,
-      ]
-      #if os(macOS)
-        query[kSecUseDataProtectionKeychain as String] = true
-      #endif
-      return query
-    }
-
-    public func loadKey(label: String) throws -> Curve25519.Signing.PrivateKey?
-    {
-      var query = baseQuery(label: label)
-      query[kSecReturnData as String] = true
-      query[kSecMatchLimit as String] = kSecMatchLimitOne
-      var result: CFTypeRef?
-      let status = SecItemCopyMatching(query as CFDictionary, &result)
-      if status == errSecItemNotFound { return nil }
-      guard status == errSecSuccess else { throw KeychainError.status(status) }
-      guard let data = result as? Data,
-        let key = try? Curve25519.Signing.PrivateKey(rawRepresentation: data)
-      else { throw KeychainError.malformedItem }
-      return key
-    }
-
-    public func storeKey(_ key: Curve25519.Signing.PrivateKey, label: String)
-      throws
-    {
-      let query = baseQuery(label: label)
-      let attributes: [String: Any] = [
-        kSecValueData as String: key.rawRepresentation,
-        kSecAttrAccessible as String:
-          kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-      ]
-      var status = SecItemUpdate(
-        query as CFDictionary,
-        attributes as CFDictionary
-      )
-      if status == errSecItemNotFound {
-        var add = query
-        add.merge(attributes) { $1 }
-        status = SecItemAdd(add as CFDictionary, nil)
-      }
-      guard status == errSecSuccess else { throw KeychainError.status(status) }
-    }
-
-    public func deleteKey(label: String) throws {
-      let status = SecItemDelete(baseQuery(label: label) as CFDictionary)
-      guard status == errSecSuccess || status == errSecItemNotFound else {
-        throw KeychainError.status(status)
-      }
+  public func deleteKey(label: String) throws {
+    let status = SecItemDelete(baseQuery(label: label) as CFDictionary)
+    guard status == errSecSuccess || status == errSecItemNotFound else {
+      throw KeychainError.status(status)
     }
   }
+}
 #endif

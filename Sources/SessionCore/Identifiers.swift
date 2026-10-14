@@ -54,7 +54,9 @@ public protocol RandomIdentifier: Hashable, Sendable, Codable,
 }
 
 extension RandomIdentifier {
-  public static func random() -> Self { Self(bytes: secureRandomBytes(byteCount))! }
+  public static func random() -> Self {
+    Self(bytes: secureRandomBytes(byteCount))!
+  }
 
   public init?(hex: String) {
     guard let b = SessionCore.bytes(fromHex: hex, count: Self.byteCount) else {
@@ -70,7 +72,10 @@ extension RandomIdentifier {
     let text = try decoder.singleValueContainer().decode(String.self)
     guard let value = Self(hex: text) else {
       throw DecodingError.dataCorrupted(
-        .init(codingPath: decoder.codingPath, debugDescription: "bad identifier")
+        .init(
+          codingPath: decoder.codingPath,
+          debugDescription: "bad identifier"
+        )
       )
     }
     self = value
@@ -124,7 +129,9 @@ public struct ApplicationToken: Hashable, Sendable, Codable,
     self.bytes = bytes
   }
 
-  public static func random() -> Self { Self(bytes: secureRandomBytes(byteCount))! }
+  public static func random() -> Self {
+    Self(bytes: secureRandomBytes(byteCount))!
+  }
 
   /// Constant-time comparison.
   public func matches(_ other: ApplicationToken) -> Bool {
@@ -138,7 +145,8 @@ public struct ApplicationToken: Hashable, Sendable, Codable,
 
   public init(from decoder: any Decoder) throws {
     let text = try decoder.singleValueContainer().decode(String.self)
-    guard let data = Data(base64Encoded: text), let value = Self(bytes: Array(data))
+    guard let data = Data(base64Encoded: text),
+      let value = Self(bytes: Array(data))
     else {
       throw DecodingError.dataCorrupted(
         .init(codingPath: decoder.codingPath, debugDescription: "bad token")
@@ -169,8 +177,7 @@ public struct WireUInt64: Hashable, Sendable, Codable, Comparable,
     // Canonical decimal only: no sign, no leading zeros, no whitespace.
     guard !text.isEmpty, text.utf8.count <= 20,
       text.utf8.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }),
-      text == "0" || text.utf8.first != 0x30,
-      let value = UInt64(text)
+      text == "0" || text.utf8.first != 0x30, let value = UInt64(text)
     else {
       throw DecodingError.dataCorrupted(
         .init(codingPath: decoder.codingPath, debugDescription: "bad counter")

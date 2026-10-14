@@ -56,6 +56,44 @@ struct UpdateTests {
   }
 
   @Test
+  func concurrentInstallAndStagingCannotReplaceAnActiveTransaction()
+    async throws
+  {
+    let h = try Harness()
+    let launchd = FakeLaunchd(h)
+    let replaced = Replaced()
+    let entered = Mutex(false)
+    let gate = AsyncStream<Void>.makeStream()
+    let update = UpdateCoordinator(
+      connect: {
+        entered.withLock { $0 = true }
+        for await _ in gate.stream { break }
+        return try await launchd.connect()
+      },
+      registration: launchd,
+      replace: { url in replaced.urls.withLock { $0.append(url) } }
+    )
+    let bundle = URL(fileURLWithPath: "/tmp/New.app")
+    await update.stage(bundle)
+    let install = Task { await update.install(endWorkspaces: false) }
+    let deadline = ContinuousClock.now + .seconds(5)
+    while !entered.withLock({ $0 }), ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(entered.withLock { $0 })
+    await update.stage(URL(fileURLWithPath: "/tmp/Other.app"))
+    #expect(await update.phase == .staged(bundle))
+    #expect(await update.install(endWorkspaces: true) == .staged(bundle))
+    gate.continuation.finish()
+    guard case .finished = await install.value else {
+      Issue.record("expected completed install")
+      return
+    }
+    #expect(replaced.value == [bundle])
+    #expect(launchd.log == ["unregister", "register"])
+  }
+
+  @Test
   func stagingKeepsAdmissionAndSessions() async throws {
     let h = try Harness()
     let launchd = FakeLaunchd(h)
@@ -124,6 +162,34 @@ struct UpdateTests {
     guard case let .status(s) = try await c.execute(.status) else { return }
     #expect(s.workspaces == 1)
     #expect(!s.quiescing)
+  }
+
+  @Test
+  func cancellingTheInstallTaskRestoresAdmission() async throws {
+    let h = try Harness()
+    let launchd = FakeLaunchd(h)
+    let update = coordinator(launchd, replaced: Replaced())
+    let c = try await h.connect()
+    try await c.execute(
+      .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
+    )
+    await update.stage(URL(fileURLWithPath: "/tmp/New.app"))
+    let install = Task { await update.install(endWorkspaces: false) }
+    let deadline = ContinuousClock.now + .seconds(5)
+    while await update.phase != .awaitingBarrier, ContinuousClock.now < deadline
+    { try await Task.sleep(for: .milliseconds(10)) }
+    #expect(await update.phase == .awaitingBarrier)
+    install.cancel()
+    #expect(await install.value == .cancelled)
+    guard case let .status(status) = try await c.execute(.status) else {
+      Issue.record("expected status")
+      return
+    }
+    #expect(!status.quiescing)
+    #expect(launchd.log.isEmpty)
+    try await c.execute(
+      .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
+    )
   }
 
   @Test

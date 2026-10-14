@@ -164,6 +164,10 @@ public struct ThemeSelection: Sendable, Equatable {
 /// reported in `diagnostics` and otherwise ignored, so a Ghostty config
 /// file can be shared.
 public struct Configuration: Sendable, Equatable {
+  /// File-loading budgets, shared across a root file and its include queue.
+  public static let maxFileBytes = 1024 * 1024
+  public static let maxLoadedBytes = 4 * 1024 * 1024
+  public static let maxLoadedFiles = 128
   /// Fonts.
   /// Supported point sizes for configuration and interactive zoom.
   public static let fontSizeRange: ClosedRange<Double> = 1 ... 200
@@ -251,7 +255,7 @@ public struct Configuration: Sendable, Equatable {
   public static func load(from url: URL = defaultURL) -> Configuration {
     var config = Configuration()
     var includes = Includes()
-    includes.files.append((url, true))
+    _ = includes.enqueue(url, optional: true)
     config.loadIncludes(&includes)
     return config
   }
@@ -271,10 +275,24 @@ public struct Configuration: Sendable, Equatable {
   private struct Includes {
     var files: [(url: URL, optional: Bool)] = []
     var next = 0
+    var processed = 0
+    var bytesRead = 0
+    var reportedFileLimit = false
+
+    mutating func enqueue(_ url: URL, optional: Bool) -> Bool {
+      guard processed + files.count - next < Configuration.maxLoadedFiles else {
+        return false
+      }
+      files.append((url, optional))
+      return true
+    }
 
     mutating func pop() -> (url: URL, optional: Bool)? {
       guard next < files.count else { return nil }
-      defer { next += 1 }
+      defer {
+        next += 1
+        processed += 1
+      }
       return files[next]
     }
 
@@ -287,6 +305,10 @@ public struct Configuration: Sendable, Equatable {
   private mutating func loadIncludes(_ includes: inout Includes) {
     var loaded: Set<URL> = []
     while let file = includes.pop() {
+      guard ConfigurationFile.path(for: file.url) != nil else {
+        include(file.url, optional: file.optional, includes: &includes)
+        continue
+      }
       let canonicalURL = file.url.standardizedFileURL.resolvingSymlinksInPath()
       guard loaded.insert(canonicalURL).inserted else {
         diagnostics.append("\(file.url.path): include cycle")
@@ -302,7 +324,23 @@ public struct Configuration: Sendable, Equatable {
     includes: inout Includes
   ) {
     let text: String
-    do { text = try String(contentsOf: url, encoding: .utf8) } catch {
+    let limit = min(
+      Self.maxFileBytes,
+      max(0, Self.maxLoadedBytes - includes.bytesRead)
+    )
+    do {
+      text = try ConfigurationFile.read(url, maxBytes: limit) {
+        includes.bytesRead += $0
+      }
+    } catch {
+      if case ConfigurationFile.Failure.tooLarge = error {
+        let reason =
+          limit < Self.maxFileBytes
+          ? "configuration byte budget exceeded (\(Self.maxLoadedBytes) bytes)"
+          : "file exceeds \(Self.maxFileBytes) bytes"
+        diagnostics.append("\(url.path): \(reason)")
+        return
+      }
       let missing =
         (error as? CocoaError)
         .map { $0.code == .fileReadNoSuchFile || $0.code == .fileNoSuchFile }
@@ -371,7 +409,14 @@ public struct Configuration: Sendable, Equatable {
           !rawValue.hasPrefix("\"") && value.unicodeScalars.first == "?"
         let path = optional ? String(value.unicodeScalars.dropFirst()) : value
         let url = Self.fileURL(path, directory: directory)
-        includes.files.append((url, optional))
+        if !includes.enqueue(url, optional: optional),
+          !includes.reportedFileLimit
+        {
+          includes.reportedFileLimit = true
+          diagnostics.append(
+            "\(name):\(i + 1): configuration file limit \(Self.maxLoadedFiles) exceeded"
+          )
+        }
         continue
       }
       if key == "custom-shader", !value.isEmpty, let directory {
@@ -499,8 +544,7 @@ public struct Configuration: Sendable, Equatable {
       guard !value.utf8.contains(0) else { return invalid() }
       workingDirectory =
         value.isEmpty ? nil : (value as NSString).expandingTildeInPath
-    case "window-padding-x", "window-padding-y":
-      return setPadding(key, value)
+    case "window-padding-x", "window-padding-y": return setPadding(key, value)
     case "keybind":
       if value.isEmpty {
         keybindings = .defaults
@@ -647,7 +691,7 @@ public struct Configuration: Sendable, Equatable {
     return colors.applied(to: palette)
   }
 
-  /// Theme names that could not be found.
+  /// Theme names that could not be loaded (missing, unreadable or invalid).
   public var missingThemes: [String] {
     guard let theme else { return [] }
     return Set([theme.light, theme.dark]).sorted()

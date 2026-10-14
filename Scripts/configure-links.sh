@@ -23,8 +23,11 @@
 # the committed AttentionLinks.plist and has no associated domains:
 # tvOS has no browser to hand https links to the app.
 set -eu
+# Split validated records into words without expanding the literal ? in
+# developer-mode entitlements against filenames in the caller's directory.
+set -f
 
-repository_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
+repository_root=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
 out=${1:-"$repository_root/Apps/Config/Generated"}
 domains=$("$repository_root/Scripts/link-domains.sh")
 applinks=$("$repository_root/Scripts/link-domains.sh" --entitlements)
@@ -73,7 +76,7 @@ for target in MobileClient MacClient CatalystClient VisionClient; do
 done
 
 if [ -n "$domains" ]; then
-  echo "configure-links: Universal Links for $(echo $domains)" >&2
+  echo "configure-links: Universal Links for $domains" >&2
 else
   echo "configure-links: SWIFTTY_LINK_DOMAINS unset; swiftty:// links only" >&2
 fi

@@ -18,6 +18,7 @@ final class EventMailbox: Sendable {
 
   private struct State {
     var handler: RSTConnectionHandler?
+    var started = false
     var events: [Event] = []
     var draining = false
     var closePosted = false
@@ -26,9 +27,7 @@ final class EventMailbox: Sendable {
   private let state = Mutex(State())
   let snapshotLimit: Int
 
-  init(snapshotLimit: Int) {
-    self.snapshotLimit = max(1, snapshotLimit)
-  }
+  init(snapshotLimit: Int) { self.snapshotLimit = max(1, snapshotLimit) }
 
   var hasHandler: Bool { state.withLock { $0.handler != nil } }
 
@@ -37,7 +36,8 @@ final class EventMailbox: Sendable {
   @discardableResult
   func start(_ handler: RSTConnectionHandler) -> Bool {
     let installed = state.withLock { s -> Bool in
-      guard s.handler == nil else { return false }
+      guard !s.started else { return false }
+      s.started = true
       s.handler = handler
       return true
     }
@@ -111,6 +111,14 @@ final class EventMailbox: Sendable {
         done()
       case let .closed(error):
         handler.onClosed(error)
+        // Keep callback captures until ordered closure, then release them
+        // outside the lock; their deinitializers may reenter the mailbox.
+        let retired = state.withLock { s in
+          let retired = s.handler
+          s.handler = nil
+          return retired
+        }
+        withExtendedLifetime(retired) {}
       }
     }
   }

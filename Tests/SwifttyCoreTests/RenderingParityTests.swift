@@ -21,12 +21,12 @@ struct RenderingParityTests {
     _ input: String,
     columns: Int = 8,
     rows: Int = 2
-  ) -> RendererTests.Frame {
+  ) throws -> RendererTests.Frame {
     let session = TerminalSession(columns: columns, rows: rows)
     session.feed(Array(("\u{1B}[?25l" + input).utf8))
     let w = Int(renderer.cellSize.width) * columns + 16
     let h = Int(renderer.cellSize.height) * rows + 16
-    return helper.render(renderer, session.snapshot(), width: w, height: h)
+    return try helper.render(renderer, session.snapshot(), width: w, height: h)
   }
 
   /// Pixels in the bottom half of cell (column, 0) that are not background.
@@ -54,7 +54,7 @@ struct RenderingParityTests {
   func `underline styles draw differently`() throws {
     let r = try make()
     // Spaces, so only the underline is ink.
-    let f = frame(
+    let f = try frame(
       r,
       "\u{1B}[4m \u{1B}[4:3m \u{1B}[4:4m \u{1B}[4:5m \u{1B}[21m "
     )
@@ -74,7 +74,7 @@ struct RenderingParityTests {
   @Test(.enabled(if: RendererTests.device != nil))
   func `underline color`() throws {
     let r = try make()
-    let f = frame(r, "\u{1B}[4;58;2;0;255;0m \u{1B}[59m ")
+    let f = try frame(r, "\u{1B}[4;58;2;0;255;0m \u{1B}[59m ")
     let colored = underlineInk(f, r, column: 0).map { f.pixel($0.x, $0.y) }
     #expect(colored.contains { $0.g > 200 && $0.r < 60 })
     let plain = underlineInk(f, r, column: 1).map { f.pixel($0.x, $0.y) }
@@ -84,9 +84,9 @@ struct RenderingParityTests {
   @Test(.enabled(if: RendererTests.device != nil))
   func `strikethrough and overline draw together`() throws {
     let r = try make()
-    let strike = frame(r, "\u{1B}[9m ")
-    let overline = frame(r, "\u{1B}[53m ")
-    let combined = frame(r, "\u{1B}[9;53m ")
+    let strike = try frame(r, "\u{1B}[9m ")
+    let overline = try frame(r, "\u{1B}[53m ")
+    let combined = try frame(r, "\u{1B}[9;53m ")
     #expect(strike.pixels != overline.pixels)
     #expect(
       combined.pixels == zip(strike.pixels, overline.pixels).map { max($0, $1) }
@@ -96,8 +96,8 @@ struct RenderingParityTests {
   @Test(.enabled(if: RendererTests.device != nil))
   func `concealed text also conceals its decorations`() throws {
     let r = try make()
-    let blank = frame(r, " ")
-    let concealed = frame(r, "\u{1B}[8;4:3;9;53mX")
+    let blank = try frame(r, " ")
+    let concealed = try frame(r, "\u{1B}[8;4:3;9;53mX")
     #expect(concealed.pixels == blank.pixels)
   }
 
@@ -105,11 +105,11 @@ struct RenderingParityTests {
   func `blinking text hides in its off phase`() throws {
     let r = try make()
     let bg = Palette.standard.background
-    let on = frame(r, "\u{1B}[5mX")
+    let on = try frame(r, "\u{1B}[5mX")
     #expect(on.inkCount(column: 0, row: 0, renderer: r, background: bg) > 10)
     #expect(r.hasBlinkingText)
     r.options.textBlinkVisible = false
-    let off = frame(r, "\u{1B}[5mX\u{1B}[0mY")
+    let off = try frame(r, "\u{1B}[5mX\u{1B}[0mY")
     #expect(off.inkCount(column: 0, row: 0, renderer: r, background: bg) == 0)
     #expect(off.inkCount(column: 1, row: 0, renderer: r, background: bg) > 10)
   }
@@ -123,12 +123,12 @@ struct RenderingParityTests {
     session.feed(Array("\u{1B}[41;5;4:3;9;53mX\u{1B}[1G".utf8))
     let w = Int(r.cellSize.width) * 4 + 16
     let h = Int(r.cellSize.height) + 16
-    let on = helper.render(r, session.snapshot(), width: w, height: h)
+    let on = try helper.render(r, session.snapshot(), width: w, height: h)
     r.options.textBlinkVisible = false
-    let off = helper.render(r, session.snapshot(), width: w, height: h)
+    let off = try helper.render(r, session.snapshot(), width: w, height: h)
     let reference = TerminalSession(columns: 4, rows: 1)
     reference.feed(Array("\u{1B}[41m \u{1B}[1G".utf8))
-    let blank = helper.render(r, reference.snapshot(), width: w, height: h)
+    let blank = try helper.render(r, reference.snapshot(), width: w, height: h)
     #expect(on.pixels != blank.pixels)
     #expect(off.pixels == blank.pixels)
   }
@@ -136,8 +136,8 @@ struct RenderingParityTests {
   @Test(.enabled(if: RendererTests.device != nil))
   func `faint dims color emoji`() throws {
     let r = try make()
-    let normal = frame(r, "\u{1B}]11;#000000\u{7}😀")
-    let faint = frame(r, "\u{1B}]11;#000000\u{7}\u{1B}[2m😀")
+    let normal = try frame(r, "\u{1B}]11;#000000\u{7}😀")
+    let faint = try frame(r, "\u{1B}]11;#000000\u{7}\u{1B}[2m😀")
     func brightness(_ frame: RendererTests.Frame) -> Int {
       stride(from: 0, to: frame.pixels.count, by: 4)
         .reduce(0) {
@@ -162,8 +162,8 @@ struct RenderingParityTests {
       fontManager: CoreTextFontManager(),
       font: descriptor,
     )
-    let red = frame(renderer, "\u{1B}[31m©")
-    let green = frame(renderer, "\u{1B}[32m©")
+    let red = try frame(renderer, "\u{1B}[31m©")
+    let green = try frame(renderer, "\u{1B}[32m©")
     #expect(
       red.inkCount(
         column: 0,
@@ -203,7 +203,7 @@ struct RenderingParityTests {
       }
       """
     )
-    let f = frame(r, "")
+    let f = try frame(r, "")
     let p = f.pixel(2, 2)
     let bg = Palette.standard.background
     #expect(
@@ -264,7 +264,12 @@ struct RenderingParityTests {
     let queue = try #require(device.makeCommandQueue())
     for time: Float in [0.25, 0.75] {
       let command = try #require(queue.makeCommandBuffer())
-      post.encode(from: input, to: output, commandBuffer: command, time: time)
+      try post.encode(
+        from: input,
+        to: output,
+        commandBuffer: command,
+        time: time
+      )
       command.commit()
       command.waitUntilCompleted()
       #expect(command.status == .completed)
@@ -368,7 +373,7 @@ struct RenderingParityTests {
     }
     let w = Int(r.cellSize.width) * 4 + 16
     let h = Int(r.cellSize.height) + 16
-    let f = helper.render(r, session.snapshot(), width: w, height: h)
+    let f = try helper.render(r, session.snapshot(), width: w, height: h)
     let p = f.pixel(8 + Int(r.cellSize.width) * 3 + 2, 10)
     #expect(p.g == 255 && p.r == 0)
   }
@@ -384,7 +389,7 @@ struct RenderingParityTests {
     session.feed(Array("\u{1B}[?25la漢b👩‍💻c".utf8))
     let w = Int(r.cellSize.width) * 8 + 16
     let h = Int(r.cellSize.height) + 16
-    func selected(_ start: Int, _ end: Int) -> [UInt8] {
+    func selected(_ start: Int, _ end: Int) throws -> [UInt8] {
       session.mutate {
         $0.setSelection(
           Selection(
@@ -394,12 +399,13 @@ struct RenderingParityTests {
           )
         )
       }
-      return helper.render(r, session.snapshot(), width: w, height: h).pixels
+      return try helper.render(r, session.snapshot(), width: w, height: h)
+        .pixels
     }
     for head in [1, 4] {
-      let whole = selected(head, head + 1)
-      #expect(selected(head, head) == whole)
-      #expect(selected(head + 1, head + 1) == whole)
+      let whole = try selected(head, head + 1)
+      #expect(try selected(head, head) == whole)
+      #expect(try selected(head + 1, head + 1) == whole)
     }
   }
 
@@ -417,7 +423,7 @@ struct RenderingParityTests {
     r.options.selectedSearchBackground = 0x00FF00
     let w = Int(r.cellSize.width) * 6 + 16
     let h = Int(r.cellSize.height) + 16
-    let f = helper.render(r, session.snapshot(), width: w, height: h)
+    let f = try helper.render(r, session.snapshot(), width: w, height: h)
     for column in 0 ..< 5 {
       let p = f.pixel(8 + column * Int(r.cellSize.width), 8)
       if column < 2 {

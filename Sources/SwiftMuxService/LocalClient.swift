@@ -44,14 +44,40 @@ package final class MuxLocalConnection: Sendable {
     }
   }
 
+  /// A numbered request with optional admission constraints. Refused
+  /// requests cannot dispatch their command in service order. `isAdmitted`
+  /// runs synchronously on the service actor; it must be thread-safe and
+  /// must not wait for the requesting owner queue.
+  package func sendRequest(
+    id requestID: UInt64,
+    command: MuxCommand,
+    expiresAt: ContinuousClock.Instant? = nil,
+    isAdmitted: (@Sendable () -> Bool)? = nil
+  ) {
+    let id = id
+    service.queue.async {
+      self.service.assumeIsolated {
+        $0.receiveRequest(
+          id: requestID,
+          command: command,
+          from: id,
+          expiresAt: expiresAt,
+          isAdmitted: isAdmitted
+        )
+      }
+    }
+  }
+
   /// Like a dropped connection: the lease (if any) is released and
   /// remaining paste input is cancelled. Panes keep running.
-  package func close() {
+  /// `completion` runs after the service has processed disconnection.
+  package func close(completion: (@Sendable () -> Void)? = nil) {
     let id = id
     service.queue.async {
       self.service.assumeIsolated {
         $0.disconnected(id, reason: "in-process client closed")
       }
+      completion?()
     }
   }
 }
@@ -70,6 +96,43 @@ extension MuxService {
       }
     }
     return MuxLocalConnection(service: self, id: id)
+  }
+
+  /// An unused remote reservation may be ended only until a local
+  /// frontend uses its workspace. Check local-use history in service order.
+  package nonisolated func endReservedWorkspace(
+    _ id: WorkspaceID,
+    completion: @escaping @Sendable (Bool) -> Void
+  ) {
+    queue.async {
+      self.assumeIsolated { service in
+        guard let workspace = service.workspaces.first(where: { $0.id == id }),
+          !workspace.wasAttachedLocally
+        else { return completion(false) }
+        service.endWorkspace(id)
+        completion(true)
+      }
+    }
+  }
+
+  /// Retention may remove an exited workspace only while every pane is
+  /// still exited. Validate in service order so a newly added live pane
+  /// cannot be ended by an earlier retention snapshot.
+  package nonisolated func endExitedWorkspace(
+    _ id: WorkspaceID,
+    completion: @escaping @Sendable (Bool) -> Void
+  ) {
+    queue.async {
+      self.assumeIsolated { service in
+        guard let workspace = service.workspaces.first(where: { $0.id == id }),
+          !workspace.allPanes.isEmpty,
+          workspace.allPanes.allSatisfy({ service.panes[$0]?.exitStatus != nil }
+          )
+        else { return completion(false) }
+        service.endWorkspace(id)
+        completion(true)
+      }
+    }
   }
 
   /// Runs `body` in `pane`'s order with its authoritative terminal

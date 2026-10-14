@@ -16,7 +16,9 @@ public struct HostConfiguration: Sendable, Hashable, Codable {
   public var port: UInt16
   /// Host name or address placed in grants for clients to connect to.
   public var advertisedHost: String
-  /// Owner-only state directory holding the control socket.
+  /// Owner-only state directory holding the control socket. File loading
+  /// resolves relative paths against the configuration file's parent.
+  /// Directly constructed configurations use the shared roaming directory.
   public var stateDirectory: String?
 
   public init(
@@ -42,7 +44,9 @@ public struct HostConfiguration: Sendable, Hashable, Codable {
     advertisedHost = try c.decode(String.self, forKey: .advertisedHost)
     stateDirectory = try c.decodeIfPresent(String.self, forKey: .stateDirectory)
     guard !bindAddress.isEmpty, bindAddress.utf8.count <= 255,
-      !advertisedHost.isEmpty, advertisedHost.utf8.count <= 255, port != 0
+      !bindAddress.utf8.contains(0), !advertisedHost.isEmpty,
+      advertisedHost.utf8.count <= 255, !advertisedHost.utf8.contains(0),
+      port != 0
     else {
       throw DecodingError.dataCorruptedError(
         forKey: .bindAddress,
@@ -50,10 +54,28 @@ public struct HostConfiguration: Sendable, Hashable, Codable {
         debugDescription: "bind address, advertised host and port required"
       )
     }
+    if let stateDirectory,
+      stateDirectory.isEmpty || stateDirectory.utf8.contains(0)
+    {
+      throw DecodingError.dataCorruptedError(
+        forKey: .stateDirectory,
+        in: c,
+        debugDescription: "state directory must be a nonempty NUL-free path"
+      )
+    }
   }
 
   public var stateDirectoryURL: URL {
-    stateDirectory.map { URL(fileURLWithPath: $0) } ?? ControlDirectory.defaultURL
+    stateDirectory.map {
+      Self.directoryURL($0, relativeTo: ControlDirectory.defaultURL)
+    } ?? ControlDirectory.defaultURL
+  }
+
+  private static func directoryURL(_ path: String, relativeTo base: URL) -> URL
+  {
+    let directory = URL(fileURLWithPath: base.path, isDirectory: true)
+    return URL(fileURLWithPath: path, isDirectory: true, relativeTo: directory)
+      .absoluteURL
   }
 
   public var socketPath: String {
@@ -64,12 +86,53 @@ public struct HostConfiguration: Sendable, Hashable, Codable {
     ControlDirectory.defaultURL.appendingPathComponent("config.json")
   }
 
+  /// Loads a regular local file of at most 64 KiB, with bounded reads even
+  /// if the file grows while being read.
   public static func load(from url: URL) throws -> HostConfiguration {
-    let data = try Data(contentsOf: url)
-    guard data.count <= 64 * 1024 else {
-      throw CocoaError(.fileReadTooLarge)
+    guard url.isFileURL else { throw CocoaError(.fileReadUnsupportedScheme) }
+    let path = url.path(percentEncoded: false)
+    guard !path.utf8.contains(0) else { throw POSIXError(.EINVAL) }
+    let fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+    guard fd >= 0 else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
-    return try JSONDecoder().decode(HostConfiguration.self, from: data)
+    defer { close(fd) }
+    var info = stat()
+    guard fstat(fd, &info) == 0 else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    // Configuration is a regular file, never a blocking pipe or device.
+    guard info.st_mode & S_IFMT == S_IFREG else { throw POSIXError(.EINVAL) }
+    let limit = 64 * 1024
+    guard info.st_size <= limit else { throw CocoaError(.fileReadTooLarge) }
+    // Read one excess byte to detect growth after fstat without ever reading
+    // the whole enlarged file. Short reads and interruptions remain valid.
+    var bytes = [UInt8](repeating: 0, count: limit + 1)
+    var count = 0
+    while count < bytes.count {
+      let readCount = bytes.withUnsafeMutableBytes {
+        Darwin.read(fd, $0.baseAddress! + count, $0.count - count)
+      }
+      if readCount > 0 {
+        count += readCount
+      } else if readCount == 0 {
+        break
+      } else if errno != EINTR {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+      }
+    }
+    guard count <= limit else { throw CocoaError(.fileReadTooLarge) }
+    var configuration = try JSONDecoder()
+      .decode(HostConfiguration.self, from: Data(bytes.prefix(count)))
+    if let path = configuration.stateDirectory {
+      configuration.stateDirectory =
+        directoryURL(
+          path,
+          relativeTo: url.absoluteURL.deletingLastPathComponent()
+        )
+        .path
+    }
+    return configuration
   }
 }
 
@@ -87,6 +150,38 @@ extension HostConfiguration {
       return URL(fileURLWithPath: path)
     }
     return defaultConfigurationURL
+  }
+
+  /// Loads the agent's selected configuration before service startup. Only
+  /// an absent optional default disables roaming; explicit selections and
+  /// other failures must be reported. A nil URL means roaming was disabled.
+  public static func loadForStartup(
+    from url: URL?,
+    required: Bool
+  ) throws -> HostConfiguration? {
+    guard let url else { return nil }
+    do { return try load(from: url) } catch let error as POSIXError
+      where error.code == .ENOENT && !required
+    { return nil }
+  }
+
+  /// Control socket selected by the bootstrap helper's configuration.
+  /// Only an absent default configuration permits the default socket;
+  /// explicit paths and other load failures propagate to the caller.
+  public static func resolvedSocketPath(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+  ) throws -> String {
+    do {
+      return try load(from: resolvedConfigurationURL(environment: environment))
+        .socketPath
+    } catch let error as POSIXError
+      where error.code == .ENOENT && (environment[environmentKey] ?? "").isEmpty
+    {
+      // Without a configuration, status may still ask the default service
+      // whether roaming is available. Explicit paths must never fall back.
+      return ControlDirectory.defaultURL.appendingPathComponent("control.sock")
+        .path
+    }
   }
 }
 #endif

@@ -36,29 +36,33 @@ enum SwifttydCommand {
     FileHandle.standardError.write(Data((message + "\n").utf8))
   }
 
-  private static var socketPath: String {
-    let directory =
-      (try? HostConfiguration.load(
-        from: HostConfiguration.resolvedConfigurationURL()
-      ))?.stateDirectoryURL ?? ControlDirectory.defaultURL
-    return directory.appendingPathComponent("control.sock").path
-  }
-
   // MARK: bootstrap --stdio
 
   private static func bootstrap() -> Int32 {
     let response: [UInt8]
     do {
       let request = try BootstrapService.readEnvelope(from: STDIN_FILENO)
-      response = BootstrapService.forward(
-        envelope: request,
-        socketPath: socketPath
-      )
+      switch BootstrapService.decodeRequest(request) {
+      case let .failure(code):
+        response = try BootstrapEnvelope.encode(BootstrapResponse.failure(code))
+      case .success:
+        do {
+          response = BootstrapService.forward(
+            envelope: request,
+            socketPath: try HostConfiguration.resolvedSocketPath()
+          )
+        } catch {
+          diagnose("swifttyd: cannot read roaming configuration: \(error)")
+          response =
+            (try? BootstrapEnvelope.encode(
+              BootstrapResponse.failure(.agentUnavailable)
+            )) ?? []
+        }
+      }
     } catch {
       response =
-        (try? BootstrapEnvelope.encode(
-          BootstrapResponse.failure(.malformed)
-        )) ?? []
+        (try? BootstrapEnvelope.encode(BootstrapResponse.failure(.malformed)))
+        ?? []
     }
     FileHandle.standardOutput.write(Data(response))
     return 0
@@ -74,7 +78,12 @@ enum SwifttydCommand {
         BootstrapRequest(operation: .list)
       )
     else { return 1 }
-    let reply = BootstrapService.forward(envelope: request, socketPath: socketPath)
+    let path: String
+    do { path = try HostConfiguration.resolvedSocketPath() } catch {
+      diagnose("swifttyd: cannot read roaming configuration: \(error)")
+      return 3
+    }
+    let reply = BootstrapService.forward(envelope: request, socketPath: path)
     guard
       let response = try? BootstrapEnvelope.decode(
         BootstrapResponse.self,
@@ -84,7 +93,9 @@ enum SwifttydCommand {
       diagnose("swifttyd: the SwiftMux service is not serving roaming clients")
       return 3
     }
-    diagnose("swifttyd: SwiftMux roaming is available (\(list.count) workspaces)")
+    diagnose(
+      "swifttyd: SwiftMux roaming is available (\(list.count) workspaces)"
+    )
     return 0
   }
 }

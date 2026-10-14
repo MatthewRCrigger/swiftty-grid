@@ -74,8 +74,8 @@ public enum PresentationMapper {
   public static func flags(_ attributes: TextAttributes) -> CellFlags {
     var out = CellFlags()
     let direct: [(TextAttributes, CellFlags)] = [
-      (.bold, .bold), (.faint, .faint), (.italic, .italic),
-      (.blink, .blink), (.inverse, .inverse), (.invisible, .invisible),
+      (.bold, .bold), (.faint, .faint), (.italic, .italic), (.blink, .blink),
+      (.inverse, .inverse), (.invisible, .invisible),
       (.strikethrough, .strikethrough), (.overline, .overline),
     ]
     for (attribute, flag) in direct where attributes.contains(attribute) {

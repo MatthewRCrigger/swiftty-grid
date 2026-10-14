@@ -4,6 +4,19 @@ import Testing
 
 /// OSC 7501 record semantics.
 struct ProgramStatusStoreTests {
+  @Test
+  func spacedChildClearPreservesUnrelatedRecords() {
+    var vt = vt()
+    report(&vt, "state=idle")
+    report(&vt, "state=working:id=child")
+    report(&vt, "state=working:id=child/task")
+    report(&vt, "state=error:id=other")
+    report(&vt, "state=clear: id = child ")
+    #expect(ids(vt) == ["", "other"])
+    report(&vt, "state=clear: id = ")
+    #expect(ids(vt) == ["", "other"])
+  }
+
   func vt() -> VT {
     var vt = VT(20, 3)
     vt.state.programStatusEnabled = true

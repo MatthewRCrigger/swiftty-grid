@@ -6,10 +6,44 @@ import SwifttyCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+  private let listMuxWorkspaces:
+    @MainActor () async throws -> [WorkspaceSummary]
+  private let reportMuxAttachError: @MainActor (any Error) -> Void
+  private let openMuxWorkspace:
+    @MainActor (WorkspaceSelector?, Configuration) async throws ->
+      MuxWorkspaceController
+  private let reportMuxOpenError: @MainActor (any Error) -> Void
+
+  init(
+    listMuxWorkspaces:
+      @escaping @MainActor () async throws -> [WorkspaceSummary] = {
+        try await MuxWorkspaceController.listWorkspaces()
+      },
+    reportMuxAttachError: @escaping @MainActor (any Error) -> Void = {
+      NSAlert(error: $0).runModal()
+    },
+    openMuxWorkspace:
+      @escaping @MainActor (WorkspaceSelector?, Configuration) async throws ->
+      MuxWorkspaceController = {
+        try await MuxWorkspaceController.open($0, configuration: $1)
+      },
+    reportMuxOpenError: @escaping @MainActor (any Error) -> Void = {
+      NSAlert(error: $0).runModal()
+    }
+  ) {
+    self.listMuxWorkspaces = listMuxWorkspaces
+    self.reportMuxAttachError = reportMuxAttachError
+    self.openMuxWorkspace = openMuxWorkspace
+    self.reportMuxOpenError = reportMuxOpenError
+    super.init()
+  }
+
   private var windows: [TerminalWindowController] = []
   private var config = Configuration.load()
   /// The one native SwiftMux workspace window (one lease at a time).
   private var mux: MuxWorkspaceController?
+  private var muxAttachInProgress = false
+  private var muxOpenInProgress = false
   private let muxUpdate = MuxUpdateController()
   private lazy var attentionLinks = AttentionLinkRouter(
     ownsWorkspace: { [weak self] id in
@@ -137,16 +171,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       mux.showWindow(nil)
       return
     }
+    guard !muxOpenInProgress else { return }
+    muxOpenInProgress = true
     let config = config
     Task {
+      defer { muxOpenInProgress = false }
       do {
-        let controller = try await MuxWorkspaceController.open(
-          selector,
-          configuration: config
-        )
+        let controller = try await openMuxWorkspace(selector, config)
         install(controller, replacing: nil)
         controller.showWindow(nil)
-      } catch { NSAlert(error: error).runModal() }
+      } catch { reportMuxOpenError(error) }
     }
   }
 
@@ -155,9 +189,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   @objc
   func muxAttach(_ sender: Any?) {
+    guard !muxAttachInProgress else { return }
+    // Reserve before scheduling and through modal presentation, whose
+    // nested event loop can deliver the action again.
+    muxAttachInProgress = true
     Task {
+      defer { muxAttachInProgress = false }
       do {
-        let list = try await MuxWorkspaceController.listWorkspaces()
+        let list = try await listMuxWorkspaces()
         guard !list.isEmpty else {
           let alert = NSAlert()
           alert.messageText = "No SwiftMux workspaces"
@@ -181,7 +220,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         openMux(.id(list[popup.indexOfSelectedItem].id))
-      } catch { NSAlert(error: error).runModal() }
+      } catch { reportMuxAttachError(error) }
     }
   }
 
@@ -291,7 +330,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   /// Configuration errors, shown as a sheet on the front window.
   private func reportProblems() {
     let problems =
-      config.diagnostics + config.missingThemes.map { "theme not found: \($0)" }
+      config.diagnostics
+      + config.missingThemes.map { "theme unavailable: \($0)" }
     guard !problems.isEmpty else { return }
     for problem in problems {
       FileHandle.standardError.write(Data("swiftty: \(problem)\n".utf8))

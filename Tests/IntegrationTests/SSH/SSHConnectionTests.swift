@@ -54,6 +54,28 @@ func waitUntil(
 
 @Suite(.serialized, .timeLimit(.minutes(1)))
 struct SSHConnectionTests {
+  @Test
+  func serverShutdownClosesAcceptedConnections() async throws {
+    let server = try await TestSSHServer.start()
+    defer { Task { await server.shutdown() } }
+    let first = try await server.connect()
+    do {
+      let second = try await server.connect()
+      await server.shutdown()
+      #expect(
+        try await waitUntil(timeout: .seconds(1)) {
+          !first.isActive && !second.isActive
+        }
+      )
+      await first.close()
+      await second.close()
+    } catch {
+      await first.close()
+      await server.shutdown()
+      throw error
+    }
+  }
+
   // MARK: Host trust
 
   @Test
@@ -91,9 +113,7 @@ struct SSHConnectionTests {
       trustDecider: approving
     )
     #expect(connection.hostKeyFingerprint == prompt.fingerprint)
-    #expect(
-      await store.trustedKey(for: server.identity) == server.hostKeyLine
-    )
+    #expect(await store.trustedKey(for: server.identity) == server.hostKeyLine)
     await connection.close()
 
     // A remembered key needs no further prompt.
@@ -122,7 +142,9 @@ struct SSHConnectionTests {
         trustDecider: rejecting
       )
     } throws: { error in
-      guard case .hostKeyRejected = error as? SSHClientError else { return false }
+      guard case .hostKeyRejected = error as? SSHClientError else {
+        return false
+      }
       return true
     }
     #expect(rejecting.requests.withLock { $0.count } == 1)
@@ -133,7 +155,9 @@ struct SSHConnectionTests {
       trustStore: store,
       trustDecider: approving
     )
-    #expect(fingerprint == approving.requests.withLock { $0.first?.fingerprint })
+    #expect(
+      fingerprint == approving.requests.withLock { $0.first?.fingerprint }
+    )
     #expect(await store.trustedKey(for: server.identity) == server.hostKeyLine)
     // Neither probe offered a credential.
     #expect(server.state.authRequests.withLock { $0 } == 0)
@@ -151,8 +175,7 @@ struct SSHConnectionTests {
   }
 
   @Test
-  func `changed host key fails closed and blocks reconnection`() async throws
-  {
+  func `changed host key fails closed and blocks reconnection`() async throws {
     let server = try await TestSSHServer.start()
     defer { Task { await server.shutdown() } }
     let other = NIOSSHPrivateKey(ed25519Key: .init()).publicKey
@@ -218,8 +241,9 @@ struct SSHConnectionTests {
 
   @Test
   func `file trust store persists public keys only`() async throws {
-    let dir = FileManager.default.temporaryDirectory
-      .appendingPathComponent("trust-" + UUID().uuidString)
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "trust-" + UUID().uuidString
+    )
     defer { try? FileManager.default.removeItem(at: dir) }
     let file = dir.appendingPathComponent("known_hosts.json")
     let key = NIOSSHPrivateKey(ed25519Key: .init()).publicKey
@@ -240,7 +264,9 @@ struct SSHConnectionTests {
     #expect(!json.lowercased().contains("private"))
 
     try await reloaded.removeTrustedKey(for: id)
-    #expect(try await FileHostTrustStore(fileURL: file).trustedKey(for: id) == nil)
+    #expect(
+      try await FileHostTrustStore(fileURL: file).trustedKey(for: id) == nil
+    )
 
     try Data("{not json".utf8).write(to: file)
     await #expect(throws: FileHostTrustStore.StoreError.corrupt) {
@@ -249,6 +275,76 @@ struct SSHConnectionTests {
   }
 
   // MARK: Authentication
+
+  @Test
+  func durationConversionSaturatesAtNanosecondBounds() {
+    #expect(TimeAmount(clamping: .seconds(Int64.max)).nanoseconds == .max)
+    #expect(TimeAmount(clamping: .seconds(Int64.min)).nanoseconds == .min)
+    #expect(
+      TimeAmount(
+        clamping: Duration(
+          secondsComponent: 9_223_372_036,
+          attosecondsComponent: 854_775_808_000_000_000
+        )
+      )
+      .nanoseconds == .max
+    )
+    #expect(
+      TimeAmount(
+        clamping: Duration(
+          secondsComponent: -9_223_372_036,
+          attosecondsComponent: -854_775_809_000_000_000
+        )
+      )
+      .nanoseconds == .min
+    )
+    #expect(
+      TimeAmount(clamping: .milliseconds(1500)).nanoseconds == 1_500_000_000
+    )
+  }
+
+  @Test
+  func oversizedTrustStoreWritesPreserveTheLastReadableFile() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "trust-" + UUID().uuidString
+    )
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let file = dir.appendingPathComponent("known_hosts.json")
+    let key = NIOSSHPrivateKey(ed25519Key: .init()).publicKey
+    let line = String(openSSHPublicKey: key)
+    let id = try #require(HostIdentity(host: "example.com", port: 22))
+    let store = FileHostTrustStore(fileURL: file)
+    try await store.setTrustedKey(line, for: id)
+    let original = try Data(contentsOf: file)
+    let oversized =
+      line + " "
+      + String(repeating: "x", count: FileHostTrustStore.maxFileBytes)
+    await #expect(throws: FileHostTrustStore.StoreError.tooLarge) {
+      try await store.setTrustedKey(oversized, for: id)
+    }
+    #expect(try Data(contentsOf: file) == original)
+    #expect(try await store.trustedKey(for: id) == line)
+    #expect(
+      try await FileHostTrustStore(fileURL: file).trustedKey(for: id) == line
+    )
+  }
+
+  @Test
+  func execTimeoutFailsInsteadOfReturningPartialOutput() async throws {
+    let server = try await TestSSHServer.start()
+    defer { Task { await server.shutdown() } }
+    let connection = try await server.connect()
+    defer { Task { await connection.close() } }
+    await #expect(throws: SSHClientError.execTimeout) {
+      _ = try await connection.execute(
+        command: "wait-forever",
+        limits: SSHExecLimits(timeout: .milliseconds(50))
+      )
+    }
+    #expect(connection.isActive)
+    let result = try await connection.execute(command: "echo-split")
+    #expect(result.exitStatus == 3)
+  }
 
   @Test
   func `password authentication succeeds and wrong password fails`()
@@ -265,9 +361,26 @@ struct SSHConnectionTests {
       _ = try await server.connect(credential: .password("wrong"))
     }
     #expect(
-      String(describing: SSHCredential.password("hunter2"))
-        .contains("hunter2") == false
+      String(describing: SSHCredential.password("hunter2")).contains("hunter2")
+        == false
     )
+  }
+
+  @Test
+  func concurrentKeyCreationReturnsOneNamedIdentity() async throws {
+    let keys: any Ed25519KeyStore = InMemoryEd25519KeyStore()
+    let publicKeys = try await withThrowingTaskGroup(of: Data.self) { group in
+      for _ in 0 ..< 32 {
+        group.addTask {
+          try await keys.loadOrCreateKey(label: "shared").publicKey
+            .rawRepresentation
+        }
+      }
+      var values: Set<Data> = []
+      for try await key in group { values.insert(key) }
+      return values
+    }
+    #expect(publicKeys.count == 1)
   }
 
   @Test
@@ -290,9 +403,7 @@ struct SSHConnectionTests {
         == SSHPublicKeyFormat.fingerprint(openSSHPublicKey: line)
     )
     let authorized = try NIOSSHPublicKey(openSSHPublicKey: line)
-    #expect(
-      authorized == NIOSSHPrivateKey(ed25519Key: key).publicKey
-    )
+    #expect(authorized == NIOSSHPrivateKey(ed25519Key: key).publicKey)
 
     let server = try await TestSSHServer.start(authorizedKeys: [authorized])
     defer { Task { await server.shutdown() } }
@@ -313,9 +424,9 @@ struct SSHConnectionTests {
       service: "swiftty.tests." + UUID().uuidString
     )
     let key = SSHEd25519Key.generate()
-    do {
-      try await store.storeKey(key, label: "probe")
-    } catch let KeychainEd25519KeyStore.KeychainError.status(status) {
+    do { try await store.storeKey(key, label: "probe") } catch let
+      KeychainEd25519KeyStore.KeychainError.status(status)
+    {
       // Unsigned test runners may lack keychain entitlements.
       #expect(status != 0)
       return
@@ -369,8 +480,9 @@ struct SSHConnectionTests {
     )
     #expect(response == .sessions([]))
     #expect(
-      server.state.bootstrapRequests.withLock { $0 }
-        == [BootstrapRequest(operation: .list)]
+      server.state.bootstrapRequests.withLock { $0 } == [
+        BootstrapRequest(operation: .list)
+      ]
     )
 
     // Diagnostics are bounded and never part of the protocol.
@@ -470,9 +582,7 @@ struct SSHConnectionTests {
 
     await shell.close()
     #expect(
-      try await waitUntil {
-        recorder.events.withLock { $0.contains(.closed) }
-      }
+      try await waitUntil { recorder.events.withLock { $0.contains(.closed) } }
     )
   }
 

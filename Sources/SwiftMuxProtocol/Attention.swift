@@ -194,7 +194,11 @@ public struct InboxQuery: Codable, Sendable, Hashable {
   /// At most `MuxLimits.inboxPageSize`.
   public var limit: Int
 
-  public init(section: Section = .needsYou, cursor: String? = nil, limit: Int = 100) {
+  public init(
+    section: Section = .needsYou,
+    cursor: String? = nil,
+    limit: Int = 100
+  ) {
     self.section = section
     self.cursor = cursor
     self.limit = limit
@@ -227,7 +231,8 @@ public struct InboxUpdate: Codable, Sendable, Hashable {
   public var counts: InboxCounts
   public var changed: [AttentionItem]
   public var removed: [OccurrenceID]
-  /// Set when changes were dropped for a slow subscriber: refetch.
+  /// Set when a change batch or subscriber backlog exceeded its budget:
+  /// refetch the current inbox.
   public var resync: Bool
 
   public init(

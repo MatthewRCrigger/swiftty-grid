@@ -153,7 +153,7 @@ func parseProperties(
         separator: ".",
         omittingEmptySubsequences: false
       )
-      guard (parts.count == 3 || (emoji && parts.count == 2)),
+      guard parts.count == 3 || (emoji && parts.count == 2),
         parts.allSatisfy({
           !$0.isEmpty && $0.utf8.allSatisfy { (48 ... 57).contains($0) }
         })
@@ -242,7 +242,7 @@ parseProperties("emoji/emoji-data.txt") { range, property, number, input in
   }
   if property == "Emoji_Presentation" { for cp in range { wide[cp] = true } }
 }
-for cp in 0 ..< 0x110000 { if zero[cp] { wide[cp] = false } }
+for cp in 0 ..< 0x110000 where zero[cp] { wide[cp] = false }
 
 func ranges(_ set: [Bool]) -> [(UInt32, UInt32)] {
   var out: [(UInt32, UInt32)] = []

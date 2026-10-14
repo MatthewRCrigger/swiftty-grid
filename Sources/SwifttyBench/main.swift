@@ -341,8 +341,20 @@ func runStream(
 let device = MTLCreateSystemDefaultDevice()
 
 /// Waiting also returns after GPU errors; only successful frames are samples.
-func waitForFrame(_ command: MTLCommandBuffer, benchmark: String) {
-  command.waitUntilCompleted()
+func waitForFrame(
+  _ renderer: MetalRenderer,
+  _ operation: @autoclosure () throws -> MTLCommandBuffer,
+  benchmark: String
+) {
+  let command: MTLCommandBuffer
+  do { command = try operation() } catch {
+    fputs("\(benchmark): renderer failed: \(error)\n", stderr)
+    exit(1)
+  }
+  guard renderer.waitUntilIdle(timeout: .now() + .seconds(30)) else {
+    fputs("\(benchmark): GPU command timed out\n", stderr)
+    exit(1)
+  }
   guard command.status == .completed else {
     row(
       benchmark,
@@ -413,7 +425,11 @@ func runRedraw() {
     let snapshot = session.snapshot()
     let t1 = DispatchTime.now().uptimeNanoseconds
     if let renderer, let target {
-      waitForFrame(renderer.render(snapshot, to: target), benchmark: "redraw")
+      waitForFrame(
+        renderer,
+        try renderer.render(snapshot, to: target),
+        benchmark: "redraw"
+      )
     }
     let t2 = DispatchTime.now().uptimeNanoseconds
     core.append(Double(t1 - t0) / 1e6)
@@ -463,7 +479,8 @@ func runScrollFrames() {
     let snapshot = session.snapshot()
     if let renderer, let target {
       waitForFrame(
-        renderer.render(snapshot, to: target),
+        renderer,
+        try renderer.render(snapshot, to: target),
         benchmark: "scroll-frames"
       )
     }

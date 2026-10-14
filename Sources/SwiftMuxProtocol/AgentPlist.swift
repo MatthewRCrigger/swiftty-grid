@@ -5,12 +5,13 @@ public enum AgentPlist {
     label: String = SMX.defaultMachService,
     program: String? = nil,
     bundleProgram: String? = nil
-  ) -> String {
+  ) throws(MuxError) -> String {
+    let escapedLabel = try escape(label)
     let programKey =
       if let program {
-        "<key>Program</key>\n  <string>\(escape(program))</string>"
+        "<key>Program</key>\n  <string>\(try escape(program))</string>"
       } else {
-        "<key>BundleProgram</key>\n  <string>\(escape(bundleProgram ?? "Contents/MacOS/swiftmux-agent"))</string>"
+        "<key>BundleProgram</key>\n  <string>\(try escape(bundleProgram ?? "Contents/MacOS/swiftmux-agent"))</string>"
       }
     // Started by its Mach service, and once at login so a configured
     // roaming listener is up before any local client connects. No
@@ -22,11 +23,11 @@ public enum AgentPlist {
       <plist version="1.0">
       <dict>
         <key>Label</key>
-        <string>\(escape(label))</string>
+        <string>\(escapedLabel)</string>
         \(programKey)
         <key>MachServices</key>
         <dict>
-          <key>\(escape(label))</key>
+          <key>\(escapedLabel)</key>
           <true/>
         </dict>
         <key>RunAtLoad</key>
@@ -43,9 +44,22 @@ public enum AgentPlist {
       """
   }
 
-  private static func escape(_ s: String) -> String {
-    s.replacingOccurrences(of: "&", with: "&amp;")
+  private static func escape(_ s: String) throws(MuxError) -> String {
+    guard
+      s.unicodeScalars.allSatisfy({ scalar in
+        switch scalar.value {
+        case 0x09, 0x0A, 0x0D, 0x20 ... 0xD7FF, 0xE000 ... 0xFFFD,
+          0x10000 ... 0x10FFFF:
+          true
+        default: false
+        }
+      })
+    else {
+      throw MuxError(.invalidRequest, "invalid launch-agent plist string")
+    }
+    return s.replacingOccurrences(of: "&", with: "&amp;")
       .replacingOccurrences(of: "<", with: "&lt;")
       .replacingOccurrences(of: ">", with: "&gt;")
+      .replacingOccurrences(of: "\r", with: "&#13;")
   }
 }

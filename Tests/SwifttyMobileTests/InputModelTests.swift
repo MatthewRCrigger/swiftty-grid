@@ -152,6 +152,11 @@ struct KeyTranslatorTests {
       // The initial forwarded key starts marked text before committing.
       input.cancel()
       #expect(input.commit("あ", keyboardFlags: flags) == nil)
+      let committed = KeyTranslator.inputs(forText: "あ", modifiers: [])
+      let expected =
+        flags & 8 == 0
+        ? "あ" : flags & 16 == 0 ? "\u{1B}[0u" : "\u{1B}[0;1;12354u"
+      #expect(encoded(committed, keyboardFlags: flags) == bytes(expected))
       // Even a composition that commits the original character stays text.
       input.begin(usage: 4, event: event)
       input.cancel()

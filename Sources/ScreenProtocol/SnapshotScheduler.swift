@@ -33,12 +33,11 @@ public struct SnapshotScheduler: Sendable {
   public let captureInterval: Duration
   public let cancellationLimit: Int
 
-  public init(
-    capturesPerSecond: Int = 30,
-    cancellationsPerSecond: Int = 10
-  ) {
-    captureInterval = .seconds(1) / capturesPerSecond
-    cancellationLimit = cancellationsPerSecond
+  /// Nonpositive capture rates use one capture per second. Nonpositive
+  /// cancellation rates disable replacement until a stream retires.
+  public init(capturesPerSecond: Int = 30, cancellationsPerSecond: Int = 10) {
+    captureInterval = .seconds(1) / max(1, capturesPerSecond)
+    cancellationLimit = max(0, cancellationsPerSecond)
   }
 
   /// Terminal state changed since the last capture.
@@ -52,9 +51,9 @@ public struct SnapshotScheduler: Sendable {
       return .wait(until: last + captureInterval)
     }
     switch streams.count {
-    case 0, 1:
-      return commitCapture(now: now, cancel: nil)
+    case 0, 1: return commitCapture(now: now, cancel: nil)
     default:
+      guard cancellationLimit > 0 else { return .idle }
       cancellations.removeAll { $0 + .seconds(1) <= now }
       guard cancellations.count < cancellationLimit else {
         return .wait(until: cancellations[0] + .seconds(1))

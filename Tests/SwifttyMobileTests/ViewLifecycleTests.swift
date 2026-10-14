@@ -26,6 +26,102 @@ struct ViewLifecycleTests {
   }
 
   @Test(.enabled(if: hasMetal))
+  func presentationFontChangesProposeGeometryWithoutReplacingTheHostGrid()
+    throws
+  {
+    let session = TerminalSession(presentationColumns: 80, rows: 24)
+    let proposals = Mutex<[[Int]]>([])
+    session.gridProposalHandler = { columns, rows in
+      proposals.withLock { $0.append([columns, rows]) }
+    }
+    let view = try TerminalUIView(session: session)
+    view.capabilities = .roaming
+    let window = makeWindow()
+    let controller = UIViewController()
+    window.rootViewController = controller
+    view.frame = CGRect(x: 0, y: 0, width: 320, height: 180)
+    controller.view.addSubview(view)
+    window.makeKeyAndVisible()
+    view.sceneDidActivate()
+    defer {
+      view.removeFromSuperview();
+      window.isHidden = true
+    }
+    try #require(view.isSurfaceVisible)
+    let frame = PresentationFrame(
+      columns: 6,
+      rows: 2,
+      cells: "host  remote".map { .init(text: String($0), width: 1, style: 0) },
+      wrapped: [false, false],
+      styles: [.init()],
+      cursorX: 5,
+      cursorY: 1
+    )
+    try #require(session.installPresentation(frame))
+    session.mutate { state in
+      state.setSelection(
+        Selection(
+          anchor: TerminalPoint(row: 0, column: 0),
+          head: TerminalPoint(row: 0, column: 3)
+        )
+      )
+      state.search("host")
+    }
+    let original = session.snapshot()
+    try #require(original.selection != nil && original.searchMatchCount == 1)
+    let selectedText = session.withState { $0.selectionText }
+    for change in ["configuration", "zoom", "layout"] {
+      proposals.withLock { $0.removeAll() }
+      switch change {
+      case "configuration": view.apply(Configuration.parse("font-size=18"))
+      case "zoom": try #require(view.perform(.increaseFontSize(4)))
+      default:
+        view.frame.size = CGSize(width: 640, height: 360)
+        view.layoutSubviews()
+      }
+      let snapshot = session.snapshot()
+      #expect(
+        proposals.withLock { $0.last } == [
+          view.gridSize.columns, view.gridSize.rows,
+        ]
+      )
+      #expect(
+        view.gridSize.columns != frame.columns
+          || view.gridSize.rows != frame.rows
+      )
+      #expect(
+        snapshot.columns == original.columns
+          && snapshot.rowCount == original.rowCount
+      )
+      #expect(snapshot.text == original.text)
+      #expect(
+        snapshot.cursor.x == original.cursor.x
+          && snapshot.cursor.y == original.cursor.y
+      )
+      #expect(snapshot.selection == original.selection)
+      #expect(snapshot.searchMatches == original.searchMatches)
+      #expect(snapshot.searchSelectedIndex == original.searchSelectedIndex)
+      #expect(session.withState { $0.selectionText } == selectedText)
+    }
+    let replacement = PresentationFrame(
+      columns: 4,
+      rows: 1,
+      cells: "next".map { .init(text: String($0), width: 1, style: 0) },
+      wrapped: [false],
+      styles: [.init()],
+      cursorX: 3,
+      cursorY: 0
+    )
+    try #require(session.installPresentation(replacement))
+    let snapshot = session.snapshot()
+    #expect(
+      snapshot.columns == 4 && snapshot.rowCount == 1
+        && snapshot.text == ["next"]
+    )
+    #expect(snapshot.selection == nil && snapshot.searchMatchCount == 0)
+  }
+
+  @Test(.enabled(if: hasMetal))
   func `detached blinking text does not start a timer`() async throws {
     let session = TerminalSession(columns: 10, rows: 2)
     let view = try TerminalUIView(session: session)
@@ -42,7 +138,7 @@ struct ViewLifecycleTests {
       view.renderer.device.makeTexture(descriptor: descriptor)
     )
     func renderBlinkingText() throws {
-      let command = view.renderer.render(session.snapshot(), to: texture)
+      let command = try view.renderer.render(session.snapshot(), to: texture)
       command.waitUntilCompleted()
       try #require(command.status == .completed)
     }
@@ -272,7 +368,7 @@ struct ViewLifecycleTests {
     let texture = try #require(
       view.renderer.device.makeTexture(descriptor: descriptor)
     )
-    let command = view.renderer.render(session.snapshot(), to: texture)
+    let command = try view.renderer.render(session.snapshot(), to: texture)
     command.waitUntilCompleted()
     try #require(
       command.status == .completed,

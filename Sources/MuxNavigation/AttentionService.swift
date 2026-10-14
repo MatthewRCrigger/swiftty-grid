@@ -92,7 +92,9 @@ public protocol AttentionService: Sendable {
     takeover expectedLease: UInt64?
   ) async throws(AttentionServiceError)
   /// Marks exactly this occurrence seen; never resolves it.
-  func markSeen(_ reference: AttentionReference) async throws(AttentionServiceError)
+  func markSeen(
+    _ reference: AttentionReference
+  ) async throws(AttentionServiceError)
   func close() async
 }
 

@@ -7,8 +7,8 @@ let package = Package(
   name: "swiftty",
   // Deployment minimums for every included Apple product profile
   // (spec.roaming.md §2.1). Declarations are not proof of compatibility:
-  // the watch companion links only CompanionModel, and SwifttyCore is not
-  // built for watchOS.
+  // the watch companion links CompanionModel and MuxNavigation, and
+  // SwifttyCore is not built for watchOS.
   platforms: [
     .macOS("27.0"), .iOS("27.0"), .macCatalyst("27.0"), .visionOS("27.0"),
     .tvOS("27.0"), .watchOS("27.0"),
@@ -42,7 +42,10 @@ let package = Package(
       url: "https://github.com/apple/swift-nio-transport-services.git",
       from: "1.25.0"
     ),
-    .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0" ..< "5.0.0"),
+    .package(
+      url: "https://github.com/apple/swift-crypto.git",
+      "3.0.0" ..< "5.0.0"
+    ),
     .package(
       url: "https://github.com/apple/swift-certificates.git",
       from: "1.10.0"
@@ -102,7 +105,10 @@ let package = Package(
     // Deep links (spec.inbox.md §4): typed destinations, the
     // opaque locator, URL validation and the navigation state machine.
     // Foundation only, so the watch companion can link it.
-    .target(name: "MuxNavigation", dependencies: ["SwiftMuxProtocol"]),
+    .target(
+      name: "MuxNavigation",
+      dependencies: ["SwiftMuxProtocol", "CompanionModel"]
+    ),
     // The navigator's local SwiftMux (XPC) service adapter; macOS only.
     .target(
       name: "MuxNavigationSMX",
@@ -130,7 +136,12 @@ let package = Package(
       name: "SwifttyBench",
       dependencies: ["SwifttyCore", "CAllocCounter"],
       swiftSettings: core,
-    ), .target(name: "TestSupport", path: "Tests/Support"),
+    ),
+    .target(
+      name: "TestSupport",
+      dependencies: ["SessionCore"],
+      path: "Tests/Support"
+    ),
     .executableTarget(
       name: "StorageBoundsProbe",
       dependencies: ["SwifttyCore"],
@@ -162,8 +173,7 @@ let package = Package(
         .product(
           name: "NIOTransportServices",
           package: "swift-nio-transport-services"
-        ),
-        .product(name: "Crypto", package: "swift-crypto"),
+        ), .product(name: "Crypto", package: "swift-crypto"),
       ]
     ),
     // Network framework QUIC, TLS identity and pinning policy.
@@ -236,13 +246,14 @@ let package = Package(
       dependencies: [
         "SwiftMuxProtocol", "SwiftMuxBridge", "SwiftMuxService",
         "SwiftMuxClient", "SwiftMuxTerminal", "SwifttyCore", "MuxAttention",
+        "TestSupport",
       ]
     ),
     .testTarget(
       name: "MuxNavigationTests",
       dependencies: [
         "MuxNavigation", "MuxNavigationSMX", "SwiftMuxProtocol",
-        "SwiftMuxClient", "SwiftMuxService",
+        "CompanionModel", "SwiftMuxClient", "SwiftMuxService", "TestSupport",
       ]
     ),
     .testTarget(
@@ -252,8 +263,9 @@ let package = Package(
     .testTarget(
       name: "SwifttyAppTests",
       dependencies: [
-        "Swiftty", "SwifttyMac", "SwifttyCore", "TestSupport", "SwiftMuxService",
-        "SwiftMuxClient", "SwiftMuxProtocol", "MuxNavigation", "MuxNavigationSMX",
+        "Swiftty", "SwifttyMac", "SwifttyCore", "TestSupport",
+        "SwiftMuxService", "SwiftMuxClient", "SwiftMuxProtocol",
+        "SwiftMuxExport", "MuxNavigation", "MuxNavigationSMX",
       ]
     ),
     .testTarget(

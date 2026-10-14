@@ -182,7 +182,7 @@ It does not hold the shell.
 
   | Grant state | Expiry | What happens to the workspace |
   |---|---|---|
-  | Reserved, never attached | 60 s | Ended only if this host created it |
+  | Reserved, never attached remotely | 60 s | Grant revoked; workspace ended only if this host created it and no local frontend has ever attached |
   | Detached | 24 h | Grant revoked; the workspace keeps running |
   | Exited (shown pane) | 5 min | Ended only if this host created it and every pane exited |
 
@@ -389,11 +389,16 @@ never keyed by program name or message.
   - Every acknowledgement must match all fields of the `AttentionReference`,
     so a late acknowledgement of an older occurrence cannot touch a newer
     one.
-- **Snooze:** `snooze` until a date; it expires by the clock.
+- **Snooze:** `snooze` until a date; it expires by the wall clock. The service
+  owns one reschedulable expiry timer and cancels it when no snooze remains.
+  Superseded timer events must not expire a later replacement. Expiry publishes
+  an inbox update without requiring a metadata query.
 - **Counts:** `needsYou` counts distinct sources with a current unsnoozed
   request or an unreviewed failure. `results` counts open results.
 - **Paging:** at most 100 rows per page, with an opaque cursor. Sections are
-  `needsYou`, `results` and `all`.
+  `needsYou`, `results` and `all`. A configured page capacity of zero disables
+  paging: valid page requests fail with `resourceLimit`, including for an empty
+  inbox. Retained items, counts and exact-reference commands remain available.
 - **Caps:**
   - 64 records per pane.
   - 16 MiB of decoded status text in total. Each item is charged its decoded
@@ -423,7 +428,7 @@ never keyed by program name or message.
 
 | Command | Reply |
 |---|---|
-| `subscribeInbox(Bool)` | `ok` |
+| `subscribeInbox(Bool)` | initial `inbox(InboxPage)` when enabled; `ok` when disabled |
 | `inbox(InboxQuery)` | `inbox(InboxPage)` |
 | `locateAttention(ref)` | `attention(AttentionLocation)`: availability, item, workspace, tab, pane, and `leaseHeldElsewhere` |
 | `markSeen(ref)` | `ok` |
@@ -432,6 +437,9 @@ never keyed by program name or message.
 
 `AttentionLocation.availability` is `available`, `stale`, `paneExited` or
 `missing`.
+
+Enabling an inbox subscription commits only after its initial page succeeds.
+Disabling a subscription is idempotent and does not require a page budget.
 
 ### 3.5 Native macOS UI
 
@@ -445,7 +453,8 @@ never keyed by program name or message.
     `takeover`.
 - **Mark Reviewed:** offered for failures and results only.
 - **Snooze:** a waiting request has a Snooze menu: 15 minutes, 1 hour or
-  tomorrow at 9:00 (local time), sent as `snooze(ref, until:)`. A snoozed
+  tomorrow at 9:00 (local time), calculated when the choice is activated and
+  sent as `snooze(ref, until:)`. A snoozed
   row shows "Snoozed until …", sorts after unsnoozed items and offers
   **Unsnooze** (`until: nil`). The badge already excludes snoozed requests
   (§3.2).
@@ -608,6 +617,13 @@ every piece is generated from configuration and can be checked locally.
   (`"?": "?*"`) and any fragment (`"#": "?*"`). The script validates the
   output with `python3 -m json.tool`, `plutil` and a structure check;
   `--check <file> [team bundle...]` re-validates a served copy. Each domain
+  must place all three required exclusions before the overlapping inclusion;
+  component matching stops at the first match. Validation accepts comments,
+  reordered preceding exclusions and additional exclusions, but rejects
+  unsupported matching defaults, conditional inclusions and malformed rule
+  types. Developer-mode entitlement suffixes remain literal text in both
+  configuration and packaging generators regardless of working-directory
+  filenames. Each domain
   serves it at `/.well-known/apple-app-site-association`. The apps still
   validate every link (§4.2); the file only decides which URLs the system
   hands to the app.
@@ -663,9 +679,16 @@ every piece is generated from configuration and can be checked locally.
   - **Delivery:** after each inbox refresh the iPhone sends an
     `AttentionSummaryBatch` (at most 20 redacted summaries, at most 32 KiB)
     as an extra key in its WatchConnectivity application context, beside
-    the companion status. The watch decodes the two separately and
-    re-applies the redaction limits, dropping any locator that does not
-    decode.
+    the companion status. The watch validates both components before
+    applying one whole context and re-applies the redaction limits,
+    dropping any locator that does not decode. Companion wire version 3
+    requires an installation publisher UUID and UInt64 publication revision
+    on contexts and replies. The phone saves this identity and sequence before
+    transmission; attention-only updates share that sequence while observation
+    capture times stay unchanged. The watch rejects delayed publications from
+    an established publisher using a retained watermark and confirms unfamiliar
+    publishers with a fresh request. Versions 1 and 2 are rejected; both paired
+    apps need version 3.
 
 ## 5. Verification
 

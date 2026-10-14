@@ -9,20 +9,37 @@ extension MuxService {
 
   /// Logical history committed to live and starting panes.
   var allocatedHistoryBytes: Int {
-    panes.values.reduce(pendingHistoryBytes) { $0 + $1.runtime.historyBytes }
+    panes.values.reduce(pendingHistoryBytes) {
+      let (sum, overflow) = $0.addingReportingOverflow($1.runtime.historyBytes)
+      return overflow ? Int.max : sum
+    }
   }
 
   /// Up to the per-pane cap from the shared budget, keeping the minimum
   /// back for every pane that may still be created. The sum of shares
-  /// never exceeds `totalHistoryBytes`; ended panes return theirs.
-  private func nextHistoryShare() -> Int {
-    let reserve =
-      max(0, limits.maxPanes - paneCount - 1) * limits.minHistoryBytesPerPane
-    let available = limits.totalHistoryBytes - allocatedHistoryBytes - reserve
-    return min(
-      limits.historyBytesPerPane,
-      max(limits.minHistoryBytesPerPane, available)
-    )
+  /// never exceeds `totalHistoryBytes`; ended panes return theirs. Refuse
+  /// creation when the minimum reservations cannot fit the remaining pool.
+  private func nextHistoryShare() throws(MuxError) -> Int {
+    guard limits.historyBytesPerPane >= 0, limits.totalHistoryBytes >= 0,
+      limits.minHistoryBytesPerPane >= 0
+    else { throw MuxError(.invalidRequest, "invalid history budgets") }
+    let allocated = allocatedHistoryBytes
+    guard allocated <= limits.totalHistoryBytes else {
+      throw MuxError(.resourceLimit, "history pool exhausted")
+    }
+    let remaining = limits.totalHistoryBytes - allocated
+    let minimum = min(limits.minHistoryBytesPerPane, limits.historyBytesPerPane)
+    // Pane admission above the call guarantees at least this one slot.
+    let slots = limits.maxPanes - paneCount
+    let (reserved, overflow) = slots.multipliedReportingOverflow(by: minimum)
+    guard !overflow, reserved <= remaining else {
+      throw MuxError(
+        .resourceLimit,
+        "history minimum reservations exceed the pool"
+      )
+    }
+    let futureReserve = reserved - minimum
+    return min(limits.historyBytesPerPane, remaining - futureReserve)
   }
 
   private func spawnPane(
@@ -49,9 +66,12 @@ extension MuxService {
       )
     }
     let id = PaneID()
-    let columns = min(max(columns, 1), limits.maxColumns)
-    let rows = min(max(rows, 1), limits.maxRows)
-    let historyBytes = nextHistoryShare()
+    let columns = min(max(columns, limits.minPaneColumns), limits.maxColumns)
+    let rows = min(max(rows, limits.minPaneRows), limits.maxRows)
+    let historyBytes: Int
+    do throws(MuxError) { historyBytes = try nextHistoryShare() } catch {
+      return completion(self, .failure(error))
+    }
     let runtime = PaneRuntime(
       id: id,
       workspace: workspace,
@@ -59,7 +79,8 @@ extension MuxService {
       rows: rows,
       historyBytes: historyBytes,
       innerTerm: configuration.innerTerm,
-      limits: limits
+      limits: limits,
+      observingIO: configuration.observePaneIO
     )
     if let theme { runtime.setTheme(theme) }
     runtime.onChange = { [weak self] in self?.onQueue { $0.paneChanged(id) } }
@@ -98,7 +119,9 @@ extension MuxService {
               runtime.terminate()
               return completion(
                 service,
-                .failure(MuxError(.quiescing, "service is preparing to update"))
+                .failure(
+                  MuxError(.quiescing, "service is preparing to update", )
+                )
               )
             }
             completion(service, .success(id))
@@ -208,9 +231,7 @@ extension MuxService {
     let columns =
       axis == .leftRight ? max(1, (record.columns - 1) / 2) : record.columns
     let rows = axis == .topBottom ? max(1, (record.rows - 1) / 2) : record.rows
-    guard columns >= limits.minPaneColumns || axis == .topBottom,
-      rows >= limits.minPaneRows || axis == .leftRight
-    else {
+    guard columns >= limits.minPaneColumns, rows >= limits.minPaneRows else {
       return reply(
         .failure(MuxError(.resourceLimit, "pane too small to split"))
       )
@@ -272,6 +293,7 @@ extension MuxService {
     guard let (w, t) = locate(pane: pane) else { return }
     let wsID = workspaces[w].id
     leases[wsID]?.subscriptions.removeAll { $0 == pane }
+    leases[wsID]?.reportedActivity.remove(pane)
     if let slot = leases[wsID]?.frames.removeValue(forKey: pane) {
       releaseBudget(slot)
     }
@@ -305,5 +327,60 @@ extension MuxService {
       workspaces[w].tabs[t].zoomedPane = nil
     }
     commitLayout(wsID)
+  }
+
+  // MARK: Geometry
+
+  func setGeometry(
+    _ batch: GeometryBatch,
+    workspace wsID: WorkspaceID
+  ) -> MuxError? {
+    guard var current = leases[wsID],
+      let ws = workspaces.first(where: { $0.id == wsID })
+    else { return MuxError(.notAttached) }
+    guard batch.layoutRevision == ws.layoutRevision else {
+      return MuxError(
+        .staleGeometry,
+        "layout revision \(batch.layoutRevision) is not current (\(ws.layoutRevision))"
+      )
+    }
+    guard batch.generation > current.geometryGeneration else {
+      return MuxError(.staleGeometry, "geometry generation did not advance")
+    }
+    guard batch.entries.count <= limits.maxGeometryBatch else {
+      return MuxError(.resourceLimit, "geometry batch size")
+    }
+    let members = Set(ws.allPanes)
+    var entries: [PaneID: GeometryBatch.Entry] = [:]
+    for e in batch.entries {
+      guard members.contains(e.pane) else {
+        return MuxError(
+          .staleGeometry,
+          "pane \(e.pane.short) is not in this workspace"
+        )
+      }
+      guard limits.cellCount(columns: e.columns, rows: e.rows) != nil,
+        e.columns >= limits.minPaneColumns, e.rows >= limits.minPaneRows
+      else {
+        return MuxError(.invalidRequest, "pane size \(e.columns)x\(e.rows)")
+      }
+      entries[e.pane] = e
+    }
+    guard entries.count <= limits.maxPanes else {
+      return MuxError(.resourceLimit, "geometry pane count")
+    }
+    current.geometryGeneration = batch.generation
+    leases[wsID] = current
+    for e in entries.values {
+      guard let record = panes[e.pane] else { continue }
+      panes[e.pane]?.columns = e.columns
+      panes[e.pane]?.rows = e.rows
+      record.runtime.resize(
+        columns: e.columns,
+        rows: e.rows,
+        generation: batch.generation
+      )
+    }
+    return nil
   }
 }

@@ -9,7 +9,7 @@ extension TerminalView: @MainActor NSTextInputClient {
       (string as? NSAttributedString)?.string ?? string as? String ?? ""
     let wasComposing = hasMarkedText()
     setPreedit("")
-    if !text.isEmpty {
+    if capabilities.textInput, !text.isEmpty {
       clearSelection()
       let flags = session.keyboardFlags
       if !wasComposing, InputEncoder.isKittyKeyboardActive(flags),
@@ -28,8 +28,8 @@ extension TerminalView: @MainActor NSTextInputClient {
   /// Selectors the input method did not turn into text (for example a
   /// dead key followed by an arrow); send the key as typed.
   public override func doCommand(by selector: Selector) {
-    guard let event = interpretingEvent, !sendKey(event),
-      let text = event.characters, !text.isEmpty
+    guard capabilities.textInput, let event = interpretingEvent,
+      !sendKey(event), let text = event.characters, !text.isEmpty
     else { return }
     session.send(.text(text))
   }
@@ -39,6 +39,10 @@ extension TerminalView: @MainActor NSTextInputClient {
     selectedRange: NSRange,
     replacementRange: NSRange
   ) {
+    guard capabilities.textInput else {
+      discardComposition()
+      return
+    }
     setPreedit(
       (string as? NSAttributedString)?.string ?? string as? String ?? "",
       selection: selectedRange
@@ -51,6 +55,11 @@ extension TerminalView: @MainActor NSTextInputClient {
       markedText,
       replacementRange: NSRange(location: NSNotFound, length: 0)
     )
+  }
+
+  func discardComposition() {
+    setPreedit("")
+    inputContext?.discardMarkedText()
   }
 
   private func setPreedit(

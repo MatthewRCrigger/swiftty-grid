@@ -4,7 +4,7 @@ import SessionCore
 /// Accumulates one inbound snapshot stream with strict, header-driven
 /// bounds (spec §7.2, §12). Nothing beyond the 9-byte header plus the
 /// header's `encodedLength` is ever buffered, and that length is itself
-/// capped by `RSTLimits.maxSnapshotEncodedBytes`. Only an exactly complete
+/// capped by the negotiated limit and `RSTLimits.maxSnapshotEncodedBytes`. Only an exactly complete
 /// payload is returned at FIN; partial, oversized, or trailing-data streams
 /// are errors and their bytes are discarded by the caller.
 public struct SnapshotStreamAccumulator: Sendable {
@@ -15,32 +15,45 @@ public struct SnapshotStreamAccumulator: Sendable {
   public private(set) var bytes: [UInt8] = []
   /// Header length plus the header's encoded length, once known.
   public private(set) var expectedLength: Int?
+  private let limits: NegotiatedLimits
+  private let bufferLimit: Int
 
-  public init() {}
+  public init(limits: NegotiatedLimits = NegotiatedLimits()) {
+    self.limits = limits.effective
+    bufferLimit =
+      SnapshotFrame.headerLength + max(0, self.limits.maxSnapshotEncodedBytes)
+  }
 
   /// Most bytes the next read should request: enough to complete the
   /// stream plus one, so an overrun is detected without buffering it all.
   public var nextReadLimit: Int {
-    let target = expectedLength ?? Self.hardLimit
+    let target = expectedLength ?? bufferLimit
     return max(1, min(64 * 1024, target - bytes.count + 1))
   }
 
   public mutating func append(
     _ data: some Collection<UInt8>
   ) throws(FramingError) {
-    let limit = expectedLength ?? Self.hardLimit
-    guard data.count <= limit - bytes.count else {
-      throw bytes.count + data.count > Self.hardLimit
+    let incoming = data.count
+    let limit = expectedLength ?? bufferLimit
+    guard incoming <= limit - bytes.count else {
+      throw incoming > bufferLimit - bytes.count
         ? .snapshotTooLarge : .trailingData
     }
-    bytes.append(contentsOf: data)
-    if expectedLength == nil,
-      let header = try SnapshotFrame.header(bytes)
-    {
-      let expected = SnapshotFrame.headerLength + header.encodedLength
-      guard bytes.count <= expected else { throw .trailingData }
-      expectedLength = expected
+    var consumed = 0
+    if expectedLength == nil {
+      consumed = min(incoming, SnapshotFrame.headerLength - bytes.count)
+      bytes.append(contentsOf: data.prefix(consumed))
+      guard let header = try SnapshotFrame.header(bytes, limits: limits) else {
+        return
+      }
+      expectedLength = SnapshotFrame.headerLength + header.encodedLength
     }
+    guard let expectedLength else { return }
+    guard incoming - consumed <= expectedLength - bytes.count else {
+      throw .trailingData
+    }
+    bytes.append(contentsOf: data.dropFirst(consumed))
   }
 
   /// Call at FIN. Returns the payload only when exactly complete.
@@ -69,8 +82,10 @@ public struct TokenBucket: Sendable {
   public mutating func take(now: ContinuousClock.Instant = .now) -> Bool {
     if let last {
       let elapsed = last.duration(to: now)
-      let seconds = Double(elapsed.components.seconds)
-        + Double(elapsed.components.attoseconds) / 1e18
+      let seconds =
+        Double(elapsed.components.seconds) + Double(
+          elapsed.components.attoseconds
+        ) / 1e18
       tokens = min(capacity, tokens + max(0, seconds) * refillPerSecond)
     }
     last = now

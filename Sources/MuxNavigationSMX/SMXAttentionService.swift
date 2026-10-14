@@ -22,12 +22,17 @@ public actor SMXAttentionService: AttentionService {
 
   /// `opener` handles step 5; without one, this connection attaches
   /// (or explicitly takes over) and activates the pane itself.
-  public init(connection: MuxConnection, opener: (any AttentionPaneOpener)? = nil) {
+  public init(
+    connection: MuxConnection,
+    opener: (any AttentionPaneOpener)? = nil
+  ) {
     self.connection = connection
     self.opener = opener
   }
 
-  public func serviceEpoch() async throws(AttentionServiceError) -> ServerInstanceID {
+  public func serviceEpoch() async throws(AttentionServiceError)
+    -> ServerInstanceID
+  {
     guard let welcome = await connection.welcome else {
       throw .offline("SwiftMux service not connected.")
     }
@@ -37,7 +42,8 @@ public actor SMXAttentionService: AttentionService {
   public func locate(
     _ reference: AttentionReference
   ) async throws(AttentionServiceError) -> AttentionLocation {
-    guard case let .attention(location) = try await run(.locateAttention(reference))
+    guard
+      case let .attention(location) = try await run(.locateAttention(reference))
     else { throw .other("unexpected reply") }
     return location
   }
@@ -51,13 +57,17 @@ public actor SMXAttentionService: AttentionService {
     guard let summary = list.first(where: { $0.id == workspace }) else {
       throw .notFound
     }
-    return LeaseState(generation: summary.leaseGeneration, holder: summary.leaseHolder)
+    return LeaseState(
+      generation: summary.leaseGeneration,
+      holder: summary.leaseHolder
+    )
   }
 
   public func open(
     _ target: PaneTarget,
     takeover expectedLease: UInt64?
   ) async throws(AttentionServiceError) {
+    guard !Task.isCancelled else { throw .other("Opening was cancelled.") }
     if let opener {
       try await opener.open(target, takeover: expectedLease)
       return
@@ -74,23 +84,18 @@ public actor SMXAttentionService: AttentionService {
 
   public func markSeen(
     _ reference: AttentionReference
-  ) async throws(AttentionServiceError) {
-    try await run(.markSeen(reference))
-  }
+  ) async throws(AttentionServiceError) { try await run(.markSeen(reference)) }
 
-  public func close() async {
-    await connection.close()
-  }
+  public func close() async { await connection.close() }
 
   @discardableResult
-  private func run(_ command: MuxCommand) async throws(AttentionServiceError) -> MuxReply {
-    do {
-      return try await connection.execute(command)
-    } catch let error as MuxError {
-      throw Self.map(error)
-    } catch {
-      throw .other(String(describing: error))
-    }
+  private func run(
+    _ command: MuxCommand
+  ) async throws(AttentionServiceError) -> MuxReply {
+    guard !Task.isCancelled else { throw .other("The request was cancelled.") }
+    do { return try await connection.execute(command) } catch let error
+      as MuxError
+    { throw Self.map(error) } catch { throw .other(String(describing: error)) }
   }
 
   /// SMX error codes as navigation outcomes.
@@ -116,7 +121,10 @@ public struct SMXAttentionConnector: AttentionServiceConnector {
   private let connect: Connect
   private let opener: (any AttentionPaneOpener)?
 
-  public init(opener: (any AttentionPaneOpener)? = nil, connect: @escaping Connect) {
+  public init(
+    opener: (any AttentionPaneOpener)? = nil,
+    connect: @escaping Connect
+  ) {
     self.connect = connect
     self.opener = opener
   }
@@ -125,11 +133,11 @@ public struct SMXAttentionConnector: AttentionServiceConnector {
     to host: NavigationHost
   ) async throws(AttentionServiceError) -> any AttentionService {
     do {
-      return SMXAttentionService(connection: try await connect(), opener: opener)
-    } catch let error as MuxError {
-      throw SMXAttentionService.map(error)
-    } catch {
-      throw .offline(String(describing: error))
-    }
+      return SMXAttentionService(
+        connection: try await connect(),
+        opener: opener
+      )
+    } catch let error as MuxError { throw SMXAttentionService.map(error) } catch
+    { throw .offline(String(describing: error)) }
   }
 }

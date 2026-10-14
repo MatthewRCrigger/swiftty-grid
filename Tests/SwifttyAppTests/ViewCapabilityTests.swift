@@ -33,6 +33,216 @@ struct ViewCapabilityTests {
   static let osc52 = TestFixture(Array("\u{1B}]52;c;aGk=\u{7}".utf8))
 
   @Test(.enabled(if: hasMetal), arguments: [false, true])
+  func `read only surfaces reject keyboard and IME input`(
+    _ presentation: Bool
+  ) throws {
+    let session =
+      presentation
+      ? TerminalSession(presentationColumns: 20, rows: 2)
+      : TerminalSession(columns: 20, rows: 2)
+    let view = try makeView(session: session)
+    let writes = Mutex<[[UInt8]]>([])
+    let semantic = Mutex(0)
+    session.onWrite = { bytes in writes.withLock { $0.append(bytes) } }
+    session.semanticInputHandler = { _ in semantic.withLock { $0 += 1 } }
+    view.capabilities.textInput = false
+    let enter = try KeyHandlingTests().key(36, "\r")
+    view.keyDown(with: enter)
+    #expect(view.sendKey(enter))
+    view.sendHardwareKey(KeyEvent(.enter), event: enter)
+    view.insertText(
+      "typed",
+      replacementRange: NSRange(location: NSNotFound, length: 0)
+    )
+    view.interpretingEvent = try KeyHandlingTests().key(0, "a")
+    view.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+    view.interpretingEvent = nil
+    view.setMarkedText(
+      "composing",
+      selectedRange: NSRange(location: 1, length: 0),
+      replacementRange: NSRange(location: NSNotFound, length: 0)
+    )
+    #expect(!view.hasMarkedText())
+    view.unmarkText()
+    session.queue.sync {}
+    #expect(writes.withLock { $0.isEmpty })
+    #expect(semantic.withLock { $0 } == 0)
+    #expect(view.heldKeys.isEmpty)
+    view.capabilities.textInput = true
+    view.insertText(
+      "resumed",
+      replacementRange: NSRange(location: NSNotFound, length: 0)
+    )
+    session.queue.sync {}
+    #expect(
+      presentation
+        ? semantic.withLock { $0 } == 1
+        : writes.withLock { $0 } == [Array("resumed".utf8)]
+    )
+  }
+
+  @Test(.enabled(if: hasMetal))
+  func `disabling text input releases held keys and discards composition`()
+    throws
+  {
+    let view = try makeView()
+    view.session.feed(Array("\u{1B}[=10u".utf8))
+    let writes = Mutex<[UInt8]>([])
+    view.session.onWrite = { bytes in writes.withLock { $0 += bytes } }
+    let up = try KeyHandlingTests().key(126, "\u{F700}")
+    #expect(view.sendKey(up))
+    view.setMarkedText(
+      "pending",
+      selectedRange: NSRange(location: 0, length: 1),
+      replacementRange: NSRange(location: NSNotFound, length: 0)
+    )
+    view.capabilities.textInput = false
+    #expect(view.heldKeys.isEmpty)
+    #expect(!view.hasMarkedText())
+    #expect(view.renderer.options.preedit.isEmpty)
+    #expect(view.renderer.options.preeditSelection == nil)
+    view.keyUp(with: up)
+    view.unmarkText()
+    view.session.queue.sync {}
+    #expect(
+      TestFixture(writes.withLock { $0 })
+        == TestFixture(Array("\u{1B}[A\u{1B}[1;1:3A".utf8))
+    )
+  }
+
+  @Test(.enabled(if: hasMetal))
+  func `read only surfaces keep local shortcuts without clearing selection`()
+    throws
+  {
+    _ = NSApplication.shared
+    let view = try TerminalView(
+      configuration: Configuration.parse("keybind=ctrl+a=increase_font_size:1")
+    )
+    view.session.feed(Array("selected".utf8))
+    view.selectAll(nil)
+    view.capabilities.textInput = false
+    let before = view.fontSize
+    try view.keyDown(
+      with: KeyHandlingTests().key(0, "\u{1}", unmodified: "a", [.control])
+    )
+    #expect(view.fontSize == before + 1)
+    view.selectAll(nil)
+    try view.keyDown(with: KeyHandlingTests().key(36, "\r"))
+    #expect(view.session.withState { $0.selection != nil })
+  }
+
+  @Test(.enabled(if: hasMetal), arguments: ["click", "scroll"], [false, true])
+  func `generated cursor keys respect the text input capability`(
+    _ gesture: String,
+    _ allowed: Bool
+  ) throws {
+    _ = NSApplication.shared
+    let view = try TerminalView(
+      configuration: Configuration.parse("cursor-click-to-move=true")
+    )
+    view.setFrameSize(NSSize(width: 400, height: 200))
+    let program =
+      gesture == "click"
+      ? "\u{1B}]133;A\u{7}$ \u{1B}]133;B\u{7}abc" : "\u{1B}[?1049h\u{1B}[?1007h"
+    view.session.feed(Array(program.utf8))
+    view.draw(in: view)
+    let writes = Mutex<[UInt8]>([])
+    view.session.onWrite = { bytes in writes.withLock { $0 += bytes } }
+    view.capabilities.textInput = allowed
+    if gesture == "click" {
+      func event(_ type: NSEvent.EventType) throws -> NSEvent {
+        try #require(
+          NSEvent.mouseEvent(
+            with: type,
+            location: NSPoint(
+              x: (view.renderer.options.paddingX + 2.5
+                * view.renderer.cellSize.width) / 2,
+              y: view.bounds.height
+                - (view.renderer.options.paddingY + view.renderer.cellSize
+                  .height / 2) / 2
+            ),
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 0
+          )
+        )
+      }
+      try view.mouseDown(with: event(.leftMouseDown))
+      try view.mouseUp(with: event(.leftMouseUp))
+    } else {
+      let cg = try #require(
+        CGEvent(
+          scrollWheelEvent2Source: nil,
+          units: .line,
+          wheelCount: 1,
+          wheel1: 1,
+          wheel2: 0,
+          wheel3: 0
+        )
+      )
+      view.scrollWheel(with: try #require(NSEvent(cgEvent: cg)))
+    }
+    view.session.queue.sync {}
+    let expected =
+      !allowed
+      ? "" : gesture == "click" ? "\u{1B}[D\u{1B}[D\u{1B}[D" : "\u{1B}[A"
+    #expect(
+      TestFixture(writes.withLock { $0 }) == TestFixture(Array(expected.utf8))
+    )
+  }
+
+  @Test(.enabled(if: hasMetal), arguments: [false, true])
+  func `link capability changes refresh stationary hover`(
+    _ explicit: Bool
+  ) throws {
+    let view = try makeView()
+    view.setFrameSize(NSSize(width: 400, height: 200))
+    let text =
+      explicit
+      ? "\u{1B}]8;;https://example.com\u{1B}\\link\u{1B}]8;;\u{1B}\\"
+      : "https://example.com"
+    view.session.feed(Array(text.utf8))
+    view.draw(in: view)
+    let event = try #require(
+      NSEvent.mouseEvent(
+        with: .mouseMoved,
+        location: NSPoint(
+          x: (view.renderer.options.paddingX + view.renderer.cellSize.width / 2)
+            / 2,
+          y: view.bounds.height
+            - (view.renderer.options.paddingY + view.renderer.cellSize.height
+              / 2) / 2
+        ),
+        modifierFlags: .command,
+        timestamp: 0,
+        windowNumber: 0,
+        context: nil,
+        eventNumber: 0,
+        clickCount: 0,
+        pressure: 0
+      )
+    )
+    view.updateHover(event)
+    let link = try #require(view.hoveredLink)
+    #expect((view.renderer.options.hoveredLink != 0) == explicit)
+    #expect((view.renderer.options.underlinedSpan != nil) == !explicit)
+    view.capabilities.openURLs = false
+    view.draw(in: view)
+    #expect(view.hoveredLink == nil)
+    #expect(view.renderer.options.hoveredLink == 0)
+    #expect(view.renderer.options.underlinedSpan == nil)
+    view.capabilities.openURLs = true
+    view.draw(in: view)
+    #expect(view.hoveredLink == link)
+    #expect((view.renderer.options.hoveredLink != 0) == explicit)
+    #expect((view.renderer.options.underlinedSpan != nil) == !explicit)
+  }
+
+  @Test(.enabled(if: hasMetal), arguments: [false, true])
   func `program clipboard writes pass the capability gate`(
     _ allowed: Bool
   ) async throws {

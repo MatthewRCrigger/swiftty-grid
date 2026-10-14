@@ -20,7 +20,11 @@ run = "swift build -c release"
 
 [tasks.test]
 description = "Run unit + integration tests"
-run = "swift test"
+run = "Scripts/test.sh"
+
+[tasks.test-native]
+description = "Run the full suite with the native test bundle host"
+run = "Scripts/test-native.sh"
 
 [tasks.bench]
 description = "Run microbenchmarks on a release build"
@@ -73,7 +77,7 @@ run = "Scripts/format-swift.sh check"
 
 [tasks.test-internal]
 description = "Run tests with storage and terminal invariant checks"
-run = "swift test -Xswiftc -DSWIFTTY_INTERNAL_CHECKS"
+run = "Scripts/test.sh -Xswiftc -DSWIFTTY_INTERNAL_CHECKS"
 
 [tasks.bench-storage]
 description = "Measure storage operation scaling"

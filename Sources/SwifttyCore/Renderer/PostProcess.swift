@@ -121,7 +121,8 @@ final class PostProcess {
   /// An offscreen texture the size of `target`, reused across frames.
   func intermediate(
     matching target: MTLTexture,
-    device: MTLDevice
+    device: MTLDevice,
+    allocate: ((MTLTextureDescriptor) -> MTLTexture?)? = nil
   ) -> MTLTexture? {
     if let texture, texture.width == target.width,
       texture.height == target.height
@@ -136,22 +137,32 @@ final class PostProcess {
     )
     d.usage = [.renderTarget, .shaderRead]
     d.storageMode = .private
-    texture = device.makeTexture(descriptor: d)
-    return texture
+    let replacement: MTLTexture?
+    if let allocate {
+      replacement = allocate(d)
+    } else {
+      replacement = device.makeTexture(descriptor: d)
+    }
+    guard let replacement else { return nil }
+    texture = replacement
+    return replacement
   }
 
   func encode(
     from source: MTLTexture,
     to target: MTLTexture,
     commandBuffer: MTLCommandBuffer,
-    time: Float
-  ) {
+    time: Float,
+    makeEncoder: (MTLCommandBuffer, MTLRenderPassDescriptor) ->
+      MTLRenderCommandEncoder? = { $0.makeRenderCommandEncoder(descriptor: $1) }
+  ) throws {
     let pass = MTLRenderPassDescriptor()
     pass.colorAttachments[0].texture = target
     pass.colorAttachments[0].loadAction = .dontCare
     pass.colorAttachments[0].storeAction = .store
-    guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass)
-    else { return }
+    guard let encoder = makeEncoder(commandBuffer, pass) else {
+      throw RendererError.resourceUnavailable("postprocess encoder")
+    }
     var uniforms = Uniforms(
       resolution: SIMD2(Float(target.width), Float(target.height)),
       time: time

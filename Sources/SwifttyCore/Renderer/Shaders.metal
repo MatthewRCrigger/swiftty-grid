@@ -3,7 +3,8 @@ using namespace metal;
 
 // Must match `CellInstance` in MetalRenderer.swift.
 struct CellInstance {
-    ushort2 grid;
+    uint gridX;
+    uint gridY;
     ushort2 atlasPos;
     ushort2 atlasSize;
     short2 offset;
@@ -75,7 +76,7 @@ vertex VertexOut background_vertex(uint vid [[vertex_id]], uint iid [[instance_i
                                    constant CellInstance *cells [[buffer(0)]],
                                    constant Uniforms &u [[buffer(1)]]) {
     CellInstance c = cells[iid];
-    float2 origin = u.origin + float2(c.grid) * u.cellSize;
+    float2 origin = u.origin + float2(c.gridX, c.gridY) * u.cellSize;
     VertexOut out;
     out.position = toClip(origin + corner(vid) * u.cellSize, u);
     out.texCoord = float2(0);
@@ -91,7 +92,7 @@ vertex VertexOut glyph_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
     CellInstance c = cells[iid];
     VertexOut out;
     float2 size = float2(c.atlasSize);
-    float2 origin = u.origin + float2(c.grid) * u.cellSize + float2(c.offset);
+    float2 origin = u.origin + float2(c.gridX, c.gridY) * u.cellSize + float2(c.offset);
     float2 k = corner(vid);
     bool hidden = size.x == 0 || ((c.flags & FlagBlink) && u.blinkHidden);
     out.position = hidden ? float4(0) : toClip(origin + k * size, u);
@@ -110,7 +111,7 @@ vertex VertexOut decoration_vertex(uint vid [[vertex_id]], uint iid [[instance_i
                                    constant Uniforms &u [[buffer(1)]]) {
     CellInstance c = cells[iid / DecorationSlots];
     uint slot = iid % DecorationSlots;
-    float2 cell = u.origin + float2(c.grid) * u.cellSize;
+    float2 cell = u.origin + float2(c.gridX, c.gridY) * u.cellSize;
     float t = u.underlineThickness;
     float4 rect = float4(0); // x, y, w, h
     float4 color = unpack(c.fg);

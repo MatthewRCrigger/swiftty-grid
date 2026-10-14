@@ -1,4 +1,5 @@
 import Darwin
+import Dispatch
 import Foundation
 import SwiftMuxClient
 import SwiftMuxProtocol
@@ -39,7 +40,7 @@ struct ServiceTests {
       case let .created(ws) = try await c1.execute(
         .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     let pane = ws.tabs[0].activePane
     try await c1.attachAndShow(.id(ws.id))
     try await c1.send(.text("X=persist; echo pid=$$\r"), to: pane)
@@ -71,7 +72,7 @@ struct ServiceTests {
       case let .created(ws) = try await c.execute(
         .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     let pane = ws.tabs[0].activePane
     let shown = try await c.attachAndShow(.id(ws.id), generation: 5)
     // Older generation.
@@ -124,53 +125,118 @@ struct ServiceTests {
       case let .created(ws) = try await c.execute(
         .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     let first = ws.tabs[0].activePane
     try await c.attachAndShow(.id(ws.id))
     guard
       case let .layout(after) = try await c.execute(
         .split(pane: first, axis: .topBottom, launch: shellLaunch())
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     let tab = after.tabs[0]
     #expect(tab.layout.panes.count == 2)
     #expect(tab.activePane != first)
     guard case let .layout(zoomed) = try await c.execute(.toggleZoom(tab.id))
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     #expect(zoomed.tabs[0].zoomedPane == tab.activePane)
     guard
       case let .layout(ended) = try await c.execute(.endPane(tab.activePane))
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     #expect(ended.tabs[0].layout == .pane(first))
     #expect(ended.tabs[0].zoomedPane == nil)
   }
 
-  @Test
-  func naturalExitDrainsFinalOutput() async throws {
+  @Test(arguments: [false, true])
+  func naturalExitDrainsFinalOutput(_ exitBeforeAttach: Bool) async throws {
     let h = try Harness()
     let c = try await h.connect()
-    var spec = shellLaunch()
-    spec.command = ["/bin/sh", "-c", "printf 'final-line\\n'; exit 3"]
-    guard
-      case let .created(ws) = try await c.execute(
-        .newWorkspace(NewWorkspaceRequest(launch: spec, remainOnExit: true))
-      )
-    else { return }
-    let pane = ws.tabs[0].activePane
-    try await c.attachAndShow(.id(ws.id))
-    var status: Int32?
-    var sawFinal = false
-    let deadline = ContinuousClock.now + .seconds(10)
-    while ContinuousClock.now < deadline, status == nil || !sawFinal {
-      switch try await c.nextEvent() {
-      case let .frame(f)?: sawFinal = sawFinal || f.lines.contains("final-line")
-      case let .paneExited(_, s, _)?: status = s
-      default: break
+    do {
+      var spec = shellLaunch()
+      spec.command = ["/bin/sh", "-c", "printf 'final-line\\n'; exit 3"]
+      guard
+        case let .created(ws) = try await c.execute(
+          .newWorkspace(NewWorkspaceRequest(launch: spec, remainOnExit: true))
+        )
+      else { throw MuxError(.invalidRequest, "unexpected reply") }
+      let pane = ws.tabs[0].activePane
+      if exitBeforeAttach {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while true {
+          guard
+            case let .workspaces(list) = try await c.execute(
+              .listWorkspaces,
+              timeout: .seconds(1)
+            )
+          else { throw MuxError(.invalidRequest, "workspace list") }
+          if list.first(where: { $0.id == ws.id })?.livePaneCount == 0 { break }
+          guard ContinuousClock.now < deadline else { throw TimeoutError() }
+          try await Task.sleep(for: .milliseconds(10))
+        }
       }
+      let attachment = try await c.attachAndShow(.id(ws.id))
+      if exitBeforeAttach { #expect(attachment.pane(pane)?.exitStatus == 3) }
+      var status = attachment.pane(pane)?.exitStatus
+      var sawFinal = false
+      let deadline = ContinuousClock.now + .seconds(10)
+      while ContinuousClock.now < deadline, status == nil || !sawFinal {
+        let event = try await withTimeout(deadline - ContinuousClock.now) {
+          try await c.nextEvent()
+        }
+        guard let event else {
+          throw MuxError(.connectionLost, "closed before exit output")
+        }
+        switch event {
+        case let .frame(f) where f.identity.pane == pane:
+          sawFinal = sawFinal || f.lines.contains("final-line")
+        case let .paneExited(id, s, _) where id == pane: status = s
+        default: break
+        }
+      }
+      #expect(status == 3)
+      #expect(sawFinal)
+      try await c.execute(.endAllWorkspaces, timeout: .seconds(1))
+      await c.close()
+    } catch {
+      _ = try? await c.execute(.endAllWorkspaces, timeout: .seconds(1))
+      await c.close()
+      throw error
     }
-    #expect(status == 3)
-    #expect(sawFinal)
-    _ = pane
+  }
+
+  @Test
+  func eventWaitTimeoutReleasesConsumerForLaterEvents() async throws {
+    let h = try Harness()
+    let c = try await h.connect()
+    do {
+      await #expect(throws: TimeoutError.self) {
+        try await withTimeout(.milliseconds(50)) { try await c.nextEvent() }
+      }
+      try await c.execute(.observeWorkspaces(true), timeout: .seconds(1))
+      var launch = shellLaunch()
+      launch.command = ["/bin/sh", "-c", "exit 0"]
+      guard
+        case let .created(ws) = try await c.execute(
+          .newWorkspace(
+            NewWorkspaceRequest(launch: launch, remainOnExit: true)
+          ),
+          timeout: .seconds(1)
+        )
+      else { throw MuxError(.invalidRequest, "workspace creation") }
+      let event = try await withTimeout(.seconds(1)) { try await c.nextEvent() }
+      guard case let .workspaces(list)? = event else {
+        throw MuxError(
+          .invalidRequest,
+          "workspace event missing after cancelled wait"
+        )
+      }
+      #expect(list.contains { $0.id == ws.id })
+      try await c.execute(.endAllWorkspaces, timeout: .seconds(1))
+      await c.close()
+    } catch {
+      _ = try? await c.execute(.endAllWorkspaces, timeout: .seconds(1))
+      await c.close()
+      throw error
+    }
   }
 
   @Test
@@ -184,7 +250,7 @@ struct ServiceTests {
       Issue.record("launch should fail")
     } catch let e as MuxError { #expect(e.code == .launchFailed) }
     guard case let .workspaces(list) = try await c.execute(.listWorkspaces)
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     #expect(list.isEmpty)
   }
 
@@ -196,7 +262,7 @@ struct ServiceTests {
       case let .created(ws) = try await c.execute(
         .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     let pane = ws.tabs[0].activePane
     try await c.attachAndShow(.id(ws.id))
     // tty is the slave; /dev/tty opens; the shell leads its session.
@@ -230,17 +296,21 @@ struct ServiceTests {
       case let .created(ws) = try await c.execute(
         .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     let pane = ws.tabs[0].activePane
     try await c.attachAndShow(.id(ws.id))
     // `cat -v` shows the envelope the program receives.
-    try await c.send(.text("printf '\\033[?2004h'; cat -v\r"), to: pane)
-    try await Task.sleep(for: .milliseconds(300))
+    try await c.send(
+      .text("printf '\\033[?2004hMUX_PASTE_READY\\n'; cat -v\r"),
+      to: pane
+    )
+    _ = try await c.frame(of: pane) { $0.lines.contains("MUX_PASTE_READY") }
     let state = try await c.paste("one\ntwo", to: pane)
     #expect(state == .completed)
     try await c.send(.text("\r"), to: pane)
     let f = try await c.frame(of: pane) { f in
-      f.lines.contains { $0.contains("^[[201~") }
+      let text = f.lines.joined(separator: "\n")
+      return text.contains("^[[200~one") && text.contains("two^[[201~")
     }
     let text = f.lines.joined(separator: "\n")
     #expect(text.contains("^[[200~one"))
@@ -258,7 +328,7 @@ struct ServiceTests {
       case let .created(ws) = try await c.execute(
         .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     let pane = ws.tabs[0].activePane
     try await c.attachAndShow(.id(ws.id))
     // Nothing reads the terminal while `sleep` runs, so the writer
@@ -286,7 +356,7 @@ struct ServiceTests {
       case let .created(ws) = try await c.execute(
         .newWorkspace(NewWorkspaceRequest(launch: busyLaunch()))
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     let pane = ws.tabs[0].activePane
     try await c.attachAndShow(.id(ws.id), columns: 200, rows: 60)
     // Frames stay unacknowledged. Each burst leaves earlier captures in
@@ -314,7 +384,7 @@ struct ServiceTests {
       case let .created(ws) = try await c.execute(
         .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     let pane = ws.tabs[0].activePane
     try await c.attachAndShow(.id(ws.id), columns: 40, rows: 10)
     try await c.send(
@@ -326,7 +396,7 @@ struct ServiceTests {
       case let .search(result) = try await c.execute(
         .search(pane: pane, query: "row-7")
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     #expect(result.matchCount >= 1)
     let found = try await c.frame(of: pane) { $0.lines.contains("row-7") }
     #expect(found.history.viewportOffset > 0)
@@ -367,42 +437,72 @@ struct LateSpawnTests {
   /// successful late child is terminated and reaped, never attached.
   @Test
   func lateSpawnIntoEndedPaneIsReaped() async throws {
-    let h = try Harness()
-    let c = try await h.connect()
+    let holdLaunch = Mutex(false)
+    let started = DispatchSemaphore(value: 0)
+    let proceed = DispatchSemaphore(value: 0)
+    var configuration = MuxServiceConfiguration(
+      launcherPath: try launcherPath()
+    )
+    configuration.beforeLaunch = {
+      if holdLaunch.withLock({ $0 }) {
+        started.signal()
+        proceed.wait()
+      }
+    }
+    let service = try MuxService(configuration: configuration)
+    let c = try await MuxConnection.connect(
+      endpoint: service.listenAnonymously(),
+      frontend: .native
+    )
+    defer { proceed.signal() }
     var keep = shellLaunch()
     keep.command = ["/bin/sh", "-c", "exec sleep 60"]
     guard
       case let .created(ws) = try await c.execute(
         .newWorkspace(NewWorkspaceRequest(launch: keep))
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     let target = ws.tabs[0].activePane
     try await c.attachAndShow(.id(ws.id))
     // A second tab keeps the workspace alive after the target ends.
     try await c.execute(.newTab(name: "other", launch: keep))
     var slow = shellLaunch()
     slow.command = ["/bin/sh", "-c", "exec sleep 60"]
-    // Ordered on one connection: the split is admitted, then the target
-    // ends before the spawn completes.
+    // Hold the admitted launch until ending the target commits, so this
+    // always exercises the late-child cleanup rather than a scheduling race.
+    holdLaunch.withLock { $0 = true }
     let split = Task {
       try await c.execute(.split(pane: target, axis: .leftRight, launch: slow))
     }
-    c.enqueue(.endPane(target))
-    do { _ = try await split.value } catch let e as MuxError {
-      #expect(e.code == .notFound)
+    let didStart = await withCheckedContinuation { done in
+      DispatchQueue.global()
+        .async {
+          done.resume(returning: started.wait(timeout: .now() + 5) == .success)
+        }
     }
+    #expect(didStart)
+    try await c.execute(.endPane(target))
+    proceed.signal()
+    do {
+      _ = try await split.value
+      Issue.record("A late child joined an ended target")
+    } catch let e as MuxError { #expect(e.code == .notFound) }
     // Only the other tab's pane survives; the late child was reaped.
     var panes = -1
     for _ in 0 ..< 200 {
-      guard case let .status(s) = try await c.execute(.status) else { return }
+      guard case let .status(s) = try await c.execute(.status) else {
+        throw MuxError(.invalidRequest, "unexpected reply")
+      }
       panes = s.panes
       if panes == 1 { break }
       try await Task.sleep(for: .milliseconds(25))
     }
     #expect(panes == 1)
     guard case let .workspaces(list) = try await c.execute(.listWorkspaces)
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     #expect(list.first?.paneCount == 1)
+    try await c.execute(.endWorkspace(.id(ws.id)))
+    await c.close()
   }
 }
 
@@ -414,7 +514,7 @@ struct PeerIdentityTests {
   func refusedPeerFailsFast() async throws {
     var config = MuxServiceConfiguration(launcherPath: try launcherPath())
     config.peerRequirement = "identifier \"com.example.not-this-client\""
-    let service = MuxService(configuration: config)
+    let service = try MuxService(configuration: config)
     let endpoint = service.listenAnonymously()
     let start = ContinuousClock.now
     await #expect(throws: MuxError.self) {
@@ -455,23 +555,24 @@ struct FrameFairnessTests {
         case let .created(ws) = try await c.execute(
           .newWorkspace(NewWorkspaceRequest(name: name, launch: busyLaunch()))
         )
-      else { return }
+      else { throw MuxError(.invalidRequest, "unexpected reply") }
       try await c.attachAndShow(.id(ws.id))
       shown.append((c, ws.tabs[0].activePane, ws.id))
     }
     // Both consumers keep acknowledging until each has 20 frames: one
     // that stopped would hold the whole budget.
     let counts = Mutex([0, 0])
-    let consumers = shown.enumerated().map { i, entry in
-      Task {
-        let (c, pane, _) = entry
-        while let event = try await c.nextEvent() {
-          if case let .frame(f) = event, f.identity.pane == pane {
-            counts.withLock { $0[i] += 1 }
+    let consumers = shown.enumerated()
+      .map { i, entry in
+        Task {
+          let (c, pane, _) = entry
+          while let event = try await c.nextEvent() {
+            if case let .frame(f) = event, f.identity.pane == pane {
+              counts.withLock { $0[i] += 1 }
+            }
           }
         }
       }
-    }
     let deadline = ContinuousClock.now + .seconds(20)
     while counts.withLock({ $0.min()! }) < 20, ContinuousClock.now < deadline {
       try await Task.sleep(for: .milliseconds(10))

@@ -69,7 +69,8 @@ public struct AttentionSummary: Sendable, Equatable, Codable {
       counts: counts,
       updatedAt: item.updatedAt,
       message: policy.showsMessage
-        ? Self.sanitize(item.status.message, limit: Self.maxMessageLength) : nil,
+        ? Self.sanitize(item.status.message, limit: Self.maxMessageLength)
+        : nil,
       locator: destination.map(AttentionLocator.encode)
     )
   }
@@ -101,9 +102,11 @@ public struct AttentionSummary: Sendable, Equatable, Codable {
             || $0.properties.generalCategory == .paragraphSeparator ? " " : $0
         }
       )
-    ).trimmingCharacters(in: .whitespaces)
+    )
+    .trimmingCharacters(in: .whitespaces)
     guard !cleaned.isEmpty else { return nil }
-    return cleaned.count <= limit ? cleaned : String(cleaned.prefix(limit - 1)) + "…"
+    return cleaned.count <= limit
+      ? cleaned : String(cleaned.prefix(limit - 1)) + "…"
   }
 }
 
@@ -118,16 +121,18 @@ public struct AttentionHandoffRequest: Sendable, Equatable, Codable {
   /// `userInfo` key holding `locator`.
   public static let locatorKey = "ref"
 
-  public enum Intent: String, Sendable, Codable {
-    case review, reveal
-  }
+  public enum Intent: String, Sendable, Codable { case review, reveal }
 
   public var locator: String
   public var intent: Intent
   public var requestedAt: Date
 
   /// Fails unless `locator` decodes; a watch never forwards free text.
-  public init?(locator: String, intent: Intent = .review, requestedAt: Date = .now) {
+  public init?(
+    locator: String,
+    intent: Intent = .review,
+    requestedAt: Date = .now
+  ) {
     guard (try? AttentionLocator.decode(locator)) != nil else { return nil }
     self.locator = locator
     self.intent = intent
@@ -139,14 +144,19 @@ public struct AttentionHandoffRequest: Sendable, Equatable, Codable {
   public var allowsInput: Bool { false }
 
   /// The destination for the receiving device; `.reveal` narrows intent.
-  public func destination() throws(AttentionLocator.DecodeError) -> AttentionDestination {
+  public func destination() throws(AttentionLocator.DecodeError)
+    -> AttentionDestination
+  {
     var destination = try AttentionLocator.decode(locator)
     if intent == .reveal { destination.intent = .reveal }
     return destination
   }
 
-  /// `userInfo` for an `NSUserActivity` of `activityType`.
-  public var userInfo: [String: String] { [Self.locatorKey: locator] }
+  /// `userInfo` carries the effective intent inside the existing locator.
+  public var userInfo: [String: String] {
+    guard let destination = try? destination() else { return [:] }
+    return [Self.locatorKey: AttentionLocator.encode(destination)]
+  }
 
   /// Parses a continued activity's `userInfo`, strictly.
   public init?(userInfo: [AnyHashable: Any]?) {
@@ -174,9 +184,7 @@ public struct AttentionSummaryBatch: Sendable, Equatable, Codable {
     self.sentAt = sentAt
   }
 
-  public enum CodecError: Error, Equatable {
-    case tooLarge, malformed
-  }
+  public enum CodecError: Error, Equatable { case tooLarge, malformed }
 
   public func encoded() throws(CodecError) -> Data {
     guard let data = try? JSONEncoder().encode(self),

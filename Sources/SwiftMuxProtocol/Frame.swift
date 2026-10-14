@@ -157,6 +157,15 @@ public struct FramePalette: Codable, Sendable, Equatable {
     self.selectionForeground = selectionForeground
     self.selectionBackground = selectionBackground
   }
+
+  /// Every palette entry is a 24-bit RGB value; optional overrides may
+  /// be absent to use the renderer's default.
+  public var isValid: Bool {
+    colors.count == 256 && colors.allSatisfy { $0 <= 0xFF_FFFF }
+      && [foreground, background, cursor].allSatisfy { $0 <= 0xFF_FFFF }
+      && [cursorText, selectionForeground, selectionBackground]
+        .allSatisfy { $0.map { $0 <= 0xFF_FFFF } ?? true }
+  }
 }
 
 public struct FrameCursor: Codable, Sendable, Equatable {

@@ -27,11 +27,24 @@ public struct WatchCompanionStore: Sendable {
   public private(set) var status: CompanionStatus?
   /// In memory only; cleared whenever the app is not active.
   public private(set) var preview: CompanionPreview?
+  /// Owner of `preview`. Nil when no preview is retained. A status whose
+  /// owner differs cannot keep this text.
+  private var retainedPreviewOwner: UInt64?
   public private(set) var isReachable = false
   public private(set) var isActive = false
   public private(set) var gate: RefreshGate
   public private(set) var lastRefreshFailedAt: Date?
   public var staleness: CompanionStaleness
+  /// Kept after clearing, so a delayed publication cannot restore data.
+  public private(set) var lastPublicationRevision: UInt64?
+  private var lastContextRevision: UInt64?
+  public private(set) var publisherID: UUID?
+  /// An unfamiliar publisher requires a fresh immediate request. Queued
+  /// contexts alone cannot establish order between installations.
+  public private(set) var needsPublisherConfirmation = false
+  public private(set) var confirmationPublisherID: UUID?
+  private var confirmingRequestID: CompanionRequestID?
+  private var previousPublisherID: UUID?
 
   public init(
     staleness: CompanionStaleness = .standard,
@@ -48,7 +61,7 @@ public struct WatchCompanionStore: Sendable {
   public mutating func setActive(_ active: Bool) {
     isActive = active
     if !active {
-      preview = nil
+      dropPreview()
       if gate.pending?.request.kind == .preview { gate.cancel() }
     }
   }
@@ -67,9 +80,20 @@ public struct WatchCompanionStore: Sendable {
     now: Date
   ) -> CompanionRequest? {
     guard isActive, isReachable else { return nil }
+    if needsPublisherConfirmation, let lastRefreshFailedAt {
+      let sinceFailure = now.timeIntervalSince(lastRefreshFailedAt)
+      if sinceFailure >= 0, sinceFailure < CompanionLimits.refreshTimeout {
+        return nil
+      }
+    }
     let kind: CompanionRequest.Kind =
-      kind == .preview && status?.previewAvailable == true ? .preview : .refresh
-    return gate.begin(kind, now: now)
+      !needsPublisherConfirmation && kind == .preview
+        && status?.previewAvailable == true ? .preview : .refresh
+    let request = gate.begin(kind, now: now)
+    if needsPublisherConfirmation, let request {
+      confirmingRequestID = request.id
+    }
+    return request
   }
 
   /// The transport could not deliver the request or got no reply.
@@ -89,18 +113,33 @@ public struct WatchCompanionStore: Sendable {
   public mutating func receive(_ reply: CompanionReply) -> Bool {
     guard gate.complete(reply.requestID) else { return false }
     lastRefreshFailedAt = nil
+    let confirming = confirmingRequestID == reply.requestID
+    confirmingRequestID = nil
+    if let publisherID, publisherID != reply.publisherID, !confirming {
+      requirePublisherConfirmation(for: reply.publisherID)
+      return true
+    }
+    if publisherID != reply.publisherID { adoptPublisher(reply.publisherID) }
+    if confirming {
+      needsPublisherConfirmation = false
+      confirmationPublisherID = nil
+    }
+    // A correlated old reply completes its request, but cannot change
+    // caches established by a newer context or reply.
+    guard admit(reply.revision) else { return true }
     switch reply {
-    case .status(_, let status, _):
-      apply(status)
-    case .preview(_, let status, let newPreview):
+    case .status(_, let status, let reason, _, _):
+      apply(status, previewUnavailable: reason != nil)
+    case .preview(_, let status, let newPreview, _, _):
       apply(status)
       if isActive, self.status?.previewAvailable == true,
+        newPreview.owner == status.previewOwner,
         preview.map({ $0.capturedAt <= newPreview.capturedAt }) ?? true
       {
         preview = newPreview
+        retainedPreviewOwner = status.previewOwner
       }
-    case .disabled:
-      clearAll()
+    case .disabled: clearAll()
     }
     return true
   }
@@ -108,36 +147,97 @@ public struct WatchCompanionStore: Sendable {
   /// Decodes and applies a reply; malformed data is rejected.
   @discardableResult
   public mutating func receive(replyData data: Data) -> Bool {
-    guard let reply = try? CompanionCodec.decodeReply(data) else { return false }
+    guard let reply = try? CompanionCodec.decodeReply(data) else {
+      return false
+    }
     return receive(reply)
   }
 
   /// Applies a latest-state application context.
-  public mutating func receive(_ context: CompanionApplicationContext) {
-    switch context {
-    case .status(let status): apply(status)
-    case .cleared: clearAll()
+  @discardableResult
+  public mutating func receive(_ context: CompanionApplicationContext) -> Bool {
+    if let publisherID, context.publisherID != publisherID {
+      if context.publisherID != previousPublisherID {
+        requirePublisherConfirmation(for: context.publisherID)
+      }
+      return false
     }
+    if publisherID == nil { adoptPublisher(context.publisherID) }
+    guard lastContextRevision.map({ context.revision > $0 }) ?? true,
+      admit(context.revision)
+    else { return false }
+    lastContextRevision = context.revision
+    switch context {
+    case .status(let status, _, _):
+      apply(status)
+      return true
+    case .cleared:
+      clearAll()
+      return true
+    }
+  }
+
+  private mutating func requirePublisherConfirmation(for publisher: UUID) {
+    if !needsPublisherConfirmation || confirmationPublisherID != publisher {
+      gate.cancel()
+      confirmingRequestID = nil
+    }
+    dropPreview()
+    needsPublisherConfirmation = true
+    confirmationPublisherID = publisher
+  }
+
+  private mutating func adoptPublisher(_ publisher: UUID) {
+    previousPublisherID = publisherID
+    publisherID = publisher
+    lastPublicationRevision = nil
+    lastContextRevision = nil
+    status = nil
+    dropPreview()
+    needsPublisherConfirmation = false
+    confirmationPublisherID = nil
+  }
+
+  private mutating func admit(_ revision: UInt64) -> Bool {
+    guard lastPublicationRevision.map({ revision >= $0 }) ?? true else {
+      return false
+    }
+    lastPublicationRevision = revision
+    return true
   }
 
   /// Drops every cached value (phone-side opt-out).
   public mutating func clearAll() {
     status = nil
-    preview = nil
+    dropPreview()
     gate.cancel()
   }
 
-  /// Keeps the newest status; an older one never overwrites it.
-  private mutating func apply(_ incoming: CompanionStatus) {
-    if let status, incoming.capturedAt < status.capturedAt { return }
+  /// Publication admission supplies the order. Observation time can stay
+  /// unchanged on re-enable or move backward with the phone's clock.
+  /// Preview text stays only for the same owner, and only while a preview
+  /// is still offered. A status reply that cannot serve a preview drops it.
+  private mutating func apply(
+    _ incoming: CompanionStatus,
+    previewUnavailable: Bool = false
+  ) {
+    let keep =
+      !previewUnavailable && incoming.previewAvailable
+      && retainedPreviewOwner == incoming.previewOwner
     status = incoming
-    if !incoming.previewAvailable { preview = nil }
+    if !keep { dropPreview() }
+  }
+
+  private mutating func dropPreview() {
+    preview = nil
+    retainedPreviewOwner = nil
   }
 
   // MARK: Presentation
 
   public func freshness(now: Date) -> CompanionFreshness {
-    staleness.evaluate(status, now: now)
+    if needsPublisherConfirmation, status != nil { return .stale }
+    return staleness.evaluate(status, now: now)
   }
 
   public func presentation(now: Date) -> Presentation {

@@ -1,3 +1,4 @@
+import Foundation
 import ScreenProtocol
 import SessionCore
 import SwifttyCore
@@ -13,6 +14,8 @@ import Synchronization
 /// (`receive { _ in ...; return [] }`) that runs on the session queue once
 /// the chunk is parsed and returns that chunk's credit. Unparsed output
 /// therefore never exceeds `outputWindow` plus one transport read.
+/// Credit is also withheld while the ordered writer is full, so a peer
+/// cannot grow the reply queue indefinitely by sending terminal queries.
 public final class SSHStreamBackend: TerminalSurfaceBackend {
   enum Outbound: Sendable {
     case bytes([UInt8])
@@ -24,10 +27,14 @@ public final class SSHStreamBackend: TerminalSurfaceBackend {
     var started = false
     var unparsed = 0
     var peakUnparsed = 0
+    var withheldCredit = 0
     var outbound: [Outbound] = []
     var outboundBytes = 0
+    var reservedBytes = 0
     var pumping = false
     var onLifecycleChange: (@Sendable (SurfaceLifecycle) -> Void)?
+    var onScreenInstalled: (@Sendable (Date) -> Void)?
+    var onInputRefusal: (@Sendable (InputRefusal) -> Void)?
     /// Grid last sent to (or opened on) the remote PTY.
     var remoteGrid: GridSize?
   }
@@ -36,7 +43,8 @@ public final class SSHStreamBackend: TerminalSurfaceBackend {
   let channel: any TerminalByteChannel
   /// Output credit: the most program output delivered but not yet parsed.
   public let outputWindow: Int
-  /// User input is refused while this many bytes await the channel.
+  /// User input is refused when queued encoding reservations plus bytes
+  /// awaiting the channel would exceed this limit.
   public let writeLimit: Int
   private let state = Mutex(State())
 
@@ -54,7 +62,12 @@ public final class SSHStreamBackend: TerminalSurfaceBackend {
     textInput: true
   )
 
-  /// - Parameter session: A regular (byte-stream) session with no PTY.
+  /// - Parameters:
+  ///   - channel: The remote byte channel for output, input, and resizing.
+  ///   - session: A regular byte-stream terminal session with no local PTY.
+  ///   - outputWindow: Positive initial output credit, returned as parsing
+  ///     ends.
+  ///   - writeLimit: Positive byte limit for input awaiting the channel.
   public init(
     channel: any TerminalByteChannel,
     session: TerminalSession,
@@ -73,6 +86,20 @@ public final class SSHStreamBackend: TerminalSurfaceBackend {
   /// High-water mark of `unparsedBytes`.
   public var peakUnparsedBytes: Int { state.withLock { $0.peakUnparsed } }
 
+  /// Called after program output has been parsed, with the time that
+  /// parse finished. Grid changes and local input do not call it.
+  public var onScreenInstalled: (@Sendable (Date) -> Void)? {
+    get { state.withLock { $0.onScreenInstalled } }
+    set {
+      let previous = state.withLock { s in
+        let previous = s.onScreenInstalled
+        s.onScreenInstalled = newValue
+        return previous
+      }
+      withExtendedLifetime(previous) {}
+    }
+  }
+
   /// Wires the session and channel and grants the initial credit.
   public func start() {
     let first = state.withLock { s in
@@ -80,14 +107,26 @@ public final class SSHStreamBackend: TerminalSurfaceBackend {
       return !s.started
     }
     guard first else { return }
+    // Views send full native input directly to the session. Admit it
+    // before the session queue, preserving mouse/focus and rich key data.
+    session.inputHandler = { [weak self] input in
+      guard let self else { return }
+      if case let .refused(reason) = submitInput(input) {
+        let handler = state.withLock { $0.onInputRefusal }
+        handler?(reason)
+      }
+    }
     // Encoded input and terminal replies share the ordered writer.
     session.onWrite = { [weak self] bytes in self?.enqueue(.bytes(bytes)) }
     // Any local grid change (a view resizing its session directly, or
     // `proposeGrid`) becomes a window-change request, ordered with writes.
-    let initial = session.withState { GridSize(columns: $0.columns, rows: $0.rows) }
+    let initial = session.withState {
+      GridSize(columns: $0.columns, rows: $0.rows)
+    }
     state.withLock { $0.remoteGrid = initial }
     session.onStateChange = { [weak self] terminal in
-      self?.gridChanged(GridSize(columns: terminal.columns, rows: terminal.rows))
+      self?
+        .gridChanged(GridSize(columns: terminal.columns, rows: terminal.rows))
     }
     channel.start(
       TerminalChannelHandler(
@@ -109,7 +148,10 @@ public final class SSHStreamBackend: TerminalSurfaceBackend {
     session.receive(bytes)
     // Runs on the session queue after `bytes` were parsed.
     session.receive { [weak self] _ in
+      let installed = Date()
       self?.parsed(count)
+      let handler = self?.state.withLock { $0.onScreenInstalled }
+      handler?(installed)
       return []
     }
   }
@@ -124,8 +166,20 @@ public final class SSHStreamBackend: TerminalSurfaceBackend {
   }
 
   private func parsed(_ count: Int) {
-    state.withLock { $0.unparsed -= count }
-    channel.grantCredit(count)
+    let credit = state.withLock { s in
+      s.unparsed -= count
+      guard !s.lifecycle.isFinal else { return 0 }
+      s.withheldCredit += count
+      return takeOutputCredit(&s)
+    }
+    if credit > 0 { channel.grantCredit(credit) }
+  }
+
+  private func takeOutputCredit(_ s: inout State) -> Int {
+    guard !s.lifecycle.isFinal, s.outboundBytes < writeLimit else { return 0 }
+    let credit = s.withheldCredit
+    s.withheldCredit = 0
+    return credit
   }
 
   private func exited(_ exit: TerminalChannelExit) {
@@ -139,7 +193,8 @@ public final class SSHStreamBackend: TerminalSurfaceBackend {
   }
 
   private func setLifecycle(_ next: SurfaceLifecycle) {
-    let handler = state.withLock { s -> (@Sendable (SurfaceLifecycle) -> Void)? in
+    let handler = state.withLock {
+      s -> (@Sendable (SurfaceLifecycle) -> Void)? in
       guard s.lifecycle != next, !s.lifecycle.isFinal else { return nil }
       s.lifecycle = next
       return s.onLifecycleChange
@@ -149,10 +204,18 @@ public final class SSHStreamBackend: TerminalSurfaceBackend {
 
   // MARK: Ordered channel writer
 
-  private func enqueue(_ item: Outbound) {
+  private func enqueue(_ item: Outbound, reservation: Int = 0) {
     let start = state.withLock { s -> Bool in
+      s.reservedBytes -= reservation
       guard !s.lifecycle.isFinal else { return false }
-      s.outbound.append(item)
+      if case let .bytes(bytes) = item, bytes.isEmpty { return false }
+      // Adjacent geometry changes have no intervening input to preserve.
+      // Keep the last one, while never coalescing across a byte write.
+      if case .resize = item, let last = s.outbound.last, case .resize = last {
+        s.outbound[s.outbound.count - 1] = item
+      } else {
+        s.outbound.append(item)
+      }
       if case let .bytes(bytes) = item { s.outboundBytes += bytes.count }
       guard !s.pumping else { return false }
       s.pumping = true
@@ -177,13 +240,15 @@ public final class SSHStreamBackend: TerminalSurfaceBackend {
         switch item {
         case let .bytes(bytes):
           try await channel.write(bytes)
-          state.withLock { $0.outboundBytes -= bytes.count }
+          let credit = state.withLock { s in
+            s.outboundBytes -= bytes.count
+            return takeOutputCredit(&s)
+          }
+          if credit > 0 { channel.grantCredit(credit) }
         case let .resize(columns, rows):
           try await channel.resize(columns: columns, rows: rows)
         }
-      } catch {
-        setLifecycle(.lost)
-      }
+      } catch { setLifecycle(.lost) }
     }
   }
 
@@ -203,20 +268,54 @@ public final class SSHStreamBackend: TerminalSurfaceBackend {
 
   public var onLifecycleChange: (@Sendable (SurfaceLifecycle) -> Void)? {
     get { state.withLock { $0.onLifecycleChange } }
-    set { state.withLock { $0.onLifecycleChange = newValue } }
+    set {
+      let previous = state.withLock { s in
+        let previous = s.onLifecycleChange
+        s.onLifecycleChange = newValue
+        return previous
+      }
+      withExtendedLifetime(previous) {}
+    }
+  }
+
+  /// Direct view input has no asynchronous result receiver. Refusals
+  /// are reported synchronously here, outside the backend lock.
+  public var onInputRefusal: (@Sendable (InputRefusal) -> Void)? {
+    get { state.withLock { $0.onInputRefusal } }
+    set {
+      let previous = state.withLock { s in
+        let previous = s.onInputRefusal
+        s.onInputRefusal = newValue
+        return previous
+      }
+      withExtendedLifetime(previous) {}
+    }
   }
 
   public func submit(_ input: SurfaceInput) async -> SurfaceInputResult {
+    do { try input.operation.validate() } catch { return .refused(.invalid) }
+    return submitInput(input.terminalInput)
+  }
+
+  private func submitInput(_ input: TerminalInput) -> SurfaceInputResult {
+    guard let reservation = inputReservation(for: input) else {
+      return .refused(.invalid)
+    }
     let refusal = state.withLock { s -> InputRefusal? in
       if s.lifecycle.isFinal { return .closed }
       guard s.lifecycle == .active else { return .notActive(.idle) }
-      return s.outboundBytes + input.operation.expansionBound > writeLimit
-        ? .backpressure : nil
+      guard reservation <= writeLimit - s.outboundBytes - s.reservedBytes else {
+        return .backpressure
+      }
+      s.reservedBytes += reservation
+      return nil
     }
     if let refusal { return .refused(refusal) }
-    do { try input.operation.validate() } catch { return .refused(.invalid) }
-    // Encoded with the local emulator's modes, then `onWrite`.
-    session.send(input.terminalInput)
+    // Charge before queuing encoding, then atomically exchange the
+    // reservation for encoded bytes (including an empty encoding).
+    session.send(input) { [weak self] bytes in
+      self?.enqueue(.bytes(bytes), reservation: reservation)
+    }
     return .accepted(sequence: nil)
   }
 

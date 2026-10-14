@@ -78,11 +78,9 @@ public struct BootstrapRequest: Hashable, Sendable, Codable {
     case .resume:
       guard sessionID != nil else { throw .missingSession }
       if let grid = initialGrid, !grid.isValid { throw .invalidGrid }
-    case .terminate:
-      guard sessionID != nil else { throw .missingSession }
+    case .terminate: guard sessionID != nil else { throw .missingSession }
     case .list: break
-    case .attention:
-      guard attention != nil else { throw .missingAttention }
+    case .attention: guard attention != nil else { throw .missingAttention }
     }
   }
 }
@@ -223,7 +221,8 @@ extension BootstrapResponse: Codable {
   public init(from decoder: any Decoder) throws {
     let c = try decoder.container(keyedBy: Keys.self)
     switch try c.decode(String.self, forKey: .result) {
-    case "granted": self = .granted(try c.decode(BootstrapGrant.self, forKey: .grant))
+    case "granted":
+      self = .granted(try c.decode(BootstrapGrant.self, forKey: .grant))
     case "sessions":
       let list = try c.decode([SessionSummary].self, forKey: .sessions)
       guard list.count <= RSTLimits.maxSessionsPerAccount else {
@@ -299,9 +298,7 @@ public enum BootstrapEnvelope {
     guard bytes.count == 4 + length else { throw .trailingData }
     do {
       return try JSONDecoder().decode(T.self, from: Data(bytes[4...]))
-    } catch {
-      throw .malformedJSON
-    }
+    } catch { throw .malformedJSON }
   }
 
   /// Length of the envelope once its prefix is available, bounded.

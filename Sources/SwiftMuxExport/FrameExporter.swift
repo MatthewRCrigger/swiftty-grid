@@ -39,11 +39,11 @@ public enum FrameExporter {
       if let idx = lookup[style] {
         styleIndex[i] = idx
       } else {
-        guard styles.count < limits.maxStyles else {
-          throw MuxError(.resourceLimit, "frame style table")
-        }
-        lookup[style] = UInt16(styles.count)
-        styleIndex[i] = UInt16(styles.count)
+        guard styles.count < limits.maxStyles,
+          let index = UInt16(exactly: styles.count)
+        else { throw MuxError(.resourceLimit, "frame style table") }
+        lookup[style] = index
+        styleIndex[i] = index
         styles.append(style)
       }
       if cell.flags.contains(.spacerTail) {
@@ -78,7 +78,14 @@ public enum FrameExporter {
     let search = searchState(screen)
     var title = screen.title
     if title.utf8.count > 4096 {
-      title = String(decoding: title.utf8.prefix(4096), as: UTF8.self)
+      var bytes = 0
+      let prefix = title.unicodeScalars.prefix { scalar in
+        let count = scalar.utf8.count
+        guard bytes + count <= 4096 else { return false }
+        bytes += count
+        return true
+      }
+      title = String(String.UnicodeScalarView(prefix))
     }
     return PaneFrame(
       identity: identity,

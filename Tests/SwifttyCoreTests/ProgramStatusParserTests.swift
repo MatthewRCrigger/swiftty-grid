@@ -6,6 +6,22 @@ import TestSupport
 
 /// OSC 7501 framing and validation.
 struct ProgramStatusParserTests {
+  @Test
+  func surroundingWhitespaceIsTrimmedBeforeFieldValidation() {
+    let r = record(
+      " state = blocked : id = build/test : kind = question : progress = 40 : app = cargo : title = \(b64("Approve?")) "
+    )
+    #expect(r?.id == "build/test")
+    #expect(r?.state == .blocked)
+    #expect(r?.kind == .question)
+    #expect(r?.progress == 40)
+    #expect(r?.app == "cargo")
+    #expect(r?.title == "Approve?")
+    #expect(parse("state=clear: id = child ") == .clear(id: "child"))
+    #expect(parse("state=clear: id = ") == nil)
+    #expect(parse("state=clear: id = child//bad ") == nil)
+  }
+
   func b64(_ s: String) -> String { Data(s.utf8).base64EncodedString() }
 
   func vt() -> VT {

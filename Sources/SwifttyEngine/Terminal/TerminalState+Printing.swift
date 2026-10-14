@@ -291,7 +291,11 @@ extension TerminalState {
         }
         previousClass = cls
         storeScalar(
-          c, width: w, column: x, row: row, clean: clean,
+          c,
+          width: w,
+          column: x,
+          row: row,
+          clean: clean,
           templates: (narrow, wide, tail)
         )
         x += w

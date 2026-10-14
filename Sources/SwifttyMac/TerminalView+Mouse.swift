@@ -185,6 +185,7 @@ extension TerminalView {
   /// Click-to-move: while the shell is editing a command line (OSC 133),
   /// a click moves its cursor there with arrow keys.
   private func moveShellCursor(to p: TerminalPoint, generation: UInt64) {
+    guard capabilities.textInput else { return }
     let moves = session.withState { state in
       state.addressingGeneration == generation
         ? state.promptCursorMoves(to: p) : nil
@@ -409,6 +410,7 @@ extension TerminalView {
       if lastModes.contains(.alternateScreen),
         lastModes.contains(.alternateScroll)
       {
+        guard capabilities.textInput else { return }
         for _ in 0 ..< abs(lines) {
           session.send(.key(KeyEvent(lines > 0 ? .up : .down)))
         }

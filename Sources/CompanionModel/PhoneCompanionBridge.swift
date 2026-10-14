@@ -52,11 +52,28 @@ public struct PhoneCompanionBridge: Sendable {
   public private(set) var isForeground: Bool
   private var observation: Observation
   private var cachedPreview: CompanionPreview?
+  /// Changes when `observation.sessionToken` changes. Not transmitted as
+  /// that token, and not derived from it.
+  private var previewOwner: UInt64 = 0
   /// When sharing was last turned off; reported in `.disabled` replies.
   private var clearedAt: Date
+  /// Persisted by the phone adapter before a publication leaves its lock.
+  /// Capture timestamps keep their original observation meaning.
+  public private(set) var publicationRevision: UInt64
+  public let publisherID: UUID
+
+  public var publicationIdentity: CompanionPublicationIdentity {
+    .init(publisherID: publisherID, revision: publicationRevision)
+  }
 
   /// Starts with "no session" observed at `now`.
-  public init(settings: CompanionSettings = .default, isForeground: Bool = false, now: Date) {
+  public init(
+    settings: CompanionSettings = .default,
+    isForeground: Bool = false,
+    now: Date,
+    publicationRevision: UInt64 = 0,
+    publisherID: UUID = UUID()
+  ) {
     self.settings = settings
     self.isForeground = isForeground
     self.observation = Observation(
@@ -66,6 +83,8 @@ public struct PhoneCompanionBridge: Sendable {
       observedAt: now
     )
     self.clearedAt = now
+    self.publicationRevision = publicationRevision
+    self.publisherID = publisherID
   }
 
   /// The latest observed status, or `nil` while sharing is off.
@@ -77,7 +96,8 @@ public struct PhoneCompanionBridge: Sendable {
       capturedAt: observation.observedAt,
       lastScreenAt: observation.lastScreenAt,
       pendingInputCount: observation.pendingInputCount,
-      previewAvailable: settings.allowsPreview
+      previewAvailable: settings.allowsPreview,
+      previewOwner: previewOwner
     )
   }
 
@@ -86,16 +106,45 @@ public struct PhoneCompanionBridge: Sendable {
 
   /// The context to publish with `updateApplicationContext`.
   public var applicationContext: CompanionApplicationContext {
-    status.map(CompanionApplicationContext.status) ?? .cleared(at: clearedAt)
+    if let status {
+      return .status(
+        status,
+        revision: publicationRevision,
+        publisherID: publisherID
+      )
+    }
+    return .cleared(
+      at: clearedAt,
+      revision: publicationRevision,
+      publisherID: publisherID
+    )
+  }
+
+  /// Allocates a new publication identity, including attention-only changes
+  /// and activation snapshots. Exhaustion refuses publication rather than
+  /// wrapping to an identity a watch could mistake for an old update.
+  @discardableResult
+  public mutating func advancePublication() -> Bool {
+    guard publicationRevision < UInt64.max else { return false }
+    publicationRevision += 1
+    return true
   }
 
   /// Records an observation. Returns the context to publish, or `nil` when
   /// nothing should be sent (sharing off, or an out-of-order observation
   /// older than the one already held).
-  public mutating func observe(_ next: Observation) -> CompanionApplicationContext? {
+  public mutating func observe(
+    _ next: Observation
+  ) -> CompanionApplicationContext? {
     guard settings.sharingEnabled else { return nil }
     guard next.observedAt >= observation.observedAt else { return nil }
-    if next.sessionToken != observation.sessionToken { cachedPreview = nil }
+    let selectionChanged = next.sessionToken != observation.sessionToken
+    if selectionChanged, previewOwner == UInt64.max { return nil }
+    guard advancePublication() else { return nil }
+    if selectionChanged {
+      cachedPreview = nil
+      previewOwner += 1
+    }
     observation = next
     return applicationContext
   }
@@ -105,7 +154,11 @@ public struct PhoneCompanionBridge: Sendable {
   public mutating func observePreview(lines: [String], capturedAt: Date) {
     guard settings.allowsPreview, isForeground else { return }
     if let cachedPreview, cachedPreview.capturedAt > capturedAt { return }
-    cachedPreview = CompanionPreview(lines: lines, capturedAt: capturedAt)
+    cachedPreview = CompanionPreview(
+      lines: lines,
+      capturedAt: capturedAt,
+      owner: previewOwner
+    )
   }
 
   /// Drops cached preview text (for example when the terminal is hidden).
@@ -125,6 +178,10 @@ public struct PhoneCompanionBridge: Sendable {
     now: Date
   ) -> CompanionApplicationContext? {
     let old = settings
+    guard old != newSettings else { return nil }
+    // At exhaustion opt-out still clears the local caches. The adapter
+    // refuses to send any further context or reply under that identity.
+    let advanced = advancePublication()
     settings = newSettings
     if !newSettings.allowsPreview { cachedPreview = nil }
     if old.sharingEnabled, !newSettings.sharingEnabled {
@@ -139,42 +196,87 @@ public struct PhoneCompanionBridge: Sendable {
       )
       cachedPreview = nil
       clearedAt = now
-      return .cleared(at: now)
+      return advanced ? applicationContext : nil
     }
-    return old == newSettings ? nil : applicationContext
+    return advanced ? applicationContext : nil
   }
 
   /// Answers one watch request from cached state only.
   public func reply(to request: CompanionRequest) -> CompanionReply {
-    guard let status else { return .disabled(request.id, clearedAt: clearedAt) }
+    guard let status else {
+      return .disabled(
+        request.id,
+        clearedAt: clearedAt,
+        revision: publicationRevision,
+        publisherID: publisherID
+      )
+    }
     switch request.kind {
     case .refresh:
-      return .status(request.id, status, previewUnavailable: nil)
+      return .status(
+        request.id,
+        status,
+        previewUnavailable: nil,
+        revision: publicationRevision,
+        publisherID: publisherID
+      )
     case .preview:
       guard settings.allowsPreview else {
-        return .status(request.id, status, previewUnavailable: .notEnabled)
+        return .status(
+          request.id,
+          status,
+          previewUnavailable: .notEnabled,
+          revision: publicationRevision,
+          publisherID: publisherID
+        )
       }
       guard isForeground else {
-        return .status(request.id, status, previewUnavailable: .phoneNotForeground)
+        return .status(
+          request.id,
+          status,
+          previewUnavailable: .phoneNotForeground,
+          revision: publicationRevision,
+          publisherID: publisherID
+        )
       }
       guard let cachedPreview else {
-        return .status(request.id, status, previewUnavailable: .noScreen)
+        return .status(
+          request.id,
+          status,
+          previewUnavailable: .noScreen,
+          revision: publicationRevision,
+          publisherID: publisherID
+        )
       }
-      return .preview(request.id, status, cachedPreview)
+      return .preview(
+        request.id,
+        status,
+        cachedPreview,
+        revision: publicationRevision,
+        publisherID: publisherID
+      )
     }
   }
 
   /// Decodes a request and encodes its reply. Returns `nil` for a
   /// malformed request, which the adapter answers with an error instead.
   public func reply(toMessageData data: Data) -> Data? {
-    guard let request = try? CompanionCodec.decodeRequest(data) else { return nil }
+    guard let request = try? CompanionCodec.decodeRequest(data) else {
+      return nil
+    }
     let reply = reply(to: request)
     if let encoded = try? CompanionCodec.encode(reply) { return encoded }
     // A preview reply that cannot be encoded within bounds degrades to
     // status only rather than failing the request.
     guard let status else { return nil }
     return try? CompanionCodec.encode(
-      CompanionReply.status(request.id, status, previewUnavailable: .noScreen)
+      CompanionReply.status(
+        request.id,
+        status,
+        previewUnavailable: .noScreen,
+        revision: publicationRevision,
+        publisherID: publisherID
+      )
     )
   }
 }

@@ -5,6 +5,32 @@ import Testing
 /// The OSC 7501 change journal: every transition in stream order, for
 /// consumers (the attention inbox) that must not lose rapid changes.
 struct ProgramStatusJournalTests {
+  @Test(arguments: [-1, 0, 1, 2, 5, 6], [false, true])
+  func `lowering the journal limit immediately bounds pending changes`(
+    _ limit: Int,
+    _ reset: Bool
+  ) throws {
+    var vt = vt(journal: 8)
+    report(&vt, "state=working:id=before")
+    if reset { vt.feed("\u{1B}c") }
+    for id in ["a", "b", "c", "d"] { report(&vt, "state=working:id=\(id)") }
+    vt.state.programStatusJournalLimit = limit
+    let taken = vt.state.takeProgramStatusJournal()
+    let journal = try #require(taken)
+    #expect(
+      journal.snapshot.records.map(\.id) == (reset ? [] : ["before"]) + [
+        "a", "b", "c", "d",
+      ]
+    )
+    if limit <= 0 {
+      #expect(journal.changes.isEmpty && !journal.truncated)
+    } else if limit < (reset ? 6 : 5) {
+      #expect(journal.changes == (reset ? [.reset] : []) && journal.truncated)
+    } else {
+      #expect(journal.changes.count == (reset ? 6 : 5) && !journal.truncated)
+    }
+  }
+
   func vt(journal: Int = 64) -> VT {
     var vt = VT(20, 3)
     vt.state.programStatusEnabled = true

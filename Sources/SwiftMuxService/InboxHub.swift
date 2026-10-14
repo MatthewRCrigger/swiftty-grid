@@ -19,8 +19,6 @@ struct InboxHub {
   private(set) var inbox: AttentionInbox
   private(set) var subscribers: [UUID: Subscriber] = [:]
   var flushScheduled = false
-  /// Pending snooze-expiry timer deadline.
-  var snoozeDeadline: Date?
 
   /// Coalescing window between a reduction and its update.
   static let flushDelay: DispatchTimeInterval = .milliseconds(16)
@@ -67,19 +65,23 @@ struct InboxHub {
 
   // MARK: Subscribers
 
-  /// Adds or removes a subscriber; false when the subscriber bound is
-  /// reached.
-  mutating func subscribe(_ client: UUID, _ on: Bool) -> Bool {
-    guard on else {
-      subscribers[client] = nil
-      return true
-    }
+  /// Produces the initial snapshot before committing a subscription.
+  /// Failed admission leaves the subscriber state unchanged.
+  mutating func subscribe(_ client: UUID) throws(MuxError) -> InboxPage {
     guard
       subscribers[client] != nil || subscribers.count < limits.inboxSubscribers
-    else { return false }
+    else {
+      throw MuxError(
+        .resourceLimit,
+        "inbox subscriber limit \(limits.inboxSubscribers) reached"
+      )
+    }
+    let snapshot = try page(InboxQuery())
     subscribers[client] = subscribers[client] ?? Subscriber()
-    return true
+    return snapshot
   }
+
+  mutating func unsubscribe(_ client: UUID) { subscribers[client] = nil }
 
   /// Takes the coalesced update and returns what each subscriber gets.
   mutating func flush() -> [(UUID, InboxUpdate)] {

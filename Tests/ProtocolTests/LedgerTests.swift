@@ -31,14 +31,47 @@ struct LedgerTests {
   func `an empty ledger admits a maximal paste`() throws {
     var ledger = HostInputLedger()
     try ledger.authorize(writer)
-    let paste = InputOperation.paste(String(repeating: "x", count: RSTLimits.maxPasteBytes))
+    let paste = InputOperation.paste(
+      String(repeating: "x", count: RSTLimits.maxPasteBytes)
+    )
     #expect(paste.expansionBound > ledger.byteLimit)
-    #expect(ledger.classify(writer: writer, sequence: 1, operation: paste) == .admit)
+    #expect(
+      ledger.classify(writer: writer, sequence: 1, operation: paste) == .admit
+    )
     ledger.reserve(1, operation: paste)
     // A second operation waits for it.
     #expect(
       ledger.classify(writer: writer, sequence: 2, operation: paste)
         == .rejected(.backpressure)
+    )
+  }
+
+  @Test
+  func `zero byte operations are bounded behind a blocked write`() throws {
+    var ledger = HostInputLedger(byteLimit: 100)
+    try ledger.authorize(writer)
+    let text = InputOperation.committedText("x")
+    ledger.record(1, operation: text, bytes: [0x78])
+    for sequence in UInt64(2) ... 4 {
+      let resize = InputOperation.resize(
+        columns: 80,
+        rows: 24,
+        resizeRevision: sequence
+      )
+      #expect(
+        ledger.classify(writer: writer, sequence: sequence, operation: resize)
+          == .admit
+      )
+      ledger.reserve(sequence, operation: resize)
+    }
+    let resize = InputOperation.resize(columns: 80, rows: 24, resizeRevision: 5)
+    #expect(
+      ledger.classify(writer: writer, sequence: 5, operation: resize)
+        == .rejected(.backpressure)
+    )
+    #expect(ledger.wrote(1) == 1)
+    #expect(
+      ledger.classify(writer: writer, sequence: 5, operation: resize) == .admit
     )
   }
 
@@ -56,12 +89,17 @@ struct LedgerTests {
   }
 
   @Test
-  func `discarded operations are retired, never retried, and free the writer`() throws {
+  func `discarded operations are retired, never retried, and free the writer`()
+    throws
+  {
     var ledger = HostInputLedger()
     try ledger.authorize(writer)
     for n in 1 ... 3 {
       let op = InputOperation.committedText("x\(n)")
-      #expect(ledger.classify(writer: writer, sequence: UInt64(n), operation: op) == .admit)
+      #expect(
+        ledger.classify(writer: writer, sequence: UInt64(n), operation: op)
+          == .admit
+      )
       ledger.record(UInt64(n), operation: op, bytes: [])
     }
     // A different writer cannot take over while operations are admitted.
@@ -73,8 +111,11 @@ struct LedgerTests {
     #expect(!ledger.hasPending)
     // A retired operation is not admitted again.
     #expect(
-      ledger.classify(writer: writer, sequence: 2, operation: .committedText("x2"))
-        == .alreadyApplied
+      ledger.classify(
+        writer: writer,
+        sequence: 2,
+        operation: .committedText("x2")
+      ) == .alreadyApplied
     )
     try ledger.authorize(WriterID.random())
   }
@@ -84,14 +125,24 @@ struct LedgerTests {
     var ledger = HostInputLedger()
     try ledger.authorize(writer)
     let a = InputOperation.committedText("ab")
-    #expect(ledger.classify(writer: writer, sequence: 2, operation: a) == .rejected(.gap))
-    #expect(ledger.classify(writer: writer, sequence: 1, operation: a) == .admit)
+    #expect(
+      ledger.classify(writer: writer, sequence: 2, operation: a)
+        == .rejected(.gap)
+    )
+    #expect(
+      ledger.classify(writer: writer, sequence: 1, operation: a) == .admit
+    )
     ledger.record(1, operation: a, bytes: Array("ab".utf8))
     // Identical retry continues; conflicting retry is rejected.
-    #expect(ledger.classify(writer: writer, sequence: 1, operation: a) == .inProgress)
     #expect(
-      ledger.classify(writer: writer, sequence: 1, operation: .committedText("x"))
-        == .rejected(.conflict)
+      ledger.classify(writer: writer, sequence: 1, operation: a) == .inProgress
+    )
+    #expect(
+      ledger.classify(
+        writer: writer,
+        sequence: 1,
+        operation: .committedText("x")
+      ) == .rejected(.conflict)
     )
     // A partial write keeps the unwritten suffix only.
     #expect(ledger.wrote(1) == nil)
@@ -99,7 +150,10 @@ struct LedgerTests {
     #expect(ledger.nextWrite.map { Array($0.bytes) } == Array("b".utf8))
     #expect(ledger.wrote(1) == 1)
     #expect(ledger.lastApplied == 1)
-    #expect(ledger.classify(writer: writer, sequence: 1, operation: a) == .alreadyApplied)
+    #expect(
+      ledger.classify(writer: writer, sequence: 1, operation: a)
+        == .alreadyApplied
+    )
     #expect(
       ledger.classify(writer: WriterID.random(), sequence: 2, operation: a)
         == .rejected(.wrongWriter)
@@ -111,7 +165,9 @@ struct LedgerTests {
     var ledger = HostInputLedger()
     try ledger.authorize(writer)
     let op = InputOperation.resize(columns: 90, rows: 30, resizeRevision: 1)
-    #expect(ledger.classify(writer: writer, sequence: 1, operation: op) == .admit)
+    #expect(
+      ledger.classify(writer: writer, sequence: 1, operation: op) == .admit
+    )
     ledger.record(1, operation: op, bytes: [])
     #expect(ledger.lastApplied == 0)
     #expect(ledger.completeHead() == 1)
@@ -119,7 +175,8 @@ struct LedgerTests {
   }
 
   @Test
-  func `writer takeover waits for admitted input and restarts sequence`() throws {
+  func `writer takeover waits for admitted input and restarts sequence`() throws
+  {
     var ledger = HostInputLedger()
     try ledger.authorize(writer)
     ledger.record(1, operation: .committedText("x"), bytes: [0x78])
@@ -130,7 +187,10 @@ struct LedgerTests {
     _ = ledger.wrote(1)
     try ledger.authorize(next)
     #expect(ledger.lastApplied == 0)
-    #expect(ledger.classify(writer: next, sequence: 1, operation: .committedText("y")) == .admit)
+    #expect(
+      ledger.classify(writer: next, sequence: 1, operation: .committedText("y"))
+        == .admit
+    )
   }
 
   @Test
@@ -138,11 +198,16 @@ struct LedgerTests {
     var ledger = HostInputLedger(byteLimit: 100)
     try ledger.authorize(writer)
     let small = InputOperation.paste(String(repeating: "x", count: 30))
-    #expect(ledger.classify(writer: writer, sequence: 1, operation: small) == .admit)
+    #expect(
+      ledger.classify(writer: writer, sequence: 1, operation: small) == .admit
+    )
     ledger.record(1, operation: small, bytes: Array(repeating: 0x78, count: 30))
     // 30 pending + a 60-byte paste's bound (132) exceeds the limit.
     let paste = InputOperation.paste(String(repeating: "x", count: 60))
-    #expect(ledger.classify(writer: writer, sequence: 2, operation: paste) == .rejected(.backpressure))
+    #expect(
+      ledger.classify(writer: writer, sequence: 2, operation: paste)
+        == .rejected(.backpressure)
+    )
   }
 
   @Test
@@ -166,7 +231,10 @@ struct LedgerTests {
   }
 
   @Test
-  func `exhaustive disconnect at every acknowledgment boundary applies each byte once`() throws {
+  func
+    `exhaustive disconnect at every acknowledgment boundary applies each byte once`()
+    throws
+  {
     // A3: an oracle replays a stream of operations while the connection
     // drops after every possible number of written bytes.
     let ops: [InputOperation] = [
@@ -267,5 +335,24 @@ struct LedgerTests {
     #expect(liveness.staleTimeout == .seconds(4))
     #expect(!liveness.isStale(awaitingResponseFor: nil))
     #expect(liveness.isStale(awaitingResponseFor: .seconds(5)))
+  }
+
+  @Test(arguments: [
+    -1.0, Double.nan, Double.infinity, -Double.infinity, 2.0,
+    Double.greatestFiniteMagnitude,
+  ])
+  func invalidJitterProducesFiniteNonnegativeDelays(jitter: Double) {
+    var backoff = ReconnectBackoff(jitter: jitter)
+    #expect(backoff.jitter.isFinite)
+    #expect((0 ... 1).contains(backoff.jitter))
+    for _ in 0 ..< 100 {
+      let delay = backoff.nextDelay()
+      #expect(delay.isFinite)
+      #expect((0 ... 15).contains(delay))
+    }
+    if jitter < 0 || !jitter.isFinite {
+      backoff.reset()
+      #expect(backoff.nextDelay() == 0.5)
+    }
   }
 }

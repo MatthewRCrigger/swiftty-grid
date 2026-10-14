@@ -352,15 +352,14 @@ struct UnicodeGeneratorTests {
       try? output.close()
       try? error.close()
     }
-    let process = Process()
-    process.executableURL = executable
-    process.arguments = arguments
-    process.standardOutput = output
-    process.standardError = error
-    try process.run()
-    process.waitUntilExit()
+    let status = try TestCommand.run(
+      executable.path,
+      arguments: arguments,
+      stdout: output.fileDescriptor,
+      stderr: error.fileDescriptor
+    )
     return try (
-      process.terminationStatus, String(contentsOf: outputURL, encoding: .utf8),
+      status, String(contentsOf: outputURL, encoding: .utf8),
       String(contentsOf: errorURL, encoding: .utf8),
     )
   }

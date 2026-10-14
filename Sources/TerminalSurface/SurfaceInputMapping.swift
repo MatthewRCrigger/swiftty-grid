@@ -79,8 +79,7 @@ extension SurfaceInput {
     case let .key(event):
       guard let key = SemanticKey(event) else { return nil }
       self = .key(key)
-    case .mouse, .focus, .bytes:
-      return nil
+    case .mouse, .focus, .bytes: return nil
     }
   }
 }
@@ -107,13 +106,17 @@ public final class OrderedInputPump: Sendable {
   private let onResult: @Sendable (SurfaceInput, SurfaceInputResult) -> Void
 
   /// - Parameters:
+  ///   - limit: Maximum queued operations; must be positive.
   ///   - submit: Called serially, in enqueue order.
   ///   - onResult: Called with each outcome, including immediate
   ///     refusals when the pump is full or closed.
   public init(
     limit: Int = OrderedInputPump.defaultLimit,
     submit: @escaping @Sendable (SurfaceInput) async -> SurfaceInputResult,
-    onResult: @escaping @Sendable (SurfaceInput, SurfaceInputResult) -> Void = { _, _ in }
+    onResult: @escaping @Sendable (SurfaceInput, SurfaceInputResult) -> Void = {
+      _,
+      _ in
+    }
   ) {
     precondition(limit > 0)
     self.limit = limit
@@ -128,10 +131,19 @@ public final class OrderedInputPump: Sendable {
   /// is full or closed.
   @discardableResult
   public func enqueue(_ input: SurfaceInput) -> Bool {
-    enum Outcome { case start, queued, refused(InputRefusal) }
+    let valid: Bool
+    do {
+      try input.operation.validate()
+      valid = true
+    } catch { valid = false }
+    enum Outcome {
+      case start, queued
+      case refused(InputRefusal)
+    }
     let outcome = state.withLock { s -> Outcome in
       if s.closed { return .refused(.closed) }
       guard s.queue.count < limit else { return .refused(.backpressure) }
+      guard valid else { return .refused(.invalid) }
       s.queue.append(input)
       guard !s.draining else { return .queued }
       s.draining = true
@@ -141,8 +153,7 @@ public final class OrderedInputPump: Sendable {
     case .start:
       Task { await self.drain() }
       return true
-    case .queued:
-      return true
+    case .queued: return true
     case let .refused(refusal):
       onResult(input, .refused(refusal))
       return false

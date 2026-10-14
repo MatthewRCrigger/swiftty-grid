@@ -39,6 +39,9 @@ public enum FrameValidator {
     guard frame.palette.colors.count == 256 else {
       throw MuxError(.invalidRequest, "palette size")
     }
+    guard frame.palette.isValid else {
+      throw MuxError(.invalidRequest, "palette color")
+    }
     for row in 0 ..< g.rows {
       var expectContinuation = false
       for column in 0 ..< g.columns {
@@ -156,9 +159,12 @@ public enum SMXCodec {
     return e
   }
 
-  /// Largest server record: a frame plus envelope.
+  /// Largest server record: a frame plus envelope, capped at Int.max.
   public static func serverRecordLimit(_ limits: MuxLimits) -> Int {
-    limits.maxFrameBytes + 64 << 10
+    let (limit, overflow) = limits.maxFrameBytes.addingReportingOverflow(
+      64 << 10
+    )
+    return overflow ? Int.max : limit
   }
 
   /// Client records are ordinary control records.

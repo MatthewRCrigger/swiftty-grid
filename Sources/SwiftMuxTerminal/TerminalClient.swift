@@ -61,7 +61,10 @@ public final class TerminalClient {
   private var continuation: CheckedContinuation<Outcome, Never>?
   private var outcome: Outcome?
   private var sources: [any DispatchSourceProtocol] = []
+  private let sourceCancellation = DispatchGroup()
+  private var signalDispositions: [(Int32, sigaction)] = []
   private var eventTask: Task<Void, Never>?
+  private var running = false
   private let limits: MuxLimits
 
   public init(
@@ -83,14 +86,31 @@ public final class TerminalClient {
     size = tty.size
   }
 
-  /// Runs until detach or connection loss. The outer tty is restored
+  /// Runs until detach, cancellation or connection loss. A concurrent call
+  /// fails; after completion, later calls return the original outcome.
+  /// The outer tty is restored
   /// before returning, and before waiting on any service cleanup.
   public func run() async -> Outcome {
-    do { try tty.enter() } catch { return .failed("\(error)") }
-    installSources()
-    startEvents()
-    syncLayout()
-    return await withCheckedContinuation { continuation = $0 }
+    guard !running else { return .failed("terminal client is already running") }
+    if let outcome { return outcome }
+    running = true
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        self.continuation = continuation
+        guard !Task.isCancelled else {
+          finish(.detached("cancelled"), detach: true)
+          return
+        }
+        do {
+          try tty.enter()
+          try installSources()
+          startEvents()
+          syncLayout()
+        } catch { finish(.failed("\(error)"), detach: true) }
+      }
+    } onCancel: {
+      Task { @MainActor in self.finish(.detached("cancelled"), detach: true) }
+    }
   }
 
   private func finish(_ result: Outcome, detach: Bool) {
@@ -100,12 +120,23 @@ public final class TerminalClient {
     sources = []
     escapeTimer?.cancel()
     messageTimer?.cancel()
-    tty.restore()
+    eventTask?.cancel()
     let connection = self.connection
     Task {
+      // Restore process signal state after the sources finish cancelling,
+      // and restore the tty before waiting for the service.
+      await withCheckedContinuation { continuation in
+        sourceCancellation.notify(queue: .main) { continuation.resume() }
+      }
+      tty.restore()
+      for (sig, var disposition) in signalDispositions {
+        _ = sigaction(sig, &disposition, nil)
+      }
+      signalDispositions = []
+      eventTask = nil
       if detach { await connection.detach() }
       await connection.close()
-      self.eventTask?.cancel()
+      self.running = false
       self.continuation?.resume(returning: result)
       self.continuation = nil
     }
@@ -113,7 +144,7 @@ public final class TerminalClient {
 
   // MARK: Sources
 
-  private func installSources() {
+  private func installSources() throws {
     let read = DispatchSource.makeReadSource(
       fileDescriptor: tty.input,
       queue: .main
@@ -121,21 +152,35 @@ public final class TerminalClient {
     read.setEventHandler { [weak self] in
       MainActor.assumeIsolated { self?.readInput() }
     }
-    read.resume()
-    sources.append(read)
+    startSource(read)
     // Signal handlers only notify normal execution code.
     for sig in [SIGWINCH, SIGTERM, SIGHUP, SIGCONT, SIGINT, SIGQUIT] {
-      signal(sig, SIG_IGN)
+      var ignored = sigaction()
+      ignored.__sigaction_u.__sa_handler = SIG_IGN
+      sigemptyset(&ignored.sa_mask)
+      var previous = sigaction()
+      guard sigaction(sig, &ignored, &previous) == 0 else {
+        throw POSIXFailure("sigaction")
+      }
+      signalDispositions.append((sig, previous))
       let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
       source.setEventHandler { [weak self] in
         MainActor.assumeIsolated { self?.handleSignal(sig) }
       }
-      source.resume()
-      sources.append(source)
+      startSource(source)
     }
   }
 
+  private func startSource(_ source: any DispatchSourceProtocol) {
+    let cancellation = sourceCancellation
+    cancellation.enter()
+    source.setCancelHandler { cancellation.leave() }
+    source.resume()
+    sources.append(source)
+  }
+
   private func handleSignal(_ sig: Int32) {
+    guard outcome == nil else { return }
     switch sig {
     case SIGWINCH:
       size = tty.size
@@ -156,6 +201,7 @@ public final class TerminalClient {
         while let event = try await connection.nextEvent() {
           await self?.handle(event)
         }
+        await self?.finish(.lost("connection closed"), detach: false)
       } catch { await self?.finish(.lost("\(error)"), detach: false) }
     }
   }
@@ -163,6 +209,7 @@ public final class TerminalClient {
   // MARK: Service events
 
   package func handle(_ event: MuxEvent) {
+    guard outcome == nil else { return }
     switch event {
     case let .frame(frame):
       guard frame.identity.attachment == attachment else { return }
@@ -282,7 +329,7 @@ public final class TerminalClient {
     connection.enqueue(command) { [weak self] result in
       DispatchQueue.main.async {
         MainActor.assumeIsolated {
-          guard let self else { return }
+          guard let self, self.outcome == nil else { return }
           switch result {
           case let .success(reply):
             // A switch reply also names the attached workspace.
@@ -436,6 +483,7 @@ public final class TerminalClient {
   // MARK: Input
 
   private func readInput() {
+    guard outcome == nil else { return }
     guard let bytes = tty.read() else {
       finish(.detached("terminal closed"), detach: true)
       return
@@ -445,13 +493,13 @@ public final class TerminalClient {
   }
 
   func feed(_ bytes: [UInt8]) {
-    for event in decoder.feed(bytes) { handle(event) }
+    for event in decoder.feed(bytes) { dispatch(event) }
     escapeTimer?.cancel()
     if decoder.hasPending {
       let work = DispatchWorkItem { [weak self] in
         MainActor.assumeIsolated {
           guard let self else { return }
-          for event in self.decoder.flushPending() { self.handle(event) }
+          for event in self.decoder.flushPending() { self.dispatch(event) }
         }
       }
       escapeTimer = work
@@ -463,6 +511,24 @@ public final class TerminalClient {
   }
 
   private var activePane: PaneID? { activeTab?.activePane }
+
+  /// The decoder coalesces text from one read. Command modes consume
+  /// individual keys; normal input and prompt text stay coalesced.
+  private func dispatch(_ input: DecodedInput) {
+    guard case let .text(text) = input else {
+      handle(input)
+      return
+    }
+    var remaining = text[...]
+    while !remaining.isEmpty {
+      switch mode {
+      case .normal, .prompt:
+        handle(.text(String(remaining)))
+        return
+      default: handle(.text(String(remaining.removeFirst())))
+      }
+    }
+  }
 
   func handle(_ input: DecodedInput) {
     if message != nil {
@@ -751,10 +817,7 @@ public final class TerminalClient {
       state.row = rows - 1
     case (.home, _, _), (_, _, "0"): state.column = 0
     case (.end, _, _), (_, _, "$"):
-      state.column = max(
-        0,
-        state.frame.text(row: state.row).unicodeScalars.count - 1
-      )
+      state.column = FrameText.lineEnd(state.frame, row: state.row)
     case (_, _, "w"):
       let (_, hi) = FrameText.word(
         state.frame,

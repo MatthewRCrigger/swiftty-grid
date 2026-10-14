@@ -3,7 +3,7 @@ import Foundation
 import SessionCore
 
 #if canImport(Darwin)
-  import Darwin
+import Darwin
 #endif
 
 public enum SFTPTransferError: Error, Equatable, Sendable {
@@ -11,9 +11,10 @@ public enum SFTPTransferError: Error, Equatable, Sendable {
   case notRegularFile
   /// The destination exists and overwriting was not approved.
   case destinationExists
-  /// The staged upload source no longer matches its recorded hash.
+  /// The staged source changed content or its path no longer names the
+  /// verified local file.
   case stagedSourceChanged
-  /// The remote source changed size or content during a download.
+  /// A remote source or staged upload changed size or content.
   case remoteSourceChanged
   /// Verification kept failing after the restart budget was used.
   case verificationFailed
@@ -23,6 +24,8 @@ public enum SFTPTransferError: Error, Equatable, Sendable {
   case closeFailed
   case invalidManifest
   case invalidRemotePath
+  case fileTooLarge
+  case invalidOptions
 }
 
 public struct SFTPTransferOptions: Hashable, Sendable {
@@ -30,6 +33,12 @@ public struct SFTPTransferOptions: Hashable, Sendable {
   public var maxOutstanding: Int
   /// Restarts from offset zero allowed per `upload`/`download` call.
   public var maxRestarts: Int
+
+  var isValid: Bool {
+    (1 ... SFTPClient.maxIOLength).contains(chunkSize)
+      && (1 ... RSTLimits.sftpOutstandingRequests).contains(maxOutstanding)
+      && maxRestarts >= 0
+  }
 
   public init(
     chunkSize: Int = RSTLimits.sftpChunkBytes,
@@ -66,42 +75,94 @@ public enum SFTPTransfers {
     stagingDirectory: URL,
     overwriteExisting: Bool = false
   ) async throws -> TransferManifest {
+    try await prepareUpload(
+      source: source,
+      remotePath: remotePath,
+      stagingDirectory: stagingDirectory,
+      overwriteExisting: overwriteExisting,
+      beforeCopyForTesting: nil
+    )
+  }
+
+  static func prepareUpload(
+    source: URL,
+    remotePath: String,
+    stagingDirectory: URL,
+    overwriteExisting: Bool = false,
+    beforeCopyForTesting: (@Sendable () throws -> Void)?,
+    afterHashReadForTesting: (@Sendable (UInt64) throws -> Void)? = nil
+  ) async throws -> TransferManifest {
     guard let parts = RemotePath(remotePath) else {
+      throw SFTPTransferError.invalidRemotePath
+    }
+    let temporary = parts.temporarySibling()
+    guard temporary.utf8.count <= SFTPLimits.maxPathBytes else {
       throw SFTPTransferError.invalidRemotePath
     }
     let staged = stagingDirectory.appendingPathComponent(
       "upload-" + UUID().uuidString
     )
-    let (size, digest) = try await BlockingFileIO.run {
-      () throws -> (UInt64, String?) in
+    let (size, digest) = try await BlockingFileIO.runCancellable {
+      cancellation throws -> (UInt64, String?) in
       let values = try source.resourceValues(forKeys: [.isRegularFileKey])
       guard values.isRegularFile == true else {
+        throw SFTPTransferError.notRegularFile
+      }
+      try beforeCopyForTesting?()
+      try cancellation.check()
+      let sourceFD = Darwin.open(
+        source.path,
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+      )
+      guard sourceFD >= 0 else {
+        if errno == ELOOP { throw SFTPTransferError.notRegularFile }
+        throw posixError()
+      }
+      defer { Darwin.close(sourceFD) }
+      var sourceInfo = Darwin.stat()
+      guard fstat(sourceFD, &sourceInfo) == 0 else { throw posixError() }
+      guard sourceInfo.st_mode & S_IFMT == S_IFREG else {
         throw SFTPTransferError.notRegularFile
       }
       try FileManager.default.createDirectory(
         at: stagingDirectory,
         withIntermediateDirectories: true
       )
-      try FileManager.default.copyItem(at: source, to: staged)
-      try FileManager.default.setAttributes(
-        [.posixPermissions: 0o400],
-        ofItemAtPath: staged.path
+      let fd = Darwin.open(
+        staged.path,
+        O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        0o600
       )
-      let fd = Darwin.open(staged.path, O_RDONLY | O_CLOEXEC)
       guard fd >= 0 else { throw posixError() }
-      defer { Darwin.close(fd) }
+      var prepared = false
+      defer {
+        Darwin.close(fd)
+        if !prepared { _ = Darwin.unlink(staged.path) }
+      }
+      try cancellation.check()
+      guard fcopyfile(sourceFD, fd, nil, copyfile_flags_t(COPYFILE_DATA)) == 0
+      else { throw posixError() }
+      try cancellation.check()
+      guard fchmod(fd, 0o400) == 0 else { throw posixError() }
       var info = Darwin.stat()
       guard fstat(fd, &info) == 0 else { throw posixError() }
-      let size = UInt64(info.st_size)
+      guard let size = UInt64(exactly: info.st_size) else {
+        throw SFTPTransferError.fileTooLarge
+      }
       var hasher = SHA256()
       var offset: UInt64 = 0
       while offset < size {
+        try cancellation.check()
         let want = Int(min(256 * 1024, size - offset))
         let bytes = try LocalFile.readSync(fd: fd, offset: offset, count: want)
+        try afterHashReadForTesting?(offset)
+        try cancellation.check()
         guard bytes.count == want else { return (size, nil) }
         hasher.update(data: bytes)
         offset += UInt64(want)
       }
+      try cancellation.check()
+      prepared = true
       return (size, hexString(hasher.finalize()))
     }
     guard let digest else { throw SFTPTransferError.stagedSourceChanged }
@@ -109,7 +170,7 @@ public enum SFTPTransfers {
       direction: .upload,
       localPath: staged.path,
       remotePath: remotePath,
-      remoteTemporaryPath: parts.temporarySibling(),
+      remoteTemporaryPath: temporary,
       overwriteExisting: overwriteExisting,
       sourceSize: size,
       sourceSHA256: digest
@@ -149,9 +210,14 @@ public enum SFTPTransfers {
     options: SFTPTransferOptions = SFTPTransferOptions(),
     checkpoint: @escaping TransferCheckpoint = { _ in }
   ) async throws {
-    guard manifest.direction == .upload, let sourceSHA = manifest.sourceSHA256,
-      manifest.remoteTemporaryPath != nil,
-      RemotePath(manifest.remotePath) != nil
+    guard options.isValid else { throw SFTPTransferError.invalidOptions }
+    guard manifest.direction == .upload, manifest.hasValidProgress,
+      LocalFile.isValidPath(manifest.localPath),
+      let sourceSHA = manifest.sourceSHA256,
+      let temporaryPath = manifest.remoteTemporaryPath,
+      let temporary = RemotePath(temporaryPath),
+      let destination = RemotePath(manifest.remotePath),
+      !temporary.hasEquivalentSpelling(to: destination)
     else { throw SFTPTransferError.invalidManifest }
     if manifest.state == .completed { return }
 
@@ -209,7 +275,7 @@ public enum SFTPTransfers {
           await checkpoint(manifest)
           throw SFTPTransferError.verificationFailed
         }
-        await context.restart(&manifest)
+        try await context.restart(&manifest)
       }
     }
     try await context.finish(&manifest)
@@ -240,7 +306,10 @@ public enum SFTPTransfers {
 
     /// Discards the current temporary file and starts over under a new
     /// unique name.
-    func restart(_ manifest: inout TransferManifest) async {
+    func restart(_ manifest: inout TransferManifest) async throws {
+      let (nextRestartCount, overflow) = manifest.restartCount
+        .addingReportingOverflow(1)
+      guard !overflow else { throw SFTPTransferError.invalidManifest }
       if let old = manifest.remoteTemporaryPath {
         try? await client.remove(old)
       }
@@ -248,7 +317,7 @@ public enum SFTPTransfers {
         .temporarySibling()
       manifest.acknowledgedOffset = 0
       manifest.remoteIdentity = nil
-      manifest.restartCount += 1
+      manifest.restartCount = nextRestartCount
       // The fresh temporary name has no remote state yet.
       manifest.state = .staged
       await checkpoint(manifest)
@@ -277,7 +346,7 @@ public enum SFTPTransfers {
       } else {
         if manifest.state != .staged {
           // A previous attempt may have created this name; never reuse.
-          await restart(&manifest)
+          try await restart(&manifest)
         }
         handle = try await client.open(
           manifest.remoteTemporaryPath!,
@@ -288,17 +357,14 @@ public enum SFTPTransfers {
       manifest.state = .transferring
       await checkpoint(manifest)
 
-      do {
-        try await pipelineWrite(handle: handle, manifest: &manifest)
-      } catch {
-        try? await client.close(handle)
+      do { try await pipelineWrite(handle: handle, manifest: &manifest) } catch
+      {
+        await client.closeAfterFailure(handle)
         throw error
       }
-      do {
-        try await client.close(handle)
-      } catch let error as SFTPError where error.statusCode != nil {
-        throw SFTPTransferError.closeFailed
-      }
+      do { try await client.close(handle) } catch let error as SFTPError
+        where error.statusCode != nil
+      { throw SFTPTransferError.closeFailed }
       if let attributes = try await statIfExists(
         manifest.remoteTemporaryPath!,
         client: client
@@ -324,7 +390,8 @@ public enum SFTPTransfers {
         var completed: [UInt64: UInt64] = [:]
         var inFlight = 0
         while next < size || inFlight > 0 {
-          while inFlight < options.maxOutstanding, next < size {
+          while inFlight + completed.count < options.maxOutstanding, next < size
+          {
             try await gate.waitUntilOpen()
             let length = Int(min(UInt64(options.chunkSize), size - next))
             let data = try await source.read(at: next, count: length)
@@ -357,9 +424,9 @@ public enum SFTPTransfers {
     /// Handles a manifest left in `.renaming` or `.conflict`. Returns
     /// `true` once the upload is verified and published; `false` when the
     /// transfer must run (again).
-    func resumeFinalization(_ manifest: inout TransferManifest) async throws
-      -> Bool
-    {
+    func resumeFinalization(
+      _ manifest: inout TransferManifest
+    ) async throws -> Bool {
       let temp = manifest.remoteTemporaryPath!
       let tempAttributes = try await statIfExists(temp, client: client)
       if let tempAttributes {
@@ -379,7 +446,7 @@ public enum SFTPTransfers {
           try await finish(&manifest)
           return true
         }
-        await restart(&manifest)
+        try await restart(&manifest)
         return false
       }
       if manifest.state == .conflict {
@@ -414,14 +481,33 @@ public enum SFTPTransfers {
     /// Publishes the verified temporary file under the destination name.
     func finish(_ manifest: inout TransferManifest) async throws {
       let temp = manifest.remoteTemporaryPath!
-      if try await exists(manifest.remotePath, client: client) {
-        guard manifest.overwriteExisting else {
-          manifest.state = .conflict
-          await checkpoint(manifest)
-          throw SFTPTransferError.destinationExists
-        }
-        manifest.state = .renaming
+      let destinationExists = try await exists(
+        manifest.remotePath,
+        client: client
+      )
+      if destinationExists, !manifest.overwriteExisting {
+        manifest.state = .conflict
         await checkpoint(manifest)
+        throw SFTPTransferError.destinationExists
+      }
+      manifest.state = .renaming
+      await checkpoint(manifest)
+      // Checkpoints can suspend while the temporary entry changes. Verify
+      // again before removing an approved destination or publishing bytes.
+      guard try await client.lstat(temp).isRegularFile else {
+        throw SFTPTransferError.notRegularFile
+      }
+      guard
+        try await remoteSHA256(
+          client: client,
+          path: temp,
+          length: manifest.sourceSize,
+          options: options,
+          gate: gate,
+          expectEOF: true
+        ) == manifest.sourceSHA256
+      else { throw SFTPTransferError.remoteSourceChanged }
+      if destinationExists {
         if client.supportsPOSIXRename {
           try await client.posixRename(temp, to: manifest.remotePath)
         } else {
@@ -429,8 +515,6 @@ public enum SFTPTransfers {
           try await client.rename(temp, to: manifest.remotePath)
         }
       } else {
-        manifest.state = .renaming
-        await checkpoint(manifest)
         try await client.rename(temp, to: manifest.remotePath)
       }
       await complete(&manifest)
@@ -441,9 +525,7 @@ public enum SFTPTransfers {
       manifest.state = .completed
       await checkpoint(manifest)
       let staged = manifest.localPath
-      _ = try? await BlockingFileIO.run {
-        try FileManager.default.removeItem(atPath: staged)
-      }
+      _ = try? await BlockingFileIO.run { _ = Darwin.unlink(staged) }
     }
   }
 
@@ -456,14 +538,18 @@ public enum SFTPTransfers {
     options: SFTPTransferOptions = SFTPTransferOptions(),
     checkpoint: TransferCheckpoint = { _ in }
   ) async throws {
-    guard manifest.direction == .download,
-      let destinationPath = manifest.localDestinationPath
+    guard options.isValid else { throw SFTPTransferError.invalidOptions }
+    guard manifest.direction == .download, manifest.hasValidProgress,
+      LocalFile.isValidPath(manifest.localPath),
+      let destinationPath = manifest.localDestinationPath,
+      LocalFile.isValidPath(destinationPath)
     else { throw SFTPTransferError.invalidManifest }
     if manifest.state == .completed { return }
 
     let local = try await LocalFile.open(
       manifest.localPath,
-      flags: O_RDWR | O_CREAT
+      flags: O_RDWR | O_CREAT,
+      excluding: destinationPath
     )
     defer { Darwin.close(local.fd) }
 
@@ -507,11 +593,14 @@ public enum SFTPTransfers {
           await checkpoint(manifest)
           throw SFTPTransferError.verificationFailed
         }
+        let (nextRestartCount, overflow) = manifest.restartCount
+          .addingReportingOverflow(1)
+        guard !overflow else { throw SFTPTransferError.invalidManifest }
         try await local.truncate(to: 0)
         manifest.acknowledgedOffset = 0
         manifest.prefixSHA256 = nil
         manifest.remoteIdentity = nil
-        manifest.restartCount += 1
+        manifest.restartCount = nextRestartCount
         manifest.state = .transferring
         await checkpoint(manifest)
       }
@@ -521,12 +610,39 @@ public enum SFTPTransfers {
     let overwrite = manifest.overwriteExisting
     let temporaryPath = manifest.localPath
     let published = try await BlockingFileIO.run { () throws -> Bool in
+      // Verification used the open descriptor. The caller's checkpoint
+      // may have replaced its name while that descriptor remained valid.
+      var opened = Darwin.stat()
+      guard fstat(local.fd, &opened) == 0 else { throw posixError() }
+      var named = Darwin.stat()
+      guard lstat(temporaryPath, &named) == 0 else {
+        if errno == ENOENT { throw SFTPTransferError.stagedSourceChanged }
+        throw posixError()
+      }
+      guard named.st_mode & S_IFMT == S_IFREG, named.st_dev == opened.st_dev,
+        named.st_ino == opened.st_ino
+      else { throw SFTPTransferError.stagedSourceChanged }
       let fileManager = FileManager.default
       let destination = URL(fileURLWithPath: destinationPath)
       let temporary = URL(fileURLWithPath: temporaryPath)
-      if fileManager.fileExists(atPath: destinationPath) {
+      var existing = Darwin.stat()
+      let destinationExists = lstat(destinationPath, &existing) == 0
+      if !destinationExists, errno != ENOENT { throw posixError() }
+      if destinationExists {
         guard overwrite else { return false }
-        _ = try fileManager.replaceItemAt(destination, withItemAt: temporary)
+        let kind = existing.st_mode & S_IFMT
+        guard kind == S_IFREG || kind == S_IFLNK else {
+          throw SFTPTransferError.notRegularFile
+        }
+        if kind == S_IFLNK {
+          try replaceLocalSymlink(
+            local: local,
+            temporary: temporary,
+            destination: destination
+          )
+        } else {
+          _ = try fileManager.replaceItemAt(destination, withItemAt: temporary)
+        }
       } else {
         try fileManager.moveItem(at: temporary, to: destination)
       }
@@ -544,9 +660,40 @@ public enum SFTPTransfers {
     await checkpoint(manifest)
   }
 
-  private static func identity(_ attributes: SFTPAttributes)
-    -> RemoteFileIdentity
-  {
+  /// Copies the verified descriptor beside the destination before the
+  /// same-volume rename, so even a cross-volume staging file is supported.
+  /// Called only on BlockingFileIO.queue with overwrite approval.
+  private static func replaceLocalSymlink(
+    local: LocalFile,
+    temporary: URL,
+    destination: URL
+  ) throws {
+    let sibling = destination.deletingLastPathComponent()
+      .appendingPathComponent("download-" + UUID().uuidString + ".part")
+    let fd = Darwin.open(
+      sibling.path,
+      O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+      0o600
+    )
+    guard fd >= 0 else { throw posixError() }
+    defer {
+      Darwin.close(fd)
+      _ = Darwin.unlink(sibling.path)
+    }
+    guard fcopyfile(local.fd, fd, nil, copyfile_flags_t(COPYFILE_DATA)) == 0
+    else { throw posixError() }
+    guard fsync(fd) == 0 else { throw posixError() }
+    guard Darwin.rename(sibling.path, destination.path) == 0 else {
+      throw posixError()
+    }
+    // Publication succeeded; a cleanup failure must not report an
+    // unsuccessful transfer after the destination has already changed.
+    _ = Darwin.unlink(temporary.path)
+  }
+
+  private static func identity(
+    _ attributes: SFTPAttributes
+  ) -> RemoteFileIdentity {
     RemoteFileIdentity(
       size: attributes.size ?? 0,
       modificationTime: attributes.modificationTime,
@@ -566,6 +713,9 @@ public enum SFTPTransfers {
     let attributes = try await client.stat(manifest.remotePath)
     guard attributes.isRegularFile, let size = attributes.size else {
       throw SFTPTransferError.notRegularFile
+    }
+    guard size <= UInt64(off_t.max) else {
+      throw SFTPTransferError.fileTooLarge
     }
     let current = identity(attributes)
     var hasher = SHA256()
@@ -605,7 +755,8 @@ public enum SFTPTransfers {
         var completed: [UInt64: [UInt8]] = [:]
         var inFlight = 0
         while next < size || inFlight > 0 {
-          while inFlight < options.maxOutstanding, next < size {
+          while inFlight + completed.count < options.maxOutstanding, next < size
+          {
             try await gate.waitUntilOpen()
             let offset = next
             let length = Int(min(UInt64(options.chunkSize), size - next))
@@ -634,14 +785,12 @@ public enum SFTPTransfers {
         }
       }
     } catch {
-      try? await client.close(handle)
+      await client.closeAfterFailure(handle)
       throw error
     }
-    do {
-      try await client.close(handle)
-    } catch let error as SFTPError where error.statusCode != nil {
-      throw SFTPTransferError.closeFailed
-    }
+    do { try await client.close(handle) } catch let error as SFTPError
+      where error.statusCode != nil
+    { throw SFTPTransferError.closeFailed }
   }
 
   private static func prefixHasher(
@@ -696,23 +845,26 @@ public enum SFTPTransfers {
     expectEOF: Bool
   ) async throws -> String? {
     let handle = try await client.open(path, flags: [.read])
+    var digest: String?
     do {
-      let digest = try await withThrowingTaskGroup(
-        of: (UInt64, [UInt8]?).self
-      ) { group -> String? in
+      digest = try await withThrowingTaskGroup(of: (UInt64, [UInt8]?).self) {
+        group -> String? in
         var hasher = SHA256()
         var next: UInt64 = 0
         var hashed: UInt64 = 0
         var completed: [UInt64: [UInt8]] = [:]
         var inFlight = 0
         while next < length || inFlight > 0 {
-          while inFlight < options.maxOutstanding, next < length {
+          while inFlight + completed.count < options.maxOutstanding,
+            next < length
+          {
             try await gate.waitUntilOpen()
             let offset = next
             let count = Int(min(UInt64(options.chunkSize), length - next))
             group.addTask {
               do {
-                return (offset, try await readFully(client, handle, offset, count))
+                let bytes = try await readFully(client, handle, offset, count)
+                return (offset, bytes)
               } catch SFTPTransferError.remoteSourceChanged {
                 return (offset, nil)
               }
@@ -736,28 +888,25 @@ public enum SFTPTransfers {
       }
       if digest != nil, expectEOF {
         let extra = try await client.read(handle, offset: length, length: 1)
-        if let extra, !extra.isEmpty {
-          try? await client.close(handle)
-          return nil
-        }
+        if let extra, !extra.isEmpty { digest = nil }
       }
-      try? await client.close(handle)
-      return digest
     } catch {
-      try? await client.close(handle)
+      await client.closeAfterFailure(handle)
       throw error
     }
+    do { try await client.close(handle) } catch let error as SFTPError
+      where error.statusCode != nil
+    { throw SFTPTransferError.closeFailed }
+    return digest
   }
 
   static func statIfExists(
     _ path: String,
     client: SFTPClient
   ) async throws -> SFTPAttributes? {
-    do {
-      return try await client.lstat(path)
-    } catch let error as SFTPError where error.statusCode == .noSuchFile {
-      return nil
-    }
+    do { return try await client.lstat(path) } catch let error as SFTPError
+      where error.statusCode == .noSuchFile
+    { return nil }
   }
 
   static func exists(_ path: String, client: SFTPClient) async throws -> Bool {
@@ -767,20 +916,44 @@ public enum SFTPTransfers {
   // MARK: Cleanup
 
   /// Best-effort removal of a transfer's temporary and staged files,
-  /// e.g. after the user cancels for good. Never touches the destination.
+  /// e.g. after the user cancels for good. Never touches the destination
+  /// or recursively removes a directory substituted at a temporary path.
   public static func discard(
     _ manifest: TransferManifest,
     client: SFTPClient?
   ) async {
     if manifest.direction == .upload, manifest.state != .completed,
-      let temp = manifest.remoteTemporaryPath, let client
+      let temp = manifest.remoteTemporaryPath, let client,
+      let temporary = RemotePath(temp),
+      let destination = RemotePath(manifest.remotePath),
+      !temporary.hasEquivalentSpelling(to: destination)
     {
       try? await client.remove(temp)
     }
     if manifest.state != .completed || manifest.direction == .upload {
       let path = manifest.localPath
+      let download = manifest.direction == .download
+      let destinationPath = manifest.localDestinationPath
       _ = try? await BlockingFileIO.run {
-        try FileManager.default.removeItem(atPath: path)
+        guard LocalFile.isValidPath(path) else { return }
+        if download {
+          // An invalid download may name its destination as its stage.
+          // Do not delete that file, including a destination's referent.
+          guard let destinationPath, LocalFile.isValidPath(destinationPath)
+          else { return }
+          var local = Darwin.stat()
+          guard lstat(path, &local) == 0 else { return }
+          var destination = Darwin.stat()
+          if stat(destinationPath, &destination) == 0 {
+            guard
+              local.st_dev != destination.st_dev
+                || local.st_ino != destination.st_ino
+            else { return }
+          } else if errno != ENOENT {
+            return
+          }
+        }
+        _ = Darwin.unlink(path)
       }
     }
   }
@@ -791,6 +964,22 @@ public enum SFTPTransfers {
 struct RemotePath {
   let directory: String
   let name: String
+
+  /// Compares UTF-8 path components after removing dot components and
+  /// repeated separators. Preserve POSIX's special double-slash root.
+  func hasEquivalentSpelling(to other: RemotePath) -> Bool {
+    let first = directory + name
+    let second = other.directory + other.name
+    func rootKind(_ path: String) -> Int {
+      if path.hasPrefix("//"), !path.hasPrefix("///") { return 2 }
+      return path.hasPrefix("/") ? 1 : 0
+    }
+    guard rootKind(first) == rootKind(second) else { return false }
+    func components(_ path: String) -> [[UInt8]] {
+      path.split(separator: "/").filter { $0 != "." }.map { Array($0.utf8) }
+    }
+    return components(first) == components(second)
+  }
 
   init?(_ path: String) {
     guard !path.isEmpty, path.utf8.count <= SFTPLimits.maxPathBytes,
@@ -808,7 +997,14 @@ struct RemotePath {
 
   /// `.<name>.<random>.swiftty-part` in the same directory.
   func temporarySibling() -> String {
-    let stem = String(name.prefix(100))
+    var bytes = 0
+    let prefix = name.unicodeScalars.prefix { scalar in
+      let count = scalar.utf8.count
+      guard bytes + count <= 100 else { return false }
+      bytes += count
+      return true
+    }
+    let stem = String(String.UnicodeScalarView(prefix))
     return directory + "." + stem + "." + hexString(secureRandomBytes(8))
       + ".swiftty-part"
   }

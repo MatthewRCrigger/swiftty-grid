@@ -22,6 +22,13 @@ final class MuxLocalSession: @unchecked Sendable {
   private var nextInput: UInt64 = 1
   private var inputs: [UInt64: (MuxError?) -> Void] = [:]
   private var closed = false
+  private var closePending = false
+  private var closeCompletions: [() -> Void] = []
+  /// Numbered requests still awaiting a service reply (on `queue`).
+  var pendingRequestCount: Int {
+    dispatchPrecondition(condition: .onQueue(queue))
+    return requests.count
+  }
   /// Set on `queue` before any message is expected.
   var onEvent: EventHandler?
   var onPaneChanged: ((PaneID) -> Void)?
@@ -53,6 +60,8 @@ final class MuxLocalSession: @unchecked Sendable {
 
   func request(
     _ command: MuxCommand,
+    expiresAt: ContinuousClock.Instant? = nil,
+    isAdmitted: (@Sendable () -> Bool)? = nil,
     _ completion: @escaping (MuxResult) -> Void
   ) {
     dispatchPrecondition(condition: .onQueue(queue))
@@ -62,13 +71,24 @@ final class MuxLocalSession: @unchecked Sendable {
     let id = nextRequest
     nextRequest += 1
     requests[id] = completion
-    connection.send(.request(id: id, command: command))
+    connection.sendRequest(
+      id: id,
+      command: command,
+      expiresAt: expiresAt,
+      isAdmitted: isAdmitted
+    )
   }
 
-  func request(_ command: MuxCommand) async -> MuxResult {
+  func request(
+    _ command: MuxCommand,
+    expiresAt: ContinuousClock.Instant? = nil,
+    isAdmitted: (@Sendable () -> Bool)? = nil
+  ) async -> MuxResult {
     await withCheckedContinuation { continuation in
       queue.async {
-        self.request(command) { continuation.resume(returning: $0) }
+        self.request(command, expiresAt: expiresAt, isAdmitted: isAdmitted) {
+          continuation.resume(returning: $0)
+        }
       }
     }
   }
@@ -102,12 +122,31 @@ final class MuxLocalSession: @unchecked Sendable {
   }
 
   /// Releases any lease held through this session. Pending callbacks
-  /// complete with `connectionLost`.
-  func close() {
+  /// complete with `connectionLost`; `then` waits for service disconnection.
+  func close(then completion: (() -> Void)? = nil) {
     dispatchPrecondition(condition: .onQueue(queue))
-    connection?.close()
-    connection = nil
+    if let completion { closeCompletions.append(completion) }
+    guard !closePending else { return }
+    guard let connection else {
+      finish("closed")
+      drainCloseCompletions()
+      return
+    }
+    self.connection = nil
+    closePending = true
+    connection.close { [self] in
+      queue.async { [self] in
+        closePending = false
+        drainCloseCompletions()
+      }
+    }
     finish("closed")
+  }
+
+  private func drainCloseCompletions() {
+    let completions = closeCompletions
+    closeCompletions = []
+    for completion in completions { completion() }
   }
 
   private func receive(_ message: ServerMessage) {

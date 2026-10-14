@@ -15,7 +15,8 @@ import Testing
 struct EnvelopeBootstrapper: RemoteBootstrapper {
   let service: BootstrapService
 
-  func bootstrap(_ request: BootstrapRequest) async throws -> BootstrapResponse {
+  func bootstrap(_ request: BootstrapRequest) async throws -> BootstrapResponse
+  {
     let reply = await service.respond(
       toEnvelope: try BootstrapEnvelope.encode(request)
     )
@@ -37,14 +38,15 @@ struct RoamingEndToEndTests {
     let registry: SessionRegistry
     let service: BootstrapService
     let serverConnections: ConnectionLog
+    private let shutdownTask = Mutex<Task<Void, Never>?>(nil)
 
     /// Set when clients reach the listener through an address-changing relay.
     let relay: RebindingUDPRelay?
 
     init(loginShell: Bool = false, throughRelay: Bool = false) async throws {
-      let identity = try AppleTransport.HostIdentity.generate(
-        ipAddresses: ["127.0.0.1"]
-      )
+      let identity = try AppleTransport.HostIdentity.generate(ipAddresses: [
+        "127.0.0.1"
+      ])
       listener = QUICRSTListener(
         identity: identity,
         configuration: .init(host: "127.0.0.1", port: 0)
@@ -56,14 +58,18 @@ struct RoamingEndToEndTests {
         connections.list.withLock { $0.append(connection) }
         pending.withLock { $0 }?.accept(connection)
       }
-      let relay = throughRelay ? try RebindingUDPRelay(serverPort: listener.port) : nil
+      let relay =
+        throughRelay ? try RebindingUDPRelay(serverPort: listener.port) : nil
       self.relay = relay
       let relayPort = relay?.port
       let home = NSTemporaryDirectory()
       let registry = SessionRegistry(
         service: try makeService(),
         identity: TerminalHost.HostIdentity(
-          endpoint: BootstrapEndpoint(host: "127.0.0.1", port: relayPort ?? listener.port),
+          endpoint: BootstrapEndpoint(
+            host: "127.0.0.1",
+            port: relayPort ?? listener.port
+          ),
           certificate: HostCertificate(der: identity.certificateDER)
         ),
         launch: {
@@ -98,11 +104,19 @@ struct RoamingEndToEndTests {
     }
 
     func shutdown() async {
-      relay?.stop()
-      for summary in await registry.list() {
-        _ = await registry.terminate(summary.sessionID)
+      let shutdown = shutdownTask.withLock { task in
+        if let task { return task }
+        let shutdown = Task {
+          relay?.stop()
+          await withCheckedContinuation { continuation in
+            registry.service.prepareToExit { continuation.resume() }
+          }
+          listener.stop()
+        }
+        task = shutdown
+        return shutdown
       }
-      listener.stop()
+      await shutdown.value
     }
   }
 
@@ -126,14 +140,18 @@ struct RoamingEndToEndTests {
   }
 
   @Test
-  func `typed input reaches the host shell and its screen comes back`() async throws {
+  func `typed input reaches the host shell and its screen comes back`()
+    async throws
+  {
     let harness = try await Harness()
     let display = TerminalSession(presentationColumns: 80, rows: 24)
     let client = harness.makeClient(display: display)
     try await client.start(.create(GridSize(columns: 80, rows: 24)))
     try await waitFor("active") { await client.state == .active }
 
-    #expect(await client.submit(.text("echo roam-$((6*7))")) != .refused(.closed))
+    #expect(
+      await client.submit(.text("echo roam-$((6*7))")) != .refused(.closed)
+    )
     _ = await client.submit(.key(SemanticKey(.enter)))
     try await waitFor("echo output") { screen(display).contains("roam-42") }
     try await waitFor("ack") { await client.status.pendingInputCount == 0 }
@@ -164,7 +182,10 @@ struct RoamingEndToEndTests {
   }
 
   @Test
-  func `client address change mid-session recovers the same shell exactly once`() async throws {
+  func
+    `client address change mid-session recovers the same shell exactly once`()
+    async throws
+  {
     // The phone's address changes (Wi-Fi to cellular): the server's replies
     // go to the old address, so the client detects the stall after its
     // path-change probe and reattaches to the retained session (spec §9).
@@ -178,7 +199,7 @@ struct RoamingEndToEndTests {
     let pid = try #require((await harness.pid(session)))
 
     for hop in 1 ... 3 {
-      relay.rebind()
+      try relay.rebind()
       await client.pathChanged()
       try await waitFor("recovery \(hop)", timeout: .seconds(30)) {
         await client.state == .active
@@ -200,7 +221,9 @@ struct RoamingEndToEndTests {
   }
 
   @Test
-  func `lost connection reattaches to the same shell without duplicate input`() async throws {
+  func `lost connection reattaches to the same shell without duplicate input`()
+    async throws
+  {
     let harness = try await Harness()
     let display = TerminalSession(presentationColumns: 80, rows: 24)
     let client = harness.makeClient(display: display)
@@ -243,7 +266,8 @@ struct RoamingEndToEndTests {
     guard
       case let .granted(grant) = try await bootstrapper.bootstrap(
         BootstrapRequest(
-          operation: .create, initialGrid: GridSize(columns: 80, rows: 24)
+          operation: .create,
+          initialGrid: GridSize(columns: 80, rows: 24)
         )
       )
     else {
@@ -252,7 +276,9 @@ struct RoamingEndToEndTests {
       return
     }
     #expect(grant.serverSPKISHA256 != nil)
-    let other = try AppleTransport.HostIdentity.generate(ipAddresses: ["127.0.0.1"])
+    let other = try AppleTransport.HostIdentity.generate(ipAddresses: [
+      "127.0.0.1"
+    ])
 
     // The host's key changed since SSH delivered the pin (or the endpoint
     // is an impostor): the grant pins `other`, the listener presents its
@@ -278,7 +304,7 @@ struct RoamingEndToEndTests {
     try await Task.sleep(for: .milliseconds(200))
     #expect(harness.serverConnections.list.withLock { $0.count } == 0)
     #expect(harness.listener.activeConnectionCount == 0)
-    #expect((await harness.registry.list()).map(\.state) == [.reserved])
+    #expect((try await harness.registry.list()).map(\.state) == [.reserved])
 
     // The genuine pin still attaches.
     let connection = try await QUICGrantConnector().connect(to: grant)
@@ -309,9 +335,7 @@ struct RoamingEndToEndTests {
     try await waitFor("reattached") { await relaunched.state == .active }
     _ = await relaunched.submit(.text("echo $MARK"))
     _ = await relaunched.submit(.key(SemanticKey(.enter)))
-    try await waitFor("retained env") {
-      screen(second).contains("kept-9")
-    }
+    try await waitFor("retained env") { screen(second).contains("kept-9") }
     await relaunched.close(.terminate)
     await harness.shutdown()
   }
@@ -357,9 +381,7 @@ struct RoamingOverSSHTests {
     _ = await client.submit(.key(SemanticKey(.enter)))
     while !display.snapshot().text.joined().contains("via-ssh-25"),
       ContinuousClock.now < deadline + .seconds(10)
-    {
-      try await Task.sleep(for: .milliseconds(20))
-    }
+    { try await Task.sleep(for: .milliseconds(20)) }
     #expect(display.snapshot().text.joined().contains("via-ssh-25"))
     #expect(ssh.state.authRequests.withLock { $0 } >= 1)
 

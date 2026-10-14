@@ -15,21 +15,24 @@ final class AttentionLinkRouter {
   static let thisMac = NavigationHost(id: localHostID(), name: "This Mac")
 
   private let navigator: AttentionNavigator
+  private let present: @MainActor (NSAlert) async -> NSApplication.ModalResponse
   /// Whether this app's own window holds `workspace`'s lease right now
   /// (not merely shows it: a detached window holds none).
   private let ownsWorkspace: @MainActor (WorkspaceID) -> Bool
   /// The last state rendered, so one state never shows two alerts.
   private var shown: AttentionNavigationState?
+  private var requestID = UUID()
+  private var startTask: Task<Void, Never>?
 
   /// `reveal` opens the workspace window (explicitly taking over when
   /// given a lease generation) and activates the pane.
-  init(
+  convenience init(
     ownsWorkspace: @escaping @MainActor (WorkspaceID) -> Bool,
-    reveal: @escaping @MainActor @Sendable (PaneTarget, UInt64?) async throws -> Void
+    reveal:
+      @escaping @MainActor @Sendable (PaneTarget, UInt64?) async throws -> Void
   ) {
-    self.ownsWorkspace = ownsWorkspace
     let opener = Opener(reveal: reveal)
-    navigator = AttentionNavigator(
+    let navigator = AttentionNavigator(
       configuration: AttentionLinkConfiguration(
         infoDictionary: Bundle.main.infoDictionary
       ),
@@ -38,33 +41,60 @@ final class AttentionLinkRouter {
         try await MuxWorkspaceController.connect()
       }
     )
-    navigator.onStateChange = { [weak self] state in
-      self?.schedule(state)
-    }
+    self.init(navigator: navigator, ownsWorkspace: ownsWorkspace)
+  }
+
+  init(
+    navigator: AttentionNavigator,
+    ownsWorkspace: @escaping @MainActor (WorkspaceID) -> Bool,
+    present:
+      @escaping @MainActor (NSAlert) async -> NSApplication.ModalResponse = {
+        $0.runModal()
+      }
+  ) {
+    self.navigator = navigator
+    self.ownsWorkspace = ownsWorkspace
+    self.present = present
+    navigator.onStateChange = { [weak self] state in self?.schedule(state) }
   }
 
   func handle(_ url: URL) {
-    Task { await navigator.open(url) }
+    let id = UUID()
+    requestID = id
+    shown = nil
+    startTask?.cancel()
+    navigator.cancel()
+    startTask = Task {
+      guard id == requestID, !Task.isCancelled else { return }
+      await navigator.open(url)
+    }
   }
 
   /// Alerts run modally; present them after the state change returns.
   private func schedule(_ state: AttentionNavigationState) {
-    Task { @MainActor in await self.render(state) }
+    let id = requestID
+    Task { @MainActor in await self.render(state, request: id) }
   }
 
-  private func render(_ state: AttentionNavigationState) async {
-    guard state == navigator.state, state != shown else { return }
+  private func render(_ state: AttentionNavigationState, request id: UUID) async
+  {
+    guard id == requestID, state == navigator.state, state != shown else {
+      return
+    }
     shown = state
     switch state {
     case .idle, .connecting, .opening, .opened: break
     case .rejected:
-      inform(
+      await inform(
         "This link can't be opened",
         "It is not a valid Swiftty attention link. Nothing was contacted."
       )
+      guard isCurrent(state, request: id) else { return }
       navigator.cancel()
     case let .needsHostSelection(hosts):
-      guard let host = chooseHost(hosts) else { return navigator.cancel() }
+      let host = await chooseHost(hosts)
+      guard isCurrent(state, request: id) else { return }
+      guard let host else { return navigator.cancel() }
       await navigator.selectHost(host)
     case let .unavailable(reason):
       let alert = NSAlert()
@@ -72,7 +102,9 @@ final class AttentionLinkRouter {
       alert.informativeText = DisplayText.sanitize(reason)
       alert.addButton(withTitle: "Try Again")
       alert.addButton(withTitle: "Cancel")
-      if alert.runModal() == .alertFirstButtonReturn {
+      let response = await present(alert)
+      guard isCurrent(state, request: id) else { return }
+      if response == .alertFirstButtonReturn {
         shown = nil
         await navigator.retry()
       } else {
@@ -93,48 +125,63 @@ final class AttentionLinkRouter {
       }
       alert.addButton(withTitle: "Open in Pane")
       alert.addButton(withTitle: "Close")
-      let open = alert.runModal() == .alertFirstButtonReturn
+      let open = await present(alert) == .alertFirstButtonReturn
+      guard isCurrent(state, request: id) else { return }
       await navigator.didView()
+      guard isCurrent(state, request: id) else { return }
       if open { await navigator.openInPane() } else { navigator.cancel() }
     case let .stale(preview):
-      let alert = itemAlert(preview, headline: staleHeadline(preview.item.resolution))
+      let alert = itemAlert(
+        preview,
+        headline: staleHeadline(preview.item.resolution)
+      )
       alert.addButton(withTitle: "OK")
-      alert.runModal()
+      await present(alert)
+      guard isCurrent(state, request: id) else { return }
       await navigator.didView()
+      guard isCurrent(state, request: id) else { return }
       navigator.cancel()
     case let .missing(reason):
-      inform(
+      await inform(
         "Attention item no longer exists",
         reason == .serviceRestarted
           ? "SwiftMux restarted since this link was made, so the pane it named is gone."
           : "The request, pane or terminal this link named was replaced or removed."
       )
+      guard isCurrent(state, request: id) else { return }
       navigator.cancel()
     case let .paneExited(preview):
       let alert = itemAlert(preview, headline: "The program's pane has exited")
       alert.informativeText += "\n\nIts final output may still be retained."
       alert.addButton(withTitle: "Show Final Output")
       alert.addButton(withTitle: "Close")
-      let open = alert.runModal() == .alertFirstButtonReturn
+      let open = await present(alert) == .alertFirstButtonReturn
+      guard isCurrent(state, request: id) else { return }
       await navigator.didView()
+      guard isCurrent(state, request: id) else { return }
       if open { await navigator.openInPane() } else { navigator.cancel() }
     case let .confirmTakeover(offer):
       let alert = NSAlert()
       alert.alertStyle = .warning
       alert.messageText =
         offer.controllerChanged
-        ? "Another client took control first" : "Another client controls this workspace"
-      var detail = "Taking over disconnects it from the workspace. Its shells keep running."
+        ? "Another client took control first"
+        : "Another client controls this workspace"
+      var detail =
+        "Taking over disconnects it from the workspace. Its shells keep running."
       if let holder = offer.holder {
         let place = holder.transport == .remote ? "a remote device" : "this Mac"
         detail =
           "Controlled from \(place) since "
-          + holder.since.formatted(date: .omitted, time: .shortened) + ". " + detail
+          + holder.since.formatted(date: .omitted, time: .shortened) + ". "
+          + detail
       }
       alert.informativeText = detail
       alert.addButton(withTitle: "Take Over")
       alert.addButton(withTitle: "Cancel")
-      if alert.runModal() == .alertFirstButtonReturn {
+      let response = await present(alert)
+      guard isCurrent(state, request: id) else { return }
+      if response == .alertFirstButtonReturn {
         await navigator.confirmTakeover()
       } else {
         navigator.declineTakeover()
@@ -142,6 +189,11 @@ final class AttentionLinkRouter {
       }
     }
   }
+
+  private func isCurrent(
+    _ state: AttentionNavigationState,
+    request id: UUID
+  ) -> Bool { id == requestID && state == navigator.state }
 
   /// The `.ready` note about another controller. `owned` is whether this
   /// app's window holds the lease now; a window detached by another
@@ -170,25 +222,27 @@ final class AttentionLinkRouter {
   }
 
   /// Program text is untrusted: sanitized plain text only.
-  private func itemAlert(_ preview: AttentionPreview, headline: String) -> NSAlert {
+  private func itemAlert(
+    _ preview: AttentionPreview,
+    headline: String
+  ) -> NSAlert {
     let alert = NSAlert()
     alert.messageText = headline
     let status = preview.item.status
     alert.informativeText = [status.app, status.title, status.message]
-      .compactMap { $0.map { DisplayText.sanitize($0) } }
-      .filter { !$0.isEmpty }
+      .compactMap { $0.map { DisplayText.sanitize($0) } }.filter { !$0.isEmpty }
       .joined(separator: "\n")
     return alert
   }
 
-  private func inform(_ title: String, _ text: String) {
+  private func inform(_ title: String, _ text: String) async {
     let alert = NSAlert()
     alert.messageText = title
     alert.informativeText = text
-    alert.runModal()
+    await present(alert)
   }
 
-  private func chooseHost(_ hosts: [NavigationHost]) -> NavigationHost? {
+  private func chooseHost(_ hosts: [NavigationHost]) async -> NavigationHost? {
     let alert = NSAlert()
     alert.messageText = "Which Mac should open this link?"
     alert.informativeText =
@@ -199,7 +253,7 @@ final class AttentionLinkRouter {
     alert.accessoryView = popup
     alert.addButton(withTitle: "Continue")
     alert.addButton(withTitle: "Cancel")
-    guard !hosts.isEmpty, alert.runModal() == .alertFirstButtonReturn else {
+    guard !hosts.isEmpty, await present(alert) == .alertFirstButtonReturn else {
       return nil
     }
     return hosts[popup.indexOfSelectedItem]
@@ -224,11 +278,8 @@ final class AttentionLinkRouter {
       _ target: PaneTarget,
       takeover expectedLease: UInt64?
     ) async throws(AttentionServiceError) {
-      do {
-        try await reveal(target, expectedLease)
-      } catch let error as MuxError {
-        throw SMXAttentionService.map(error)
-      } catch {
+      do { try await reveal(target, expectedLease) } catch let error as MuxError
+      { throw SMXAttentionService.map(error) } catch {
         throw .offline(error.localizedDescription)
       }
     }

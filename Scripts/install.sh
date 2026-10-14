@@ -32,18 +32,43 @@ replace_dev=0
 restart_agent=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --identity) identity=$2; shift 2 ;;
-    --dest) dest=$2; shift 2 ;;
+    --identity | --dest | --host | --bind | --port)
+      option=$1
+      if [ $# -lt 2 ]; then
+        echo "install.sh: $option requires a value" >&2; exit 64
+      fi
+      case "$2" in
+        --* | -h) echo "install.sh: $option requires a value" >&2; exit 64 ;;
+      esac
+      case "$option" in
+        --identity) identity=$2 ;;
+        --dest) dest=$2 ;;
+        --host) host=$2 ;;
+        --bind) bind=$2 ;;
+        --port) port=$2 ;;
+      esac
+      shift 2 ;;
     --roaming) roaming=1; shift ;;
-    --host) host=$2; shift 2 ;;
-    --bind) bind=$2; shift 2 ;;
-    --port) port=$2; shift 2 ;;
     --replace-dev-agent) replace_dev=1; shift ;;
     --restart-agent) restart_agent=1; shift ;;
     -h | --help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "install.sh: unknown option $1" >&2; exit 64 ;;
   esac
 done
+
+case "$dest" in
+  '' | -*) echo "install.sh: --dest must name a directory" >&2; exit 64 ;;
+esac
+
+# Validate before building, installing or changing a running agent. A
+# canonical decimal port also keeps the generated JSON number unambiguous.
+case "$port" in
+  '' | *[!0-9]* | 0*)
+    echo "install.sh: --port must be an integer from 1 to 65535" >&2; exit 64 ;;
+esac
+if [ ${#port} -gt 5 ] || [ "$port" -gt 65535 ]; then
+  echo "install.sh: --port must be an integer from 1 to 65535" >&2; exit 64
+fi
 
 label=com.chr33s.swiftty.swiftmux
 bundle_id=com.chr33s.swiftty
@@ -127,8 +152,7 @@ sudo_if_needed() {
   if [ -w "$1" ]; then shift; "$@"; else shift; sudo "$@"; fi
 }
 mkdir -p "$dest" 2>/dev/null || sudo mkdir -p "$dest"
-sudo_if_needed "$dest" rm -rf -- "$app"
-sudo_if_needed "$dest" ditto "$built" "$app"
+sudo_if_needed "$dest" /usr/bin/python3 -I Scripts/install-app.py "$built" "$app" "$new_team"
 echo "installed $app"
 
 if [ "$reregister" -eq 1 ]; then
@@ -173,15 +197,21 @@ if [ "$roaming" -eq 1 ]; then
     echo "kept existing $roaming_config"
   else
     [ -n "$host" ] || host="$(scutil --get LocalHostName).local"
-    umask 077
-    cat >"$roaming_config" <<EOF
-{
-  "bindAddress": "$bind",
-  "port": $port,
-  "advertisedHost": "$host"
-}
-EOF
-    plutil -lint "$roaming_config" >/dev/null
+    (
+      umask 077
+      temporary=$(mktemp "$roaming_dir/.config.XXXXXX")
+      trap 'rm -f "$temporary"' EXIT
+      trap 'exit 1' HUP INT TERM
+      # Pass strings as values: plutil escapes JSON quotes, backslashes and
+      # control characters. Publish only the completed configuration.
+      plutil -create xml1 "$temporary"
+      plutil -insert bindAddress -string "$bind" "$temporary"
+      plutil -insert port -integer "$port" "$temporary"
+      plutil -insert advertisedHost -string "$host" "$temporary"
+      plutil -lint "$temporary" >/dev/null
+      plutil -convert json "$temporary"
+      mv "$temporary" "$roaming_config"
+    )
     echo "wrote $roaming_config ($host, $bind:$port/udp)"
   fi
 

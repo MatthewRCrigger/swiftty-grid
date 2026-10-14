@@ -1,6 +1,6 @@
 import Foundation
 
-/// Bounds enforced by the SFTP v3 codec before any allocation.
+/// Resource bounds for SFTP v3 packet bodies and individual fields.
 public enum SFTPLimits {
   /// Largest accepted packet body (after the 4-byte length). OpenSSH
   /// uses 256 KiB.
@@ -12,6 +12,7 @@ public enum SFTPLimits {
   public static let maxExtensions = 64
   public static let maxExtensionBytes = 4096
   public static let maxStatusMessageBytes = 4096
+  public static let maxLanguageBytes = 256
 }
 
 public enum SFTPCodecError: Error, Equatable, Sendable {
@@ -23,6 +24,7 @@ public enum SFTPCodecError: Error, Equatable, Sendable {
   case tooManyEntries
   case invalidUTF8
   case trailingBytes
+  case invalidAttributes
 }
 
 /// `SSH_FXF_*` open flags.
@@ -155,10 +157,25 @@ public enum SFTPMessage: Hashable, Sendable {
   case attrs(id: UInt32, SFTPAttributes)
 
   enum PacketType: UInt8 {
-    case initialize = 1, version = 2, open = 3, close = 4, read = 5
-    case write = 6, lstat = 7, fstat = 8, opendir = 11, readdir = 12
-    case remove = 13, realpath = 16, stat = 17, rename = 18
-    case status = 101, handle = 102, data = 103, name = 104, attrs = 105
+    case initialize = 1
+    case version = 2
+    case open = 3
+    case close = 4
+    case read = 5
+    case write = 6
+    case lstat = 7
+    case fstat = 8
+    case opendir = 11
+    case readdir = 12
+    case remove = 13
+    case realpath = 16
+    case stat = 17
+    case rename = 18
+    case status = 101
+    case handle = 102
+    case data = 103
+    case name = 104
+    case attrs = 105
     case extended = 200
   }
 
@@ -178,75 +195,112 @@ public enum SFTPMessage: Hashable, Sendable {
 
   // MARK: Encoding
 
-  /// The complete packet including its `uint32` length prefix.
-  public func encoded() -> [UInt8] {
-    var w = SFTPWriter()
-    w.bytes = [0, 0, 0, 0]
+  /// Validates every field and total body size before allocating a packet.
+  func validatedBodyLength() throws(SFTPCodecError) -> Int {
+    var writer = SFTPWriter(collectBytes: false)
+    try write(to: &writer)
+    return writer.bodyLength
+  }
+
+  /// The complete packet including its `uint32` length prefix. Invalid
+  /// fields and oversized bodies are refused before packet allocation.
+  public func encoded() throws(SFTPCodecError) -> [UInt8] {
+    let length = try validatedBodyLength()
+    var writer = SFTPWriter(collectBytes: true)
+    writer.bytes = [0, 0, 0, 0]
+    writer.bytes.reserveCapacity(length + 4)
+    try write(to: &writer)
+    let size = UInt32(length)
+    writer.bytes[0] = UInt8(size >> 24)
+    writer.bytes[1] = UInt8(size >> 16 & 0xFF)
+    writer.bytes[2] = UInt8(size >> 8 & 0xFF)
+    writer.bytes[3] = UInt8(size & 0xFF)
+    return writer.bytes
+  }
+
+  private func write(to w: inout SFTPWriter) throws(SFTPCodecError) {
     switch self {
     case let .initialize(version, extensions):
-      w.byte(PacketType.initialize.rawValue)
-      w.uint32(version)
-      for e in extensions { w.string(e.name); w.string(e.data) }
+      try w.byte(PacketType.initialize.rawValue)
+      try w.uint32(version)
+      try w.extensions(extensions, counted: false)
     case let .version(version, extensions):
-      w.byte(PacketType.version.rawValue)
-      w.uint32(version)
-      for e in extensions { w.string(e.name); w.string(e.data) }
+      try w.byte(PacketType.version.rawValue)
+      try w.uint32(version)
+      try w.extensions(extensions, counted: false)
     case let .open(id, path, flags, attrs):
-      w.header(.open, id)
-      w.string(path)
-      w.uint32(flags.rawValue)
-      w.attributes(attrs)
+      try w.header(.open, id)
+      try w.string(path, max: SFTPLimits.maxPathBytes)
+      try w.uint32(flags.rawValue)
+      try w.attributes(attrs)
     case let .close(id, handle):
-      w.header(.close, id)
-      w.string(handle)
+      try w.header(.close, id)
+      try w.string(handle, max: SFTPLimits.maxHandleBytes)
     case let .read(id, handle, offset, length):
-      w.header(.read, id)
-      w.string(handle)
-      w.uint64(offset)
-      w.uint32(length)
+      try w.header(.read, id)
+      try w.string(handle, max: SFTPLimits.maxHandleBytes)
+      try w.uint64(offset)
+      try w.uint32(length)
     case let .write(id, handle, offset, data):
-      w.header(.write, id)
-      w.string(handle)
-      w.uint64(offset)
-      w.string(data)
-    case let .lstat(id, path): w.header(.lstat, id); w.string(path)
-    case let .fstat(id, handle): w.header(.fstat, id); w.string(handle)
-    case let .opendir(id, path): w.header(.opendir, id); w.string(path)
-    case let .readdir(id, handle): w.header(.readdir, id); w.string(handle)
-    case let .remove(id, path): w.header(.remove, id); w.string(path)
-    case let .realpath(id, path): w.header(.realpath, id); w.string(path)
-    case let .stat(id, path): w.header(.stat, id); w.string(path)
+      try w.header(.write, id)
+      try w.string(handle, max: SFTPLimits.maxHandleBytes)
+      try w.uint64(offset)
+      try w.string(data, max: SFTPLimits.maxPacketBytes)
+    case let .lstat(id, path):
+      try w.header(.lstat, id);
+      try w.string(path, max: SFTPLimits.maxPathBytes)
+    case let .fstat(id, handle):
+      try w.header(.fstat, id);
+      try w.string(handle, max: SFTPLimits.maxHandleBytes)
+    case let .opendir(id, path):
+      try w.header(.opendir, id);
+      try w.string(path, max: SFTPLimits.maxPathBytes)
+    case let .readdir(id, handle):
+      try w.header(.readdir, id);
+      try w.string(handle, max: SFTPLimits.maxHandleBytes)
+    case let .remove(id, path):
+      try w.header(.remove, id);
+      try w.string(path, max: SFTPLimits.maxPathBytes)
+    case let .realpath(id, path):
+      try w.header(.realpath, id);
+      try w.string(path, max: SFTPLimits.maxPathBytes)
+    case let .stat(id, path):
+      try w.header(.stat, id);
+      try w.string(path, max: SFTPLimits.maxPathBytes)
     case let .rename(id, old, new):
-      w.header(.rename, id)
-      w.string(old)
-      w.string(new)
+      try w.header(.rename, id)
+      try w.string(old, max: SFTPLimits.maxPathBytes)
+      try w.string(new, max: SFTPLimits.maxPathBytes)
     case let .extended(id, name, data):
-      w.header(.extended, id)
-      w.string(name)
-      w.bytes += data
+      try w.header(.extended, id)
+      try w.string(name, max: SFTPLimits.maxExtensionBytes)
+      try w.raw(data)
     case let .status(id, status):
-      w.header(.status, id)
-      w.uint32(status.code.rawValue)
-      w.string(status.message)
-      w.string(status.language)
-    case let .handle(id, handle): w.header(.handle, id); w.string(handle)
-    case let .data(id, data): w.header(.data, id); w.string(data)
+      try w.header(.status, id)
+      try w.uint32(status.code.rawValue)
+      try w.string(status.message, max: SFTPLimits.maxStatusMessageBytes)
+      try w.string(status.language, max: SFTPLimits.maxLanguageBytes)
+    case let .handle(id, handle):
+      try w.header(.handle, id);
+      try w.string(handle, max: SFTPLimits.maxHandleBytes)
+    case let .data(id, data):
+      try w.header(.data, id);
+      try w.string(data, max: SFTPLimits.maxPacketBytes)
     case let .name(id, entries):
-      w.header(.name, id)
-      w.uint32(UInt32(entries.count))
-      for entry in entries {
-        w.string(entry.filename)
-        w.string(entry.longname)
-        w.attributes(entry.attributes)
+      guard entries.count <= SFTPLimits.maxNamesPerPacket else {
+        throw .tooManyEntries
       }
-    case let .attrs(id, attrs): w.header(.attrs, id); w.attributes(attrs)
+      try w.header(.name, id)
+      try w.uint32(UInt32(entries.count))
+      for entry in entries {
+        try w.string(entry.filename, max: SFTPLimits.maxPathBytes)
+        try w.string(entry.longname, max: SFTPLimits.maxLongnameBytes)
+        try w.attributes(entry.attributes)
+      }
+    case let .attrs(id, attrs):
+      try w.header(.attrs, id);
+      try w.attributes(attrs)
     }
-    let length = UInt32(w.bytes.count - 4)
-    w.bytes[0] = UInt8(length >> 24)
-    w.bytes[1] = UInt8(length >> 16 & 0xFF)
-    w.bytes[2] = UInt8(length >> 8 & 0xFF)
-    w.bytes[3] = UInt8(length & 0xFF)
-    return w.bytes
   }
 
   // MARK: Decoding
@@ -285,8 +339,7 @@ public enum SFTPMessage: Hashable, Sendable {
     }
     let id = try r.uint32()
     switch type {
-    case .initialize, .version:
-      preconditionFailure("handled above")
+    case .initialize, .version: preconditionFailure("handled above")
     case .open:
       let path = try r.path()
       let flags = SFTPOpenFlags(rawValue: try r.uint32())
@@ -323,8 +376,10 @@ public enum SFTPMessage: Hashable, Sendable {
       let code = SFTPStatusCode(rawValue: try r.uint32())
       // Some v3 servers omit message/language; accept their absence.
       let text =
-        r.isAtEnd ? "" : try r.lossyString(max: SFTPLimits.maxStatusMessageBytes)
-      let language = r.isAtEnd ? "" : try r.string(max: 256)
+        r.isAtEnd
+        ? "" : try r.lossyString(max: SFTPLimits.maxStatusMessageBytes)
+      let language =
+        r.isAtEnd ? "" : try r.string(max: SFTPLimits.maxLanguageBytes)
       message = .status(
         id: id,
         SFTPStatus(code: code, message: text, language: language)
@@ -358,29 +413,87 @@ public enum SFTPMessage: Hashable, Sendable {
 }
 
 /// Incremental packet framer. Rejects an oversized length prefix before
-/// buffering the body, so buffered bytes stay bounded.
+/// buffering its body. Complete coalesced packets remain buffered until
+/// `next()` drains them.
 public struct SFTPPacketReader: Sendable {
   private var buffer: [UInt8] = []
   private var start = 0
+  private var scan = 0
+  private var bodyRemaining = 0
+  private var rejectedPrefix = false
 
   public init() {}
 
   public var bufferedBytes: Int { buffer.count - start }
 
   public mutating func append(_ bytes: some Sequence<UInt8>) {
+    compact()
+    guard !rejectedPrefix else { return }
+    for byte in bytes {
+      buffer.append(byte)
+      if bodyRemaining > 0 {
+        bodyRemaining -= 1
+        if bodyRemaining == 0 { scan = buffer.count }
+      } else if buffer.count - scan == 4 {
+        checkPrefix()
+        if rejectedPrefix { return }
+      }
+    }
+  }
+
+  /// Copy bounded portions of ordinary receive buffers in bulk.
+  public mutating func append(_ bytes: some Collection<UInt8>) {
+    compact()
+    guard !rejectedPrefix else { return }
+    var index = bytes.startIndex
+    while index != bytes.endIndex {
+      let remaining =
+        bodyRemaining > 0 ? bodyRemaining : 4 - (buffer.count - scan)
+      let next =
+        bytes.index(index, offsetBy: remaining, limitedBy: bytes.endIndex)
+        ?? bytes.endIndex
+      let copied = bytes.distance(from: index, to: next)
+      buffer.append(contentsOf: bytes[index ..< next])
+      index = next
+      if bodyRemaining > 0 {
+        bodyRemaining -= copied
+        if bodyRemaining == 0 { scan = buffer.count }
+      } else if buffer.count - scan == 4 {
+        checkPrefix()
+        if rejectedPrefix { return }
+      }
+    }
+  }
+
+  private mutating func compact() {
     if start > 0, start >= buffer.count / 2 {
       buffer.removeFirst(start)
+      scan -= start
       start = 0
     }
-    buffer.append(contentsOf: bytes)
+  }
+
+  private mutating func checkPrefix() {
+    let length =
+      Int(buffer[scan]) << 24 | Int(buffer[scan + 1]) << 16 | Int(
+        buffer[scan + 2]
+      ) << 8 | Int(buffer[scan + 3])
+    guard length > 0, length <= SFTPLimits.maxPacketBytes else {
+      // Keep the prefix for next() to report in stream order, but
+      // never read its body or any later input from the sequence.
+      rejectedPrefix = true
+      return
+    }
+    bodyRemaining = length
   }
 
   /// The next complete packet, or `nil` if more bytes are needed.
   public mutating func next() throws(SFTPCodecError) -> SFTPMessage? {
     guard bufferedBytes >= 4 else { return nil }
     let length =
-      Int(buffer[start]) << 24 | Int(buffer[start + 1]) << 16
-      | Int(buffer[start + 2]) << 8 | Int(buffer[start + 3])
+      Int(buffer[start]) << 24 | Int(buffer[start + 1]) << 16 | Int(
+        buffer[start + 2]
+      ) << 8 | Int(buffer[start + 3])
     guard length <= SFTPLimits.maxPacketBytes else {
       throw .packetTooLarge(length)
     }
@@ -389,57 +502,6 @@ public struct SFTPPacketReader: Sendable {
     let body = buffer[(start + 4) ..< (start + 4 + length)]
     start += 4 + length
     return try SFTPMessage.decode(body: body)
-  }
-}
-
-struct SFTPWriter {
-  var bytes: [UInt8] = []
-
-  mutating func byte(_ value: UInt8) { bytes.append(value) }
-
-  mutating func uint32(_ value: UInt32) {
-    bytes += [
-      UInt8(value >> 24), UInt8(value >> 16 & 0xFF), UInt8(value >> 8 & 0xFF),
-      UInt8(value & 0xFF),
-    ]
-  }
-
-  mutating func uint64(_ value: UInt64) {
-    uint32(UInt32(value >> 32))
-    uint32(UInt32(value & 0xFFFF_FFFF))
-  }
-
-  mutating func string(_ value: String) { string(Array(value.utf8)) }
-
-  mutating func string(_ value: [UInt8]) {
-    uint32(UInt32(value.count))
-    bytes += value
-  }
-
-  mutating func header(_ type: SFTPMessage.PacketType, _ id: UInt32) {
-    byte(type.rawValue)
-    uint32(id)
-  }
-
-  mutating func attributes(_ a: SFTPAttributes) {
-    var flags: UInt32 = 0
-    if a.size != nil { flags |= 0x1 }
-    if a.uid != nil, a.gid != nil { flags |= 0x2 }
-    if a.permissions != nil { flags |= 0x4 }
-    if a.accessTime != nil, a.modificationTime != nil { flags |= 0x8 }
-    if !a.extended.isEmpty { flags |= 0x8000_0000 }
-    uint32(flags)
-    if let size = a.size { uint64(size) }
-    if let uid = a.uid, let gid = a.gid { uint32(uid); uint32(gid) }
-    if let permissions = a.permissions { uint32(permissions) }
-    if let atime = a.accessTime, let mtime = a.modificationTime {
-      uint32(atime)
-      uint32(mtime)
-    }
-    if !a.extended.isEmpty {
-      uint32(UInt32(a.extended.count))
-      for e in a.extended { string(e.name); string(e.data) }
-    }
   }
 }
 
@@ -464,8 +526,9 @@ struct SFTPReader {
   mutating func uint32() throws(SFTPCodecError) -> UInt32 {
     guard remaining >= 4 else { throw .truncated }
     defer { index += 4 }
-    return UInt32(bytes[index]) << 24 | UInt32(bytes[index + 1]) << 16
-      | UInt32(bytes[index + 2]) << 8 | UInt32(bytes[index + 3])
+    return UInt32(bytes[index]) << 24 | UInt32(bytes[index + 1]) << 16 | UInt32(
+      bytes[index + 2]
+    ) << 8 | UInt32(bytes[index + 3])
   }
 
   mutating func uint64() throws(SFTPCodecError) -> UInt64 {

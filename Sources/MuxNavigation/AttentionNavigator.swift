@@ -9,7 +9,8 @@ public struct AttentionPreview: Sendable, Equatable {
   public var target: PaneTarget
   public var leaseHeldElsewhere: Bool
 
-  public init(item: AttentionItem, target: PaneTarget, leaseHeldElsewhere: Bool) {
+  public init(item: AttentionItem, target: PaneTarget, leaseHeldElsewhere: Bool)
+  {
     self.item = item
     self.target = target
     self.leaseHeldElsewhere = leaseHeldElsewhere
@@ -94,16 +95,25 @@ public final class AttentionNavigator {
   }
   public private(set) var destination: AttentionDestination?
 
-  @ObservationIgnored public var onStateChange:
-    (@MainActor (AttentionNavigationState) -> Void)?
+  @ObservationIgnored
+  public var onStateChange: (@MainActor (AttentionNavigationState) -> Void)?
 
-  @ObservationIgnored private let configuration: AttentionLinkConfiguration
-  @ObservationIgnored private let hosts: any AttentionHostDirectory
-  @ObservationIgnored private let connector: any AttentionServiceConnector
-  @ObservationIgnored private var service: (any AttentionService)?
-  @ObservationIgnored private var host: NavigationHost?
-  @ObservationIgnored private var generation: UInt64 = 0
-  @ObservationIgnored private var seenSent = false
+  @ObservationIgnored
+  private let configuration: AttentionLinkConfiguration
+  @ObservationIgnored
+  private let hosts: any AttentionHostDirectory
+  @ObservationIgnored
+  private let connector: any AttentionServiceConnector
+  @ObservationIgnored
+  private var service: (any AttentionService)?
+  @ObservationIgnored
+  private var host: NavigationHost?
+  @ObservationIgnored
+  private var generation: UInt64 = 0
+  @ObservationIgnored
+  private var seenSent = false
+  @ObservationIgnored
+  private var activation: (id: UUID, task: Task<Void, Never>)?
 
   public init(
     configuration: AttentionLinkConfiguration,
@@ -142,7 +152,10 @@ public final class AttentionNavigator {
     // Step 2: the recipient's own mapping, or an explicit choice.
     let configured = await hosts.configuredHosts()
     guard gen == generation else { return }
-    guard let host = configured.first(where: { $0.id == destination.localHostProfileID })
+    guard
+      let host = configured.first(where: {
+        $0.id == destination.localHostProfileID
+      })
     else {
       state = .needsHostSelection(configured)
       return
@@ -160,7 +173,9 @@ public final class AttentionNavigator {
 
   /// Re-runs resolution after an unavailable state.
   public func retry() async {
-    guard case .unavailable = state, destination != nil, let host else { return }
+    guard case .unavailable = state, destination != nil, let host else {
+      return
+    }
     await resolve(on: host, generation: generation)
   }
 
@@ -180,7 +195,11 @@ public final class AttentionNavigator {
   /// The user confirmed the takeover offer.
   public func confirmTakeover() async {
     guard case let .confirmTakeover(offer) = state else { return }
-    await activate(offer.preview, takeover: offer.expectedLease, generation: generation)
+    await activate(
+      offer.preview,
+      takeover: offer.expectedLease,
+      generation: generation
+    )
   }
 
   /// The user declined the takeover offer: back to read-only metadata.
@@ -213,6 +232,8 @@ public final class AttentionNavigator {
   @discardableResult
   private func restart(_ destination: AttentionDestination?) -> UInt64 {
     generation &+= 1
+    activation?.task.cancel()
+    activation = nil
     self.destination = destination
     seenSent = false
     host = nil
@@ -229,14 +250,14 @@ public final class AttentionNavigator {
     guard let destination else { return }
     self.host = host
     state = .connecting(host)
+    guard gen == generation else { return }
     if let old = service {
       service = nil
       await old.close()
     }
+    guard gen == generation else { return }
     let connected: any AttentionService
-    do {
-      connected = try await connector.connect(to: host)
-    } catch {
+    do { connected = try await connector.connect(to: host) } catch {
       guard gen == generation else { return }
       state = failureState(error)
       return
@@ -292,7 +313,9 @@ public final class AttentionNavigator {
     }
   }
 
-  private func failureState(_ error: AttentionServiceError) -> AttentionNavigationState {
+  private func failureState(
+    _ error: AttentionServiceError
+  ) -> AttentionNavigationState {
     switch error {
     case .serviceRestarted: .missing(.serviceRestarted)
     case .notFound: .missing(.notFound)
@@ -334,8 +357,29 @@ public final class AttentionNavigator {
     takeover: UInt64?,
     generation gen: UInt64
   ) async {
+    activation?.task.cancel()
+    let id = UUID()
+    let task = Task {
+      await performActivation(preview, takeover: takeover, generation: gen)
+    }
+    activation = (id, task)
+    await withTaskCancellationHandler {
+      await task.value
+    } onCancel: {
+      task.cancel()
+    }
+    if activation?.id == id { activation = nil }
+  }
+
+  private func performActivation(
+    _ preview: AttentionPreview,
+    takeover: UInt64?,
+    generation gen: UInt64
+  ) async {
+    guard gen == generation, !Task.isCancelled else { return }
     guard let service else { return }
     state = .opening(preview.target)
+    guard gen == generation, !Task.isCancelled else { return }
     do {
       try await service.open(preview.target, takeover: takeover)
       guard gen == generation else { return }

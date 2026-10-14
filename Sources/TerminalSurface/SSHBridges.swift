@@ -50,7 +50,10 @@ public struct SSHBootstrapper: RemoteBootstrapper {
   public var endpoint: SSHEndpoint
   public var eventLoopGroup: (any EventLoopGroup)?
 
-  public init(endpoint: SSHEndpoint, eventLoopGroup: (any EventLoopGroup)? = nil) {
+  public init(
+    endpoint: SSHEndpoint,
+    eventLoopGroup: (any EventLoopGroup)? = nil
+  ) {
     self.endpoint = endpoint
     self.eventLoopGroup = eventLoopGroup
   }
@@ -61,9 +64,7 @@ public struct SSHBootstrapper: RemoteBootstrapper {
     let connection: SSHConnection
     do {
       connection = try await endpoint.connect(eventLoopGroup: eventLoopGroup)
-    } catch {
-      throw Self.map(error)
-    }
+    } catch { throw Self.map(error) }
     do {
       let response = try await connection.runBootstrap(
         helperPath: endpoint.helperPath,
@@ -92,10 +93,18 @@ public struct SSHBootstrapper: RemoteBootstrapper {
 }
 
 /// `TerminalByteChannel` over an interactive SSH shell channel.
-public final class SSHShellByteChannel: TerminalByteChannel, @unchecked Sendable {
+public final class SSHShellByteChannel: TerminalByteChannel, @unchecked Sendable
+{
+  private enum QueuedEvent {
+    case output([UInt8])
+    case closed
+  }
+
   private struct State {
     var handler: TerminalChannelHandler?
-    var backlog: [SSHShellEvent] = []
+    var backlog: [QueuedEvent] = []
+    var draining = false
+    var closed = false
     var exitStatus: TerminalChannelExit?
     var finished = false
   }
@@ -103,7 +112,7 @@ public final class SSHShellByteChannel: TerminalByteChannel, @unchecked Sendable
   private let state = Mutex(State())
   private var channel: SSHShellChannel?
 
-  private init() {}
+  init() {}
 
   /// Opens a PTY shell. Output is held until `start` and credit arrive.
   public static func open(
@@ -120,21 +129,56 @@ public final class SSHShellByteChannel: TerminalByteChannel, @unchecked Sendable
     return adapter
   }
 
-  private func receive(_ event: SSHShellEvent) {
-    let handler = state.withLock { s -> TerminalChannelHandler? in
-      if s.handler == nil { s.backlog.append(event) }
-      return s.handler
+  func receive(_ event: SSHShellEvent) {
+    let drain = state.withLock { s in
+      guard !s.closed else { return false }
+      switch event {
+      case let .exitStatus(code):
+        s.exitStatus = .exited(Int32(truncatingIfNeeded: code))
+        return false
+      case let .exitSignal(name):
+        s.exitStatus = .signaled(name)
+        return false
+      case let .output(bytes): s.backlog.append(.output(bytes))
+      case .closed:
+        s.closed = true
+        s.backlog.append(.closed)
+      }
+      guard s.handler != nil, !s.draining else { return false }
+      s.draining = true
+      return true
     }
-    if let handler { dispatch(event, to: handler) }
+    if drain { drainEvents() }
   }
 
-  private func dispatch(_ event: SSHShellEvent, to handler: TerminalChannelHandler) {
+  /// Retained delivery work, excluding the single coalesced exit reason.
+  var pendingEventCount: Int { state.withLock { $0.backlog.count } }
+
+  /// Exactly one caller drains events. Concurrent or reentrant arrivals
+  /// join the backlog; callbacks run without holding the state lock.
+  private func drainEvents() {
+    while true {
+      let batch = state.withLock {
+        s -> ([QueuedEvent], TerminalChannelHandler)? in
+        guard let handler = s.handler, !s.backlog.isEmpty else {
+          s.draining = false
+          return nil
+        }
+        let events = s.backlog
+        s.backlog = []
+        return (events, handler)
+      }
+      guard let (events, handler) = batch else { return }
+      for event in events { dispatch(event, to: handler) }
+    }
+  }
+
+  private func dispatch(
+    _ event: QueuedEvent,
+    to handler: TerminalChannelHandler
+  ) {
     switch event {
     case let .output(bytes): handler.onOutput(bytes)
-    case let .exitStatus(code):
-      state.withLock { $0.exitStatus = .exited(Int32(truncatingIfNeeded: code)) }
-    case let .exitSignal(name):
-      state.withLock { $0.exitStatus = .signaled(name) }
     case .closed:
       let exit = state.withLock { s -> TerminalChannelExit? in
         guard !s.finished else { return nil }
@@ -146,12 +190,14 @@ public final class SSHShellByteChannel: TerminalByteChannel, @unchecked Sendable
   }
 
   public func start(_ handler: TerminalChannelHandler) {
-    let backlog = state.withLock { s -> [SSHShellEvent] in
+    let drain = state.withLock { s in
+      guard s.handler == nil else { return false }
       s.handler = handler
-      defer { s.backlog = [] }
-      return s.backlog
+      guard !s.backlog.isEmpty else { return false }
+      s.draining = true
+      return true
     }
-    for event in backlog { dispatch(event, to: handler) }
+    if drain { drainEvents() }
   }
 
   public func grantCredit(_ bytes: Int) { channel?.grantReadCredit(bytes) }

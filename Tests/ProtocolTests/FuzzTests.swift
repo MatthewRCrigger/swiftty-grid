@@ -45,17 +45,16 @@ struct FuzzTests {
           lastFullyAppliedInputSequence: 4,
           resizeRevision: 1
         )
-      ),
-      .error(.init(.inputGap, sequence: 1)),
-    ].map { try ControlRecord.encode($0) }
+      ), .error(.init(.inputGap, sequence: 1)),
+    ]
+    .map { try ControlRecord.encode($0) }
     for round in 0 ..< 4000 {
       var reader = ControlRecordReader()
       let input =
         round % 2 == 0
         ? mutate(seeds[round % seeds.count], &rng)
-        : (0 ..< Int.random(in: 0 ... 64, using: &rng)).map { _ in
-          UInt8.random(in: 0 ... 255, using: &rng)
-        }
+        : (0 ..< Int.random(in: 0 ... 64, using: &rng))
+          .map { _ in UInt8.random(in: 0 ... 255, using: &rng) }
       _ = try? reader.append(input)
       #expect(reader.bufferedBytes <= RSTLimits.maxControlRecordBytes + 4)
     }
@@ -64,9 +63,8 @@ struct FuzzTests {
   @Test
   func `snapshot decoder rejects mutated frames without crashing`() throws {
     var rng = SplitMix64(state: 2)
-    let frames = try [SnapshotFrame.Encoding.plain, .zlib].map {
-      try SnapshotFrame.encode(sampleSnapshot(), encoding: $0)
-    }
+    let frames = try [SnapshotFrame.Encoding.plain, .zlib]
+      .map { try SnapshotFrame.encode(sampleSnapshot(), encoding: $0) }
     var accepted = 0
     for round in 0 ..< 3000 {
       let frame = mutate(frames[round % 2], &rng)
@@ -100,11 +98,17 @@ struct FuzzTests {
   func `bootstrap envelope decoder survives mutation`() throws {
     var rng = SplitMix64(state: 3)
     let seed = try BootstrapEnvelope.encode(
-      BootstrapRequest(operation: .create, initialGrid: GridSize(columns: 80, rows: 24))
+      BootstrapRequest(
+        operation: .create,
+        initialGrid: GridSize(columns: 80, rows: 24)
+      )
     )
     for _ in 0 ..< 3000 {
       let bytes = mutate(seed, &rng)
-      if let request = try? BootstrapEnvelope.decode(BootstrapRequest.self, from: bytes) {
+      if let request = try? BootstrapEnvelope.decode(
+        BootstrapRequest.self,
+        from: bytes
+      ) {
         _ = try? request.validate()
       }
     }
@@ -125,10 +129,19 @@ struct FuzzTests {
         case 0:
           // Submit a random sequence: next, retry, gap or stale.
           let seq = UInt64(
-            max(1, Int(ledger.lastAdmitted) + Int.random(in: -2 ... 2, using: &rng))
+            max(
+              1,
+              Int(ledger.lastAdmitted) + Int.random(in: -2 ... 2, using: &rng)
+            )
           )
-          let op = ops[seq] ?? .committedText(String(repeating: "x", count: Int(seq % 7) + 1))
-          let admission = ledger.classify(writer: writer, sequence: seq, operation: op)
+          let op =
+            ops[seq]
+            ?? .committedText(String(repeating: "x", count: Int(seq % 7) + 1))
+          let admission = ledger.classify(
+            writer: writer,
+            sequence: seq,
+            operation: op
+          )
           if admission == .admit {
             #expect(seq == ledger.lastAdmitted + 1)
             let bytes = Array("[\(seq)]".utf8)
@@ -140,7 +153,9 @@ struct FuzzTests {
           if let next = ledger.nextWrite {
             let n = Int.random(in: 1 ... next.bytes.count, using: &rng)
             written += next.bytes.prefix(n)
-            if let done = ledger.wrote(n) { #expect(done == ledger.lastApplied) }
+            if let done = ledger.wrote(n) {
+              #expect(done == ledger.lastApplied)
+            }
           }
         }
         #expect(ledger.pendingBytes <= 256)

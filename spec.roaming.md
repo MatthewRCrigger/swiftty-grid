@@ -1,13 +1,13 @@
 # Minimal specification: Apple-platform SSH clients with a persistent macOS terminal
 
-**Version:** 0.3 — implementation proposal; Apple-platform OS 27 scope and capability profiles  
+**Version:** 0.4 — combined proposal, Swiftty integration and design provenance\
 **Research date:** 2026-10-10  
 **First-party language:** Swift 6.4, Swift 6 language mode  
 **Product platform scope:** iOS 27.x, iPadOS 27.x, native macOS 27.x, Mac Catalyst 27 on macOS 27.x, visionOS 27.x, tvOS 27.x, and a watchOS 27.x companion; Linux and Windows deferred  
 **Required deployment minimums:** 27.0 for each included Apple platform; see §2.1 for component profiles  
 **Swiftty integration:** Appendix A defines the Swiftty integration and supersedes terminal/frontend-specific choices in this base proposal. Appendix B records design provenance.  
 **Protocol working name:** Remote Screen Transport, `RST/1`  
-**Status:** Design only. Dependency resolution, device builds, protocol security review, and performance tests have not been performed.
+**Status:** Base proposal and integration design. [README.md](README.md) records implementation and verification status. [spec.inbox.md](spec.inbox.md) supersedes this proposal's service ownership, leases, retention and input-acknowledgment rules for the unified service. Historical source-review and document-revision statements below describe their recorded review times, not current implementation status.
 
 ## 1. Product decision
 
@@ -164,7 +164,17 @@ All first-party application, helper, session, and protocol logic MUST be Swift 6
 
 Install one signed helper and a per-user launchd agent. The agent runs as the same account used for SSH, never as root. The initial deployment assumes that account's user agent is loaded; the installer MUST validate this. User logout and agent restart are outside session-survival guarantees.
 
+Stage a complete replacement app beside the destination and validate its bundle, required executables, signature and expected signing team before retiring the previous app. The staged copy's team must agree with the source metadata used for the restart decision. Publish with an atomic exchange for replacement or an exclusive rename for a first install. Copy, validation and publication failures must preserve the previous installed app, and a concurrent first-install destination must not be overwritten. Settle owned copy/verification workers and attempt private staging cleanup on handled interruption, reporting cleanup failures. Keep existing signing-team and explicit agent-restart checks; registration and roaming setup follow publication as separate steps.
+
 The helper exposes a local Unix-domain control socket in an owner-only directory. Validate peer UID and socket ownership. `bootstrap --stdio` communicates with this socket; arbitrary remote users cannot select another UID.
+
+A configurable control-socket name must be one nonempty NUL-free filename component, excluding dot/parent components and separators, so it stays inside the verified directory. Reject empty/NUL client socket paths before lookup or connection, and enforce native UTF-8 path capacity including its terminator before copying into the Unix address.
+
+Use one monotonic elapsed budget for the client control exchange across connection setup, every partial request write, and the full response prefix/body. Partial progress and retries must not restart it. Wait on nonblocking sockets only within the remaining budget and reject completion after expiry. Keep socket ownership until synchronous I/O settles, check frame lengths before body allocation, and translate elapsed transport failure to the helper's unavailable response.
+
+Resolve a file-loaded relative state directory against the selected configuration file's parent, and retain its absolute path in the loaded configuration. Agent and bootstrap helper must therefore select the same control socket regardless of their working directories. Directly constructed relative configurations use the shared default roaming directory. Reject empty or NUL-containing paths when decoding configuration and before opening its file.
+
+Load the agent's selected configuration before initializing its service. Only an absent default configuration permits local-only startup; missing explicit environment or command-line selections, unreadable files and invalid configurations must report failure and exit with status 78. An explicit `--no-roaming` disables loading, and the last roaming command-line option wins.
 
 The agent owns one configurable QUIC/UDP listener and up to eight sessions. A deployment may choose a private-range port such as UDP 51222; that is a project default, not an assigned service port. Bind-address and firewall configuration must be explicit.
 
@@ -210,9 +220,15 @@ limits                    negotiated protocol bounds
 
 The certificate authenticates the QUIC server, while the application token authorizes access to the particular user's session. These are separate checks.
 
+Validate every advertised limit before accepting a grant. Grid and framing bounds must be positive; input and paste budgets may be zero to disable those capacities. Use the smaller of each advertised bound and the client's local hard cap. The granted initial grid must fit those bounds, and the control budget must fit the capability-bearing `Attach` record. Clamp subsequent view-grid proposals to the negotiated dimensions; refuse individual input operations that exceed the paste, generated-input or encoded control-record bounds. Enforce snapshot encoded and decoded byte limits from the header before buffering the body or decompressing, and validate its dimensions before presentation.
+
+A refreshed grant updates these limits without dropping accepted input. Preserve the input sequence and retained operations even when the new pending-byte budget is smaller than their total; refuse new input until acknowledgments free enough room. Reconcile with `Attached` before replay. If an unapplied operation cannot fit the new per-operation bounds, fail that attachment with a protocol error and retain the operation rather than transmitting it beyond the limit or silently discarding it.
+
 The client MUST validate the exact SSH-delivered certificate and TLS proof of possession before sending the token. A self-issued certificate is acceptable **only as an explicitly SSH-authenticated, connection-scoped trust anchor**; accepting arbitrary self-signed certificates is forbidden. Configure a scoped trust policy, expected certificate identity, and validity checks. Certificate replacement requires fresh SSH authentication. [S7]
 
 The helper's certificate/private key is agent-owned and independent of the SSH host private key. Never export the SSH host private key. Certificate construction and Security identity integration require a build-and-device spike. [S8]
+
+Persist the helper identity in an owner-only directory. Validate the opened directory and file descriptors, refuse final-component symlinks and nonregular identity files, and anchor child reads and atomic replacements to that directory. The raw P-256 key must contain exactly 32 bytes; certificate DER is capped locally at 64 KiB. Check size before reading, enforce the cap while reading if a file grows, and refuse oversized generated certificates before replacing persisted identity.
 
 ### 5.3 Application attachment
 
@@ -373,7 +389,15 @@ Required on the iOS/iPadOS, native macOS, Mac Catalyst, and visionOS full client
 
 Implement the SFTP v3 subset over an SSH `sftp` subsystem channel: initialization, directory listing, stat, open, read, write, close, and rename for completing an upload. SFTP requests use explicit offsets and request identifiers; reconnecting creates a new subsystem and new handles. [S15, S16]
 
+Apply the same local packet and field caps to outgoing encoding as incoming decoding. Validate before queueing a request or allocating its encoded packet; bound extension counts/bytes and include all headers and attributes in the total packet budget. Supplied UID/GID and access/modification-time fields must be complete pairs rather than silently omitted.
+
+Directory listing must make bounded progress: reject empty NAME replies, permit at most two excluded dot entries, and limit retained visible entries. A negative listing capacity is refused before opening a handle. Close the directory handle on success or failure; a per-request timeout alone does not bound repeated successful replies.
+
 Limit the UI to regular files, directory navigation, upload, download, cancel, and resume. Reject recursive directory transfer and unexpected special files. Do not invoke a remote shell to quote or manipulate filenames.
+
+Keep directory rows associated with their displayed path: clear old rows when listing starts and reject superseded list results, including repeated refreshes of the same path. Upload preparation belongs to its presentation; cancellation or dismissal must prevent late manifests, overwrite prompts and uploads from appearing in a reopened browser. Join owned preparation and discard any late staged file or staging result whose checkpoint cannot be saved.
+
+Transfer checkpoints are nonsecret JSON capped at 64 KiB per file. Validate regular-file type and size on the opened descriptor before reading, enforce the read cap if the file grows, and reject invalid progress or oversized encoding before replacing a checkpoint.
 
 For upload, first stage an immutable local source in app-controlled storage. Create a uniquely named remote temporary file beside the destination. Use positioned writes, never append mode. Track the highest contiguous acknowledged offset, not the highest offset submitted.
 
@@ -388,6 +412,8 @@ This conservative read-back strategy may be expensive but needs no custom macOS 
 Start with eight outstanding 32 KiB reads/writes and a bounded queue. Pause or reduce bulk work when terminal input is stalled. Separate connections avoid sharing the terminal's application stream, but still compete on the same network bottleneck.
 
 Suspension-bound lifecycle transitions pause SFTP. Resume when permitted execution returns; no continuous suspended-app file-transfer guarantee is made. A Mac window losing focus alone does not pause a transfer; follow the actual lifecycle policy in §9.
+
+Local hashing and upload staging must observe cancellation before queued execution and between bounded hash reads. Keep descriptor ownership until the queued job and its cleanup settle, and remove unpublished staging on cancellation. In-flight filesystem calls may finish before cancellation is observed; this does not promise a fixed settlement deadline.
 
 ## 11. Swift structure and ownership rules
 
@@ -910,9 +936,9 @@ Required by §14. Records where the roaming design and its implementation come f
 
 | Idea | Source | How it is used |
 |---|---|---|
-| Server-authoritative terminal | Winstein & Balakrishnan, *Mosh* paper draft, §§2–3 [S1] | `TerminalHost` keeps the only parser of the PTY output |
+| Server-authoritative terminal | Winstein & Balakrishnan, *Mosh* paper draft, §§2–3 [S1] | The SwiftMux service keeps the only parser of the PTY output; `TerminalHost` exports its current screen |
 | Synchronising replaceable display state instead of a byte log | [S1] | Complete `ScreenSnapshot`s; missed screens are never replayed |
-| Session survives network changes | [S1] | `swifttyd` owns the PTY; clients reattach by session ID |
+| Session survives network changes | [S1] | `swiftmux-agent` owns the PTY; clients reattach to its workspace by session ID |
 | Speculative local echo | [S1] | **Not adopted** in v1 |
 
 No Mosh source, tests, protobuf definitions, packet captures, prediction
@@ -925,8 +951,9 @@ with Mosh, tssh, tsshd or trzsz.
 - TLS for QUIC, early data and replay: RFC 9001 [S9]; 0-RTT is disabled
 - QUIC loss detection and congestion control: RFC 9002 [S11] (delegated to
   Network framework)
-- zlib framing: RFC 1950 [S12]; DEFLATE through the Compression framework, the
-  2-byte header and Adler-32 trailer written in `ScreenProtocol/Zlib.swift`
+- zlib framing: RFC 1950 [S12]; raw DEFLATE encoding through the Compression
+  framework and strict decoding through system zlib, with the 2-byte header
+  and Adler-32 trailer handled in `ScreenProtocol/Zlib.swift`
 - SSH connection protocol, session channels and subsystems: RFC 4254 [S16]
 - SFTP version 3: `draft-ietf-secsh-filexfer-02` [S15]
 

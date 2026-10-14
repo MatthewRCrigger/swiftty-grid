@@ -3,6 +3,16 @@ import SwiftMuxProtocol
 /// Selection text from one frozen frame: immutable cells, graphemes and
 /// wrap flags. New output never changes it.
 public enum FrameText {
+  /// Last nonblank display cell, keeping wide and combining characters
+  /// on their leading cell. An empty line starts at column zero.
+  static func lineEnd(_ frame: PaneFrame, row: Int) -> Int {
+    for column in stride(from: frame.grid.columns - 1, through: 0, by: -1) {
+      let scalars = frame.scalars(row: row, column: column)
+      if !scalars.isEmpty, scalars != [" "] { return column }
+    }
+    return 0
+  }
+
   /// Inclusive range; soft-wrapped rows join without a newline and
   /// trailing blanks of each hard line are trimmed.
   public static func text(

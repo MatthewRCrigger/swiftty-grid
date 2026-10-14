@@ -13,6 +13,30 @@ private final class CallbackLifetime: Sendable {
 }
 
 struct SessionCallbackTests {
+  @Test
+  func `throwing mutations publish changes before propagating the error`() {
+    enum MutationFailure: Error, Equatable { case stopped }
+    let session = TerminalSession(columns: 4, rows: 1)
+    _ = session.snapshot()
+    let observed = Mutex<[UInt32]>([])
+    let redraws = Mutex(0)
+    session.onStateChange = { state in
+      observed.withLock { $0.append(state.palette.foreground) }
+    }
+    session.onUpdate = { redraws.withLock { $0 += 1 } }
+    var palette = Palette.standard
+    palette.foreground = 0x123456
+    #expect(throws: MutationFailure.stopped) {
+      try session.mutate { state in
+        state.setDefaultPalette(palette)
+        throw MutationFailure.stopped
+      }
+    }
+    #expect(observed.withLock { $0 } == [palette.foreground])
+    #expect(redraws.withLock { $0 } == 1)
+    #expect(session.snapshot().palette.foreground == palette.foreground)
+  }
+
   @Test(arguments: ["receive", "generated", "feed", "span"])
   func `program output observers see each transport chunk before parsing`(
     _ transport: String

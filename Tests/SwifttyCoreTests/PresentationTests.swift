@@ -60,6 +60,21 @@ private func scalars(
 }
 
 struct PresentationTests {
+  @Test
+  func `installed frames preserve the active buffer across transitions`() {
+    let session = TerminalSession(presentationColumns: 8, rows: 2)
+    for alternate in [true, false, true, false] {
+      var frame = textFrame([alternate ? "alt" : "primary"], columns: 8)
+      frame.alternateScreen = alternate
+      #expect(session.installPresentation(frame))
+      #expect(session.withState { $0.isAlternateScreen } == alternate)
+      let snapshot = session.snapshot()
+      #expect(snapshot.modes.contains(.alternateScreen) == alternate)
+      #expect(snapshot.text == [alternate ? "alt" : "primary"])
+      #expect(session.withState { $0.scrollbackCount } == 0)
+    }
+  }
+
   static let red: UInt32 = 0xFF0000
   static let green: UInt32 = 0x00FF00
   static let blue: UInt32 = 0x0000FF

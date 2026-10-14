@@ -45,6 +45,8 @@ public final class PTYProcess: @unchecked Sendable {
     rows: Int,
     cellPixelSize: (width: Int, height: Int),
     retainingSlaveForDrain: Bool,
+    copyingCString: (String) -> UnsafeMutablePointer<CChar>? = { strdup($0) },
+    freeingCString: (UnsafeMutablePointer<CChar>) -> Void = { free($0) },
   ) throws(POSIXError) -> PTYProcess {
     let executable = try configuration.executablePath()
     var masterFD: Int32 = -1
@@ -55,9 +57,12 @@ public final class PTYProcess: @unchecked Sendable {
       cellPixelSize: cellPixelSize
     )
     var nameBuffer = [CChar](repeating: 0, count: 128)
-    guard openpty(&masterFD, &slaveFD, &nameBuffer, nil, &size) == 0 else {
-      throw POSIXError("openpty")
-    }
+    try PTYAllocation.open(
+      master: &masterFD,
+      slave: &slaveFD,
+      name: &nameBuffer,
+      size: &size
+    )
     let master = FileDescriptor(masterFD)
     let slave = FileDescriptor(slaveFD)
     // The child reopens the slave by path; neither parent descriptor
@@ -130,8 +135,16 @@ public final class PTYProcess: @unchecked Sendable {
     )
 
     var pid: pid_t = 0
-    let status = withCStrings(argv) { cArgv in
-      withCStrings(env) { cEnv in
+    let status = try CStringVector.withStrings(
+      argv,
+      copying: copyingCString,
+      freeing: freeingCString
+    ) { cArgv throws(POSIXError) in
+      try CStringVector.withStrings(
+        env,
+        copying: copyingCString,
+        freeing: freeingCString
+      ) { cEnv in
         posix_spawn(&pid, executable, &actions, &attributes, cArgv, cEnv)
       }
     }
@@ -190,12 +203,4 @@ public final class PTYProcess: @unchecked Sendable {
   }
 }
 
-private func withCStrings<R>(
-  _ strings: [String],
-  _ body: (UnsafePointer<UnsafeMutablePointer<CChar>?>) -> R
-) -> R {
-  let pointers = strings.map { strdup($0) } + [nil]
-  defer { for p in pointers { free(p) } }
-  return pointers.withUnsafeBufferPointer { body($0.baseAddress!) }
-}
 #endif

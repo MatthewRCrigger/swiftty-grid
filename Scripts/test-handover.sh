@@ -11,7 +11,14 @@
 set -eu
 [ "$#" -ge 1 ] || { echo "usage: $0 <device-udid> [switches] [team-id]" >&2; exit 2; }
 udid=$1
-switches=${2:-50}
+switches=${2-50}
+case "$switches" in
+  *[!0-9]*|'') echo "switches must be a positive integer" >&2; exit 2 ;;
+esac
+if ! [ "$switches" -gt 0 ] 2>/dev/null; then
+  echo "switches must be a positive integer" >&2
+  exit 2
+fi
 team=${3:-72KB9YQR7B}
 repository_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
 # RST_PUBLIC_HOST=<router's public IP> with RST_QUIC_PORT/RST_SSH_PORT
@@ -24,7 +31,19 @@ export RST_PUBLIC_HOST
 
 env_file=$("$repository_root/Scripts/real-ssh-env.sh" start)
 workspace=$(dirname "$env_file")
-trap '"$repository_root/Scripts/real-ssh-env.sh" stop "$workspace"' EXIT INT TERM
+cleanup_fixture() {
+  fixture_status=$?
+  trap - EXIT
+  trap '' INT TERM
+  if ! "$repository_root/Scripts/real-ssh-env.sh" stop "$workspace"; then
+    echo "fixture cleanup incomplete: $workspace" >&2
+    [ "$fixture_status" -ne 0 ] || fixture_status=1
+  fi
+  exit "$fixture_status"
+}
+trap cleanup_fixture EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 . "$env_file"
 
 bundle=dev.swiftty.roaming.handover
@@ -48,7 +67,10 @@ targets:
   Handover:
     type: application
     platform: iOS
-    sources: [{ path: "$repository_root/Tests/DeviceHandover" }]
+    sources:
+      - { path: "$repository_root/Tests/DeviceHandover" }
+      - { path: "$repository_root/Tests/Support/HandoverObservation.swift" }
+      - { path: "$repository_root/Tests/Support/HandoverExecution.swift" }
     dependencies:
       - { package: Swiftty, product: TerminalSurface }
       - { package: Swiftty, product: SSHClient }
@@ -82,18 +104,6 @@ xcrun devicectl device process launch --device "$udid" --terminate-existing \
 echo "HANDOVER launched; Mac at $RST_REAL_SSH_HOST; evidence in $progress"
 echo "HANDOVER watch the phone; toggle Wi-Fi once it says 'toggle Wi-Fi'"
 
-# The retained shell on this Mac appends one line per step.
-seen=0
-while :; do
-  total=$(wc -l <"$progress" | tr -d ' ')
-  while [ "$seen" -lt "$total" ]; do
-    seen=$((seen + 1))
-    echo "HANDOVER mac-log: $(sed -n "${seen}p" "$progress")"
-  done
-  grep -qE '^(done|FAILED)-' "$progress" && break
-  sleep 1
-done
-echo "HANDOVER summary: $(grep -c '^hop-' "$progress") hop lines," \
-  "$(cut -d- -f3 "$progress" | grep -v '^$' | sort -u | wc -l | tr -d ' ') distinct shell pid(s)," \
-  "$(grep '^hop-' "$progress" | cut -d- -f2 | sort | uniq -d | wc -l | tr -d ' ') duplicated hop(s)," \
-  "$(grep -c -- '-migrated$' "$progress") migrated, $(grep -c -- '-reattached$' "$progress") reattached"
+# Validate ordered hops, one retained shell PID, and every path/mode field.
+# The monitor uses monotonic phase deadlines even if the app exits silently.
+python3 -I "$repository_root/Scripts/handover-evidence.py" "$progress" "$switches"

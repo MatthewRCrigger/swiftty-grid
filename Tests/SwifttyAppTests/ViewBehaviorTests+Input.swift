@@ -111,15 +111,20 @@ extension ViewBehaviorTests {
 
   @Test(
     .enabled(if: hasMetal),
-    arguments: ["plain", "attributed", "composition"]
+    arguments: ["plain", "attributed", "composition"],
+    [UInt8(0), 8, 24, 31]
   )
-  func `text system commits clear terminal selection`(_ route: String) throws {
+  func `text system commits clear terminal selection`(
+    _ route: String,
+    _ flags: UInt8
+  ) throws {
     let view = try makeView()
     let writes = Mutex<[UInt8]>([])
     view.session.onWrite = { bytes in
       writes.withLock { $0.append(contentsOf: bytes) }
     }
     view.session.feed(Array("selected output".utf8))
+    view.session.feed(Array("\u{1B}[=\(flags)u".utf8))
     view.selectAll(nil)
     let replacement = NSRange(location: NSNotFound, length: 0)
     view.insertText("", replacementRange: replacement)
@@ -145,7 +150,10 @@ extension ViewBehaviorTests {
     _ = view.session.snapshot()
     #expect(!view.hasSelection)
     #expect(view.session.withState { $0.selection == nil })
-    #expect(writes.withLock { $0 } == Array(text.utf8))
+    let expected =
+      flags & 8 == 0
+      ? text : flags & 16 == 0 ? "\u{1B}[0u" : "\u{1B}[0;1;28450:101:769u"
+    #expect(writes.withLock { $0 } == Array(expected.utf8))
   }
 
   @Test(.enabled(if: hasMetal))

@@ -11,6 +11,149 @@ import UIKit
 @MainActor
 @Suite(.serialized)
 struct ViewCapabilityTests {
+  @Test(
+    .enabled(if: hasMetal),
+    arguments: [false, true],
+    ["insert", "delete", "accessory"]
+  )
+  func `refused keyboard input preserves selection and latched modifiers`(
+    _ allowed: Bool,
+    _ operation: String
+  ) throws {
+    let session = TerminalSession(columns: 20, rows: 3)
+    let view = try TerminalUIView(session: session)
+    session.feed(Array("selected output".utf8))
+    view.selectAll(nil)
+    let selection = try #require(session.withState { $0.selection })
+    view.sticky.tap(.control)
+    view.capabilities.textInput = allowed
+    let writes = Mutex<[UInt8]>([])
+    session.onWrite = { bytes in writes.withLock { $0 += bytes } }
+    switch operation {
+    case "insert": view.insertText("c")
+    case "delete": view.deleteBackward()
+    default: view.accessoryKey(.tab)
+    }
+    _ = session.snapshot()
+    if allowed {
+      #expect(!view.hasSelection && session.withState { $0.selection == nil })
+      #expect(view.sticky.active.isEmpty)
+      #expect(!writes.withLock { $0.isEmpty })
+    } else {
+      #expect(
+        view.hasSelection && session.withState { $0.selection == selection }
+      )
+      #expect(view.sticky.active == .control)
+      #expect(writes.withLock { $0.isEmpty })
+    }
+  }
+
+  @Test(.enabled(if: hasMetal), arguments: [false, true], [false, true])
+  func `accessibility page scrolling respects scrollback permission`(
+    _ allowed: Bool,
+    _ readingElement: Bool
+  ) throws {
+    let session = TerminalSession(columns: 20, rows: 3)
+    let view = try TerminalUIView(session: session)
+    session.feed(Array("0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6".utf8))
+    view.capabilities.scrollback = allowed
+    _ = session.snapshot()
+    view.accessibilityScreen = AccessibilityText(session.snapshot())
+    let before = view.accessibilityPageContent()
+    let moved =
+      readingElement
+      ? view.accessibilityTerminal.accessibilityScroll(.previous)
+      : view.accessibilityScroll(.down)
+    #expect(moved == allowed)
+    #expect(session.withState { $0.viewportOffset } == (allowed ? 2 : 0))
+    if allowed {
+      #expect(
+        TestFixture(view.accessibilityPageContent()) == TestFixture("2\n3\n4")
+      )
+    } else {
+      #expect(view.accessibilityPageContent() == before)
+    }
+  }
+
+  @Test(.enabled(if: hasMetal))
+  func `withdrawing input releases held keys and clears IME and repeat`() throws
+  {
+    let session = TerminalSession(columns: 10, rows: 2)
+    let view = try TerminalUIView(session: session)
+    defer { view.releaseHardwareKeys() }
+    session.feed(Array("\u{1B}[=10u".utf8))
+    let writes = Mutex<[UInt8]>([])
+    session.onWrite = { bytes in writes.withLock { $0 += bytes } }
+    try #require(
+      view.keyDown(
+        usage: 82,
+        modifiers: [],
+        base: "\u{F700}",
+        characters: "\u{F700}"
+      )
+    )
+    let repeatTimer = try #require(view.keyRepeat)
+    view.capabilities.textInput = false
+    #expect(!repeatTimer.isValid)
+    #expect(view.keyRepeat == nil)
+    #expect(view.heldKeys.isEmpty)
+    _ = session.snapshot()
+    #expect(
+      TestFixture(writes.withLock { $0 })
+        == TestFixture(Array("\u{1B}[A\u{1B}[1;1:3A".utf8))
+    )
+    view.pressesEnded([ReviewKeyPress(82)], with: nil)
+    view.capabilities.textInput = true
+    view.setMarkedText(
+      "pending",
+      selectedRange: NSRange(location: 1, length: 0)
+    )
+    view.capabilities.textInput = false
+    #expect(view.markedText.isEmpty)
+    #expect(view.renderer.options.preedit.isEmpty)
+    view.setMarkedText(
+      "refused",
+      selectedRange: NSRange(location: 1, length: 0)
+    )
+    #expect(view.markedText.isEmpty)
+    view.unmarkText()
+    _ = session.snapshot()
+    #expect(
+      TestFixture(writes.withLock { $0 })
+        == TestFixture(Array("\u{1B}[A\u{1B}[1;1:3A".utf8))
+    )
+  }
+
+  @Test(.enabled(if: hasMetal), arguments: [false, true])
+  func
+    `alternate scroll obeys input permission while mouse reporting stays independent`(
+      _ allowed: Bool
+    ) throws
+  {
+    let session = TerminalSession(columns: 10, rows: 2)
+    let view = try TerminalUIView(session: session)
+    session.feed(Array("\u{1B}[?1049h\u{1B}[?1007h".utf8))
+    view.draw(in: view)
+    let writes = Mutex<[UInt8]>([])
+    session.onWrite = { bytes in writes.withLock { $0 += bytes } }
+    view.capabilities.textInput = allowed
+    view.scroll(lines: 1, at: .zero)
+    _ = session.snapshot()
+    #expect(
+      TestFixture(writes.withLock { $0 })
+        == TestFixture(allowed ? Array("\u{1B}[A".utf8) : [])
+    )
+    writes.withLock { $0 = [] }
+    session.feed(Array("\u{1B}[?1000h\u{1B}[?1006h".utf8))
+    view.draw(in: view)
+    view.scroll(lines: 1, at: .zero)
+    _ = session.snapshot()
+    #expect(
+      TestFixture(writes.withLock { $0 })
+        == TestFixture(Array("\u{1B}[<64;1;1M".utf8))
+    )
+  }
+
   nonisolated static let hasMetal = MTLCreateSystemDefaultDevice() != nil
 
   /// Runs the main run loop until `condition` holds or a second passes.

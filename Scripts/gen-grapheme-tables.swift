@@ -29,8 +29,7 @@ guard let dir = args.first,
   args.count == 1 || (args.count == 2 && args.last == "--test-data")
 else {
   FileHandle.standardError.write(
-    "usage: gen-grapheme-tables.swift <ucd-dir> [--test-data]\n"
-      .data(using: .utf8)!
+    Data("usage: gen-grapheme-tables.swift <ucd-dir> [--test-data]\n".utf8)
   )
   exit(2)
 }
@@ -112,7 +111,7 @@ func version(_ text: String, path: String) -> String {
       value = String(header.dropFirst(prefix.count).dropLast(4))
     }
     let parts = value.split(separator: ".", omittingEmptySubsequences: false)
-    guard (parts.count == 3 || (emoji && parts.count == 2)),
+    guard parts.count == 3 || (emoji && parts.count == 2),
       parts.allSatisfy({
         !$0.isEmpty && $0.utf8.allSatisfy { (48 ... 57).contains($0) }
       })
@@ -543,8 +542,10 @@ for shift in 5 ... 8 {
   let t = build(shift: shift)
   let bytes = t.stage1.count * 2 + t.stage2.count
   FileHandle.standardError.write(
-    "shift=\(shift) stage1=\(t.stage1.count) stage2=\(t.stage2.count) total=\(bytes)\n"
-      .data(using: .utf8)!
+    Data(
+      "shift=\(shift) stage1=\(t.stage1.count) stage2=\(t.stage2.count) total=\(bytes)\n"
+        .utf8
+    )
   )
   if best.stage1.isEmpty || bytes < best.stage1.count * 2 + best.stage2.count {
     best = (shift, t.stage1, t.stage2)

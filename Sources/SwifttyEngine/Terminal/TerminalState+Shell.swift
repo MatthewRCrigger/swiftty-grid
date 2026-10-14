@@ -1,3 +1,5 @@
+import Foundation
+
 /// Where the shell is in its prompt/command cycle (OSC 133).
 public enum SemanticState: Sendable, Equatable {
   case none, prompt, input, output
@@ -455,7 +457,8 @@ extension TerminalState {
   }
 
   /// OSC 21, the kitty color protocol: `key=value` pairs where the value
-  /// is a color, `?` to query, or empty to reset. Keys are `foreground`,
+  /// is a color, `?` to query, or empty for a supported dynamic color.
+  /// A bare key resets to its configured default. Keys are `foreground`,
   /// `background`, `cursor`, `cursor_text`, `selection_foreground`,
   /// `selection_background` and palette indices.
   mutating func kittyColors(
@@ -465,16 +468,30 @@ extension TerminalState {
     var answers: [String] = []
     var changed = false
     for item in String(decoding: rest, as: UTF8.self).split(separator: ";") {
-      guard let eq = item.firstIndex(of: "=") else { continue }
+      guard let eq = item.firstIndex(of: "=") else {
+        changed = setKittyColor(item, nil) || changed
+        continue
+      }
       let key = item[..<eq]
       let value = item[item.index(after: eq)...]
       if value == "?" {
-        answers.append("\(key)=\(kittyColor(key).map(Self.formatColor) ?? "")")
+        switch kittyColor(key) {
+        case let .known(rgb):
+          answers.append("\(key)=\(rgb.map(Self.formatColor) ?? "")")
+        case .unknown:
+          // Unknown names are opaque: never reflect them as PTY input.
+          // The protocol uses Base64 without padding to delimit fields.
+          var encoded = Data(key.utf8).base64EncodedString()
+          while encoded.last == "=" { encoded.removeLast() }
+          answers.append("unknown=\(encoded)")
+        }
         continue
       }
-      let rgb = value.isEmpty ? nil : Self.parseColor(value)
-      guard value.isEmpty || rgb != nil else { continue }
-      changed = setKittyColor(key, rgb) || changed
+      if value.isEmpty {
+        changed = setDynamicKittyColor(key) || changed
+      } else if let rgb = Self.parseColor(value) {
+        changed = setKittyColor(key, rgb) || changed
+      }
     }
     if !answers.isEmpty {
       reply("\u{1B}]21;" + answers.joined(separator: ";") + st)
@@ -482,17 +499,38 @@ extension TerminalState {
     if changed { damage.setFull() }
   }
 
-  private func kittyColor(_ key: Substring) -> UInt32? {
+  private enum KittyColor {
+    case unknown
+    case known(UInt32?)
+  }
+
+  private func kittyColor(_ key: Substring) -> KittyColor {
     switch key {
-    case "foreground": palette.foreground
-    case "background": palette.background
-    case "cursor": palette.cursor
-    case "cursor_text": palette.cursorText
-    case "selection_foreground": palette.selectionForeground
-    case "selection_background": palette.selectionBackground
+    case "foreground": .known(palette.foreground)
+    case "background": .known(palette.background)
+    case "cursor": .known(palette.cursor)
+    case "cursor_text": .known(palette.cursorText)
+    case "selection_foreground": .known(palette.selectionForeground)
+    case "selection_background": .known(palette.selectionBackground)
     default:
-      Int(key).flatMap { (0 ..< 256).contains($0) ? palette.colors[$0] : nil }
+      if let index = Int(key), (0 ..< 256).contains(index) {
+        .known(palette.colors[index])
+      } else {
+        .unknown
+      }
     }
+  }
+
+  /// Only these overrides have a dynamic representation in the renderer.
+  /// Palette entries cannot be dynamic; unsupported requests do nothing.
+  private mutating func setDynamicKittyColor(_ key: Substring) -> Bool {
+    switch key {
+    case "cursor_text": palette.cursorText = nil
+    case "selection_foreground": palette.selectionForeground = nil
+    case "selection_background": palette.selectionBackground = nil
+    default: return false
+    }
+    return true
   }
 
   /// Sets (or with nil resets) one color; returns whether `key` is known.

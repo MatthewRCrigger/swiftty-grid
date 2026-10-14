@@ -17,7 +17,7 @@ struct BoundsTests {
       case let .created(ws) = try await c.execute(
         .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     try await c.attachAndShow(.id(ws.id))
     _ = try await c.execute(
       .split(
@@ -44,12 +44,14 @@ struct BoundsTests {
       case let .created(ws) = try await c.execute(
         .newWorkspace(NewWorkspaceRequest(launch: noisy))
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     try await c.attachAndShow(.id(ws.id))
     // Do not consume events for a while; frames must not pile up.
     try await Task.sleep(for: .milliseconds(500))
     let start = ContinuousClock.now
-    guard case .status = try await c.execute(.status) else { return }
+    guard case .status = try await c.execute(.status) else {
+      throw MuxError(.invalidRequest, "unexpected reply")
+    }
     #expect(ContinuousClock.now - start < .milliseconds(500))
     var frames = 0
     while true {
@@ -80,7 +82,7 @@ struct BoundsTests {
       case let .created(ws) = try await c.execute(
         .newWorkspace(NewWorkspaceRequest(launch: spec))
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     let pane = ws.tabs[0].activePane
     var reply = ""
     for _ in 0 ..< 100 {
@@ -113,7 +115,7 @@ struct BoundsTests {
       case let .created(ws) = try await c.execute(
         .newWorkspace(NewWorkspaceRequest(launch: spec))
       )
-    else { return }
+    else { throw MuxError(.invalidRequest, "unexpected reply") }
     let pane = ws.tabs[0].activePane
     try await c.attachAndShow(.id(ws.id))
     try await Task.sleep(for: .milliseconds(200))
@@ -130,7 +132,7 @@ struct BoundsTests {
   }
 
   @Test
-  func oversizedRecordsAreRefusedBeforeDecoding() async throws {
+  func oversizedRecordsAreRefusedBeforeDecoding() throws {
     #expect(throws: MuxError.self) {
       _ = try SMXCodec.decode(
         ClientMessage.self,
@@ -141,8 +143,154 @@ struct BoundsTests {
   }
 }
 
+struct ServerRecordLimitTests {
+  @Test(arguments: [
+    0, 1, 16 << 20, Int.max - (64 << 10), Int.max - (64 << 10) + 1, Int.max,
+  ])
+  func recordEnvelopeRemainsRepresentable(frameBytes: Int) throws {
+    var limits = MuxLimits()
+    limits.maxFrameBytes = frameBytes
+    let limit = SMXCodec.serverRecordLimit(limits)
+    let expected =
+      switch frameBytes {
+      case 0: 65536
+      case 1: 65537
+      case 16 << 20: 16_842_752
+      default: Int.max
+      }
+    #expect(limit == expected)
+    let message = ServerMessage.event(.detached(reason: "record limit probe"))
+    let data = try SMXCodec.encode(message, limit: limit)
+    guard
+      case let .event(.detached(reason)) = try SMXCodec.decode(
+        ServerMessage.self,
+        from: data,
+        limit: limit
+      )
+    else { throw MuxError(.invalidRequest, "unexpected round-trip message") }
+    #expect(reason == "record limit probe")
+  }
+
+  @Test(arguments: [Int.max - (64 << 10) + 1, Int.max])
+  func serviceWithAnUnrepresentableRecordEnvelopeIsRefused(
+    frameBytes: Int
+  ) throws {
+    var limits = MuxLimits()
+    limits.maxFrameBytes = frameBytes
+    #expect(throws: MuxError.self) { try Harness(limits: limits) }
+  }
+
+  private func retire(_ h: Harness) async {
+    await withCheckedContinuation { continuation in
+      h.service.prepareToExit { continuation.resume() }
+    }
+  }
+}
+
 @Suite(.serialized, .timeLimit(.minutes(1)))
 struct HistoryBudgetTests {
+  private func retire(_ h: Harness, _ c: MuxConnection) async {
+    await withCheckedContinuation { continuation in
+      h.service.prepareToExit { continuation.resume() }
+    }
+    await c.close()
+  }
+
+  @Test(arguments: [1, 4])
+  func anUnaffordableMinimumReservationCannotExceedTheHistoryPool(
+    panes: Int
+  ) async throws {
+    var limits = MuxLimits()
+    limits.maxPanes = panes
+    limits.totalHistoryBytes = panes * (512 << 10)
+    let h = try Harness(limits: limits)
+    let c = try await h.connect(.control)
+    var created: [WorkspaceID] = []
+    do {
+      for _ in 0 ..< panes {
+        do {
+          guard
+            case let .created(ws) = try await c.execute(
+              .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
+            )
+          else { throw MuxError(.invalidRequest, "unexpected reply") }
+          created.append(ws.id)
+          let budget = try #require(
+            await h.service.historyBudget(ws.tabs[0].activePane)
+          )
+          #expect(budget.total <= limits.totalHistoryBytes)
+        } catch let error as MuxError {
+          #expect(error.code == .resourceLimit)
+          break
+        }
+      }
+      #expect(
+        created.isEmpty,
+        "A minimum reservation that cannot fit must be refused before launch."
+      )
+      await retire(h, c)
+    } catch {
+      await retire(h, c)
+      throw error
+    }
+  }
+
+  @Test
+  func anUnrepresentableReservationIsRefusedWithoutStartingAPane() async throws
+  {
+    var limits = MuxLimits()
+    limits.maxPanes = Int.max
+    let h = try Harness(limits: limits)
+    let c = try await h.connect(.control)
+    do {
+      do {
+        _ = try await c.execute(
+          .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
+        )
+        Issue.record("Accepted an overflowing history reservation.")
+      } catch let error as MuxError { #expect(error.code == .resourceLimit) }
+      #expect(await h.service.isEmpty)
+      guard case let .status(status) = try await c.execute(.status) else {
+        throw MuxError(.invalidRequest, "unexpected reply")
+      }
+      #expect(status.panes == 0)
+      await retire(h, c)
+    } catch {
+      await retire(h, c)
+      throw error
+    }
+  }
+
+  @Test(arguments: [false, true])
+  func disabledHistoryAndCapsBelowTheMinimumRemainUsable(
+    disabled: Bool
+  ) async throws {
+    var limits = MuxLimits()
+    limits.maxPanes = 4
+    limits.historyBytesPerPane = disabled ? 0 : 256 << 10
+    limits.totalHistoryBytes = disabled ? 0 : 1 << 20
+    let h = try Harness(limits: limits)
+    let c = try await h.connect(.control)
+    do {
+      for _ in 0 ..< 4 {
+        guard
+          case let .created(ws) = try await c.execute(
+            .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
+          )
+        else { throw MuxError(.invalidRequest, "unexpected reply") }
+        let budget = try #require(
+          await h.service.historyBudget(ws.tabs[0].activePane)
+        )
+        #expect(budget.pane == limits.historyBytesPerPane)
+        #expect(budget.total <= limits.totalHistoryBytes)
+      }
+      await retire(h, c)
+    } catch {
+      await retire(h, c)
+      throw error
+    }
+  }
+
   /// Early panes get the full per-pane cap; later ones share what is
   /// left without the total ever exceeding the service budget.
   @Test
@@ -154,21 +302,133 @@ struct HistoryBudgetTests {
     limits.minHistoryBytesPerPane = 1 << 20
     let h = try Harness(limits: limits)
     let c = try await h.connect(.control)
-    var shares: [Int] = []
-    var total = 0
-    for _ in 0 ..< 4 {
+    do {
+      var shares: [Int] = []
+      var total = 0
+      for _ in 0 ..< 4 {
+        guard
+          case let .created(ws) = try await c.execute(
+            .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
+          )
+        else { throw MuxError(.invalidRequest, "unexpected reply") }
+        let budget = try #require(
+          await h.service.historyBudget(ws.tabs[0].activePane)
+        )
+        shares.append(budget.pane >> 20)
+        total = budget.total
+      }
+      #expect(shares == [4, 2, 1, 1])
+      #expect(total == 8 << 20)
+      await retire(h, c)
+    } catch {
+      await retire(h, c)
+      throw error
+    }
+  }
+}
+
+@Suite(.serialized, .timeLimit(.minutes(1)))
+struct ScrollBoundTests {
+  @Test(arguments: [10000, Int.max - 256, Int.max - 255, Int.max])
+  func scrollBoundsPreserveMovementAndAddressValidation(
+    historyRows: Int
+  ) async throws {
+    var limits = MuxLimits()
+    limits.historyRowsPerPane = historyRows
+    if historyRows > 1_000_000 {
+      #expect(throws: MuxError.self) { try Harness(limits: limits) }
+      return
+    }
+    let h = try Harness(limits: limits)
+    let c: MuxConnection
+    do { c = try await h.connect() } catch {
+      await retire(h)
+      throw error
+    }
+    do {
       guard
         case let .created(ws) = try await c.execute(
           .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
         )
-      else { return }
-      let budget = try #require(
-        await h.service.historyBudget(ws.tabs[0].activePane)
+      else { throw MuxError(.invalidRequest, "unexpected create reply") }
+      let pane = ws.tabs[0].activePane
+      try await c.attachAndShow(.id(ws.id), columns: 40, rows: 10)
+      try await c.send(
+        .text("i=0; while [ $i -lt 60 ]; do echo row-$i; i=$((i+1)); done\r", ),
+        to: pane
       )
-      shares.append(budget.pane >> 20)
-      total = budget.total
+      var frame = try await c.frame(of: pane) {
+        $0.lines.contains("row-59") && $0.history.scrollbackRows > 0
+      }
+
+      func move(_ request: ScrollRequest, towardHistory: Bool, ) async throws {
+        let revision = frame.identity.viewportRevision
+        try await c.execute(.scroll(pane: pane, request))
+        frame = try await c.frame(of: pane) {
+          $0.identity.viewportRevision > revision
+            && $0.history.viewportOffset
+              == (towardHistory ? $0.history.scrollbackRows : 0)
+        }
+      }
+
+      let bound = historyRows == 10000 ? 10256 : Int.max
+      for request in [ScrollRequest.lines(bound), .pages(bound)] {
+        try await move(request, towardHistory: true)
+      }
+      let address = frame.history.address(
+        viewportRow: 0,
+        alternateScreen: false
+      )
+      try await move(.bottom, towardHistory: false)
+      try await move(.top(address), towardHistory: true)
+      #expect(frame.history.viewportTop == address.row)
+      var stale = address
+      stale.generation &+= 1
+      do {
+        try await c.execute(.scroll(pane: pane, .top(stale)))
+        Issue.record("Accepted a stale history address")
+      } catch let error as MuxError {
+        #expect(error.code == .historyUnavailable)
+      }
+      for request in [ScrollRequest.lines(-bound), .pages(-bound)] {
+        try await move(request, towardHistory: false)
+      }
+      if historyRows >= Int.max - 255 {
+        for request in [ScrollRequest.lines(Int.min), .pages(Int.min)] {
+          try await move(request, towardHistory: false)
+        }
+      } else {
+        var rejected = [ScrollRequest.lines(Int.min), .pages(Int.min)]
+        if historyRows == 10000 {
+          rejected += [
+            .lines(10257), .lines(-10257), .pages(10257), .pages(-10257),
+          ]
+        }
+        for request in rejected {
+          do {
+            try await c.execute(.scroll(pane: pane, request))
+            Issue.record(
+              "Accepted an out-of-bounds relative scroll: \(request)"
+            )
+          } catch let error as MuxError {
+            #expect(error.code == .invalidRequest)
+          }
+        }
+      }
+      guard case .status = try await c.execute(.status) else {
+        throw MuxError(.invalidRequest, "unexpected status reply")
+      }
+      await retire(h, c)
+    } catch {
+      await retire(h, c)
+      throw error
     }
-    #expect(shares == [4, 2, 1, 1])
-    #expect(total == 8 << 20)
+  }
+
+  private func retire(_ h: Harness, _ c: MuxConnection? = nil) async {
+    await withCheckedContinuation { continuation in
+      h.service.prepareToExit { continuation.resume() }
+    }
+    await c?.close()
   }
 }

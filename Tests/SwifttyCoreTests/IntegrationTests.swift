@@ -231,6 +231,7 @@ struct IntegrationTests {
       env: ["PATH": path],
       workingDirectory: directory.path
     )
+    defer { h.session.stop() }
     #expect(h.wait(for: "startup-ok"))
     #expect(h.waitForExit() == 0)
   }
@@ -265,6 +266,7 @@ struct IntegrationTests {
       env: ["PATH": path],
       workingDirectory: directory.path
     )
+    defer { h.session.stop() }
     #expect(h.wait(for: "unicode-startup-ok"))
     #expect(h.waitForExit() == 0)
   }
@@ -273,6 +275,7 @@ struct IntegrationTests {
   func `rapid PTY restarts keep new output and exit status intact`() throws {
     for generation in 0 ..< 20 {
       let h = try Harness(["/bin/sleep", "30"])
+      defer { h.session.stop() }
       // Fill the line discipline so cancellation also covers a write
       // source that may have unsent input and a read source with echo.
       h.session.send(.paste(String(repeating: "x", count: 64 * 1024)))
@@ -297,6 +300,7 @@ struct IntegrationTests {
     let h = try Harness([
       "/bin/sh", "-c", "printf 'old\\033]2;pending'; \(ending)",
     ])
+    defer { h.session.stop() }
     if stop {
       #expect(h.wait(for: "old"))
       h.session.stop()
@@ -314,6 +318,7 @@ struct IntegrationTests {
   @Test
   func `shell runs commands and exits`() throws {
     let h = try Harness(["/bin/sh"], env: ["PS1": "$ ", "ENV": ""])
+    defer { h.session.stop() }
     #expect(h.wait(for: "$"))
     h.type("echo hello-$((40+2))\r")
     #expect(h.wait(for: "hello-42"))
@@ -331,6 +336,7 @@ struct IntegrationTests {
   @Test
   func `shell has controlling terminal and job control`() throws {
     let h = try Harness(["/bin/sh"], env: ["PS1": "$ "])
+    defer { h.session.stop() }
     #expect(h.wait(for: "$"))
     h.type("tty && echo tty-$((20+22))\r")
     #expect(h.wait(for: "/dev/tty"))
@@ -352,6 +358,7 @@ struct IntegrationTests {
       columns: 40,
       rows: 10
     )
+    defer { h.session.stop() }
     #expect(h.wait(for: "200"))
     let count = h.session.withState { $0.scrollbackCount }
     #expect(count >= 190)
@@ -366,12 +373,13 @@ struct IntegrationTests {
   @Test
   func `vim edits in alternate screen`() throws {
     let file = FileManager.default.temporaryDirectory.appendingPathComponent(
-      "swiftty-vim-\(getpid()).txt"
+      "swiftty-vim-" + UUID().uuidString + ".txt"
     )
     defer { try? FileManager.default.removeItem(at: file) }
     let h = try Harness([
       "/usr/bin/vim", "-u", "NONE", "-i", "NONE", "-N", "-n", file.path,
     ])
+    defer { h.session.stop() }
     #expect(h.wait(for: "~"))
     #expect(h.session.modes.contains(.alternateScreen))
     h.type("ihello from swiftty")
@@ -389,7 +397,7 @@ struct IntegrationTests {
   @Test
   func `less pages through file`() throws {
     let file = FileManager.default.temporaryDirectory.appendingPathComponent(
-      "swiftty-less-\(getpid()).txt"
+      "swiftty-less-" + UUID().uuidString + ".txt"
     )
     defer { try? FileManager.default.removeItem(at: file) }
     try (1 ... 300).map { "row \($0)" }.joined(separator: "\n")
@@ -398,6 +406,7 @@ struct IntegrationTests {
       ["/usr/bin/less", file.path],
       env: ["LESS": "", "LESSHISTFILE": "-"]
     )
+    defer { h.session.stop() }
     #expect(TestFixture(h.wait(for: "row 1\n")) == TestFixture(true))
     h.type(" ")
     #expect(h.wait(for: "row 30"))
@@ -410,19 +419,22 @@ struct IntegrationTests {
 
   @Test(.enabled(if: which("tmux") != nil))
   func `tmux draws status and panes`() throws {
-    let socket = "swiftty-test-\(getpid())"
+    let socket = "swiftty-test-" + UUID().uuidString
     let tmux = try #require(Self.which("tmux"))
     defer {
-      let p = Process()
-      p.executableURL = URL(fileURLWithPath: tmux)
-      p.arguments = ["-L", socket, "kill-server"]
-      try? p.run()
-      p.waitUntilExit()
+      do {
+        _ = try TestCommand.run(
+          tmux,
+          arguments: ["-L", socket, "kill-server"],
+          timeout: .seconds(3)
+        )
+      } catch { Issue.record("tmux cleanup failed: \(error)") }
     }
     let h = try Harness(
       [tmux, "-L", socket, "-f", "/dev/null", "new-session", "/bin/sh"],
       env: ["PS1": "$ "]
     )
+    defer { h.session.stop() }
     #expect(h.wait("status line") { $0.contains("[0]") || $0.contains("0:sh") })
     h.type("echo inside-tmux-$((40+2))\r")
     #expect(h.wait(for: "inside-tmux-42"))
@@ -438,6 +450,7 @@ struct IntegrationTests {
   @Test
   func `top renders and quits`() throws {
     let h = try Harness(["/usr/bin/top", "-s", "1", "-n", "10"])
+    defer { h.session.stop() }
     #expect(h.wait(for: "Processes:"))
     #expect(h.wait(for: "PID"))
     h.type("q")

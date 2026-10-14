@@ -38,6 +38,30 @@ private func export(
 
 struct ScreenExporterTests {
   @Test
+  func maximumGridPreservesEveryDistinctStyle() throws {
+    var input = ""
+    for index in 0 ..< RSTLimits.maxColumns * RSTLimits.maxRows {
+      input += "\(esc)[38;2;0;\(index >> 8);\(index & 255)mX"
+    }
+    let snapshot = try export(
+      input,
+      columns: RSTLimits.maxColumns,
+      rows: RSTLimits.maxRows
+    )
+    #expect(snapshot.styles.count == RSTLimits.maxStyles)
+    for y in 0 ..< snapshot.rows {
+      for x in 0 ..< snapshot.columns {
+        let index = y * snapshot.columns + x
+        let cell = snapshot.cells[y][x]
+        #expect(cell.text == "X")
+        #expect(
+          snapshot.styles[cell.style].foreground == RGBColor(UInt32(index))
+        )
+      }
+    }
+  }
+
+  @Test
   func `graphemes keep complete text and server widths`() throws {
     let s = try export("e\u{301}界👩‍👩‍👧x")
     let row = s.cells[0]
@@ -79,13 +103,16 @@ struct ScreenExporterTests {
     let row = s.cells[0]
     let x = s.styles[row[0].style]
     #expect(
-      x.attributes == [.bold, .italic, .curlyUnderline, .strikethrough, .overline]
+      x.attributes == [
+        .bold, .italic, .curlyUnderline, .strikethrough, .overline,
+      ]
     )
     #expect(x.underlineColor == RGBColor(0x0A141E))
     #expect(s.styles[row[1].style].attributes == [.inverse])
     #expect(
-      s.styles[row[2].style].attributes
-        == [.faint, .blink, .invisible, .doubleUnderline]
+      s.styles[row[2].style].attributes == [
+        .faint, .blink, .invisible, .doubleUnderline,
+      ]
     )
     #expect(s.styles[row[3].style].attributes == [.dottedUnderline])
     #expect(s.styles[row[4].style].attributes == [.dashedUnderline])
@@ -109,7 +136,16 @@ struct ScreenExporterTests {
     )
     #expect(s.activeBuffer == .alternate)
     #expect(s.textLines.first == "ALT")
-    #expect(s.cursor == ScreenCursor(row: 2, column: 3, visible: false, shape: .bar, blinking: true))
+    #expect(
+      s.cursor
+        == ScreenCursor(
+          row: 2,
+          column: 3,
+          visible: false,
+          shape: .bar,
+          blinking: true
+        )
+    )
     #expect(s.title == "mytitle")
     #expect(s.reverseVideo)
 
@@ -122,7 +158,9 @@ struct ScreenExporterTests {
   @Test
   func `oversized graphemes and titles are bounded`() throws {
     let marks = String(repeating: "\u{301}", count: 40)
-    let s = try export("a\(marks)b\(esc)]2;\(String(repeating: "é", count: 600))\u{07}")
+    let s = try export(
+      "a\(marks)b\(esc)]2;\(String(repeating: "é", count: 600))\u{07}"
+    )
     #expect(s.cells[0][0].text == RSTLimits.graphemePlaceholder)
     #expect(s.cells[0][1].text == "b")
     #expect(s.title.utf8.count <= RSTLimits.maxTitleBytes)

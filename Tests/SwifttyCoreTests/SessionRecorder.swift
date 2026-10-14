@@ -22,8 +22,8 @@ struct SessionRecorder {
     let bytes = Mutex<[UInt8]>([])
 
     init(_ command: [String], env: [String: String] = [:]) throws {
-      session.onProgramOutput = { [unowned self] chunk in
-        bytes.withLock { $0 += chunk }
+      session.onProgramOutput = { [weak self] chunk in
+        self?.bytes.withLock { $0 += chunk }
       }
       var config = SessionConfiguration(command: command, environment: env)
       config.removedEnvironment = ["TMUX", "TMUX_PANE"]
@@ -36,27 +36,49 @@ struct SessionRecorder {
       }
     }
 
-    func wait(for text: String) {
-      let deadline = Date().addingTimeInterval(10)
-      while Date() < deadline, !screen().contains(text) { usleep(20000) }
-      #expect(
-        screen().contains(text),
-        Comment(rawValue: escapedTestText("waiting for \(text)"))
-      )
+    enum ReadinessFailure: Error, Equatable {
+      case timedOut(String)
+      case exited(String)
+    }
+
+    /// Missing markers stop the recording before it can publish fixtures.
+    func wait(for text: String, timeout: Duration = .seconds(10)) throws {
+      precondition(timeout > .zero)
+      let deadline = ContinuousClock.now + timeout
+      while true {
+        let readiness = session.withState { state in
+          let screen = (0 ..< state.rows).map { state.text(row: $0) }
+            .joined(separator: "\n")
+          return (screen.contains(text), session.isRunning)
+        }
+        if readiness.0 { return }
+        if !readiness.1 { throw ReadinessFailure.exited(text) }
+        if ContinuousClock.now >= deadline {
+          throw ReadinessFailure.timedOut(text)
+        }
+        usleep(20000)
+      }
     }
 
     func type(_ s: String) { session.send(.text(s)) }
 
-    /// Saves the bytes parsed so far and the screen they produced. Both
-    /// are read on the session queue, so they match exactly.
+    /// Physical reads can include a tail still held behind reply pressure.
+    /// Replay the captured bytes so the saved text describes all of them.
+    func capture() -> (data: [UInt8], text: String) {
+      let data = session.withState { _ in bytes.withLock { $0 } }
+      var replay = TerminalState(columns: 80, rows: 24)
+      replay.discardsReplies = true
+      var parser = Parser()
+      parser.consume(data.span, into: &replay)
+      let text = (0 ..< replay.rows).map { replay.text(row: $0) }
+        .joined(separator: "\n")
+      return (data, text)
+    }
+
+    /// Saves received bytes and the screen produced by replaying them.
     func save(_ name: String) throws {
       usleep(300_000)  // let the application finish drawing
-      let (data, text) = session.withState { state in
-        (
-          bytes.withLock { $0 },
-          (0 ..< state.rows).map { state.text(row: $0) }.joined(separator: "\n")
-        )
-      }
+      let (data, text) = capture()
       try FileManager.default.createDirectory(
         at: SessionRecorder.fixtures,
         withIntermediateDirectories: true
@@ -76,42 +98,42 @@ struct SessionRecorder {
   @Test
   func shell() throws {
     let r = try Recorder(["/bin/sh"], env: ["PS1": "$ ", "ENV": ""])
-    r.wait(for: "$")
+    defer { r.session.stop() }
+    try r.wait(for: "$")
     r.type(
       "printf '\\033[1;31mred\\033[0m \\033[4:3;58;5;2mcurly\\033[0m 中文 e\\314\\201\\n'\r"
     )
-    r.wait(for: "curly")
+    try r.wait(for: "curly")
     r.type(
       "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do echo line-$i; done\r"
     )
-    r.wait(for: "line-30")
+    try r.wait(for: "line-30")
     try r.save("shell")
-    r.session.stop()
   }
 
   @Test
   func vim() throws {
     let file = FileManager.default.temporaryDirectory.appendingPathComponent(
-      "swiftty-record.txt"
+      "swiftty-record-" + UUID().uuidString + ".txt"
     )
     defer { try? FileManager.default.removeItem(at: file) }
     let r = try Recorder([
       "/usr/bin/vim", "-u", "NONE", "-i", "NONE", "-N", "-n", file.path,
     ])
-    r.wait(for: "~")
+    defer { r.session.stop() }
+    try r.wait(for: "~")
     r.type("ifirst line\rsecond line\rthird line")
     r.session.send(.key(KeyEvent(.escape)))
     r.type(":set number\r")
-    r.wait(for: "  3 third line")
+    try r.wait(for: "  3 third line")
     try r.save("vim")
     r.type(":q!\r")
-    r.session.stop()
   }
 
   @Test
   func less() throws {
     let file = FileManager.default.temporaryDirectory.appendingPathComponent(
-      "swiftty-record-less.txt"
+      "swiftty-record-less-" + UUID().uuidString + ".txt"
     )
     defer { try? FileManager.default.removeItem(at: file) }
     try (1 ... 300).map { "row \($0)" }.joined(separator: "\n")
@@ -120,30 +142,32 @@ struct SessionRecorder {
       ["/usr/bin/less", file.path],
       env: ["LESS": "", "LESSHISTFILE": "-"]
     )
-    r.wait(for: "row 1\n")
+    defer { r.session.stop() }
+    try r.wait(for: "row 1\n")
     r.type(" ")
-    r.wait(for: "row 30")
+    try r.wait(for: "row 30")
     r.type("/row 4\r")
-    r.wait(for: "row 49")
+    try r.wait(for: "row 49")
     try r.save("less")
     r.type("q")
-    r.session.stop()
   }
 
   @Test(.enabled(if: IntegrationTests.which("tmux") != nil))
   func tmux() throws {
     let tmux = try #require(IntegrationTests.which("tmux"))
-    let socket = "swiftty-record-\(getpid())"
+    let socket = "swiftty-record-" + UUID().uuidString
     defer {
-      let p = Process()
-      p.executableURL = URL(fileURLWithPath: tmux)
-      p.arguments = ["-L", socket, "kill-server"]
-      try? p.run()
-      p.waitUntilExit()
+      do {
+        _ = try TestCommand.run(
+          tmux,
+          arguments: ["-L", socket, "kill-server"],
+          timeout: .seconds(3)
+        )
+      } catch { Issue.record("tmux cleanup failed: \(error)") }
     }
     // A neutral prompt and status line, so the fixture names no user or host.
     let conf = FileManager.default.temporaryDirectory.appendingPathComponent(
-      "swiftty-record.tmux.conf"
+      "swiftty-record-" + UUID().uuidString + ".tmux.conf"
     )
     defer { try? FileManager.default.removeItem(at: conf) }
     try """
@@ -158,16 +182,16 @@ struct SessionRecorder {
       [tmux, "-L", socket, "-f", conf.path, "new-session"],
       env: ["PS1": "$ "]
     )
-    r.wait(for: "$")
+    defer { r.session.stop() }
+    try r.wait(for: "$")
     r.type("echo left-pane\r")
-    r.wait(for: "left-pane")
+    try r.wait(for: "left-pane")
     r.session.send(.key(KeyEvent(.character("b"), modifiers: .control)))
     r.type("%")
-    r.wait(for: "│")
+    try r.wait(for: "│")
     r.type("echo right-pane\r")
-    r.wait(for: "right-pane")
+    try r.wait(for: "right-pane")
     try r.save("tmux")
-    r.session.stop()
   }
 
   @Test
@@ -176,10 +200,26 @@ struct SessionRecorder {
     let r = try Recorder([
       "/usr/bin/top", "-s", "1", "-n", "10", "-U", "nobody",
     ])
-    r.wait(for: "PID")
+    defer { r.session.stop() }
+    try r.wait(for: "PID")
     usleep(1_200_000)  // one refresh
     try r.save("top")
     r.type("q")
-    r.session.stop()
+  }
+}
+
+struct SessionRecorderLifetimeTests {
+  @Test
+  func `a retained session accepts output after its recorder is released`()
+    throws
+  {
+    var recorder: SessionRecorder.Recorder? = try SessionRecorder.Recorder([
+      "/usr/bin/true"
+    ])
+    let session = try #require(recorder).session
+    defer { session.stop() }
+    recorder = nil
+    session.feed(Array("retained".utf8))
+    #expect(session.snapshot().text.first == "retained")
   }
 }

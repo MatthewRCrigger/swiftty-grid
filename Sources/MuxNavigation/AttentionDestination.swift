@@ -61,11 +61,7 @@ public struct AttentionDestination: Sendable, Hashable, Codable {
 
   /// A destination for `item` on the host the sender knows as
   /// `hostProfileID`. Program text in the item is not carried over.
-  public init(
-    hostProfileID: UUID,
-    item: AttentionItem,
-    intent: Intent? = nil
-  ) {
+  public init(hostProfileID: UUID, item: AttentionItem, intent: Intent? = nil) {
     self.init(
       localHostProfileID: hostProfileID,
       serviceEpoch: item.source.serviceEpoch,
@@ -134,8 +130,8 @@ public enum RecordPathGrammar {
   }
 
   static func isNameByte(_ b: UInt8) -> Bool {
-    (0x30...0x39).contains(b) || (0x41...0x5A).contains(b)
-      || (0x61...0x7A).contains(b) || b == 0x2E || b == 0x2D || b == 0x5F
+    (0x30 ... 0x39).contains(b) || (0x41 ... 0x5A).contains(b)
+      || (0x61 ... 0x7A).contains(b) || b == 0x2E || b == 0x2D || b == 0x5F
       || b == 0x2B
   }
 }

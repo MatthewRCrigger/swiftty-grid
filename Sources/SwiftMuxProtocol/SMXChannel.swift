@@ -20,6 +20,9 @@ public final class SMXChannel: @unchecked Sendable {
   private let connection: xpc_connection_t
   private var handler: (@Sendable (Event) -> Void)?
   private var closed = false
+  private var recordLimit: @Sendable () -> Int = {
+    SMXCodec.serverRecordLimit(.standard)
+  }
 
   init(connection: xpc_connection_t, queue: DispatchQueue) {
     self.connection = connection
@@ -59,7 +62,15 @@ public final class SMXChannel: @unchecked Sendable {
       == 0
   }
 
-  public func activate(_ handler: @escaping @Sendable (Event) -> Void) {
+  /// Checks the current receive limit before copying an XPC payload into Data.
+  /// The limit closure runs on `queue`, allowing negotiated limits to change.
+  public func activate(
+    recordLimit: @escaping @Sendable () -> Int = {
+      SMXCodec.serverRecordLimit(.standard)
+    },
+    _ handler: @escaping @Sendable (Event) -> Void
+  ) {
+    self.recordLimit = recordLimit
     self.handler = handler
     xpc_connection_set_event_handler(connection) { [weak self] object in
       self?.receive(object)
@@ -68,19 +79,32 @@ public final class SMXChannel: @unchecked Sendable {
   }
 
   private func receive(_ object: xpc_object_t) {
+    guard !closed else { return }
     if xpc_get_type(object) == XPC_TYPE_DICTIONARY {
       var length = 0
       guard let bytes = xpc_dictionary_get_data(object, "d", &length) else {
         return
       }
+      let limit = recordLimit()
+      guard length <= limit else {
+        finish("record exceeds \(limit) bytes")
+        return
+      }
       handler?(.message(Data(bytes: bytes, count: length)))
       return
     }
-    guard !closed else { return }
-    closed = true
     let reason =
       xpc_dictionary_get_string(object, XPC_ERROR_KEY_DESCRIPTION)
       .map { String(cString: $0) } ?? "connection closed"
+    finish(reason)
+  }
+
+  private func finish(_ reason: String) {
+    guard !closed else { return }
+    closed = true
+    // Interruption leaves native XPC live and able to reconnect on send.
+    // Our closed event is terminal, including sends from its callback.
+    xpc_connection_cancel(connection)
     let h = handler
     handler = nil
     h?(.closed(reason))

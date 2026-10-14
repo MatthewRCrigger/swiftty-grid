@@ -31,33 +31,61 @@ func fail(_ message: String, code: Int32 = 1) -> Never {
 }
 
 var arguments = Array(CommandLine.arguments.dropFirst())
-let allowHost = arguments.contains("--allow-host")
-arguments.removeAll { $0 == "--allow-host" }
-let command = arguments.first.map { $0.hasPrefix("-") ? "" : $0 } ?? ""
-var rest = command.isEmpty ? arguments : Array(arguments.dropFirst())
 /// Everything after `--` is the program and its arguments, never options.
 var trailing: [String]?
-if let i = rest.firstIndex(of: "--") {
-  trailing = Array(rest[(i + 1)...])
-  rest = Array(rest[..<i])
+if let i = arguments.firstIndex(of: "--") {
+  trailing = Array(arguments[(i + 1)...])
+  arguments = Array(arguments[..<i])
 }
+var allowHost = arguments.first == "--allow-host"
+if allowHost { arguments.removeFirst() }
+let command =
+  arguments.first.map {
+    ["-h", "--help", "--version"].contains($0) || !$0.hasPrefix("-") ? $0 : ""
+  } ?? ""
+var rest = command.isEmpty ? arguments : Array(arguments.dropFirst())
 
 @MainActor
-func option(_ flag: String) -> String? {
-  guard let i = rest.firstIndex(of: flag), i + 1 < rest.count else {
-    return nil
+func parseArguments(
+  values: Set<String> = [],
+  flags: Set<String> = [],
+  allowsSubcommand: Bool = false
+) -> (options: [String: String], subcommand: String?) {
+  var options: [String: String] = [:]
+  var subcommand: String?
+  var tokens = rest[...]
+  while let token = tokens.popFirst() {
+    if token == "--allow-host" || values.contains(token)
+      || flags.contains(token)
+    {
+      guard options[token] == nil else {
+        fail("duplicate option: \(token)", code: 64)
+      }
+      if values.contains(token) {
+        guard let value = tokens.popFirst() else {
+          fail("\(token) requires a value", code: 64)
+        }
+        // Consume the value before recognizing any later flags.
+        options[token] = value
+      } else {
+        options[token] = ""
+        if token == "--allow-host" { allowHost = true }
+      }
+    } else if allowsSubcommand, subcommand == nil, !token.hasPrefix("-") {
+      subcommand = token
+    } else {
+      fail("unexpected argument: \(token)", code: 64)
+    }
   }
-  let value = rest[i + 1]
-  rest.removeSubrange(i ... i + 1)
-  return value
+  rest = []
+  guard trailing == nil || command == "new" else {
+    fail("only new accepts a command after --", code: 64)
+  }
+  return (options, subcommand)
 }
 
 @MainActor
-func flag(_ name: String) -> Bool {
-  guard let i = rest.firstIndex(of: name) else { return false }
-  rest.remove(at: i)
-  return true
-}
+func validateArguments() { _ = parseArguments() }
 
 func connect(_ kind: FrontendKind) async -> MuxConnection {
   do {
@@ -142,7 +170,8 @@ func newWorkspace(
   directory: String?,
   command: [String]?
 ) async -> WorkspaceSnapshot {
-  let settings = (try? Settings.load()) ?? Settings()
+  let settings: Settings
+  do { settings = try Settings.load() } catch { fail("settings: \(error)") }
   var ws = winsize()
   let size =
     ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0
@@ -193,13 +222,9 @@ func agentCommand(_ sub: String) -> Never {
   )
   let domain = "gui/\(getuid())"
   func launchctl(_ args: [String]) -> Int32 {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-    p.arguments = args
-    p.standardError = FileHandle.nullDevice
-    try? p.run()
-    p.waitUntilExit()
-    return p.terminationStatus
+    do { return try LaunchAgentCommand.run(args) } catch {
+      fail("launchctl: \(error)")
+    }
   }
   switch sub {
   case "install":
@@ -210,7 +235,10 @@ func agentCommand(_ sub: String) -> Never {
     guard FileManager.default.isExecutableFile(atPath: agent) else {
       fail("swiftmux-agent not found next to swmux (\(agent))")
     }
-    let contents = AgentPlist.contents(label: label, program: agent)
+    let contents: String
+    do {
+      contents = try AgentPlist.contents(label: label, program: agent)
+    } catch { fail("launch-agent plist: \(error)") }
     do {
       try FileManager.default.createDirectory(
         at: plist.deletingLastPathComponent(),
@@ -225,17 +253,27 @@ func agentCommand(_ sub: String) -> Never {
     print("installed \(plist.path) -> \(agent)")
     exit(0)
   case "uninstall":
-    _ = launchctl(["bootout", "\(domain)/\(label)"])
-    try? FileManager.default.removeItem(at: plist)
-    print("removed \(label); running sessions ended with the agent")
+    do {
+      try LaunchAgentRemoval.remove(
+        bootout: { launchctl(["bootout", "\(domain)/\(label)"]) },
+        probe: { launchctl(["print", "\(domain)/\(label)"]) },
+        removePlist: { try LaunchAgentRemoval.unlinkPlist(at: plist) },
+      )
+    } catch { fail("uninstalling \(label): \(error)") }
+    print("removed development LaunchAgent registration \(label)")
     exit(0)
   case "status":
-    let loaded = launchctl(["print", "\(domain)/\(label)"]) == 0
+    let loaded: Bool
+    do {
+      loaded = try LaunchAgentRemoval.isLoaded(
+        probeStatus: launchctl(["print", "\(domain)/\(label)"])
+      )
+    } catch { fail("reading agent status for \(label): \(error)") }
     print(
       "\(label): \(loaded ? "loaded" : "not loaded")\(FileManager.default.fileExists(atPath: plist.path) ? " (\(plist.path))" : "")"
     )
     exit(0)
-  default: fail("usage: swmux agent install|uninstall|status")
+  default: fail("usage: swmux agent install|uninstall|status", code: 64)
   }
 }
 
@@ -243,17 +281,24 @@ func agentCommand(_ sub: String) -> Never {
 
 signal(SIGPIPE, SIG_IGN)
 switch command {
-case "help", "-h", "--help": print(usage, terminator: "")
+case "help", "-h", "--help":
+  validateArguments()
+  print(usage, terminator: "")
 case "--version", "version":
+  validateArguments()
   print("swmux \(SMX.build) (SMX/\(SMX.protocolVersion))")
-case "agent": agentCommand(rest.first ?? "")
+case "agent":
+  let parsed = parseArguments(allowsSubcommand: true)
+  agentCommand(parsed.subcommand ?? "")
 case "list", "ls":
+  validateArguments()
   let c = await connect(.control)
   guard case let .workspaces(list) = try await c.execute(.listWorkspaces) else {
     exit(1)
   }
   print(formatList(list))
 case "status":
+  validateArguments()
   let c = await connect(.control)
   guard case let .status(s) = try await c.execute(.status) else { exit(1) }
   print(
@@ -264,22 +309,28 @@ case "status":
     """
   )
 case "detach":
+  validateArguments()
   let c = await connect(.control)
   _ = try await c.execute(.detachActive)
 case "end", "kill":
-  guard let name = option("-t") else { fail("end requires -t NAME") }
+  let parsed = parseArguments(values: ["-t"])
+  guard let name = parsed.options["-t"] else {
+    fail("end requires -t NAME", code: 64)
+  }
   let c = await connect(.control)
   do { _ = try await c.execute(.endWorkspace(.name(name))) } catch {
     fail("\(error)")
   }
 case "end-all":
+  validateArguments()
   let c = await connect(.control)
   _ = try await c.execute(.endAllWorkspaces)
   _ = try await c.execute(.quiesce(false))
 case "new":
-  let detached = flag("-d")
-  let name = option("-s")
-  let dir = option("-c")
+  let parsed = parseArguments(values: ["-s", "-c"], flags: ["-d"])
+  let detached = parsed.options["-d"] != nil
+  let name = parsed.options["-s"]
+  let dir = parsed.options["-c"]
   let cmd = trailing
   if !detached { checkHost() }
   let c = await connect(detached ? .control : .terminal)
@@ -295,11 +346,12 @@ case "new":
   }
   await attach(.id(ws.id), connection: c)
 case "attach", "a":
+  let target = parseArguments(values: ["-t"]).options["-t"]
   checkHost()
-  let target = option("-t")
   let c = await connect(.terminal)
   await attach(target.map { .name($0) } ?? .latest, connection: c)
 case "":
+  validateArguments()
   checkHost()
   let c = await connect(.terminal)
   guard case let .workspaces(list) = try await c.execute(.listWorkspaces) else {

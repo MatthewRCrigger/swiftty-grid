@@ -84,8 +84,7 @@ final class HostAttachment: @unchecked Sendable {
     for message in messages {
       let current = phase.withLock { $0 }
       switch current {
-      case .closed:
-        return
+      case .closed: return
       case .awaitingAttach:
         guard case let .attach(request) = message else {
           fail(.notAttached)
@@ -103,8 +102,7 @@ final class HostAttachment: @unchecked Sendable {
           fail(code)
           return
         }
-      case let .attached(session):
-        await session.receive(message, from: self)
+      case let .attached(session): await session.receive(message, from: self)
       }
     }
   }

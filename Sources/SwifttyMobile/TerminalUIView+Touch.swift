@@ -586,6 +586,7 @@ extension TerminalUIView {
       }
     case .arrows:
       horizontalScrollAccumulator.reset()
+      guard effectiveCapabilities.textInput else { return }
       for _ in 0 ..< abs(n) {
         session.send(.key(KeyEvent(n > 0 ? .up : .down)))
       }

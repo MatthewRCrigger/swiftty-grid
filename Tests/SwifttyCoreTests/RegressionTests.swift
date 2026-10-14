@@ -112,6 +112,43 @@ struct RegressionTests {
 @Suite(.serialized)
 struct RendererRegressionTests {
   @Test(.enabled(if: RendererTests.device != nil))
+  func synchronizedRepeatAfterASkippedSnapshotRepaintsItsRows() throws {
+    let manager = CoreTextFontManager()
+    let device = try #require(RendererTests.device)
+    let renderer = try MetalRenderer(
+      device: device,
+      fontManager: manager,
+      font: FontDescriptor()
+    )
+    let session = TerminalSession(columns: 10, rows: 4)
+    let width = Int(renderer.cellSize.width) * 10 + 16
+    let height = Int(renderer.cellSize.height) * 4 + 16
+    let helper = RendererTests()
+    session.feed(Array("one".utf8))
+    _ = try helper.render(
+      renderer,
+      session.snapshot(),
+      width: width,
+      height: height
+    )
+    session.feed(Array("\(CSI)3;1Hlost\(CSI)1;4H".utf8))
+    _ = session.snapshot()  // no drawable for this frame
+    session.feed(Array("\(CSI)?2026h\(CSI)4;1Hpending".utf8))
+    let held = session.snapshot()
+    #expect(held.damage.isEmpty)
+    let actual = try helper.render(renderer, held, width: width, height: height)
+    let fresh = try MetalRenderer(
+      device: device,
+      fontManager: manager,
+      font: FontDescriptor()
+    )
+    let expected = try helper.render(fresh, held, width: width, height: height)
+    #expect(actual.pixels == expected.pixels)
+    #expect(TestFixture(held.text[2]) == TestFixture("lost"))
+    #expect(TestFixture(held.text[3]) == TestFixture(""))
+  }
+
+  @Test(.enabled(if: RendererTests.device != nil))
   func `skipped snapshot still repaints its rows`() throws {
     let manager = CoreTextFontManager()
     let renderer = try MetalRenderer(
@@ -124,18 +161,23 @@ struct RendererRegressionTests {
     let h = Int(renderer.cellSize.height) * 4 + 16
     let helper = RendererTests()
     session.feed(Array("one".utf8))
-    _ = helper.render(renderer, session.snapshot(), width: w, height: h)
+    _ = try helper.render(renderer, session.snapshot(), width: w, height: h)
     session.feed(Array("\(CSI)3;1Hlost".utf8))
     _ = session.snapshot()  // no drawable this frame
     session.feed(Array("\(CSI)4;1Hlast".utf8))
-    let frame = helper.render(renderer, session.snapshot(), width: w, height: h)
+    let frame = try helper.render(
+      renderer,
+      session.snapshot(),
+      width: w,
+      height: h
+    )
     let fresh = try MetalRenderer(
       device: #require(RendererTests.device),
       fontManager: manager,
       font: FontDescriptor()
     )
     session.mutate { $0.damage.setFull() }
-    let reference = helper.render(
+    let reference = try helper.render(
       fresh,
       session.snapshot(),
       width: w,

@@ -112,7 +112,8 @@ public struct SemanticKey: Hashable, Sendable, Codable {
   public init(from decoder: any Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
     let wire = try c.decode(String.self, forKey: .name)
-    guard wire.utf8.count <= 16, let name = SemanticKeyName(wireName: wire) else {
+    guard wire.utf8.count <= 16, let name = SemanticKeyName(wireName: wire)
+    else {
       throw DecodingError.dataCorruptedError(
         forKey: .name,
         in: c,
@@ -166,7 +167,7 @@ public enum InputOperation: Hashable, Sendable, Codable {
   }
 
   public enum ValidationError: Error, Equatable {
-    case empty, pasteTooLarge, textTooLarge, gridOutOfRange
+    case empty, pasteTooLarge, textTooLarge, gridOutOfRange, invalidKey
   }
 
   public func validate() throws(ValidationError) {
@@ -180,7 +181,13 @@ public enum InputOperation: Hashable, Sendable, Codable {
       guard text.utf8.count <= RSTLimits.maxPasteBytes else {
         throw .pasteTooLarge
       }
-    case .key: break
+    case let .key(key):
+      if case let .function(number) = key.name, !(1 ... 12).contains(number) {
+        throw .invalidKey
+      }
+      guard key.modifiers.isSubset(of: [.shift, .alt, .control]) else {
+        throw .invalidKey
+      }
     case let .resize(columns, rows, _):
       guard (1 ... RSTLimits.maxColumns).contains(columns),
         (1 ... RSTLimits.maxRows).contains(rows)

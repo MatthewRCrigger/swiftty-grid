@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import NIOCore
 import NIOSSH
+import Testing
 
 @testable import SSHClient
 
@@ -25,8 +26,18 @@ final class TestSFTPServer {
     self.state = state
   }
 
-  deinit {
+  deinit { closeHandles() }
+
+  func closeHandles() {
+    let count = items.count
     for case let .file(fd) in items.values { close(fd) }
+    items.removeAll()
+    state.sftpOpenHandles.withLock { $0 -= count }
+  }
+
+  private struct ResponseTarget {
+    weak var server: TestSFTPServer?
+    weak var context: ChannelHandlerContext?
   }
 
   func receive(_ bytes: [UInt8], context: ChannelHandlerContext) {
@@ -36,13 +47,17 @@ final class TestSFTPServer {
         guard context.channel.isActive else { return }
         handle(message, context: context)
       }
-    } catch {
-      context.close(promise: nil)
-    }
+    } catch { context.close(promise: nil) }
   }
 
   private func respond(_ message: SFTPMessage, context: ChannelHandlerContext) {
-    let bytes = message.encoded()
+    guard context.channel.isActive else { return }
+    let bytes: [UInt8]
+    do { bytes = try message.encoded() } catch {
+      Issue.record(error)
+      context.close(promise: nil)
+      return
+    }
     var buffer = context.channel.allocator.buffer(capacity: bytes.count)
     buffer.writeBytes(bytes)
     context.writeAndFlush(
@@ -51,12 +66,51 @@ final class TestSFTPServer {
     )
   }
 
-  private func dropConnection(_ context: ChannelHandlerContext) {
-    context.channel.parent?.close(promise: nil)
+  private func dropConnection(
+    _ context: ChannelHandlerContext,
+    requestID: UInt32,
+    message: SFTPMessage,
+    cause: TestServerState.SFTPDrop.Cause
+  ) {
+    let operation: TestServerState.SFTPDrop.Operation
+    switch message {
+    case .open: operation = .open
+    case .close: operation = .close
+    case .read: operation = .read
+    case .write: operation = .write
+    case .fstat: operation = .fstat
+    case .stat: operation = .stat
+    case .rename: operation = .rename
+    case .realpath: operation = .realpath
+    default: operation = .other
+    }
+    let parent = context.channel.parent
+    let observation = TestServerState.SFTPDrop(
+      operation: operation,
+      cause: cause,
+      requestID: requestID,
+      parentPresent: parent != nil
+    )
+    let state = state
+    state.lastSFTPDrop.withLock { $0 = observation }
+    context.channel.closeFuture.whenComplete { _ in
+      state.lastSFTPDrop.withLock {
+        if $0?.id == observation.id { $0?.childClosed = true }
+      }
+    }
+    parent?.closeFuture
+      .whenComplete { _ in
+        state.lastSFTPDrop.withLock {
+          if $0?.id == observation.id { $0?.parentClosed = true }
+        }
+      }
+    parent?.close(promise: nil)
   }
 
   private func handle(_ message: SFTPMessage, context: ChannelHandlerContext) {
     if case .initialize = message {
+      state.sftpInitializations.withLock { $0 += 1 }
+      if state.faults.withLock({ $0.withholdVersionResponse }) { return }
       respond(.version(version: 3, extensions: []), context: context)
       return
     }
@@ -73,10 +127,58 @@ final class TestSFTPServer {
       return true
     }
     if shouldDrop {
-      dropConnection(context)
+      dropConnection(
+        context,
+        requestID: id,
+        message: message,
+        cause: .requestLimit
+      )
       return
     }
-    respond(process(message, id: id, context: context), context: context)
+    let response = process(message, id: id, context: context)
+    let (hold, holdAll) = state.faults.withLock { plan -> (Bool, Bool) in
+      switch message {
+      case .read where plan.holdAllReadResponses: return (true, true)
+      case let .read(_, _, offset, _)
+      where offset == 0 && plan.holdNextReadResponse:
+        plan.holdNextReadResponse = false
+        return (true, false)
+      case let .write(_, _, offset, _)
+      where offset == 0 && plan.holdNextWriteResponse:
+        plan.holdNextWriteResponse = false
+        return (true, false)
+      case .open, .opendir:
+        guard plan.holdNextOpenResponse else { return (false, false) }
+        plan.holdNextOpenResponse = false
+        return (true, false)
+      case .realpath where plan.holdNextRealpathResponse:
+        plan.holdNextRealpathResponse = false
+        return (true, false)
+      default: return (false, false)
+      }
+    }
+    if hold {
+      let loop = context.eventLoop
+      let bound = NIOLoopBound(
+        ResponseTarget(server: self, context: context),
+        eventLoop: loop
+      )
+      let release: @Sendable () -> Void = {
+        loop.execute {
+          guard let server = bound.value.server,
+            let context = bound.value.context
+          else { return }
+          server.respond(response, context: context)
+        }
+      }
+      if holdAll {
+        state.heldSFTPResponses.withLock { $0.append(release) }
+      } else {
+        state.heldSFTPResponse.withLock { $0 = release }
+      }
+    } else {
+      respond(response, context: context)
+    }
   }
 
   private func process(
@@ -107,8 +209,16 @@ final class TestSFTPServer {
       guard let key = key(handle), let item = items.removeValue(forKey: key)
       else { return status(id, .failure) }
       if case let .file(fd) = item { Darwin.close(fd) }
+      state.sftpOpenHandles.withLock { $0 -= 1 }
+      let reject = state.faults.withLock { plan in
+        let reject = plan.rejectNextClose
+        plan.rejectNextClose = false
+        return reject
+      }
+      if reject { return status(id, .failure) }
       return status(id, .ok)
     case let .read(_, handle, offset, length):
+      state.reads.withLock { $0 += 1 }
       guard let fd = fd(handle) else { return status(id, .failure) }
       var bytes = [UInt8](repeating: 0, count: Int(min(length, 65536)))
       let n = bytes.withUnsafeMutableBytes {
@@ -124,34 +234,40 @@ final class TestSFTPServer {
         pwrite(fd, $0.baseAddress, $0.count, off_t(offset))
       }
       return n == data.count ? status(id, .ok) : errnoStatus(id)
-    case let .stat(_, path):
-      return attributes(id, path: path, follow: true)
-    case let .lstat(_, path):
-      return attributes(id, path: path, follow: false)
+    case let .stat(_, path): return attributes(id, path: path, follow: true)
+    case let .lstat(_, path): return attributes(id, path: path, follow: false)
     case let .fstat(_, handle):
       guard let fd = fd(handle) else { return status(id, .failure) }
       var info = Darwin.stat()
       guard fstat(fd, &info) == 0 else { return errnoStatus(id) }
       return .attrs(id: id, Self.attributes(info))
     case let .opendir(_, path):
-      guard let local = map(path),
-        let names = try? FileManager.default.contentsOfDirectory(
-          atPath: local
-        )
-      else { return status(id, .noSuchFile) }
-      let entries = names.sorted().map { name -> SFTPNameEntry in
-        var info = Darwin.stat()
-        lstat(local + "/" + name, &info)
-        return SFTPNameEntry(
-          filename: name,
-          longname: name,
-          attributes: Self.attributes(info)
-        )
+      if state.faults.withLock({ $0.rejectedDirectoryPaths.contains(path) }) {
+        return status(id, .permissionDenied)
       }
+      guard let local = map(path),
+        let names = try? FileManager.default.contentsOfDirectory(atPath: local)
+      else { return status(id, .noSuchFile) }
+      let entries = names.sorted()
+        .map { name -> SFTPNameEntry in
+          var info = Darwin.stat()
+          lstat(local + "/" + name, &info)
+          return SFTPNameEntry(
+            filename: name,
+            longname: name,
+            attributes: Self.attributes(info)
+          )
+        }
       return .handle(id: id, register(.directory(entries)))
     case let .readdir(_, handle):
       guard let key = key(handle), case let .directory(entries) = items[key]
       else { return status(id, .failure) }
+      state.directoryReads.withLock { $0 += 1 }
+      let scripted = state.faults.withLock { plan -> [SFTPNameEntry]? in
+        guard !plan.readDirectoryBatches.isEmpty else { return nil }
+        return plan.readDirectoryBatches.removeFirst()
+      }
+      if let scripted { return .name(id: id, scripted) }
       if entries.isEmpty { return status(id, .eof) }
       items[key] = .directory(Array(entries.dropFirst(3)))
       return .name(id: id, Array(entries.prefix(3)))
@@ -184,14 +300,12 @@ final class TestSFTPServer {
         return plan.dropRenameResponse
       }
       if drop {
-        dropConnection(context)
+        dropConnection(context, requestID: id, message: message, cause: .rename)
         return status(id, .ok)  // never delivered: connection is closing
       }
       return status(id, .ok)
-    case .extended:
-      return status(id, .operationUnsupported)
-    default:
-      return status(id, .badMessage)
+    case .extended: return status(id, .operationUnsupported)
+    default: return status(id, .badMessage)
     }
   }
 
@@ -207,6 +321,7 @@ final class TestSFTPServer {
     let key = nextHandle
     nextHandle += 1
     items[key] = item
+    state.sftpOpenHandles.withLock { $0 += 1 }
     return withUnsafeBytes(of: key.bigEndian) { Array($0) }
   }
 
@@ -241,18 +356,19 @@ final class TestSFTPServer {
   ) -> SFTPMessage {
     guard let local = map(path) else { return status(id, .noSuchFile) }
     var info = Darwin.stat()
-    let result =
-      follow ? statFollowing(local, &info) : lstat(local, &info)
+    let result = follow ? statFollowing(local, &info) : lstat(local, &info)
     guard result == 0 else { return errnoStatus(id) }
-    return .attrs(id: id, Self.attributes(info))
+    var attributes = Self.attributes(info)
+    if let size = state.faults.withLock({ $0.reportedFileSize }) {
+      attributes.size = size
+    }
+    return .attrs(id: id, attributes)
   }
 
   private func statFollowing(
     _ path: String,
     _ info: UnsafeMutablePointer<Darwin.stat>
-  ) -> Int32 {
-    fstatat(AT_FDCWD, path, info, 0)
-  }
+  ) -> Int32 { fstatat(AT_FDCWD, path, info, 0) }
 
   static func attributes(_ info: Darwin.stat) -> SFTPAttributes {
     SFTPAttributes(

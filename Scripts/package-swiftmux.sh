@@ -15,6 +15,9 @@
 #                     Contents/embedded.provisionprofile; macOS honours
 #                     the associated-domains entitlement only with one.
 set -eu
+# Domain records are deliberately word-split below. Their developer-mode
+# suffix is literal text, even when the caller has matching filenames.
+set -f
 
 identity=${1:--}
 out=${2:-.build/package}
@@ -77,7 +80,8 @@ cat > "$app/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-# On demand through its Mach service; no KeepAlive or pressured exit.
+# Mach-service activation and login startup for configured roaming hosts;
+# no KeepAlive or pressured exit.
 cat > "$app/Contents/Library/LaunchAgents/$label.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -87,8 +91,10 @@ cat > "$app/Contents/Library/LaunchAgents/$label.plist" <<EOF
   <key>BundleProgram</key><string>Contents/MacOS/swiftmux-agent</string>
   <key>AssociatedBundleIdentifiers</key><array><string>$bundle_id</string></array>
   <key>MachServices</key><dict><key>$label</key><true/></dict>
+  <key>RunAtLoad</key><true/>
   <key>ProcessType</key><string>Interactive</string>
   <key>EnablePressuredExit</key><false/>
+  <key>EnableTransactions</key><false/>
 </dict>
 </plist>
 EOF

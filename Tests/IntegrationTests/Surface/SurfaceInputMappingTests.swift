@@ -30,21 +30,24 @@ struct SurfaceInputMappingTests {
       SemanticKey(KeyEvent(.character("c"), modifiers: .control))
         == SemanticKey(.character("c"), modifiers: .control)
     )
-    #expect(SemanticKey(KeyEvent(.character("é"))) == SemanticKey(.character("é")))
+    #expect(
+      SemanticKey(KeyEvent(.character("é"))) == SemanticKey(.character("é"))
+    )
   }
 
   @Test
   func `repeats map like presses and releases are dropped`() {
-    #expect(
-      SemanticKey(KeyEvent(.left, action: .repeat)) == SemanticKey(.left)
-    )
+    #expect(SemanticKey(KeyEvent(.left, action: .repeat)) == SemanticKey(.left))
     #expect(SemanticKey(KeyEvent(.left, action: .release)) == nil)
   }
 
   @Test
-  func `command shortcuts and unrepresentable keys never become remote input`() {
+  func `command shortcuts and unrepresentable keys never become remote input`()
+  {
     #expect(SemanticKey(KeyEvent(.character("v"), modifiers: .command)) == nil)
-    #expect(SemanticKey(KeyEvent(.enter, modifiers: [.command, .shift])) == nil)
+    #expect(
+      SemanticKey(KeyEvent(.enter, modifiers: [.command, .shift])) == nil
+    )
     #expect(SemanticKey(KeyEvent(.function(13))) == nil)
     #expect(SemanticKey(KeyEvent(.function(0))) == nil)
     #expect(SemanticKey(KeyEvent(.character("\u{1B}"))) == nil)
@@ -65,14 +68,17 @@ struct SurfaceInputMappingTests {
     #expect(SurfaceInput(TerminalInput.text("ls")) == .text("ls"))
     #expect(SurfaceInput(TerminalInput.paste("a\nb")) == .paste("a\nb"))
     #expect(
-      SurfaceInput(TerminalInput.key(KeyEvent(.enter))) == .key(SemanticKey(.enter))
+      SurfaceInput(TerminalInput.key(KeyEvent(.enter)))
+        == .key(SemanticKey(.enter))
     )
     #expect(SurfaceInput(TerminalInput.text("")) == nil)
     #expect(SurfaceInput(TerminalInput.paste("")) == nil)
     #expect(SurfaceInput(TerminalInput.focus(true)) == nil)
     #expect(SurfaceInput(TerminalInput.bytes([0x1B])) == nil)
     #expect(
-      SurfaceInput(TerminalInput.key(KeyEvent(.character("q"), modifiers: .command))) == nil
+      SurfaceInput(
+        TerminalInput.key(KeyEvent(.character("q"), modifiers: .command))
+      ) == nil
     )
   }
 }
@@ -81,6 +87,51 @@ struct OrderedInputPumpTests {
   final class Log: Sendable {
     let submitted = Mutex<[SurfaceInput]>([])
     let results = Mutex<[SurfaceInputResult]>([])
+  }
+
+  @Test(arguments: [false, true])
+  func invalidPayloadIsRefusedBeforeQueueRetention(paste: Bool) async {
+    let log = Log()
+    let gate = Mutex(false)
+    let entered = Mutex(false)
+    let pump = OrderedInputPump(
+      limit: 2,
+      submit: { input in
+        entered.withLock { $0 = true }
+        while !gate.withLock({ $0 }) {
+          try? await Task.sleep(for: .milliseconds(1))
+        }
+        log.submitted.withLock { $0.append(input) }
+        return .accepted(sequence: nil)
+      },
+      onResult: { _, result in log.results.withLock { $0.append(result) } }
+    )
+    defer {
+      gate.withLock { $0 = true };
+      pump.close()
+    }
+    #expect(pump.enqueue(.text("first")))
+    #expect(await eventually { entered.withLock { $0 } })
+    let oversized = String(
+      repeating: "🙂",
+      count: RSTLimits.maxPasteBytes / 4 + 1
+    )
+    #expect(!pump.enqueue(paste ? .paste(oversized) : .text(oversized)))
+    #expect(pump.queuedCount == 0)
+    #expect(log.results.withLock { $0 } == [.refused(.invalid)])
+    let boundary = String(repeating: "🙂", count: RSTLimits.maxPasteBytes / 4)
+    #expect(pump.enqueue(paste ? .paste(boundary) : .text(boundary)))
+    #expect(pump.enqueue(.text("last")))
+    #expect(!pump.enqueue(.text(oversized)))
+    #expect(log.results.withLock { $0.last } == .refused(.backpressure))
+    pump.close()
+    #expect(!pump.enqueue(.text(oversized)))
+    #expect(log.results.withLock { $0.last } == .refused(.closed))
+    gate.withLock { $0 = true }
+    #expect(
+      await eventually { log.submitted.withLock { $0 } == [.text("first")] }
+    )
+    #expect(await eventually { log.results.withLock { $0.count } == 6 })
   }
 
   @Test
@@ -107,7 +158,9 @@ struct OrderedInputPumpTests {
     let pump = OrderedInputPump(
       limit: 2,
       submit: { _ in
-        while !gate.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(1)) }
+        while !gate.withLock({ $0 }) {
+          try? await Task.sleep(for: .milliseconds(1))
+        }
         return .accepted(sequence: nil)
       },
       onResult: { _, result in log.results.withLock { $0.append(result) } }
