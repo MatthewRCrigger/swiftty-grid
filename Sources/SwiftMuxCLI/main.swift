@@ -128,7 +128,7 @@ func attach(
   let settings: Settings
   do { settings = try Settings.load() } catch { fail("settings: \(error)") }
   let reply: MuxReply
-  do { reply = try await connection.execute(.attach(selector)) } catch {
+  do { reply = try await connection.execute(.attach(AttachRequest(selector))) } catch {
     fail("\(error)")
   }
   guard case let .attached(attachment, workspace) = reply else {

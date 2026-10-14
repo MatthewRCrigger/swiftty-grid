@@ -28,10 +28,13 @@ public actor MuxService {
 
   var workspaces: [Workspace] = []
   var panes: [PaneID: PaneRecord] = [:]
-  private var clients: [UUID: Client] = [:]
-  /// At most one lease per workspace and per client.
+  var clients: [UUID: Client] = [:]
+  /// At most one writer lease per workspace and per client.
   var leases: [WorkspaceID: Lease] = [:]
-  private var clientLeases: [UUID: WorkspaceID] = [:]
+  var clientLeases: [UUID: WorkspaceID] = [:]
+  /// Read-only viewers. At most `SMX.maxObservers` per workspace.
+  var viewers: [WorkspaceID: [Viewer]] = [:]
+  var clientViewers: [UUID: WorkspaceID] = [:]
   /// Last granted lease generation per workspace; `takeover` names it.
   private var leaseGenerations: [WorkspaceID: UInt64] = [:]
   var pendingLaunches = 0
@@ -46,16 +49,16 @@ public actor MuxService {
   /// never joins the graph.
   var endAllEpoch: UInt64 = 0
   /// Frame bytes sent and not yet acknowledged.
-  private var inflightFrameBytes = 0
+  var inflightFrameBytes = 0
   /// Estimates held by captures in progress, so concurrent captures
   /// cannot overrun `pendingFrameBudget` together.
-  private var reservedFrameBytes = 0
-  private var pumpScheduled = false
+  var reservedFrameBytes = 0
+  var pumpScheduled = false
   /// Leases in grant order; `pump` rotates through them.
-  private var leaseOrder: [WorkspaceID] = []
-  private var workspaceCursor = 0
-  private var nextCapture: UInt64 = 0
-  private var idleWork: DispatchWorkItem?
+  var leaseOrder: [WorkspaceID] = []
+  var workspaceCursor = 0
+  var nextCapture: UInt64 = 0
+  var idleWork: DispatchWorkItem?
   private var listeners: [SMXListener] = []
   /// Called once the empty-state barrier holds for `idleExitDelay`.
   private var onIdle: (@Sendable () -> Void)?
@@ -163,13 +166,16 @@ public actor MuxService {
     }
     attention.unsubscribe(id)
     if let ws = clientLeases[id] {
-      // Connection loss: cancel remaining input, release the lease.
+      // Connection loss: cancel remaining input, release the writer lease.
+      // Observers and PTYs stay.
       releaseLease(ws, notify: false, reason: "connection lost: \(reason)")
+    } else if clientViewers[id] != nil {
+      releaseViewer(id, reason: "connection lost: \(reason)")
     }
     checkIdle()
   }
 
-  private func send(_ message: ServerMessage, to id: UUID) {
+  func send(_ message: ServerMessage, to id: UUID) {
     guard let client = clients[id] else { return }
     switch client.transport {
     case let .xpc(channel):
@@ -379,58 +385,21 @@ public actor MuxService {
       endAllEpoch &+= 1
       for ws in workspaces { endWorkspace(ws.id) }
       ok()
-    case let .attach(selector):
-      guard hello.frontend != .control else {
-        return fail(
-          MuxError(.invalidRequest, "control connections cannot attach"),
-        )
-      }
-      guard !quiescing else {
-        return fail(MuxError(.quiescing, "service is preparing to update"))
-      }
-      guard clientLeases[client.id] == nil else {
-        return fail(MuxError(.alreadyAttached, "this connection is attached"))
-      }
-      let ws = try workspace(selector)
-      guard leases[ws.id] == nil else {
-        return fail(
-          MuxError(.leaseHeld, "another frontend controls this workspace"),
-        )
-      }
-      reply(.success(grantLease(ws, to: client, hello: hello)))
+    case let .attach(request):
+      try attach(request, client: client, hello: hello, reply: reply)
     case let .takeover(selector, expected):
-      guard hello.frontend != .control else {
-        return fail(
-          MuxError(.invalidRequest, "control connections cannot attach"),
-        )
-      }
-      guard !quiescing else {
-        return fail(MuxError(.quiescing, "service is preparing to update"))
-      }
-      let ws = try workspace(selector)
-      // Names the lease the user agreed to displace; a newer holder
-      // (or none) means the prompt is stale.
-      guard expected == leaseGenerations[ws.id, default: 0] else {
-        return fail(
-          MuxError(.staleRevision, "the workspace's controller changed"),
-        )
-      }
-      if let held = clientLeases[client.id] {
-        releaseLease(held, notify: false, reason: "took over another workspace")
-      }
-      if leases[ws.id] != nil {
-        // Fence the old holder: its pastes close and its attachment ID
-        // stops admitting input before the new lease exists.
-        releaseLease(
-          ws.id,
-          notify: true,
-          reason: "another frontend took control",
-        )
-      }
-      reply(.success(grantLease(ws, to: client, hello: hello)))
+      try takeover(
+        selector,
+        expected: expected,
+        client: client,
+        hello: hello,
+        reply: reply,
+      )
     case .detach:
       if let ws = clientLeases[client.id] {
         releaseLease(ws, notify: false, reason: "detached")
+      } else if clientViewers[client.id] != nil {
+        releaseViewer(client.id, reason: "detached")
       }
       ok()
     case let .switchWorkspace(selector):
@@ -461,11 +430,87 @@ public actor MuxService {
       .markReviewed:
       handleAttention(command, client: client, reply: reply)
     default:
+      if let ws = clientViewers[client.id] {
+        handleViewer(command, workspace: ws, client: client.id, reply: reply)
+        return
+      }
       guard let ws = clientLeases[client.id] else {
         return fail(MuxError(.notAttached))
       }
       handleLeased(command, workspace: ws, client: client.id, reply: reply)
     }
+  }
+
+  private func attach(
+    _ request: AttachRequest,
+    client: Client,
+    hello: Hello,
+    reply: @escaping Reply,
+  ) throws(MuxError) {
+    let fail = { (e: MuxError) in reply(.failure(e)) }
+    guard hello.frontend != .control else {
+      return fail(
+        MuxError(.invalidRequest, "control connections cannot attach"),
+      )
+    }
+    guard !quiescing else {
+      return fail(MuxError(.quiescing, "service is preparing to update"))
+    }
+    guard clientLeases[client.id] == nil, clientViewers[client.id] == nil else {
+      return fail(MuxError(.alreadyAttached, "this connection is attached"))
+    }
+    let ws = try workspace(request.selector)
+    if request.role == .observer {
+      do throws(MuxError) {
+        reply(.success(try grantViewer(ws, to: client, hello: hello)))
+      } catch { fail(error) }
+      return
+    }
+    guard leases[ws.id] == nil else {
+      return fail(
+        MuxError(.leaseHeld, "another frontend controls this workspace"),
+      )
+    }
+    reply(.success(grantLease(ws, to: client, hello: hello)))
+  }
+
+  private func takeover(
+    _ selector: WorkspaceSelector,
+    expected: UInt64,
+    client: Client,
+    hello: Hello,
+    reply: @escaping Reply,
+  ) throws(MuxError) {
+    let fail = { (e: MuxError) in reply(.failure(e)) }
+    guard hello.frontend != .control else {
+      return fail(
+        MuxError(.invalidRequest, "control connections cannot attach"),
+      )
+    }
+    guard !quiescing else {
+      return fail(MuxError(.quiescing, "service is preparing to update"))
+    }
+    let ws = try workspace(selector)
+    // Names the lease the user agreed to displace; a newer holder
+    // (or none) means the prompt is stale.
+    guard expected == leaseGenerations[ws.id, default: 0] else {
+      return fail(
+        MuxError(.staleRevision, "the workspace's controller changed"),
+      )
+    }
+    if let held = clientLeases[client.id] {
+      releaseLease(held, notify: false, reason: "took over another workspace")
+    }
+    if leases[ws.id] != nil {
+      // Fence the old holder: its pastes close and its attachment ID
+      // stops admitting input before the new lease exists.
+      releaseLease(
+        ws.id,
+        notify: true,
+        reason: "another frontend took control",
+      )
+    }
+    reply(.success(grantLease(ws, to: client, hello: hello)))
   }
 
   private func switchWorkspace(
@@ -483,7 +528,7 @@ public actor MuxService {
         MuxError(.leaseHeld, "another frontend controls this workspace"),
       )
     }
-    cancelPastes(from)
+    cancelPastes(from, discardDeferredInput: true)
     _ = setSubscriptions([], client: client.id)
     if ws.id != from, var moved = leases.removeValue(forKey: from) {
       // Leaving returns the old workspace to live output, as a release
@@ -502,7 +547,7 @@ public actor MuxService {
     reply(.success(.layout(snapshot(ws))))
   }
 
-  private func recordLocalUse(_ id: WorkspaceID, by client: Client) {
+  func recordLocalUse(_ id: WorkspaceID, by client: Client) {
     if !client.remote, let index = workspaces.firstIndex(where: { $0.id == id })
     {
       workspaces[index].wasAttachedLocally = true
@@ -528,12 +573,16 @@ public actor MuxService {
         since: Date(),
       ),
     )
-    leases[ws.id] = lease
+    var granted = lease
+    granted.readiness.enabled = hello.capabilities.contains(.attachReadiness)
+    leases[ws.id] = granted
     leaseOrder.append(ws.id)
     clientLeases[client.id] = ws.id
     idleWork?.cancel()
     publishWorkspaces()
-    return .attached(attachment: lease.attachment, workspace: snapshot(ws))
+    var snap = snapshot(ws)
+    snap.attachmentRole = .controller
+    return .attached(attachment: granted.attachment, workspace: snap)
   }
 
   /// OSC 7501 inbox commands: metadata only. They never take a lease,
@@ -746,6 +795,8 @@ public actor MuxService {
       } else {
         ok()
       }
+    case let .setViewport(request):
+      setControllerViewport(request, workspace: leased, reply: reply)
     case let .scroll(pane, request):
       guard validScroll(request) else {
         return fail(MuxError(.invalidRequest, "scroll distance"))
@@ -759,15 +810,9 @@ public actor MuxService {
     case let .search(pane, query):
       search(query, pane: pane, workspace: leased, reply: reply)
     case let .searchStep(pane, forward):
-      guard let runtime = attachedRuntime(pane, in: leased) else {
-        return fail(MuxError(.notFound, "pane"))
-      }
-      runtime.search(nil, step: forward) { reply(.success(.search($0))) }
+      stepSearch(forward, pane: pane, workspace: leased, reply: reply)
     case let .endSearch(pane):
-      guard let runtime = attachedRuntime(pane, in: leased) else {
-        return fail(MuxError(.notFound, "pane"))
-      }
-      runtime.search(nil, step: nil) { reply(.success(.search($0))) }
+      stepSearch(nil, pane: pane, workspace: leased, reply: reply)
     case .status, .listWorkspaces, .newWorkspace, .endWorkspace,
       .renameWorkspace, .detachActive, .endAllWorkspaces, .attach, .detach,
       .switchWorkspace, .quiesce, .setTheme, .takeover, .observeWorkspaces,
@@ -793,12 +838,30 @@ public actor MuxService {
     runtime.search(query, step: nil) { reply(.success(.search($0))) }
   }
 
+  private func stepSearch(
+    _ forward: Bool?,
+    pane: PaneID,
+    workspace leased: WorkspaceID,
+    reply: @escaping Reply,
+  ) {
+    guard let runtime = attachedRuntime(pane, in: leased) else {
+      reply(.failure(MuxError(.notFound, "pane")))
+      return
+    }
+    runtime.search(nil, step: forward) { reply(.success(.search($0))) }
+  }
+
   /// Lease and update-barrier admission for a command.
   private func admission(
     of command: MuxCommand,
     from client: Client,
   ) -> MuxError? {
-    if command.requiresLease, clientLeases[client.id] == nil {
+    if clientViewers[client.id] != nil, !command.allowedForObserver {
+      return MuxError(.unauthorized, "observers cannot mutate the session")
+    }
+    if command.requiresLease, clientLeases[client.id] == nil,
+      clientViewers[client.id] == nil
+    {
       return MuxError(.notAttached, "this connection holds no attachment")
     }
     // At the update barrier only status, ending sessions and leaving are
@@ -819,7 +882,7 @@ public actor MuxService {
 
   /// Relative scrolls never exceed what a pane could hold: history plus
   /// a screen, in lines or (at least one line each) pages.
-  private func validScroll(_ request: ScrollRequest) -> Bool {
+  func validScroll(_ request: ScrollRequest) -> Bool {
     switch request {
     case let .lines(n), let .pages(n):
       guard limits.historyRowsPerPane >= 0, limits.maxRows >= 0 else {
@@ -946,7 +1009,7 @@ public actor MuxService {
   }
 
   /// A pane of the attached workspace.
-  private func attachedRuntime(
+  func attachedRuntime(
     _ pane: PaneID,
     in workspace: WorkspaceID,
   ) -> PaneRuntime? {
@@ -975,8 +1038,12 @@ public actor MuxService {
   func commitLayout(_ id: WorkspaceID) {
     guard let i = workspaces.firstIndex(where: { $0.id == id }) else { return }
     workspaces[i].layoutRevision &+= 1
+    let snap = snapshot(workspaces[i])
     if let lease = leases[id] {
-      send(.event(.layout(snapshot(workspaces[i]))), to: lease.client)
+      send(.event(.layout(snap)), to: lease.client)
+    }
+    for viewer in viewers[id] ?? [] {
+      send(.event(.layout(snap)), to: viewer.client)
     }
     publishWorkspaces()
   }
@@ -990,8 +1057,11 @@ public actor MuxService {
     record.runtime.changePosted.store(false, ordering: .releasing)
     let wsID = record.workspace
     if let holder = leases[wsID], let sink = clients[holder.client]?.local {
-      // The roaming bridge exports its own screens on demand.
+      // The roaming bridge exports its own screens on demand. Observers
+      // still need a pump: a dirty slot is not delivered on its own.
       sink.onPaneChanged(id)
+      markViewersDirty(wsID, pane: id)
+      pump()
       return
     }
     if reportActivity, let current = leases[wsID],
@@ -1005,8 +1075,12 @@ public actor MuxService {
         send(.event(.activity(id)), to: current.client)
       }
     }
-    guard leases[wsID]?.frames[id] != nil else { return }
-    leases[wsID]?.frames[id]?.dirty = true
+    if leases[wsID]?.frames[id] != nil {
+      leases[wsID]?.frames[id]?.dirty = true
+    }
+    markViewersDirty(wsID, pane: id)
+    guard leases[wsID]?.frames[id] != nil || viewerSubscribed(wsID, pane: id)
+    else { return }
     pump()
   }
 
@@ -1059,347 +1133,12 @@ public actor MuxService {
     }
   }
 
-  // MARK: Geometry and subscriptions
-
-  private func setSubscriptions(_ list: [PaneID], client: UUID) -> MuxError? {
-    guard let wsID = clientLeases[client], let current = leases[wsID],
-      let ws = workspaces.first(where: { $0.id == wsID })
-    else { return MuxError(.notAttached) }
-    let members = Set(ws.allPanes)
-    guard clients[client]?.local == nil || list.isEmpty else {
-      return MuxError(.invalidRequest, "in-process clients export screens")
-    }
-    guard list.count <= limits.maxPanes, Set(list).count == list.count,
-      list.allSatisfy(members.contains)
-    else { return MuxError(.invalidRequest, "subscription list") }
-    var frames: [PaneID: FrameSlot] = [:]
-    var activity: [PaneID] = []
-    for pane in list {
-      // Keep in-flight state; a new subscription forces a full frame.
-      frames[pane] = current.frames[pane] ?? FrameSlot()
-      frames[pane]?.hiddenActivity = false
-    }
-    for (pane, slot) in current.frames where frames[pane] == nil {
-      releaseBudget(slot)
-      if slot.hiddenActivity, let tab = ws.tabIndex(containing: pane),
-        ws.tabs[tab].id != ws.activeTab,
-        !current.reportedActivity.contains(pane)
-      {
-        activity.append(pane)
-      }
-    }
-    leases[wsID]?.subscriptions = list
-    leases[wsID]?.frames = frames
-    leases[wsID]?.reportedActivity.subtract(list)
-    for pane in activity {
-      leases[wsID]?.reportedActivity.insert(pane)
-      send(.event(.activity(pane)), to: current.client)
-    }
-    pump()
-    return nil
-  }
-
-  // MARK: Frames
-
-  private func pump() {
-    let now = DispatchTime.now().uptimeNanoseconds
-    var wake: UInt64?
-    // Rotate which workspace goes first so one cannot starve the others
-    // of the shared frame budget: start after the last lease served.
-    let n = leaseOrder.count
-    let start = n == 0 ? 0 : workspaceCursor % n
-    var served: Int?
-    for k in 0 ..< n {
-      let i = (start + k) % n
-      let (due, started) = pump(leaseOrder[i], now: now)
-      if started, served == nil { served = i }
-      if let due { wake = min(wake ?? due, due) }
-    }
-    workspaceCursor = n == 0 ? 0 : ((served ?? start) + 1) % n
-    if let wake, !pumpScheduled {
-      pumpScheduled = true
-      queue.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: wake)) {
-        [weak self] in
-        self?
-          .assumeIsolated {
-            $0.pumpScheduled = false
-            $0.pump()
-          }
-      }
-    }
-  }
-
-  /// Starts captures for one lease; returns when a throttled pane is due
-  /// and whether any capture started.
-  private func pump(
-    _ wsID: WorkspaceID,
-    now: UInt64,
-  ) -> (due: UInt64?, started: Bool) {
-    guard let current = leases[wsID], !current.subscriptions.isEmpty else {
-      return (nil, false)
-    }
-    let interval = limits.frameIntervalNanoseconds
-    var wake: UInt64?
-    var started = false
-    let order = current.subscriptions
-    let n = order.count
-    let first = current.paneCursor % n
-    leases[wsID]?.paneCursor = (first + 1) % n
-    for k in 0 ..< n {
-      let pane = order[(first + k) % n]
-      guard let slot = current.frames[pane], slot.dirty, slot.capture == nil,
-        slot.inflight == nil, let record = panes[pane]
-      else { continue }
-      if now &- slot.lastSent < interval, slot.lastSent != 0 {
-        let due = slot.lastSent + interval
-        wake = min(wake ?? due, due)
-        continue
-      }
-      guard inflightFrameBytes + reservedFrameBytes < limits.pendingFrameBudget
-      else { break }
-      nextCapture &+= 1
-      let token = nextCapture
-      let estimate = captureEstimate(record)
-      reservedFrameBytes += estimate
-      leases[wsID]?.frames[pane]?.dirty = false
-      leases[wsID]?.frames[pane]?.capture = token
-      leases[wsID]?.frames[pane]?.reserved = estimate
-      started = true
-      let attachment = current.attachment
-      let layoutRevision =
-        workspaces.first { $0.id == wsID }?.layoutRevision ?? 0
-      record.runtime.captureFrame(
-        server: instance,
-        attachment: attachment,
-        layoutRevision: layoutRevision,
-      ) { [weak self] result in
-        self?
-          .onQueue {
-            $0.frameCaptured(pane, workspace: wsID, token: token, result)
-          }
-      }
-    }
-    return (wake, started)
-  }
-
-  private func frameCaptured(
-    _ pane: PaneID,
-    workspace wsID: WorkspaceID,
-    token: UInt64,
-    _ result: Result<(Data, UInt64), MuxError>,
-  ) {
-    // The token is unique to this slot's capture: a completion for a
-    // pane since unsubscribed (or resubscribed), or for another lease,
-    // never reaches the client or the frame budget.
-    guard let current = leases[wsID], let slot = current.frames[pane],
-      slot.capture == token
-    else { return }
-    leases[wsID]?.frames[pane]?.capture = nil
-    leases[wsID]?.frames[pane]?.reserved = 0
-    reservedFrameBytes -= slot.reserved
-    switch result {
-    case let .success((data, revision)):
-      guard let client = clients[current.client],
-        case let .xpc(channel) = client.transport
-      else { return }
-      if let stale = slot.inflight { inflightFrameBytes -= stale.bytes }
-      channel.send(data)
-      leases[wsID]?.frames[pane]?.inflight = (revision, data.count)
-      leases[wsID]?.frames[pane]?.lastSent =
-        DispatchTime.now().uptimeNanoseconds
-      inflightFrameBytes += data.count
-    case let .failure(error):
-      // Preserve the session; report instead of omitting cells.
-      send(.event(.frameUnavailable(pane, error)), to: current.client)
-    }
-    pump()
-  }
-
-  /// Frame bytes a capture of `record` may produce, held from its start.
-  private func captureEstimate(_ record: PaneRecord) -> Int {
-    let cells = max(1, record.columns) * max(1, record.rows)
-    let (bytes, overflow) = cells.multipliedReportingOverflow(
-      by: Self.frameBytesPerCell,
-    )
-    return overflow ? limits.maxFrameBytes : min(bytes, limits.maxFrameBytes)
-  }
-
-  /// Rough encoded size of one cell; frames carry per-cell attributes.
-  static let frameBytesPerCell = 32
-
-  /// Returns a dropped slot's budget: its unacknowledged frame and the
-  /// estimate held by a capture still in progress (whose completion,
-  /// carrying a token no slot holds, is then dropped).
-  func releaseBudget(_ slot: FrameSlot) {
-    if let inflight = slot.inflight { inflightFrameBytes -= inflight.bytes }
-    reservedFrameBytes -= slot.reserved
-  }
-
-  private func frameAck(_ pane: PaneID, _ revision: UInt64, from id: UUID) {
-    guard let wsID = clientLeases[id], let slot = leases[wsID]?.frames[pane],
-      let inflight = slot.inflight, inflight.revision == revision
-    else { return }
-    leases[wsID]?.frames[pane]?.inflight = nil
-    inflightFrameBytes -= inflight.bytes
-    pump()
-  }
-
-  // MARK: Input
-
-  private func input(_ record: InputRecord, from id: UUID) {
-    let ack = { (error: MuxError?) in
-      self.send(.inputAck(sequence: record.sequence, error: error), to: id)
-    }
-    guard let wsID = clientLeases[id], let current = leases[wsID] else {
-      return ack(MuxError(.notAttached))
-    }
-    guard record.attachment == current.attachment else {
-      return ack(MuxError(.staleAttachment, "attachment is no longer current"))
-    }
-    // Ledger (spec.inbox.md §1–2): each sequence is answered once and in
-    // order. A duplicate was already answered and is never written
-    // again; a gap is refused without consuming anything.
-    guard record.sequence >= current.nextInput else { return ack(nil) }
-    guard record.sequence == current.nextInput else {
-      return ack(MuxError(.inputGap, "expected input \(current.nextInput)"))
-    }
-    leases[wsID]?.nextInput += 1
-    guard let pane = panes[record.pane], pane.workspace == wsID,
-      !pane.detachedFromLayout
-    else { return ack(MuxError(.notFound, "pane")) }
-    guard pane.exitStatus == nil else { return ack(MuxError(.paneExited)) }
-    let runtime = pane.runtime
-    switch record.payload {
-    case let .input(input):
-      if case let .text(s) = input, s.utf8.count > limits.maxPasteChunkBytes {
-        return ack(MuxError(.resourceLimit, "text input record too large"))
-      }
-      if case let .paste(s) = input, s.utf8.count > limits.maxPasteChunkBytes {
-        return ack(MuxError(.resourceLimit, "text input record too large"))
-      }
-      let estimate = Self.estimate(input)
-      guard runtime.reserve(estimate) else {
-        return ack(MuxError(.resourceLimit, "pane input buffer is full"))
-      }
-      runtime.write(input, estimate: estimate)
-      ack(nil)
-    case let .pasteBegin(pasteID):
-      guard current.pastes[pasteID] == nil,
-        !current.pastes.values.contains(where: { $0.pane == record.pane })
-      else { return ack(MuxError(.invalidRequest, "paste already active")) }
-      let estimate = PaneWriter.pasteMarkerBytes
-      guard runtime.reserve(estimate) else {
-        return ack(MuxError(.resourceLimit, "pane input buffer is full"))
-      }
-      leases[wsID]?.pastes[pasteID] = ActivePaste(pane: record.pane)
-      runtime.pasteBegin(id: pasteID, estimate: estimate)
-      ack(nil)
-    case let .pasteChunk(pasteID, text):
-      guard let paste = current.pastes[pasteID], paste.pane == record.pane
-      else { return ack(MuxError(.invalidRequest, "unknown paste")) }
-      let n = text.utf8.count
-      guard n <= limits.maxPasteChunkBytes,
-        paste.bytes + n <= limits.maxPasteBytes
-      else {
-        cancelPaste(pasteID, in: wsID, notify: id)
-        return ack(
-          MuxError(
-            .resourceLimit,
-            "paste exceeds \(limits.maxPasteBytes) bytes",
-          ),
-        )
-      }
-      let estimate = n + text.utf8.reduce(0) { $0 + ($1 == 0x0A ? 1 : 0) }
-      guard runtime.reserve(estimate) else {
-        return ack(MuxError(.resourceLimit, "pane input buffer is full"))
-      }
-      leases[wsID]?.pastes[pasteID]?.bytes += n
-      runtime.pasteChunk(id: pasteID, text: text, estimate: estimate)
-      ack(nil)
-    case let .pasteEnd(pasteID):
-      // The paste stays open on a mismatch, so detach still cancels it.
-      guard let paste = current.pastes[pasteID], paste.pane == record.pane
-      else { return ack(MuxError(.invalidRequest, "unknown paste")) }
-      leases[wsID]?.pastes.removeValue(forKey: pasteID)
-      runtime.pasteEnd(id: pasteID)
-      ack(nil)
-      send(.event(.paste(id: pasteID, state: .completed)), to: id)
-    case let .pasteCancel(pasteID):
-      guard let paste = current.pastes[pasteID], paste.pane == record.pane
-      else { return ack(MuxError(.invalidRequest, "unknown paste")) }
-      cancelPaste(pasteID, in: wsID, notify: id)
-      ack(nil)
-    }
-  }
-
-  /// True when this text can never fit the peer's chunk or pane budget.
-  /// A full pane buffer is a different, transient `resourceLimit`.
-  package static func permanentlyExceedsText(
-    utf8Count: Int,
-    limits: MuxLimits
-  ) -> Bool {
-    utf8Count > limits.maxPasteChunkBytes
-      || utf8Count > limits.inputBytesPerPane
-  }
-
-  /// True when this paste can never fit. `newlineCount` is the number of
-  /// `0x0A` bytes, which the service expands while estimating the write.
-  package static func permanentlyExceedsPaste(
-    utf8Count: Int,
-    newlineCount: Int,
-    limits: MuxLimits
-  ) -> Bool {
-    let estimate = utf8Count + PaneWriter.pasteMarkerBytes + newlineCount
-    return utf8Count > limits.maxPasteChunkBytes
-      || estimate > limits.inputBytesPerPane
-  }
-
-  /// True when a key encoding cannot fit an empty pane budget.
-  package static func permanentlyExceedsKey(limits: MuxLimits) -> Bool {
-    32 > limits.inputBytesPerPane
-  }
-
-  static func estimate(_ input: MuxInput) -> Int {
-    switch input {
-    case let .text(s): s.utf8.count
-    // Brackets plus a carriage return for every newline.
-    case let .paste(s):
-      s.utf8.count + PaneWriter.pasteMarkerBytes
-        + s.utf8.reduce(0) { $0 + ($1 == 0x0A ? 1 : 0) }
-    case .key: 32
-    case .focus: 3
-    }
-  }
-
-  private func cancelPaste(
-    _ pasteID: UInt64,
-    in wsID: WorkspaceID,
-    notify client: UUID?,
-  ) {
-    guard let paste = leases[wsID]?.pastes.removeValue(forKey: pasteID),
-      let runtime = panes[paste.pane]?.runtime
-    else { return }
-    runtime.pasteCancel(id: pasteID) { [weak self] state in
-      guard let client else { return }
-      self?
-        .onQueue {
-          $0.send(.event(.paste(id: pasteID, state: state)), to: client)
-        }
-    }
-  }
-
-  private func cancelPastes(_ wsID: WorkspaceID) {
-    for id in leases[wsID]?.pastes.keys.map(\.self) ?? [] {
-      cancelPaste(id, in: wsID, notify: nil)
-    }
-  }
-
   // MARK: Lease and lifetime
 
   func releaseLease(_ wsID: WorkspaceID, notify: Bool, reason: String) {
     guard let current = leases[wsID] else { return }
     // Cancellation cleanup is queued on each pane ahead of any later input.
-    cancelPastes(wsID)
+    cancelPastes(wsID, discardDeferredInput: true)
     resetViewports(wsID)
     for slot in current.frames.values { releaseBudget(slot) }
     leases.removeValue(forKey: wsID)
@@ -1469,14 +1208,40 @@ public actor MuxService {
   /// captures in progress (tests, diagnostics).
   package var pendingFrameBytes: Int { inflightFrameBytes + reservedFrameBytes }
 
+  /// In-flight plus replaceable queued frames one observer holds for
+  /// `pane` (tests). A capture still in progress is not included.
+  package func observerQueuedFrames(_ pane: PaneID) -> Int {
+    var most = 0
+    for list in viewers.values {
+      for viewer in list {
+        guard let slot = viewer.frames[pane] else { continue }
+        var held = 0
+        if slot.inflight != nil { held += 1 }
+        if slot.queued != nil { held += 1 }
+        most = max(most, held)
+      }
+    }
+    return most
+  }
+
   /// Frames being captured or awaiting acknowledgement (tests).
   package var outstandingFrames: Int {
-    leases.values.reduce(0) { n, lease in
-      n + lease.frames.values.count { $0.capture != nil || $0.inflight != nil }
+    let held: (FrameSlot) -> Bool = {
+      $0.capture != nil || $0.inflight != nil || $0.queued != nil
     }
+    let controllers = leases.values.reduce(0) { n, lease in
+      n + lease.frames.values.count(where: held)
+    }
+    let watching = viewers.values.reduce(0) { n, list in
+      n + list.reduce(0) { count, viewer in
+        count + viewer.frames.values.count(where: held)
+      }
+    }
+    return controllers + watching
   }
 
   public func panePID(_ pane: PaneID) -> Int32? {
     panes[pane].map(\.runtime.pid)
   }
+
 }

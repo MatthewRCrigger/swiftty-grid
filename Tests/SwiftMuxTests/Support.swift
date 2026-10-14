@@ -51,18 +51,36 @@ extension MuxConnection {
   func frame(
     of pane: PaneID,
     timeout: Duration = .seconds(10),
+    label: String = "",
     where predicate: (PaneFrame) -> Bool
   ) async throws -> PaneFrame {
     let deadline = ContinuousClock.now + timeout
+    var last = "no frame"
     while ContinuousClock.now < deadline {
-      let event = try await withTimeout(deadline - ContinuousClock.now) {
-        try await self.nextEvent()
+      let remaining = deadline - ContinuousClock.now
+      if remaining <= .zero { break }
+      let event: MuxEvent?
+      do {
+        event = try await withTimeout(remaining) { try await self.nextEvent() }
+      } catch is TimeoutError {
+        break
       }
-      if case let .frame(f)? = event, f.identity.pane == pane, predicate(f) {
-        return f
+      guard let event else { continue }
+      if case let .frameUnavailable(id, error) = event, id == pane {
+        last = "unavailable \(error.code) \(error.message)"
+      }
+      if case let .frame(f) = event, f.identity.pane == pane {
+        let tail = f.lines.joined(separator: " | ")
+        last =
+          "rev=\(f.identity.revision) gen=\(f.history.generation) "
+          + "top=\(f.history.viewportTop) first=\(f.history.firstRow) "
+          + "off=\(f.history.viewportOffset) sb=\(f.history.scrollbackRows) "
+          + "grid=\(f.grid.columns)x\(f.grid.rows) [\(tail)]"
+        if predicate(f) { return f }
       }
     }
-    throw MuxError(.notFound, "timed out waiting for frame")
+    let prefix = label.isEmpty ? "" : "\(label): "
+    throw MuxError(.notFound, "\(prefix)timed out waiting for frame; last \(last)")
   }
 
   /// Attach, size and subscribe the active tab's panes.
@@ -73,7 +91,7 @@ extension MuxConnection {
     rows: Int = 24,
     generation: UInt64 = 1
   ) async throws -> WorkspaceSnapshot {
-    guard case let .attached(_, ws) = try await execute(.attach(selector))
+    guard case let .attached(_, ws) = try await execute(.attach(AttachRequest(selector)))
     else { throw MuxError(.invalidRequest, "attach reply") }
     let panes = ws.activeTabSnapshot!.layout.panes
     try await execute(

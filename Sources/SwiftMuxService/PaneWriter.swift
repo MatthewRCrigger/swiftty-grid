@@ -116,12 +116,23 @@ struct PaneWriter {
   /// discarded, and the closing marker is committed if needed.
   /// Returns the number of discarded bytes and whether any payload byte
   /// had been written (a partly written chunk counts).
-  mutating func cancelPaste(id: UInt64) -> (discarded: Int, wrote: Bool) {
+  ///
+  /// `discardDeferredInput` drops keystrokes queued behind the paste
+  /// instead of releasing them. Lease loss uses that so the previous
+  /// writer's pending input cannot run after the fence.
+  mutating func cancelPaste(
+    id: UInt64,
+    discardDeferredInput: Bool = false
+  ) -> (discarded: Int, wrote: Bool) {
     guard let p = paste, p.id == id else { return (0, false) }
     var discarded = 0
     var kept: [Segment] = []
     for (i, s) in queue.enumerated() where i >= head {
       if s.kind == .paste(id), s.offset == 0 {
+        discarded += s.bytes.count
+        continue
+      }
+      if discardDeferredInput, case .input = s.kind, s.offset == 0 {
         discarded += s.bytes.count
         continue
       }
@@ -133,8 +144,83 @@ struct PaneWriter {
     if p.bracketed {
       queue.append(Segment(bytes: Array("\u{1B}[201~".utf8), kind: .marker))
     }
+    if discardDeferredInput {
+      var replies: [Segment] = []
+      for s in deferred {
+        if case .input = s.kind {
+          discarded += s.bytes.count
+          pendingInputBytes -= s.bytes.count
+          continue
+        }
+        replies.append(s)
+      }
+      deferred = replies
+      deferredReplyBytes = replies.reduce(0) { total, segment in
+        if case .reply = segment.kind { total + segment.bytes.count } else { total }
+      }
+    }
     releaseDeferred()
     return (discarded, p.wrote)
+  }
+
+  /// Drops user input and paste payload that have not reached the program.
+  /// Bytes already accepted by the kernel stay. The unwritten suffix of a
+  /// chunk that has started is still this writer's and is dropped with the
+  /// unstarted chunks. Replies and markers stay. An open bracketed paste
+  /// still receives its closing marker. Used when the writer lease ends,
+  /// including after `pasteEnd` has retired the lease's paste record while
+  /// bytes are still queued.
+  mutating func discardUnwrittenInput() -> Int {
+    var discarded = 0
+    var kept: [Segment] = []
+    for (i, s) in queue.enumerated() where i >= head {
+      switch s.kind {
+      case .input, .paste:
+        guard s.offset < s.bytes.count else { break }
+        // The prefix already in the kernel cannot be rewritten. Credit
+        // covers only the suffix that flush has not released.
+        discarded += s.bytes.count - s.offset
+        continue
+      case .marker, .reply:
+        break
+      }
+      kept.append(s)
+    }
+    if discarded != 0 {
+      queue = kept
+      head = 0
+      pendingInputBytes -= discarded
+    }
+    var replies: [Segment] = []
+    for s in deferred {
+      if case .input = s.kind {
+        discarded += s.bytes.count
+        pendingInputBytes -= s.bytes.count
+        continue
+      }
+      replies.append(s)
+    }
+    if replies.count != deferred.count {
+      deferred = replies
+      deferredReplyBytes = replies.reduce(0) { total, segment in
+        if case .reply = segment.kind { total + segment.bytes.count } else { total }
+      }
+    }
+    // A later pasteEnd must not flush the tail or release deferred
+    // keystrokes. The closer was reserved with the opener; flush writes it.
+    if let open = paste {
+      if open.bracketed {
+        queue.append(Segment(bytes: Array("\u{1B}[201~".utf8), kind: .marker))
+      }
+      paste = nil
+      if !deferred.isEmpty {
+        queue.append(contentsOf: deferred)
+        pendingReplyBytes += deferredReplyBytes
+        deferredReplyBytes = 0
+        deferred = []
+      }
+    }
+    return discarded
   }
 
   private mutating func releaseDeferred() {

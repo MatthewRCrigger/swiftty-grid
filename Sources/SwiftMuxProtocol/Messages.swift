@@ -3,6 +3,8 @@ import Foundation
 /// SMX/1: tagged Codable records carried as bounded XPC data payloads.
 public enum SMX {
   public static let protocolVersion = 1
+  /// Read-only viewers per workspace. Not configurable.
+  public static let maxObservers = 4
   /// Versions this build can talk to. Only exact matches for now.
   public static let compatibleVersions: ClosedRange<Int> = 1 ... 1
   public static let build = "swiftmux-0.2"
@@ -57,22 +59,82 @@ public enum FrontendKind: String, Codable, Sendable {
   case control
 }
 
+/// What a client can consume beyond the original single-controller attach.
+/// A hello that omits this set is a role-less client: it attaches as the
+/// sole controller and is never sent a `ready` event.
+public struct ClientCapabilities: OptionSet, Codable, Sendable, Equatable {
+  public var rawValue: UInt32
+  public init(rawValue: UInt32) { self.rawValue = rawValue }
+
+  /// The client installs owned frames and waits for `ready`.
+  public static let attachReadiness = ClientCapabilities(rawValue: 1 << 0)
+  /// The client may request `role: observer`.
+  public static let observers = ClientCapabilities(rawValue: 1 << 1)
+  /// The client scrolls a viewport without resizing the PTY.
+  public static let viewerViewport = ClientCapabilities(rawValue: 1 << 2)
+
+  public static let supported: ClientCapabilities = [
+    .attachReadiness, .observers, .viewerViewport,
+  ]
+}
+
+/// Writer or read-only viewer. Absent on the wire means controller.
+public enum AttachmentRole: String, Codable, Sendable, Equatable {
+  case controller
+  case observer
+}
+
 public struct Hello: Codable, Sendable {
   public var protocolVersion: Int
   public var build: String
   public var frontend: FrontendKind
   public var terminalProfile: String?
+  /// Empty when the peer omitted the field (role-less single controller).
+  public var capabilities: ClientCapabilities
 
   public init(
     frontend: FrontendKind,
     terminalProfile: String? = nil,
     protocolVersion: Int = SMX.protocolVersion,
-    build: String = SMX.build
+    build: String = SMX.build,
+    capabilities: ClientCapabilities = .supported
   ) {
     self.protocolVersion = protocolVersion
     self.build = build
     self.frontend = frontend
     self.terminalProfile = terminalProfile
+    self.capabilities = capabilities
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion, build, frontend, terminalProfile, capabilities
+  }
+
+  public init(from decoder: any Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(Int.self, forKey: .protocolVersion)
+    build = try container.decode(String.self, forKey: .build)
+    frontend = try container.decode(FrontendKind.self, forKey: .frontend)
+    terminalProfile = try container.decodeIfPresent(
+      String.self,
+      forKey: .terminalProfile
+    )
+    capabilities =
+      try container.decodeIfPresent(
+        ClientCapabilities.self,
+        forKey: .capabilities
+      ) ?? []
+  }
+
+  public func encode(to encoder: any Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(protocolVersion, forKey: .protocolVersion)
+    try container.encode(build, forKey: .build)
+    try container.encode(frontend, forKey: .frontend)
+    try container.encodeIfPresent(terminalProfile, forKey: .terminalProfile)
+    if !capabilities.isEmpty {
+      try container.encode(capabilities, forKey: .capabilities)
+    }
   }
 }
 
@@ -163,6 +225,8 @@ public struct WorkspaceSnapshot: Codable, Sendable, Equatable {
   public var panes: [PaneSummary]
   /// Increments on every committed layout mutation.
   public var layoutRevision: UInt64
+  /// Set on an attach or takeover reply. Layout events leave it nil.
+  public var attachmentRole: AttachmentRole?
 
   public var activeTabSnapshot: TabSnapshot? {
     tabs.first { $0.id == activeTab }
@@ -180,7 +244,8 @@ public struct WorkspaceSnapshot: Codable, Sendable, Equatable {
     tabs: [TabSnapshot],
     activeTab: TabID,
     panes: [PaneSummary],
-    layoutRevision: UInt64
+    layoutRevision: UInt64,
+    attachmentRole: AttachmentRole? = nil
   ) {
     self.id = id
     self.name = name
@@ -188,6 +253,7 @@ public struct WorkspaceSnapshot: Codable, Sendable, Equatable {
     self.activeTab = activeTab
     self.panes = panes
     self.layoutRevision = layoutRevision
+    self.attachmentRole = attachmentRole
   }
 }
 
@@ -278,6 +344,112 @@ public struct ServiceStatus: Codable, Sendable, Equatable {
 }
 
 // MARK: Commands
+
+/// Attach payload. A role-less encoding is the historical selector alone
+/// and means controller, so older clients keep single-controller attach.
+public struct AttachRequest: Codable, Sendable, Equatable {
+  public var selector: WorkspaceSelector
+  public var role: AttachmentRole
+  /// When false, the wire form is the bare selector (no role key).
+  public var includesRole: Bool
+
+  public init(
+    _ selector: WorkspaceSelector,
+    role: AttachmentRole = .controller,
+    includesRole: Bool = true
+  ) {
+    self.selector = selector
+    self.role = role
+    self.includesRole = includesRole
+  }
+
+  private enum CodingKeys: String, CodingKey { case selector, role }
+
+  public init(from decoder: any Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    if container.contains(.selector) || container.contains(.role) {
+      selector = try container.decode(WorkspaceSelector.self, forKey: .selector)
+      role =
+        try container.decodeIfPresent(AttachmentRole.self, forKey: .role)
+        ?? .controller
+      includesRole = container.contains(.role)
+    } else {
+      selector = try WorkspaceSelector(from: decoder)
+      role = .controller
+      includesRole = false
+    }
+  }
+
+  public func encode(to encoder: any Encoder) throws {
+    if !includesRole {
+      try selector.encode(to: encoder)
+      return
+    }
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(selector, forKey: .selector)
+    try container.encode(role, forKey: .role)
+  }
+}
+
+/// One viewer's window onto a pane. Display size crops or pads the
+/// authoritative grid; it does not change the PTY.
+public struct ViewportRequest: Codable, Sendable, Equatable {
+  public var pane: PaneID
+  /// Absolute row pinned at the top of the viewport. Ignored when
+  /// `followTail` is set.
+  public var anchorRow: Int?
+  public var followTail: Bool
+  public var historyGeneration: UInt64
+  /// Nil uses the authoritative grid size.
+  public var rows: Int?
+  public var columns: Int?
+
+  public init(
+    pane: PaneID,
+    anchorRow: Int? = nil,
+    followTail: Bool,
+    historyGeneration: UInt64,
+    rows: Int? = nil,
+    columns: Int? = nil
+  ) {
+    self.pane = pane
+    self.anchorRow = anchorRow
+    self.followTail = followTail
+    self.historyGeneration = historyGeneration
+    self.rows = rows
+    self.columns = columns
+  }
+}
+
+/// Sent once the attachment has installed a current frame for every
+/// required visible pane. Hidden panes are absent from `initialFrames`.
+public struct ReadyNotice: Codable, Sendable, Equatable {
+  public struct PaneRevision: Codable, Sendable, Equatable {
+    public var pane: PaneID
+    public var frameRevision: UInt64
+    public var geometryRevision: UInt64
+
+    public init(pane: PaneID, frameRevision: UInt64, geometryRevision: UInt64) {
+      self.pane = pane
+      self.frameRevision = frameRevision
+      self.geometryRevision = geometryRevision
+    }
+  }
+
+  public var attachment: AttachmentID
+  public var server: ServerInstanceID
+  public var initialFrames: [PaneRevision]
+
+  public init(
+    attachment: AttachmentID,
+    server: ServerInstanceID,
+    initialFrames: [PaneRevision]
+  ) {
+    self.attachment = attachment
+    self.server = server
+    self.initialFrames = initialFrames
+  }
+}
 
 /// Selects a workspace by identity or display name.
 public enum WorkspaceSelector: Codable, Sendable, Equatable {
@@ -398,7 +570,7 @@ public enum MuxCommand: Codable, Sendable, Equatable {
   case setTheme(MuxTheme)
 
   // Attachment.
-  case attach(WorkspaceSelector)
+  case attach(AttachRequest)
   /// Fences the current holder of the workspace's lease and attaches.
   /// `expectedLease` must name the lease generation the user saw, so a
   /// stale prompt cannot displace a newer holder.
@@ -433,8 +605,11 @@ public enum MuxCommand: Codable, Sendable, Equatable {
   case setGeometry(GeometryBatch)
   /// Visible panes whose frames this attachment wants.
   case setSubscriptions([PaneID])
+  /// Moves this attachment's viewport. Does not resize the PTY.
+  /// Observers may call it; it never changes another viewer's anchor.
+  case setViewport(ViewportRequest)
 
-  // History (lease required): the active attachment's viewport.
+  // History: each attachment's viewport. Observers may scroll and search.
   case scroll(pane: PaneID, ScrollRequest)
   case search(pane: PaneID, query: String)
   case searchStep(pane: PaneID, forward: Bool)
@@ -447,9 +622,20 @@ public enum MuxCommand: Codable, Sendable, Equatable {
     switch self {
     case .status, .listWorkspaces, .detachActive, .detach, .endWorkspace,
       .endAllWorkspaces, .quiesce, .endPane, .endTab, .setGeometry,
-      .setSubscriptions, .scroll, .searchStep, .endSearch, .setTheme,
-      .observeWorkspaces, .subscribeInbox, .inbox, .locateAttention, .markSeen,
-      .snooze, .markReviewed:
+      .setSubscriptions, .setViewport, .scroll, .searchStep, .endSearch,
+      .setTheme, .observeWorkspaces, .subscribeInbox, .inbox, .locateAttention,
+      .markSeen, .snooze, .markReviewed:
+      true
+    default: false
+    }
+  }
+
+  /// Read-only viewer commands. Everything else is refused to an observer.
+  public var allowedForObserver: Bool {
+    switch self {
+    case .status, .listWorkspaces, .detach, .observeWorkspaces, .subscribeInbox,
+      .inbox, .locateAttention, .setSubscriptions, .setViewport, .scroll,
+      .search, .searchStep, .endSearch:
       true
     default: false
     }
@@ -587,6 +773,8 @@ public enum MuxEvent: Codable, Sendable {
   /// An unsubscribed pane in another tab of the attached workspace
   /// changed. Sent once until it is subscribed again.
   case activity(PaneID)
+  /// Initial visible frames are installed. Hidden panes are not listed.
+  case ready(ReadyNotice)
   /// The lease ended without this client asking (e.g. another client
   /// released it, or the workspace ended).
   case detached(reason: String)

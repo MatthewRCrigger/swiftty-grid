@@ -403,6 +403,29 @@ extension TerminalState {
 
   // MARK: Search
 
+  package struct TerminalSearchSnapshot: Sendable {
+    package var query: String?
+    package var matches: [TerminalRange]
+    package var selected: Int?
+    package var needsRefresh: Bool
+  }
+
+  package mutating func snapshotSearch() -> TerminalSearchSnapshot {
+    TerminalSearchSnapshot(
+      query: searchQuery,
+      matches: searchMatches,
+      selected: searchSelected,
+      needsRefresh: searchNeedsRefresh
+    )
+  }
+
+  package mutating func restoreSearch(_ snapshot: TerminalSearchSnapshot) {
+    searchQuery = snapshot.query
+    searchMatches = snapshot.matches
+    searchSelected = snapshot.selected
+    searchNeedsRefresh = snapshot.needsRefresh
+  }
+
   /// Finds every occurrence of `needle` (case-insensitive unless it has
   /// an uppercase letter), oldest first; matches may span soft wraps.
   public mutating func search(_ needle: String) {
@@ -605,6 +628,17 @@ extension TerminalState {
     scrollToShow(row: searchMatches[next].start.row)
     damage.setFull()
     return next
+  }
+
+  /// Restores a resolved match index without moving the viewport. The
+  /// caller has already placed the window. An index outside the current
+  /// list selects nothing.
+  package mutating func reselectSearchMatch(_ index: Int) {
+    guard searchMatches.indices.contains(index) else {
+      searchSelected = nil
+      return
+    }
+    searchSelected = index
   }
 
   public mutating func endSearch() {

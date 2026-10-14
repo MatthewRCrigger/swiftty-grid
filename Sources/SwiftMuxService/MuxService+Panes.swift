@@ -286,6 +286,7 @@ extension MuxService {
     // endPane removes the workspace with its last pane.
     workspaces.removeAll { $0.id == id }
     releaseLease(id, notify: true, reason: "workspace ended")
+    releaseViewers(in: id, reason: "workspace ended")
     publishWorkspaces()
   }
 
@@ -294,9 +295,12 @@ extension MuxService {
     let wsID = workspaces[w].id
     leases[wsID]?.subscriptions.removeAll { $0 == pane }
     leases[wsID]?.reportedActivity.remove(pane)
+    leases[wsID]?.readiness.required.remove(pane)
+    leases[wsID]?.readiness.installed.removeValue(forKey: pane)
     if let slot = leases[wsID]?.frames.removeValue(forKey: pane) {
       releaseBudget(slot)
     }
+    dropPaneFromViewers(pane, workspace: wsID)
     if let pasteIDs = leases[wsID]?.pastes.filter({ $0.value.pane == pane })
       .map(\.key)
     {
@@ -309,6 +313,7 @@ extension MuxService {
       if workspaces[w].tabs.isEmpty {
         workspaces.remove(at: w)
         releaseLease(wsID, notify: true, reason: "workspace ended")
+        releaseViewers(in: wsID, reason: "workspace ended")
         publishWorkspaces()
         return
       }

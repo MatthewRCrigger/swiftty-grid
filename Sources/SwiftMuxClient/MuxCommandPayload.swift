@@ -58,9 +58,10 @@ private struct MuxCommandPayload {
     case let .newWorkspace(request):
       try text(request.name)
       try launch(request.launch)
-    case let .endWorkspace(value), let .attach(value),
-      let .switchWorkspace(value), let .takeover(value, _):
+    case let .endWorkspace(value), let .switchWorkspace(value),
+      let .takeover(value, _):
       try selector(value)
+    case let .attach(request): try selector(request.selector)
     case let .renameWorkspace(value, name):
       try selector(value)
       try text(name)
@@ -87,6 +88,8 @@ private struct MuxCommandPayload {
       )
     case let .setSubscriptions(panes):
       try add(count: panes.count, stride: MemoryLayout<PaneID>.stride)
+    case .setViewport:
+      try add(MemoryLayout<ViewportRequest>.stride)
     case let .search(_, query): try text(query)
     case .status, .listWorkspaces, .detachActive, .endAllWorkspaces, .quiesce,
       .detach, .observeWorkspaces, .subscribeInbox, .selectTab, .endTab,

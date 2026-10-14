@@ -350,7 +350,7 @@ extension MuxNativeTests {
             .newWorkspace(NewWorkspaceRequest(launch: launch))
           ),
           case let .attached(_, ws) = try await other.execute(
-            .attach(.id(created.id))
+            .attach(AttachRequest(.id(created.id)))
           ), let pane = ws.activeTabSnapshot?.activePane
         else {
           Issue.record("no second workspace")
@@ -372,7 +372,7 @@ extension MuxNativeTests {
           asked.append(message)
           if asked.count == 1 {
             _ = try? await other.execute(.detach)
-            _ = try? await other.execute(.attach(.id(ws.id)))
+            _ = try? await other.execute(.attach(AttachRequest(.id(ws.id))))
           }
           return true
         }
@@ -619,7 +619,7 @@ extension MuxNativeTests {
             .newWorkspace(NewWorkspaceRequest(launch: launch))
           ),
           case let .attached(_, ws) = try await other.execute(
-            .attach(.id(created.id))
+            .attach(AttachRequest(.id(created.id)))
           ), let pane = ws.activeTabSnapshot?.activePane
         else {
           Issue.record("no second workspace")
@@ -678,7 +678,7 @@ extension MuxNativeTests {
                 )
               )
             )
-          ), case .attached = try await other.execute(.attach(.id(created.id)))
+          ), case .attached = try await other.execute(.attach(AttachRequest(.id(created.id))))
         else {
           Issue.record("no second workspace")
           return

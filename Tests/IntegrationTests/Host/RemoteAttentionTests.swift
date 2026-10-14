@@ -129,7 +129,7 @@ struct RemoteAttentionTests {
       let first = ws.tabs[0].activePane
       guard
         case let .attached(_, attached) = try await local.execute(
-          .attach(.id(ws.id))
+          .attach(AttachRequest(.id(ws.id)))
         ),
         case let .layout(split) = try await local.execute(
           .split(pane: first, axis: .leftRight, launch: shellLaunch())
@@ -183,7 +183,7 @@ struct RemoteAttentionTests {
           .newWorkspace(NewWorkspaceRequest(launch: shellLaunch()))
         )
       else { throw HostTestTimeout(what: "workspace") }
-      _ = try await local.execute(.attach(.id(ws.id)))
+      _ = try await local.execute(.attach(AttachRequest(.id(ws.id))))
       let id = SessionID(ws.id)
       let seen = try #require(
         try await registry.workspaces().first?.leaseGeneration
@@ -306,7 +306,7 @@ struct RemoteAttentionTests {
         )
         guard
           case let .attached(_, ws) = try await local.execute(
-            .attach(.id(grant.sessionID.workspace))
+            .attach(AttachRequest(.id(grant.sessionID.workspace)))
           )
         else { throw HostTestTimeout(what: "attach") }
         let first = ws.tabs[0].activePane

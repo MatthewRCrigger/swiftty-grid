@@ -429,7 +429,7 @@ public final class RoamingSession: @unchecked Sendable {
     session.connect(to: service, frontend: .native, remote: true)
     let target = WorkspaceSelector.id(workspace)
     session.request(
-      .attach(target),
+      .attach(AttachRequest(target)),
       expiresAt: expiresAt,
       isAdmitted: { admission.isAllowed },
       { [self] result in

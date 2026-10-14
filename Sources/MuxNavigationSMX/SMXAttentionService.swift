@@ -76,7 +76,7 @@ public actor SMXAttentionService: AttentionService {
     if let expectedLease {
       try await run(.takeover(selector, expectedLease: expectedLease))
     } else {
-      try await run(.attach(selector))
+      try await run(.attach(AttachRequest(selector)))
     }
     if let tab = target.tab { try await run(.selectTab(tab)) }
     try await run(.focusPane(target.pane))

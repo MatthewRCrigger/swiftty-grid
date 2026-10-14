@@ -63,7 +63,7 @@ struct InputCancellationTests {
         }
       )
       let original = peer.records.withLock { $0 }
-      _ = try await connection.execute(.attach(.id(peer.workspace.id)))
+      _ = try await connection.execute(.attach(AttachRequest(.id(peer.workspace.id))))
       #expect(await waitUntil { finished.withLock { $0 } })
       peer.acknowledge()
       await #expect { try await caller.value } throws: {
@@ -281,7 +281,7 @@ struct InputCancellationTests {
       await #expect { try await first.value } throws: {
         ($0 as? MuxError)?.code == .notAttached
       }
-      _ = try await connection.execute(.attach(.id(peer.workspace.id)))
+      _ = try await connection.execute(.attach(AttachRequest(.id(peer.workspace.id))))
       await connection.setInputAcknowledgmentTimeout(.seconds(2))
       let finished = Mutex(false)
       let next = Task {
@@ -509,7 +509,7 @@ struct InputCancellationTests {
       try #require(
         await waitUntil { retired.withLock { $0 == (bytes ? 4 : 256) } }
       )
-      _ = try await connection.execute(.attach(.id(peer.workspace.id)))
+      _ = try await connection.execute(.attach(AttachRequest(.id(peer.workspace.id))))
       // Do not send withheld ACKs from the old attachment into the new one.
       peer.acknowledgeFutureInputs()
       #expect(try await connection.paste("fresh", to: pane) == .completed)
@@ -898,7 +898,7 @@ struct InputCancellationTests {
       let cleanup = try #require(delayed.withLock { $0 })
       peer.sendAcknowledgment(1)
       try await first.value
-      _ = try await connection.execute(.attach(.id(peer.workspace.id)))
+      _ = try await connection.execute(.attach(AttachRequest(.id(peer.workspace.id))))
       let second = Task { try await connection.send(.text("second"), to: pane) }
       defer { second.cancel() }
       do {
@@ -931,7 +931,7 @@ struct InputCancellationTests {
       frontend: .native,
     )
     do {
-      _ = try await connection.execute(.attach(.id(peer.workspace.id)))
+      _ = try await connection.execute(.attach(AttachRequest(.id(peer.workspace.id))))
       return connection
     } catch {
       await connection.close()

@@ -317,7 +317,7 @@ struct ConnectionTests {
       endpoint: service.listener.endpoint,
       frontend: .native
     )
-    _ = try await c.execute(.attach(.name("silent")))
+    _ = try await c.execute(.attach(AttachRequest(.name("silent"))))
     await c.setDetachTimeout(.milliseconds(200))
     let start = ContinuousClock.now
     try await withTimeout(.seconds(10)) { await c.detach() }
@@ -353,12 +353,12 @@ struct ConnectionTests {
     )
     let task = Task {
       withUnsafeCurrentTask { $0?.cancel() }
-      return try await c.execute(.attach(.name("silent")))
+      return try await c.execute(.attach(AttachRequest(.name("silent"))))
     }
     await #expect(throws: CancellationError.self) { try await task.value }
     // A following request is answered after any earlier message on the
     // same channel, so this count needs no timing-based sleep.
-    _ = try await c.execute(.attach(.name("silent")))
+    _ = try await c.execute(.attach(AttachRequest(.name("silent"))))
     #expect(service.requests.withLock { $0 } == 1)
     await c.close()
   }
@@ -445,7 +445,7 @@ struct ConnectionTests {
     phase = "initial attachment"
     guard
       case let .attached(attachment, _) = try await c.execute(
-        .attach(.id(ws.id))
+        .attach(AttachRequest(.id(ws.id)))
       )
     else { throw MuxError(.invalidRequest, "unexpected attachment reply") }
     let huge = String(repeating: "x", count: 300 << 10)
@@ -468,7 +468,7 @@ struct ConnectionTests {
     var attached = false
     for attempt in 0 ..< 200 {
       phase = "replacement attachment attempt \(attempt)"
-      if case .attached? = try? await other.execute(.attach(.id(ws.id))) {
+      if case .attached? = try? await other.execute(.attach(AttachRequest(.id(ws.id)))) {
         attached = true
         break
       }

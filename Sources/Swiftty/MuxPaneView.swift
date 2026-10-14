@@ -219,6 +219,8 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
     if let current = pending ?? presented,
       current.frame.identity.server == server,
       current.frame.identity.revision > presentation.frame.identity.revision
+        || current.frame.identity.geometryGeneration
+          > presentation.frame.identity.geometryGeneration
     {
       return
     }

@@ -51,7 +51,7 @@ struct ServiceTests {
     // A second interactive attachment is rejected while the first lives.
     let c2 = try await h.connect()
     await #expect(throws: MuxError.self) {
-      try await c2.execute(.attach(.id(ws.id)))
+      try await c2.execute(.attach(AttachRequest(.id(ws.id))))
     }
     // Client death releases the lease; the shell keeps running.
     await c1.close()

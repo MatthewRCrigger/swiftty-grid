@@ -531,7 +531,7 @@ struct MuxInboxRefreshTests {
     try #require(
       await until { service.state.withLock { $0.detachReply != nil } }
     )
-    _ = try await connection.execute(.attach(.id(service.workspace.id)))
+    _ = try await connection.execute(.attach(AttachRequest(.id(service.workspace.id))))
     if outcome != "timeout" {
       service.releaseDetach(failure: outcome == "refusal")
     }
@@ -603,7 +603,7 @@ struct MuxInboxRefreshTests {
     #expect(await until { controller.inbox.revision == 7 })
     if inputFinished && pasteFinished {
       service.state.withLock { $0.acknowledgeInputs = true }
-      _ = try await connection.execute(.attach(.id(service.workspace.id)))
+      _ = try await connection.execute(.attach(AttachRequest(.id(service.workspace.id))))
       #expect(try await connection.paste("fresh", to: pane) == .completed)
     }
     // Close only after checking retirement, so a broken implementation

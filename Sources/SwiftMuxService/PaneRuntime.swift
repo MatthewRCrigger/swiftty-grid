@@ -475,13 +475,26 @@ final class PaneRuntime: @unchecked Sendable {
   /// rest, as the client reports it.
   func pasteCancel(
     id: UInt64,
+    discardDeferredInput: Bool = false,
     completion: @escaping @Sendable (PasteState) -> Void,
   ) {
     queue.async { [self] in
-      let (discarded, wrote) = writer.cancelPaste(id: id)
+      let (discarded, wrote) = writer.cancelPaste(
+        id: id,
+        discardDeferredInput: discardDeferredInput
+      )
       release(discarded)
       flush()
       completion(wrote ? .partial : .aborted)
+    }
+  }
+
+  /// Drops this pane's unwritten user input. Queued ahead of any later
+  /// writer's bytes when a lease is released.
+  func discardUnwrittenInput() {
+    queue.async { [self] in
+      release(writer.discardUnwrittenInput())
+      flush()
     }
   }
 
@@ -719,25 +732,69 @@ final class PaneRuntime: @unchecked Sendable {
 
   // MARK: Frames
 
+  struct CapturedFrame: Sendable {
+    var data: Data
+    var revision: UInt64
+    var geometry: UInt64
+  }
+
+  /// Result of applying a viewer's anchor without touching the engine
+  /// viewport that the controller is using.
+  struct ResolvedViewport: Sendable {
+    var followTail: Bool
+    var historyGeneration: UInt64
+    var anchorRow: Int?
+    var search: SearchResult?
+  }
+
   /// Captures cells and metadata in one operation and encodes the frame
-  /// message, off the service queue.
+  /// message, off the service queue. `viewport` nil uses the controller's
+  /// engine viewport. A viewer viewport is applied only for the capture
+  /// and then restored, so it cannot move the controller or the PTY.
   func captureFrame(
     server: ServerInstanceID,
     attachment: AttachmentID,
     layoutRevision: UInt64,
-    completion: @escaping @Sendable (Result<(Data, UInt64), MuxError>) -> Void,
+    viewport: ViewerCapture? = nil,
+    completion: @escaping @Sendable (Result<CapturedFrame, MuxError>) -> Void,
   ) {
     queue.async { [self] in
-      state.refreshSearchIfNeeded()
-      let screen = state.captureOwnedScreen()
+      let savedOffset = state.viewportOffset
+      let savedSearch = state.snapshotSearch()
+      var failure: MuxError?
+      if let viewport {
+        failure = apply(viewport)
+      } else {
+        state.refreshSearchIfNeeded()
+      }
+      if let failure {
+        restore(offset: savedOffset, search: savedSearch)
+        completion(.failure(failure))
+        return
+      }
+      var screen = state.captureOwnedScreen()
+      let selected = state.searchSelected
+      let geometry = geometryGeneration
+      // A viewer capture does not share the controller's revision: each
+      // exported frame for this pane stays strictly newer than the last.
+      if viewport != nil { revision &+= 1 }
+      let shownRevision = viewport?.viewportRevision ?? viewportRevision
+      restore(offset: savedOffset, search: savedSearch)
+      if let viewport {
+        fit(
+          &screen,
+          columns: viewport.columns ?? screen.columns,
+          rows: viewport.rows ?? screen.rows,
+        )
+      }
       let identity = FrameIdentity(
         server: server,
         attachment: attachment,
         pane: id,
         revision: revision,
         layoutRevision: layoutRevision,
-        geometryGeneration: geometryGeneration,
-        viewportRevision: viewportRevision,
+        geometryGeneration: geometry,
+        viewportRevision: shownRevision,
       )
       do {
         var frame = try FrameExporter.frame(
@@ -745,16 +802,133 @@ final class PaneRuntime: @unchecked Sendable {
           identity: identity,
           limits: limits,
         )
-        frame.search?.selected = state.searchSelected
+        frame.search?.selected = selected
         let data = try SMXCodec.encode(
           ServerMessage.event(.frame(frame)),
           limit: limits.maxFrameBytes,
         )
-        completion(.success((data, revision)))
+        completion(
+          .success(
+            CapturedFrame(data: data, revision: revision, geometry: geometry)
+          )
+        )
       } catch let error as MuxError { completion(.failure(error)) } catch {
         completion(.failure(MuxError(.resourceLimit, "\(error)")))
       }
     }
+  }
+
+  /// Checks an anchor and, for a search, the match list. Restores the
+  /// controller viewport and search before returning.
+  func resolveViewer(
+    _ request: ViewportRequest,
+    searchQuery: String?,
+    searchStep: Bool?,
+    searchSelected: Int? = nil,
+    completion: @escaping @Sendable (Result<ResolvedViewport, MuxError>) -> Void,
+  ) {
+    queue.async { [self] in
+      let savedOffset = state.viewportOffset
+      let savedSearch = state.snapshotSearch()
+      defer { restore(offset: savedOffset, search: savedSearch) }
+      if let searchStep {
+        if let searchQuery, !searchQuery.isEmpty { state.search(searchQuery) }
+        // `search` clears the selection. Continue from the viewer's match
+        // so a step does not jump back to the last occurrence.
+        if let searchSelected { state.reselectSearchMatch(searchSelected) }
+        _ = state.selectSearchMatch(forward: searchStep)
+      } else if let searchQuery {
+        state.search(searchQuery)
+        _ = state.selectSearchMatch(forward: false)
+      } else if request.followTail {
+        state.scrollViewportToBottom()
+      } else if let row = request.anchorRow {
+        guard request.historyGeneration == state.addressingGeneration,
+          state.contains(absoluteRow: row)
+        else {
+          completion(
+            .failure(MuxError(.historyUnavailable, "history anchor is stale"))
+          )
+          return
+        }
+        state.scrollViewport(by: -state.viewportRow(absoluteRow: row))
+      }
+      let searchResult: SearchResult? =
+        searchQuery != nil || searchStep != nil
+        ? SearchResult(
+          matchCount: state.searchMatches.count,
+          selected: state.searchSelected,
+        ) : nil
+      let follow =
+        request.followTail && searchQuery == nil && searchStep == nil
+        ? true : state.viewportOffset == 0
+      completion(
+        .success(
+          ResolvedViewport(
+            followTail: follow,
+            historyGeneration: state.addressingGeneration,
+            anchorRow: state.absoluteRow(viewportRow: 0),
+            search: searchResult,
+          )
+        )
+      )
+    }
+  }
+
+  /// Applies a viewer window for the duration of one capture.
+  private func apply(_ viewport: ViewerCapture) -> MuxError? {
+    if viewport.followTail {
+      state.scrollViewportToBottom()
+    } else if let row = viewport.anchorRow {
+      guard viewport.historyGeneration == state.addressingGeneration,
+        state.contains(absoluteRow: row)
+      else {
+        return MuxError(.historyUnavailable, "history anchor is stale")
+      }
+      state.scrollViewport(by: -state.viewportRow(absoluteRow: row))
+    }
+    if let query = viewport.searchQuery, !query.isEmpty {
+      state.search(query)
+      if let index = viewport.searchSelected {
+        state.reselectSearchMatch(index)
+      }
+    }
+    return nil
+  }
+
+  private func restore(offset: Int, search: TerminalState.TerminalSearchSnapshot) {
+    state.restoreSearch(search)
+    let delta = offset - state.viewportOffset
+    if delta != 0 { state.scrollViewport(by: delta) }
+  }
+
+  /// Crops or pads a captured grid. Does not change addressing of the
+  /// rows that remain; the PTY size is the caller's responsibility.
+  private func fit(_ screen: inout OwnedScreen, columns: Int, rows: Int) {
+    guard columns > 0, rows > 0,
+      columns != screen.columns || rows != screen.rows
+    else { return }
+    var cells: [Cell] = []
+    cells.reserveCapacity(columns * rows)
+    var wrapped: [Bool] = []
+    wrapped.reserveCapacity(rows)
+    for y in 0 ..< rows {
+      let source = y < screen.rows
+      wrapped.append(source && y < screen.wrapped.count ? screen.wrapped[y] : false)
+      for x in 0 ..< columns {
+        if source, x < screen.columns {
+          cells.append(screen.cells[y * screen.columns + x])
+        } else {
+          cells.append(.blank)
+        }
+      }
+    }
+    screen.cells = cells
+    screen.wrapped = wrapped
+    screen.columns = columns
+    screen.rows = rows
+    screen.cursor.x = min(max(0, screen.cursor.x), columns - 1)
+    screen.cursor.y = min(max(0, screen.cursor.y), rows - 1)
   }
 
   /// Plain text of the visible screen (tests, diagnostics).

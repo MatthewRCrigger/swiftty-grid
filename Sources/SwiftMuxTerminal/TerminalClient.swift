@@ -44,6 +44,8 @@ public final class TerminalClient {
   let settings: Settings
   private var decoder: InputDecoder
   package private(set) var workspace: WorkspaceSnapshot
+  /// True only after the service reports Ready for this attachment.
+  package private(set) var isReady = false
   /// Orders snapshots against the attach and switch replies.
   private var sequencer = LayoutSequencer()
   private var frames: [PaneID: PaneFrame] = [:]
@@ -242,7 +244,12 @@ public final class TerminalClient {
       redraw()
     case .bell: tty.write("\u{07}")
     case .activity: break
-    case let .detached(reason): finish(.detached(reason), detach: false)
+    case let .ready(notice):
+      guard notice.attachment == attachment else { return }
+      isReady = true
+    case let .detached(reason):
+      isReady = false
+      finish(.detached(reason), detach: false)
     case let .paste(_, state):
       if state != .completed { show("paste \(state.rawValue)") }
     case let .frameUnavailable(_, error): show("frame unavailable: \(error)")
@@ -269,6 +276,7 @@ public final class TerminalClient {
         lastGeometry = nil
       }
       if ws.id != workspace.id { frames = [:] }
+      if attached { isReady = false }
       workspace = ws
       let live = Set(ws.panes.map(\.id))
       frames = frames.filter { live.contains($0.key) }

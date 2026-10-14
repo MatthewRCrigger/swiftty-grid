@@ -124,6 +124,13 @@ final class Client {
   }
 }
 
+struct QueuedFrame {
+  var revision: UInt64
+  var bytes: Int
+  var geometry: UInt64
+  var data: Data
+}
+
 struct FrameSlot {
   var dirty = true
   /// Output while the tab was hidden but its old subscription remained.
@@ -134,7 +141,45 @@ struct FrameSlot {
   /// Budget held for `capture` until it completes or the slot goes.
   var reserved = 0
   var inflight: (revision: UInt64, bytes: Int)?
+  var inflightGeometry: UInt64 = 0
+  /// Newest complete frame waiting behind the one in flight. Replaced,
+  /// never queued deeper than one.
+  var queued: QueuedFrame?
   var lastSent: UInt64 = 0
+  var lastCapture: UInt64 = 0
+}
+
+/// Initial-frame gate. Hidden panes are never required.
+struct Readiness {
+  var enabled = false
+  var required: Set<PaneID> = []
+  var installed: [PaneID: (frame: UInt64, geometry: UInt64)] = [:]
+  var sent = false
+}
+
+/// One viewer's window. Display size never changes the PTY.
+struct ViewerViewport: Sendable {
+  var followTail: Bool
+  var historyGeneration: UInt64
+  var anchorRow: Int?
+  var rows: Int?
+  var columns: Int?
+  var searchQuery: String?
+  /// Match index from the last search reply. Capture reselects it after
+  /// `search` clears the engine selection.
+  var searchSelected: Int?
+  var revision: UInt64 = 1
+}
+
+struct ViewerCapture: Sendable {
+  var followTail: Bool
+  var historyGeneration: UInt64
+  var anchorRow: Int?
+  var rows: Int?
+  var columns: Int?
+  var searchQuery: String?
+  var searchSelected: Int?
+  var viewportRevision: UInt64
 }
 
 struct ActivePaste {
@@ -161,4 +206,19 @@ struct Lease {
   var pastes: [UInt64: ActivePaste] = [:]
   /// Unsubscribed panes already reported through `activity`.
   var reportedActivity: Set<PaneID> = []
+  var readiness = Readiness()
+}
+
+/// Read-only attachment. It never holds the writer lease or a paste.
+struct Viewer {
+  let client: UUID
+  let attachment = AttachmentID()
+  var workspace: WorkspaceID
+  var subscriptions: [PaneID] = []
+  var frames: [PaneID: FrameSlot] = [:]
+  var paneCursor = 0
+  var reportedActivity: Set<PaneID> = []
+  var viewports: [PaneID: ViewerViewport] = [:]
+  var readiness = Readiness()
+  var unavailable: Set<PaneID> = []
 }

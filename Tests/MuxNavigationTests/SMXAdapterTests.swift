@@ -66,7 +66,7 @@ struct SMXAdapterTests {
           .newWorkspace(NewWorkspaceRequest(name: "w", launch: launch))
         )
       else { throw MuxError(.invalidRequest, "create") }
-      _ = try await owner.execute(.attach(.id(ws.id)))
+      _ = try await owner.execute(.attach(AttachRequest(.id(ws.id))))
 
       let connection = try await MuxConnection.connect(
         endpoint: endpoint,

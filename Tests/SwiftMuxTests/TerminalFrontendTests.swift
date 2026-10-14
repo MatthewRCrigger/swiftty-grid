@@ -406,7 +406,7 @@ struct TerminalClientTests {
         .newWorkspace(NewWorkspaceRequest(name: "demo", launch: shellLaunch()))
       ),
       case let .attached(attachment, workspace) = try await connection.execute(
-        .attach(.id(ws.id))
+        .attach(AttachRequest(.id(ws.id)))
       )
     else {
       Issue.record("setup")
@@ -462,7 +462,7 @@ struct TerminalClientTests {
           )
         ),
         case let .attached(attachment, workspace) =
-          try await connection.execute(.attach(.id(ws.id)))
+          try await connection.execute(.attach(AttachRequest(.id(ws.id))))
       else { throw MuxError(.invalidRequest, "setup") }
       let outer = try Outer()
       var saved = termios()
@@ -541,7 +541,7 @@ struct TerminalClientTests {
         .newWorkspace(NewWorkspaceRequest(name: "demo", launch: shellLaunch()))
       ),
       case let .attached(attachment, workspace) = try await connection.execute(
-        .attach(.id(ws.id))
+        .attach(AttachRequest(.id(ws.id)))
       )
     else {
       Issue.record("setup")
@@ -579,7 +579,7 @@ struct TerminalClientTests {
         .newWorkspace(NewWorkspaceRequest(name: "demo", launch: shellLaunch()))
       ),
       case let .attached(attachment, workspace) = try await connection.execute(
-        .attach(.id(ws.id))
+        .attach(AttachRequest(.id(ws.id)))
       )
     else {
       Issue.record("setup");
@@ -640,7 +640,7 @@ struct TerminalClientTests {
         .newWorkspace(NewWorkspaceRequest(name: "demo", launch: shellLaunch()))
       ),
       case let .attached(attachment, workspace) = try await connection.execute(
-        .attach(.id(ws.id))
+        .attach(AttachRequest(.id(ws.id)))
       )
     else {
       Issue.record("setup")
@@ -681,7 +681,7 @@ struct TerminalClientTests {
         .newWorkspace(NewWorkspaceRequest(name: "two", launch: shellLaunch()))
       ),
       case let .attached(attachment, workspace) = try await connection.execute(
-        .attach(.id(one.id))
+        .attach(AttachRequest(.id(one.id)))
       ),
       case let .layout(reply) = try await connection.execute(
         .switchWorkspace(.id(two.id))

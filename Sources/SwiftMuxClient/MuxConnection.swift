@@ -70,6 +70,20 @@ public actor MuxConnection {
   }
   public private(set) var welcome: Welcome?
   public private(set) var attachment: AttachmentID?
+  /// Installed owned frames. A stale revision never replaces a newer one.
+  public private(set) var installation = FrameInstallation()
+  /// Nil until the service has seen an installed frame for every required
+  /// visible pane. The attach reply does not set this.
+  public private(set) var readiness: ReadyNotice?
+  /// When set, frames are installed but not acknowledged, so the service
+  /// must not report Ready.
+  package var suppressesFrameAcknowledgement = false
+
+  /// Tests withhold frame credit without dropping the connection.
+  package func setSuppressesFrameAcknowledgement(_ suppress: Bool) {
+    suppressesFrameAcknowledgement = suppress
+  }
+  private let capabilities: ClientCapabilities
   private var nextRequest: UInt64 = 1
   private var nextInput: UInt64 = 1
   private var nextPaste: UInt64 = 1
@@ -132,9 +146,14 @@ public actor MuxConnection {
   /// Non-frame events held for the consumer before the connection fails.
   public static let maxBufferedEvents = 4096
 
-  private init(channel: SMXChannel, queue: DispatchSerialQueue) {
+  private init(
+    channel: SMXChannel,
+    queue: DispatchSerialQueue,
+    capabilities: ClientCapabilities
+  ) {
     self.channel = channel
     self.queue = queue
+    self.capabilities = capabilities
   }
 
   isolated deinit {
@@ -148,7 +167,8 @@ public actor MuxConnection {
       "SWMUX_SERVICE"
     ] ?? SMX.defaultMachService,
     frontend: FrontendKind,
-    terminalProfile: String? = nil
+    terminalProfile: String? = nil,
+    capabilities: ClientCapabilities = .supported
   ) async throws -> MuxConnection {
     try Task.checkCancellation()
     let queue = DispatchSerialQueue(
@@ -156,19 +176,27 @@ public actor MuxConnection {
       qos: .userInitiated
     )
     let channel = SMXChannel.connect(machService: name, queue: queue)
-    return try await start(channel, queue, frontend, terminalProfile)
+    return try await start(
+      channel,
+      queue,
+      frontend,
+      terminalProfile,
+      capabilities: capabilities
+    )
   }
 
   /// Connects to an in-process anonymous listener (tests).
   public static func connect(
     endpoint: SMXEndpoint,
     frontend: FrontendKind,
-    terminalProfile: String? = nil
+    terminalProfile: String? = nil,
+    capabilities: ClientCapabilities = .supported
   ) async throws -> MuxConnection {
     try await connect(
       endpoint: endpoint,
       frontend: frontend,
       terminalProfile: terminalProfile,
+      capabilities: capabilities,
       beforeHandshakeTimeoutForTesting: nil
     )
   }
@@ -177,6 +205,7 @@ public actor MuxConnection {
     endpoint: SMXEndpoint,
     frontend: FrontendKind,
     terminalProfile: String? = nil,
+    capabilities: ClientCapabilities = .supported,
     beforeHandshakeTimeoutForTesting: (@Sendable () async -> Void)?,
     beforeReturnForTesting: (@Sendable (MuxConnection) async throws -> Void)? =
       nil
@@ -192,6 +221,7 @@ public actor MuxConnection {
       queue,
       frontend,
       terminalProfile,
+      capabilities: capabilities,
       beforeHandshakeTimeoutForTesting: beforeHandshakeTimeoutForTesting,
       beforeReturnForTesting: beforeReturnForTesting
     )
@@ -202,14 +232,23 @@ public actor MuxConnection {
     _ queue: DispatchSerialQueue,
     _ frontend: FrontendKind,
     _ profile: String?,
+    capabilities: ClientCapabilities = .supported,
     beforeHandshakeTimeoutForTesting: (@Sendable () async -> Void)? = nil,
     beforeReturnForTesting: (@Sendable (MuxConnection) async throws -> Void)? =
       nil
   ) async throws -> MuxConnection {
-    let connection = MuxConnection(channel: channel, queue: queue)
+    let connection = MuxConnection(
+      channel: channel,
+      queue: queue,
+      capabilities: capabilities
+    )
     do {
       try await connection.open(
-        Hello(frontend: frontend, terminalProfile: profile),
+        Hello(
+          frontend: frontend,
+          terminalProfile: profile,
+          capabilities: capabilities
+        ),
         beforeHandshakeTimeoutForTesting: beforeHandshakeTimeoutForTesting
       )
       try await beforeReturnForTesting?(connection)
@@ -405,8 +444,38 @@ public actor MuxConnection {
       }
       inputs.removeValue(forKey: sequence)?(error)
     case let .event(event):
+      switch event {
+      case let .ready(notice):
+        // Attach itself is not Ready. Only this notice is.
+        guard notice.attachment == attachment, notice.server == welcome?.server
+        else { return }
+        readiness = notice
+      case let .frame(frame):
+        guard
+          installation.install(
+            frame,
+            server: welcome?.server,
+            attachment: attachment
+          )
+        else {
+          // A stale frame is not shown. Acknowledge it unless the caller
+          // is deliberately holding credit.
+          if !suppressesFrameAcknowledgement {
+            transmit(
+              .frameAck(
+                pane: frame.identity.pane,
+                revision: frame.identity.revision
+              )
+            )
+          }
+          return
+        }
+      default: break
+      }
       if case .detached = event {
         attachment = nil
+        readiness = nil
+        installation = FrameInstallation()
         failPendingInputs(MuxError(.notAttached))
       }
       deliver(event)
@@ -431,6 +500,7 @@ public actor MuxConnection {
   private func take(_ event: MuxEvent) {
     switch event {
     case let .frame(frame):
+      guard !suppressesFrameAcknowledgement else { return }
       transmit(
         .frameAck(pane: frame.identity.pane, revision: frame.identity.revision)
       )
@@ -614,11 +684,36 @@ public actor MuxConnection {
     requests.removeValue(forKey: id)?.resume(throwing: error)
   }
 
+  /// Role-less clients encode attach as the historical selector.
+  private func wire(_ command: MuxCommand) -> MuxCommand {
+    guard capabilities.isEmpty, case let .attach(request) = command else {
+      return command
+    }
+    return .attach(
+      AttachRequest(request.selector, role: .controller, includesRole: false)
+    )
+  }
+
+  /// Re-runs the shipped frame gate. An older or foreign frame does not
+  /// replace the installed one.
+  public func install(_ frame: PaneFrame) -> Bool {
+    installation.install(
+      frame,
+      server: welcome?.server,
+      attachment: attachment
+    )
+  }
+
+  /// Releases one frame credit without taking a buffered event.
+  package func acknowledgeFrame(pane: PaneID, revision: UInt64) {
+    transmit(.frameAck(pane: pane, revision: revision))
+  }
+
   /// Sends one request. A request too large to encode is refused alone;
   /// the connection stays up.
   private func request(_ id: UInt64, _ command: MuxCommand) -> MuxError? {
     do {
-      channel.send(try encode(.request(id: id, command: command)))
+      channel.send(try encode(.request(id: id, command: wire(command))))
       return nil
     } catch {
       commandAdmissions.removeValue(forKey: id)

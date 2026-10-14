@@ -46,7 +46,7 @@ struct UnifiedServiceTests {
       defer { queue.sync { remote.close() } }
       do {
         if takeover {
-          _ = try await local.execute(.attach(.id(grant.sessionID.workspace)))
+          _ = try await local.execute(.attach(AttachRequest(.id(grant.sessionID.workspace))))
         }
         guard case .success = await remote.request(.status) else {
           throw HostTestTimeout(what: "in-process remote client ready")
@@ -57,7 +57,7 @@ struct UnifiedServiceTests {
         let command: MuxCommand =
           takeover
           ? .takeover(.id(grant.sessionID.workspace), expectedLease: generation)
-          : .attach(.id(grant.sessionID.workspace))
+          : .attach(AttachRequest(.id(grant.sessionID.workspace)))
         let release = DispatchSemaphore(value: 0)
         let blocked = Mutex(false)
         registry.service.queue.async {
@@ -152,7 +152,7 @@ struct UnifiedServiceTests {
         }
         guard
           case .attached(_, let initialWorkspace) = try await local.execute(
-            .attach(.id(starting))
+            .attach(AttachRequest(.id(starting)))
           )
         else { throw HostTestTimeout(what: "local reservation attachment") }
         var workspace = initialWorkspace
@@ -210,7 +210,7 @@ struct UnifiedServiceTests {
         )
         do {
           if addLivePane {
-            _ = try await local.execute(.attach(.id(grant.sessionID.workspace)))
+            _ = try await local.execute(.attach(AttachRequest(.id(grant.sessionID.workspace))))
             _ = try await local.execute(
               .newTab(name: "live", launch: shellLaunch())
             )
@@ -262,7 +262,7 @@ struct UnifiedServiceTests {
           frontend: .native
         )
         do {
-          _ = try await local.execute(.attach(.id(grant.sessionID.workspace)))
+          _ = try await local.execute(.attach(AttachRequest(.id(grant.sessionID.workspace))))
           guard
             case .layout(let workspace) = try await local.execute(
               .newTab(name: "live", launch: shellLaunch())
@@ -409,7 +409,7 @@ struct UnifiedServiceTests {
         )
       else { throw HostTestTimeout(what: "workspace") }
       let pane = ws.tabs[0].activePane
-      _ = try await local.execute(.attach(.id(ws.id)))
+      _ = try await local.execute(.attach(AttachRequest(.id(ws.id))))
       try await local.send(.text("export MARK=from-mac\r"), to: pane)
       let pid = try #require(await registry.service.panePID(pane))
 
@@ -459,7 +459,7 @@ struct UnifiedServiceTests {
       try await hostEventuallyAsync("lease released") {
         try await registry.workspaces().first?.isAttached == false ? true : nil
       }
-      _ = try await local.execute(.attach(.id(ws.id)))
+      _ = try await local.execute(.attach(AttachRequest(.id(ws.id))))
       await local.close()
     }
   }

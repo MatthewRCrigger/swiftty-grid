@@ -305,7 +305,7 @@ struct ReviewTests {
     let c = try await h.connect()
     let ws = try await create(c, launch: busyLaunch())
     var panes = [ws.tabs[0].activePane]
-    guard case .attached = try await c.execute(.attach(.id(ws.id))) else {
+    guard case .attached = try await c.execute(.attach(AttachRequest(.id(ws.id)))) else {
       throw MuxError(.invalidRequest)
     }
     for _ in 0 ..< 3 {

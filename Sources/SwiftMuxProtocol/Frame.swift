@@ -327,6 +327,10 @@ public struct PaneFrame: Codable, Sendable, Equatable {
 
   public var lines: [String] { (0 ..< grid.rows).map(text(row:)) }
 
+  /// Local copy of this frozen frame. New output cannot change it.
+  /// v1 copies the displayed frame only; selection does not cross pages.
+  public func copiedText() -> String { lines.joined(separator: "\n") }
+
   /// Display scalars of a cell; a blank is one space, structural cells none.
   public func scalars(row y: Int, column x: Int) -> [Unicode.Scalar] {
     let i = y * grid.columns + x
@@ -341,5 +345,35 @@ public struct PaneFrame: Codable, Sendable, Equatable {
     }
     if g == 0 { return [" "] }
     return [Unicode.Scalar(g) ?? " "]
+  }
+}
+
+/// Decides which owned frame is visible. A stale server instance,
+/// attachment, geometry revision, layout revision, or older frame
+/// revision never replaces a newer installed frame.
+public struct FrameInstallation: Sendable, Equatable {
+  public private(set) var visible: [PaneID: PaneFrame] = [:]
+
+  public init() {}
+
+  @discardableResult
+  public mutating func install(
+    _ frame: PaneFrame,
+    server: ServerInstanceID?,
+    attachment: AttachmentID?
+  ) -> Bool {
+    let identity = frame.identity
+    if let server, identity.server != server { return false }
+    if let attachment, identity.attachment != attachment { return false }
+    if let current = visible[identity.pane] {
+      let shown = current.identity
+      if shown.server != identity.server { return false }
+      if shown.attachment != identity.attachment { return false }
+      if identity.revision <= shown.revision { return false }
+      if identity.geometryGeneration < shown.geometryGeneration { return false }
+      if identity.layoutRevision < shown.layoutRevision { return false }
+    }
+    visible[identity.pane] = frame
+    return true
   }
 }

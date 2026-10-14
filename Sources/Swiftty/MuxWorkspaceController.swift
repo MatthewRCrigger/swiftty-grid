@@ -50,6 +50,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private var subscribed: [PaneID] = []
   private var detached = false
   private var presentationAttachment: AttachmentID?
+  /// True only after the service reports Ready for this attachment.
+  private(set) var isReady = false
   /// Lease loss leaves inbox metadata available until the window closes.
   private var closed = false
   private var closeRequested = false
@@ -161,7 +163,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     try Task.checkCancellation()
     let attach: MuxCommand =
       expectedLease.map { .takeover(target, expectedLease: $0) }
-      ?? .attach(target)
+      ?? .attach(AttachRequest(target))
     guard
       case let .attached(attachment, ws) = try await connection.execute(
         attach,
@@ -332,7 +334,12 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       NSSound.beep()
       if pane != activePane { markActivity(pane) }
     case let .activity(pane): markActivity(pane)
-    case let .detached(reason): connectionEnded(reason)
+    case let .ready(notice):
+      guard notice.attachment == presentationAttachment else { return }
+      isReady = true
+    case let .detached(reason):
+      isReady = false
+      connectionEnded(reason)
     case let .paneExited(pane, status, truncated):
       if truncated, !detached {
         window?.subtitle =
@@ -352,6 +359,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private func connectionEnded(_ reason: String) {
     guard !detached else { return }
     detached = true
+    isReady = false
     stopPipelines()
     for view in views.values { view.reset() }
     window?.title = "SwiftMux — detached (\(reason))"
@@ -378,6 +386,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     guard !detached else { return }
     if let attachment, presentationAttachment != attachment {
       presentationAttachment = attachment
+      isReady = false
       for view in views.values { view.reset() }
     }
     let update = attached ? sequencer.attached(ws) : sequencer.layout(ws)
@@ -1000,6 +1009,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     connectionAttempts.cancel()
     inboxReadID = UUID()
     detached = true
+    isReady = false
     for view in views.values { view.cancelComposition() }
     stopPipelines()
     for task in tasks { task.cancel() }
@@ -1471,24 +1481,11 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     }
   }
 
-  private func notice(_ message: String) {
-    if let hook = confirmDestructive {
-      Task { _ = await hook(message) }
-      return
-    }
-    let alert = NSAlert()
-    alert.messageText = message
-    if let window {
-      alert.beginSheetModal(for: window)
-    } else {
-      alert.runModal()
-    }
-  }
-
   func windowWillClose(_ notification: Notification) {
     closeRequested = true
     connectionAttempts.cancel()
     detached = true
+    isReady = false
     stopPipelines()
     Task { await detach() }
     onClose?()

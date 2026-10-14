@@ -183,4 +183,18 @@ extension MuxWorkspaceController {
     return controller
   }
 
+  func notice(_ message: String) {
+    if let hook = confirmDestructive {
+      Task { _ = await hook(message) }
+      return
+    }
+    let alert = NSAlert()
+    alert.messageText = message
+    if let window {
+      alert.beginSheetModal(for: window)
+    } else {
+      alert.runModal()
+    }
+  }
+
 }

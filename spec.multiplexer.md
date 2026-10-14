@@ -24,7 +24,7 @@ Preserve the requested sequence: first a small `swmux` terminal attachment runni
 | Borders, status and workspace presentation | Small terminal compositor | Native tabs, dividers, menus and pane views |
 | Inner PTY, VT parser, history, replies and `TERM` | Keep | Keep |
 | Automation and configuration | Basic commands and settings only | Same typed actions, native preferences |
-| Frontend concurrency | One interactive attachment | One interactive attachment and one workspace window initially |
+| Frontend concurrency | One controller and at most four local read-only observers per workspace | Same attachment rules; one workspace window |
 
 A fixed host removes a compatibility matrix. It does not remove the outer terminal protocol while `swmux` is still a terminal application. Native attachment removes that protocol from its own path.
 
@@ -39,7 +39,7 @@ Provide named workspaces, ordered terminal tabs, split panes, focus, zoom, resiz
 | Pane | One PTY, process lifecycle and authoritative terminal | Pane |
 | Native window | AppKit presentation container, introduced later | Frontend UI, not a server window |
 
-Initially permit one interactive attachment to the service, showing one workspace at a time. Other workspaces and inactive tabs continue running. Reject a second live attachment; forced takeover, independent viewers and simultaneous writers are deferred. A lost connection releases its lease through the input-cancellation barrier.
+Each workspace has one controlling attachment and at most four authenticated same-user local observers. The cap is fixed. A connection that does not request a role attaches as that controller. A second controller is refused until an explicit takeover. Observers may subscribe, scroll and search; they cannot write. Simultaneous writers are not supported. Other workspaces and inactive tabs continue running. A lost controller connection releases only its writer lease through the input-cancellation barrier; observers and PTYs stay. A lost observer drops only that viewer. This does not authorize a remote or roaming observer.
 
 Defer tmux command/config/plugin compatibility, linked tabs/session groups, broad scripting, third-party frontend APIs, advanced keyboard protocols, application mouse reporting, terminal graphics, network transports, multi-user sharing and crash/reboot restoration. Native pointer selection and scrolling are included later; mouse reporting to programs is a separate extension. The earlier SSH/SFTP and RST designs remain separate specifications.
 
@@ -59,11 +59,11 @@ flowchart TD
     B <--> K["Shell and jobs B"]
 ```
 
-The two frontends are successive presentation paths, not simultaneous writers. The service never requires a connected view to retain a pane.
+The two frontends share one service and are not simultaneous writers. A workspace has one controller; local read-only observers may attach beside it, as specified in §3. The service never requires a connected view to retain a pane.
 
 | Owner | Responsibilities |
 |---|---|
-| SwiftMux service | Workspace graph, stable IDs, attachment lease, layout revisions, environment snapshots, lifecycle and limits |
+| SwiftMux service | Workspace graph, stable IDs, one writer lease and local observer records, layout revisions, environment snapshots, lifecycle and limits |
 | Pane runtime | PTY master, child PID, terminal engine, modes, history, query replies, ordered input writer and final-output drainage |
 | Terminal frontend | Outer tty state, fixed-profile input decoder, prefix, composed display and local copy action |
 | Native frontend | AppKit windows/views, pixel layout, fonts, Metal resources, focus, IME, native gestures and accessibility presentation |
@@ -96,7 +96,13 @@ Decoration belongs to the frontend. The terminal client subtracts its one-cell d
 
 Inactive tabs and detached panes retain their last valid dimensions. Zoom changes the displayed pane sizes while retaining the original split tree. Default split minima are 10 columns by 2 rows. When the available area is too small, retain valid pane dimensions and show a clipped/size-constrained presentation; never resize a PTY to zero.
 
-On attachment, establish the lease and workspace snapshot at a server ordering barrier, then subscribe to visible pane frames. Give each input operation a fixed pane and attachment generation. Closing the connection rejects later old-generation messages. A replacement attachment receives a fresh lease only after cancellation cleanup is committed ahead of its input.
+On attachment, establish the controller lease or the observer record and the workspace snapshot at a server ordering barrier, then subscribe to visible pane frames. SMX/1 stays protocol version 1. An attach with no role attaches as the controller. A second controller is refused. Hello capabilities name attach readiness, observers and viewer viewports. A hello that omits them is the historical role-less controller and is not sent `ready`.
+
+An attachment that asked for attach readiness is not Ready until it has installed and acknowledged a complete current owned cell frame for every required visible pane. Required panes are the subscription intersected with the visible tab, or the zoomed pane alone when the tab is zoomed. Hidden panes do not block Ready. An empty subscription while visible panes exist does not publish Ready. History fetch is not on this path. The `ready` event names the attachment, the server instance and those panes' frame and geometry revisions. The client records it only when both identities match the connection. Reattach to the same shell presents the current screen from those owned frames. It does not replay PTY bytes. A stale server instance, attachment, geometry revision, layout revision or older frame revision never replaces a newer installed frame. Native panes render validated cell and viewport frames only. They do not parse PTY output.
+
+Each input record names a pane and an attachment. The service admits controller input only after that attachment's lease exists. A replacement lease is granted only after the previous writer's cancellation cleanup is queued ahead of the new input. The client does not replay uncertain writes. Input does not wait for the Ready event; Ready is the display barrier, and the lease is the write barrier. Closing the connection rejects later old-generation messages.
+
+A workspace grants one controller and at most four observers. Observers are local same-user peers under the existing peer check; a remote client is refused, and this specification does not authorize roaming observers. Each attachment has its own identity and capabilities. Observers may subscribe and unsubscribe, receive frames, scroll and search supported history, and read workspace metadata, including status and workspace lists. The server rejects observer shell input, paste, resize, focus or layout mutation, takeover and destructive actions before it handles the command. A fifth observer is refused. Controller disconnect releases only the writer lease: pending input is cancelled, an open paste drops its unwritten suffix, bytes the kernel has already accepted stay, and observers and PTYs remain. Observer disconnect drops only that viewer's state and frame queues. Takeover is an explicit command that names the lease generation the user agreed to displace. It is not an observer command and never promotes an observer. The previous writer's pending input and unwritten paste suffix are cancelled before the new lease admits input, so the shell sees one writer's bytes and no duplicate of the cancelled suffix.
 
 ## 4. Owned frames and local messages
 
@@ -128,7 +134,7 @@ Frames contain no Swift memory layout, pointers, borrowed `Span`, pooled storage
 
 ### Bounded frame delivery
 
-Allow one frame delivery in flight and one newest pending complete frame per subscribed pane, with a global byte cap and fair scheduling. A client acknowledgement releases transport credit; it is not evidence of GPU completion or user observation. A newer complete frame may replace an unsubmitted older frame. Never discard required ordered input or terminal output bytes under this rule.
+Allow one frame delivery in flight and one newest pending complete frame per subscribed pane, for the controller and for each observer, under the same global byte cap and fair scheduling. Observer captures run only while a controller is not waiting on that budget. A slow or disconnected observer cannot stall PTY consumption, control messages or the controller: its queue stays at one in-flight full frame and one replaceable newest frame per subscribed pane, and those bytes count toward the global cap. A client acknowledgement releases transport credit; it is not evidence of GPU completion or user observation. A newer complete frame may replace an unsubmitted older frame. Never discard required ordered input or terminal output bytes under this rule.
 
 Export only subscribed visible panes when exported state changes, at an initial maximum of 60 Hz. Dirty state includes modes, cursor, palette, geometry, history/viewport and search metadata, not only cell damage. Use the ordered state-change boundary; a callback driven only by damaged cells is insufficient. Initial subscription, reattachment and resuming a paused subscription force a complete current frame even if no cells changed. Detached or hidden panes still parse output and maintain bounded history, but produce no unnecessary display frames. The native app may further pause drawing when occluded.
 
@@ -136,7 +142,9 @@ The first version uses full frames and full damage. Deltas, compression, shared 
 
 ### Shared history and selection
 
-The service owns bounded history, the active attachment's viewport and literal search. Both frontends request bounded viewport frames using pane/screen/history generation and stable row addresses. Eviction, resize reflow and primary/alternate-screen changes can invalidate a request; return `historyUnavailable` or a current replacement viewport explicitly. Never silently reinterpret an old address against different text. Do not send the entire history on every update.
+The service owns one PTY grid, bounded history and literal search per pane. Each attachment has its own viewport over that grid: history generation, anchor row and `followTail`. Two observers can rest at different history positions of the same pane. That does not move the controller's viewport or change the PTY size. New PTY output does not move a viewer that is not following the tail. `followTail` resumes the latest screen. An evicted or reflowed anchor fails with `historyUnavailable`. A follow-tail or search resolution that moves the window reports the anchor it actually applied, and that reported anchor is the only replacement. The service never silently shows unrelated text under an old address. Both frontends request bounded viewport frames using pane, screen and history generation and stable row addresses. Do not send the entire history on every update.
+
+A viewer's display size may crop or pad the authoritative grid. Only the controller may change PTY geometry, through the geometry batch and `TIOCSWINSZ`. The controller's viewport request does not crop the grid.
 
 For the smaller first implementation, selection and copy are local operations on one frozen owned viewport frame, including a viewport reached by scrolling or search. Freeze the presentation actually used for interaction, then perform word/line expansion and copy against its immutable cells, graphemes and wrap flags. New output must not change that selection; cancelling or completing selection resumes current frames. Row identity alone cannot protect against in-place edits such as carriage-return progress output.
 
@@ -203,7 +211,7 @@ Swiftty's `TerminalSession` currently uses a serial Dispatch queue, asynchronous
 | Read work | Start at 64 KiB per pane turn; measure fairness |
 | Frame size | 16 MiB encoded maximum, plus cell/text/table limits |
 | Pane dimensions | At most 512 columns by 256 rows |
-| Pending frames | One delivery and one replacement per visible pane; global 64 MiB budget |
+| Pending frames | One in-flight delivery and one replacement per subscribed pane, for the controller and each observer; global 64 MiB budget |
 | Paste | 1 MiB total, 32 KiB maximum chunks, admitted under writer credit |
 | Ordinary control records | 256 KiB maximum |
 
@@ -213,9 +221,9 @@ History eviction removes oldest eligible rows and updates addressing generations
 
 Send committed text, supported keys/modifiers, paste operations and later native focus events as semantic input. The service encodes them using authoritative pane modes. One ordered writer handles input and terminal replies.
 
-A paste fixes pane and attachment identity at its start. The service controls its inner bracketed-paste envelope. On disconnect/cancellation/limit failure, stop accepting payload, finish a partly written chunk, discard unstarted chunks and commit a reserved closing marker if needed. New input follows that cleanup; it never interleaves inside the old envelope. Defer replies with bounded reserved capacity while necessary.
+A paste fixes pane and attachment identity at its start. The service controls its inner bracketed-paste envelope. On user cancellation or a limit failure, stop accepting payload, finish a partly written chunk, discard unstarted chunks and commit a reserved closing marker if needed. When the writer lease ends, on disconnect or explicit takeover, also drop the unwritten suffix of a chunk that has already started, so that tail cannot run as the next writer's input. Bytes the kernel has already accepted stay. Commit the reserved closing marker when the envelope is still open. New input follows that cleanup; it never interleaves inside the old envelope. Defer replies with bounded reserved capacity while necessary.
 
-For unbracketed destinations, stop at a completed chunk boundary. Report partial/aborted paste accurately; already written text cannot be rolled back. A blocked PTY may delay physical completion, so expose pending state and retain order instead of blocking the UI or replaying input.
+For unbracketed destinations, a user cancellation stops at a completed chunk boundary. Report partial/aborted paste accurately; already written text cannot be rolled back. A blocked PTY may delay physical completion, so expose pending state and retain order instead of blocking the UI or replaying input.
 
 ## 6. Initial frontend: swmux inside Swiftty
 
@@ -294,7 +302,7 @@ For the first native release, pointer actions focus panes, select/copy text and 
 
 Use the shared frozen-frame selection/copy and asynchronous history/search policy from section 4. Visible accessibility text, selected text and IME cursor positioning come from the retained interaction presentation. Do not block a main-actor accessibility callback on IPC. Existing Swiftty mouse/search/accessibility paths require this redirection because several consult live `TerminalSession` state. [S15], [S18]
 
-Resolved hyperlinks, shell prompt navigation, application mouse reporting and independent viewports can be added afterward with explicit contracts. None is required to prove native attachment and persistent shells.
+Resolved hyperlinks, shell prompt navigation and application mouse reporting can be added afterward with explicit contracts. None is required to prove native attachment and persistent shells. Per-attachment viewports are specified in §4.
 
 ### 7.6 Workspace window
 

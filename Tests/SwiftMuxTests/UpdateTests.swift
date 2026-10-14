@@ -127,7 +127,7 @@ struct UpdateTests {
     }
     let terminal = try await h.connect()
     await #expect(throws: MuxError.self) {
-      try await terminal.execute(.attach(.name("keep")))
+      try await terminal.execute(.attach(AttachRequest(.name("keep"))))
     }
     #expect(await update.phase == .awaitingBarrier)
     await update.cancel()
