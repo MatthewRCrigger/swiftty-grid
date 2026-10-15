@@ -326,6 +326,7 @@ final class MuxTabButton: GridFlatView, NSTextFieldDelegate {
     label.textColor = ink
     icon.contentTintColor = ink
     closeButton.contentTintColor = ink
+    if !renaming { showTitle() }
   }
 
   override func mouseDown(with event: NSEvent) {
@@ -460,7 +461,7 @@ final class MuxTabButton: GridFlatView, NSTextFieldDelegate {
     if renaming {
       label.placeholderString = item.title
     } else {
-      label.stringValue = item.title
+      Grid.setCaps(label, item.title, color: label.textColor ?? Grid.ink200)
     }
     closeButton.setAccessibilityLabel("End tab \(item.title)")
     setAccessibilityLabel(item.title + (item.hasActivity ? ", new output" : ""))
@@ -594,10 +595,13 @@ final class MuxPaneHeader: NSView {
   ) {
     didSet {
       guard state != oldValue else { return }
-      label.stringValue =
-        state.hasExited ? "\(state.title) (exited)" : state.title
       // The active pane reads at full strength, the others dimmed.
       label.textColor = state.isActive ? Grid.ink100 : Grid.ink300
+      Grid.setCaps(
+        label,
+        state.hasExited ? "\(state.title) (exited)" : state.title,
+        color: label.textColor ?? Grid.ink100
+      )
       icon.contentTintColor = label.textColor
       icon.image = MuxIcons.image(MuxIcons.symbol(for: state.title), "")
       dot.isHidden = !state.hasActivity

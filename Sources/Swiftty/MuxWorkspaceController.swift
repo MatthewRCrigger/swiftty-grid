@@ -509,7 +509,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     let size = views[tab.activePane]?.gridSize ?? (columns: 0, rows: 0)
     statusBar.status = GridStatus(
       theme: config.theme?.dark ?? "default",
-      tab: active ?? workspaceTitle,
+      tab: title(of: tab.activePane),
       columns: size.columns,
       rows: size.rows,
       exitStatus: ws.pane(tab.activePane)?.exitStatus

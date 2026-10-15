@@ -44,6 +44,18 @@ enum Grid {
     NSFont.systemFont(ofSize: max(12, size), weight: .semibold)
   }
 
+  /// Tracked caps for interface labels (`type-label`: 0.18em). Display
+  /// only: the model string is never changed.
+  static func setCaps(_ field: NSTextField, _ text: String, color: NSColor) {
+    let font = labelFont()
+    field.attributedStringValue = NSAttributedString(
+      string: text.uppercased(),
+      attributes: [
+        .font: font, .foregroundColor: color, .kern: font.pointSize * 0.18,
+      ]
+    )
+  }
+
   /// Hairline stroke width; panel borders in the round profile are 2px.
   static let stroke: CGFloat = 1
   static let panelStroke: CGFloat = 2

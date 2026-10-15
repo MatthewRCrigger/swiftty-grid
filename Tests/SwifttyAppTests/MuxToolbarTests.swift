@@ -66,7 +66,7 @@ extension MuxNativeTests {
     #expect(named.label.stringValue == "Renamed")
     await commit(window, String(repeating: "x", count: 300), on: named)
     #expect(await until { window.subtitle.hasPrefix("Tab not renamed: ") })
-    #expect(await until { named.label.stringValue == "Renamed" })
+    #expect(await until { named.label.stringValue == "RENAMED" })
     // A second rename request keeps the edit already open.
     named.beginRename()
     type(" Again ", into: named)
@@ -280,7 +280,7 @@ extension MuxNativeTests {
       ]
     )
     #expect(await until { window.firstResponder is MuxPaneView })
-    #expect(named.label.stringValue == "Again")
+    #expect(named.label.stringValue == "AGAIN")
     #expect(await until { window.subtitle.isEmpty })
     let secondButton = try #require(
       c.tabStrip.buttons.first { $0.item?.id == secondTab }
@@ -293,7 +293,7 @@ extension MuxNativeTests {
     type("x", into: secondButton)
     await commit(window, "", on: secondButton)
     #expect(log.names.count == 8)
-    #expect(secondButton.label.stringValue == secondButton.item?.title)
+    #expect(secondButton.label.stringValue == secondButton.item?.title.uppercased())
     #expect(secondButton.label.placeholderString == nil)
   }
 
@@ -370,7 +370,7 @@ extension MuxNativeTests {
     #expect(strip.buttons.last === active)
     #expect(active.label.currentEditor() == nil)
     #expect(!active.label.isEditable)
-    #expect(active.label.stringValue == "New tab")
+    #expect(active.label.stringValue == "NEW TAB")
     #expect(renamed.isEmpty)
     #expect(ended == 1)
     // Escape cancels a rename the same way.
@@ -379,7 +379,7 @@ extension MuxNativeTests {
     let editor = try #require(active.label.currentEditor() as? NSTextView)
     editor.doCommand(by: #selector(NSResponder.cancelOperation(_:)))
     #expect(active.label.currentEditor() == nil)
-    #expect(active.label.stringValue == "New tab")
+    #expect(active.label.stringValue == "NEW TAB")
     #expect(renamed.isEmpty)
     #expect(ended == 2)
     // A rename open on a tab that goes, its button removed, ends without
