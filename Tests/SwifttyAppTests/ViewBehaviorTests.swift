@@ -122,7 +122,7 @@ struct ViewBehaviorTests {
     throws
   {
     _ = NSApplication.shared
-    let config = Configuration.parse("command=/bin/sleep 30")
+    let config = Configuration.parse("command=/bin/sleep 30\nbackground-opacity=0.8")
     let controller = try TerminalWindowController(configuration: config)
     let window = try #require(controller.window)
     defer { window.close() }
@@ -158,6 +158,7 @@ struct ViewBehaviorTests {
     _ = NSApplication.shared
     var config = Configuration()
     config.command = "/bin/sleep 30"
+    config.backgroundOpacity = 0.8
     let controller = try TerminalWindowController(configuration: config)
     let window = try #require(controller.window)
     defer { window.close() }

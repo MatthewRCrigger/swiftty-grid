@@ -202,10 +202,11 @@ public struct Configuration: Sendable, Equatable {
   public var adjustCellWidth = CellAdjustment()
   public var adjustCellHeight = CellAdjustment()
 
-  public var theme: ThemeSelection?
+  /// GRID by default; an empty `theme` key selects the built-in palette.
+  public var theme: ThemeSelection? = ThemeSelection(parsing: "GRID")
   public var colors = ColorSet()
-  public var backgroundOpacity = 0.8
-  /// Glass behind a translucent background; zero disables it.
+  public var backgroundOpacity = 1.0
+  /// Glass behind a translucent background (opacity below 1); zero disables it.
   public var backgroundBlur = 20
   public var minimumContrast = 1.0
   /// Metal post-processing shader file (see `MetalRenderer.setPostProcessShader`).

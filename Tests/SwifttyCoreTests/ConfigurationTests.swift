@@ -681,6 +681,7 @@ struct ConfigurationTests {
     expected.colors[255] = 0xFEDCBA
     #expect(colors.applied(to: .standard) == expected)
     var config = Configuration()
+    config.theme = nil
     config.colors = colors
     #expect(config.palette() == expected)
   }
@@ -1324,5 +1325,26 @@ struct ConfigurationTests {
     #expect(text.lineRanges[1] == NSRange(location: 6, length: 2))
     #expect(text.cursorLine == 2 && text.cursorOffset == 11)
     #expect(text.line(forOffset: 7) == 1)
+  }
+}
+
+@Suite
+struct GridDefaultTests {
+  @Test
+  func `GRID is the default theme in both appearances on true black`() {
+    let config = Configuration()
+    #expect(config.theme?.light == "GRID")
+    #expect(config.theme?.dark == "GRID")
+    #expect(config.backgroundOpacity == 1)
+    #expect(config.missingThemes.isEmpty)
+    #expect(config.palette(for: .light).background == 0x000000)
+    #expect(config.palette(for: .dark).background == 0x000000)
+  }
+
+  @Test
+  func `an empty theme key restores the built-in palette`() {
+    var config = Configuration()
+    #expect(config.set("theme", "") == nil)
+    #expect(config.theme == nil)
   }
 }
