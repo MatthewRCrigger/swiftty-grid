@@ -24,18 +24,33 @@ public struct TrustPrompt: Hashable, Sendable, Identifiable {
   public let keyAlgorithm: String
   /// `SHA256:` base64 fingerprint, display only.
   public let fingerprint: String
+  /// The key already matched a pairing code the user confirmed.
+  public let matchesPairingCode: Bool
 
   public init(
     host: HostProfile,
     kind: Kind,
     keyAlgorithm: String,
-    fingerprint: String
+    fingerprint: String,
+    matchesPairingCode: Bool = false
   ) {
     self.host = host
     self.kind = kind
     self.keyAlgorithm = keyAlgorithm
     self.fingerprint = fingerprint
+    self.matchesPairingCode = matchesPairingCode
   }
+}
+
+/// Which workspace a roaming screen attaches to. Chosen explicitly by the
+/// user (workspace chooser, attention link, Resume Last Workspace); a
+/// remembered identity is a convenience, never permission to create.
+public enum WorkspaceIntent: Hashable, Sendable {
+  /// New Workspace: the only intent that sends a create request.
+  case create
+  /// An existing workspace by identity. With a target, focus its pane
+  /// and take over only the lease generation the user confirmed.
+  case resume(SessionID, ResumeTarget?)
 }
 
 /// The user's answer to a `TrustPrompt`.
@@ -106,6 +121,8 @@ public final class TerminalScreenModel: Identifiable {
   public private(set) var lastFailure: RoamingFailure?
   /// Consecutive reconnect attempts since the last success.
   public private(set) var reconnectAttempt = 0
+  /// The roaming (QUIC) endpoint SSH authorized, for diagnostics only.
+  public private(set) var roamingEndpoint: BootstrapEndpoint?
   /// Supplies the current visible rows for an opted-in companion preview.
   /// Set by the terminal integration; `nil` means no screen yet.
   @ObservationIgnored
@@ -184,6 +201,9 @@ public final class TerminalScreenModel: Identifiable {
     if status.lastFailure != lastFailure { lastFailure = status.lastFailure }
     if status.reconnectAttempt != reconnectAttempt {
       reconnectAttempt = status.reconnectAttempt
+    }
+    if status.roamingEndpoint != roamingEndpoint {
+      roamingEndpoint = status.roamingEndpoint
     }
     if changed {
       companionObservedAt = now
@@ -339,9 +359,10 @@ public final class RoamingAppModel {
   private var savedHostsReadable = true
   @ObservationIgnored
   private let resumeStore: SessionResumeStore
-  /// Attention links waiting for their host's next roaming start.
+  /// Explicit workspace choices waiting for their host's next roaming
+  /// start (chooser selections and attention links).
   @ObservationIgnored
-  private var pendingReveals: [UUID: ResumeTarget] = [:]
+  private var pendingIntents: [UUID: WorkspaceIntent] = [:]
   @ObservationIgnored
   private var trustQueue:
     [(
@@ -432,6 +453,7 @@ public final class RoamingAppModel {
     if activeSession?.host.id == host.id { close() }
     invalidateConnectionPrompts(for: host)
     forgetSession(for: host)
+    pendingIntents[host.id] = nil
   }
 
   private func invalidateConnectionPrompts(for host: HostProfile) {
@@ -534,15 +556,37 @@ public final class RoamingAppModel {
     workspace: SessionID,
     target: ResumeTarget
   ) {
+    openWorkspace(host, intent: .resume(workspace, target))
+  }
+
+  /// Attaches the one active roaming terminal to the workspace the user
+  /// chose. The previous terminal is detached through the ordinary close,
+  /// never ended. Choosing the workspace already shown changes nothing.
+  public func openWorkspace(_ host: HostProfile, intent: WorkspaceIntent) {
+    // A reveal (pane focus or takeover) always reattaches.
+    if case let .resume(id, nil) = intent, let active = activeSession,
+      active.host == host, active.kind == .roaming, active.sessionID == id
+    {
+      return
+    }
     if activeSession != nil { close() }
-    rememberSession(workspace, for: host)
-    pendingReveals[host.id] = target
+    if case let .resume(id, _) = intent { rememberSession(id, for: host) }
+    pendingIntents[host.id] = intent
     open(host)
   }
 
-  /// The reveal for `host`'s next start, consumed once.
-  func takeReveal(for host: HostProfile) -> ResumeTarget? {
-    pendingReveals.removeValue(forKey: host.id)
+  /// Resume Last Workspace: the remembered identity only. Returns false,
+  /// creating nothing, when no workspace is remembered for `host`.
+  @discardableResult
+  public func resumeLastWorkspace(_ host: HostProfile) -> Bool {
+    guard let id = resumableSessionID(for: host) else { return false }
+    openWorkspace(host, intent: .resume(id, nil))
+    return true
+  }
+
+  /// The explicit choice for `host`'s next start, consumed once.
+  func takeIntent(for host: HostProfile) -> WorkspaceIntent? {
+    pendingIntents.removeValue(forKey: host.id)
   }
 
   // MARK: Resume (non-secret session identifiers only)

@@ -57,6 +57,54 @@ extension MainActorIntegrationTests {
       #expect(try store.load() == [first])
     }
 
+    /// A file written before Connect to Mac loads unchanged: no store
+    /// version or field migration (spec.connection-setup.md T1).
+    @Test
+    func existingVersionOneFileLoadsUnchanged() throws {
+      let text = #"""
+        {
+          "hosts" : [
+            {
+              "auth" : { "password" : {} },
+              "host" : "macbook.local",
+              "id" : "3F8A3108-AF67-4FA6-A94D-6F175876E934",
+              "nickname" : "MacBook",
+              "port" : 22,
+              "username" : "chris"
+            },
+            {
+              "auth" : { "keychainKey" : { "label" : "phone" } },
+              "host" : "fd00::5",
+              "id" : "9C1B4E2A-0D55-4C7E-9E39-2B7C3B6A1F00",
+              "nickname" : "Studio",
+              "port" : 2222,
+              "username" : "me"
+            }
+          ],
+          "version" : 1
+        }
+        """#
+      let hosts = try HostProfileStore.decode(Data(text.utf8))
+      #expect(
+        hosts == [
+          HostProfile(
+            id: UUID(uuidString: "3F8A3108-AF67-4FA6-A94D-6F175876E934")!,
+            nickname: "MacBook",
+            host: "macbook.local",
+            username: "chris"
+          ),
+          HostProfile(
+            id: UUID(uuidString: "9C1B4E2A-0D55-4C7E-9E39-2B7C3B6A1F00")!,
+            nickname: "Studio",
+            host: "fd00::5",
+            port: 2222,
+            username: "me",
+            auth: .keychainKey(label: "phone")
+          ),
+        ]
+      )
+    }
+
     @Test
     func decodingKeepsTheFirstValidHostForEachIdentity() throws {
       let first = HostProfile(

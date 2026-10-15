@@ -196,7 +196,14 @@ extension MainActorIntegrationTests {
             username: "test",
             auth: .password
           )
-          app.open(host, kind: kind)
+          if kind == .roaming {
+            // A roaming screen signs in only for an explicit workspace
+            // choice (spec.connection-setup.md D1). Trust is rejected
+            // below, before any create request could be sent.
+            app.openWorkspace(host, intent: .create)
+          } else {
+            app.open(host, kind: kind)
+          }
           let model = try #require(app.activeSession)
           try #require(try await until { model.controller != nil })
           let controller = try #require(model.controller)

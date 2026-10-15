@@ -54,6 +54,44 @@ enum SurfacePhase: Hashable, Sendable {
   case failed(SurfaceProblem)
 }
 
+/// SSH succeeded and granted an attachment, but the grant's roaming
+/// endpoint could not be reached. Names the endpoint SSH returned and
+/// never blames authentication, guesses at firewalls or permissions, or
+/// substitutes another address.
+struct EndpointStageNotice: Hashable, Sendable {
+  static let title = "SSH connected; roaming endpoint unavailable"
+  let endpoint: String
+  let timedOut: Bool
+
+  init?(
+    state: ClientConnectionState,
+    failure: RoamingFailure?,
+    endpoint: BootstrapEndpoint?
+  ) {
+    guard let endpoint, state == .attaching || state == .reconnecting else {
+      return nil
+    }
+    switch failure {
+    case .endpointUnreachable: timedOut = false
+    case .attachTimedOut: timedOut = true
+    default: return nil
+    }
+    let host =
+      endpoint.host.contains(":") ? "[\(endpoint.host)]" : endpoint.host
+    self.endpoint = "\(host):\(endpoint.port) (UDP)"
+  }
+
+  var detail: String {
+    (timedOut
+      ? "The Mac's roaming endpoint at \(endpoint) did not answer in time. "
+      : "The Mac's roaming endpoint at \(endpoint) could not be reached. ")
+      + "Sign-in succeeded; this address is the one the Mac's roaming "
+      + "configuration advertises. A local-network name or address may not be "
+      + "reachable over the route used for SSH, such as cellular or a VPN. "
+      + "The session is kept on the Mac."
+  }
+}
+
 /// Holds the current client for nonisolated input submission.
 final class ClientSlot: Sendable {
   private let value = Mutex<RoamingClient?>(nil)
@@ -75,9 +113,12 @@ final class ClientSlot: Sendable {
 @Observable
 final class RoamingTerminalController: TerminalSurfaceController {
   enum StartChoice {
-    /// Resume the remembered session if any, else create one.
-    case automatic
-    /// Forget any remembered session and create a new one.
+    /// The workspace the user chose (`WorkspaceIntent`); a retry reuses
+    /// it, resuming a workspace once one was granted. Without a choice,
+    /// only a remembered workspace is resumed: nothing is created.
+    case selected
+    /// An explicit Start New Session: forget the remembered session and
+    /// create one.
     case newSession
   }
 
@@ -110,6 +151,9 @@ final class RoamingTerminalController: TerminalSurfaceController {
   private var pathSeen = false
   @ObservationIgnored
   private var observers: [any NSObjectProtocol] = []
+  /// The workspace this screen attaches to, once chosen.
+  @ObservationIgnored
+  private(set) var intent: WorkspaceIntent?
 
   init(model: TerminalScreenModel, app: RoamingAppModel) {
     self.model = model
@@ -148,7 +192,7 @@ final class RoamingTerminalController: TerminalSurfaceController {
   }
 
   /// Starts (or retries) sign-in and attachment. No-op while running.
-  func start(_ choice: StartChoice = .automatic) {
+  func start(_ choice: StartChoice = .selected) {
     guard !closed, runTask == nil else { return }
     started = true
     runTask = Task {
@@ -160,6 +204,19 @@ final class RoamingTerminalController: TerminalSurfaceController {
   private func run(_ choice: StartChoice) async {
     guard let app else { return }
     let host = model.host
+    if choice == .newSession {
+      app.forgetSession(for: host)
+      intent = .create
+    } else if let chosen = app.takeIntent(for: host) {
+      intent = chosen
+    } else if intent == nil, let remembered = app.resumableSessionID(for: host)
+    {
+      intent = .resume(remembered, nil)
+    }
+    guard let intent else {
+      phase = .failed(Self.noWorkspaceChosen)
+      return
+    }
     phase = .preparing("Signing in")
     if let old = client {
       client = nil
@@ -203,17 +260,17 @@ final class RoamingTerminalController: TerminalSurfaceController {
 
     guard !closed, !Task.isCancelled else { return }
 
-    if choice == .newSession { app.forgetSession(for: host) }
-    let resume = app.resumableSessionID(for: host)
-    let reveal = app.takeReveal(for: host)
-    phase = .preparing(resume == nil ? "Starting session" : "Resuming session")
+    let target: RoamingTarget =
+      switch intent {
+      case .create: .create(grid)
+      case let .resume(id, reveal?): .reveal(id, reveal)
+      case let .resume(id, nil): .resume(id)
+      }
+    let resuming = intent != .create
+    // A reveal's pane focus and takeover apply to this attempt only.
+    if case let .resume(id, _?) = intent { self.intent = .resume(id, nil) }
+    phase = .preparing(resuming ? "Resuming session" : "Starting session")
     do {
-      let target: RoamingTarget =
-        switch (resume, reveal) {
-        case let (id?, reveal?): .reveal(id, reveal)
-        case let (id?, nil): .resume(id)
-        case (nil, _): .create(grid)
-        }
       try await client.start(target)
       guard !closed else { return }
       if case .preparing = phase { phase = .running }
@@ -223,7 +280,7 @@ final class RoamingTerminalController: TerminalSurfaceController {
         app.forgetSession(for: host)
       }
       if error == .authenticationFailed { app.forgetPassword(for: host) }
-      phase = .failed(Self.problem(for: error, resuming: resume != nil))
+      phase = .failed(Self.problem(for: error, resuming: resuming))
     }
   }
 
@@ -240,7 +297,11 @@ final class RoamingTerminalController: TerminalSurfaceController {
       phase = .failed(Self.exited(status.exitStatus))
     case .userClosed: break
     default:
-      if let id = status.sessionID { app.rememberSession(id, for: model.host) }
+      if let id = status.sessionID {
+        app.rememberSession(id, for: model.host)
+        // A retry reattaches the granted workspace; it never creates again.
+        if intent == .create { intent = .resume(id, nil) }
+      }
       if status.state == .active, phase != .running { phase = .running }
     }
   }
@@ -252,8 +313,20 @@ final class RoamingTerminalController: TerminalSurfaceController {
     switch model.connectionState {
     case .attaching, .reconnecting:
       return model.reconnectAttempt >= 2 || model.lastFailure == .attachTimedOut
+        || model.lastFailure == .endpointUnreachable
     default: return false
     }
+  }
+
+  /// Which stage failed when SSH authorized an attachment but its QUIC
+  /// endpoint did not answer (spec.connection-setup.md D6).
+  var endpointNotice: EndpointStageNotice? {
+    guard phase == .running else { return nil }
+    return EndpointStageNotice(
+      state: model.connectionState,
+      failure: model.lastFailure,
+      endpoint: model.roamingEndpoint
+    )
   }
 
   // MARK: Lifecycle
@@ -359,10 +432,20 @@ final class RoamingTerminalController: TerminalSurfaceController {
 
   // MARK: Messages
 
+  /// No workspace was chosen and none is remembered: nothing is created
+  /// without an explicit request.
+  static let noWorkspaceChosen = SurfaceProblem(
+    title: "Choose a workspace",
+    detail:
+      "Open this Mac from the host list to pick one of its workspaces, or start "
+      + "a new one here.",
+    actions: [.startNewSession]
+  )
+
   static func problem(for error: SSHAccessError) -> SurfaceProblem {
     let actions: [SurfaceAction] =
       switch error {
-      case .hostKeyChanged, .trustStoreUnavailable: []
+      case .hostKeyChanged, .hostKeyMismatch, .trustStoreUnavailable: []
       default: [.retry]
       }
     return SurfaceProblem(

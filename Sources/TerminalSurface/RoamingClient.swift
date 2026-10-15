@@ -459,7 +459,8 @@ public actor RoamingClient {
         default: break
         }
         attemptFailed(.attachRejected(code))
-      case .unreachable: attemptFailed(.unreachable)
+      // SSH already granted this attachment: only the QUIC route failed.
+      case .unreachable: attemptFailed(.endpointUnreachable)
       case .closed: attemptFailed(.connectionLost)
       case .timedOut: attemptFailed(.attachTimedOut)
       case .protocolViolation: attemptFailed(.protocolViolation)
@@ -1198,7 +1199,8 @@ public actor RoamingClient {
       title: store?.current?.title ?? "",
       exitStatus: exitStatus,
       lastFailure: lastFailure,
-      reconnectAttempt: backoff.attempt
+      reconnectAttempt: backoff.attempt,
+      roamingEndpoint: grant?.endpoint
     )
     guard next != currentStatus else { return }
     currentStatus = next

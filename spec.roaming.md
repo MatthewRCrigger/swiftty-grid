@@ -379,7 +379,7 @@ Use available background time only for bounded cleanup, then stop networking. No
 
 For native macOS and Mac Catalyst, loss of window focus alone MUST NOT be treated as process suspension. Honor explicit disconnect, termination, sleep, and network-loss events; preserve the host session and prevent stale input. Each platform adapter maps its actual lifecycle events into the common state machine and validates them on that platform. No Apple client receives an indefinite-background-execution guarantee.
 
-On foreground return or recovery from sleep, reconnect as needed and obtain a complete current screen before enabling input. On cold launch, reauthenticate with SSH and resume by session ID. Distinguish “temporarily unreachable” from an authenticated “session no longer exists.”
+On foreground return or recovery from sleep, reconnect as needed and obtain a complete current screen before enabling input. On cold launch, reauthenticate with SSH and resume by session ID. Distinguish “temporarily unreachable” from an authenticated “session no longer exists.” A client attaches only to a workspace the user chose or explicitly created; a remembered session ID is a convenience for resuming, never permission to create a replacement ([spec.connection-setup.md](spec.connection-setup.md) §1.3).
 
 If UDP is blocked, offer ordinary SSH. This opens a **different** shell; the retained roaming shell remains available until expiry. Same-session RST tunneling through an SSH channel is a later extension, not a hidden v1 promise.
 

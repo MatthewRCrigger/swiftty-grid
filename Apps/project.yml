@@ -49,8 +49,12 @@ settings:
 # Shared Info.plist keys for direct clients. No UIBackgroundModes: the
 # clients never claim background execution (spec §9).
 directClientSettings: &directClientSettings
+  # Covers Nearby Macs (Bonjour browsing for _swiftty._tcp, declared in
+  # Config/AttentionLinks.plist's NSBonjourServices) and SSH/QUIC
+  # connections to Macs on the local network (spec.connection-setup.md D5).
   INFOPLIST_KEY_NSLocalNetworkUsageDescription: >-
-    Roaming SSH connects to Macs on your local network over SSH and QUIC.
+    Find and connect to your Mac to access terminal workspaces on your local
+    network.
   INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
   INFOPLIST_KEY_CFBundleDisplayName: Roaming SSH
   INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: YES
@@ -88,6 +92,9 @@ targets:
         <<: *directClientSettings
         INFOPLIST_FILE: Config/Generated/AttentionLinks.plist
         PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mobile
+        # Scan Mac Code; the only target that uses the camera.
+        INFOPLIST_KEY_NSCameraUsageDescription: >-
+          Scan the connection code displayed by your Mac.
         CODE_SIGN_ENTITLEMENTS: Config/Generated/MobileClient.entitlements
         TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_MACCATALYST: NO

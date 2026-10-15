@@ -323,6 +323,8 @@ final class HostKeyVerifier: NIOSSHClientServerAuthenticationDelegate, Sendable
   let host: HostIdentity
   let store: any HostTrustStore
   let decider: any HostTrustDecider
+  /// Pairing-code fingerprints the presented key must match, if any.
+  let expected: Set<String>?
   /// The first trust failure, reported by `connect` instead of the
   /// generic NIO error.
   let failure = Mutex<SSHClientError?>(nil)
@@ -345,11 +347,13 @@ final class HostKeyVerifier: NIOSSHClientServerAuthenticationDelegate, Sendable
   init(
     host: HostIdentity,
     store: any HostTrustStore,
-    decider: any HostTrustDecider
+    decider: any HostTrustDecider,
+    expected: Set<String>? = nil
   ) {
     self.host = host
     self.store = store
     self.decider = decider
+    self.expected = expected
   }
 
   func validateHostKey(
@@ -437,6 +441,11 @@ final class HostKeyVerifier: NIOSSHClientServerAuthenticationDelegate, Sendable
   private func evaluate(_ line: String) async throws -> SSHClientError? {
     try Task.checkCancellation()
     let presented = SSHPublicKeyFormat.fingerprint(openSSHPublicKey: line) ?? ""
+    // A pairing expectation is enforced first, for known and unknown keys
+    // alike: neither the store nor the decider can accept another key.
+    if let expected, !expected.contains(presented) {
+      return .hostKeyMismatch(host: host, presented: presented)
+    }
     let trusted = try await store.trustedKey(for: host)
     try Task.checkCancellation()
     if let trusted {

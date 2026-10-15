@@ -63,6 +63,14 @@ public struct PlatformProfile: Hashable, Sendable {
   /// May host the watch companion bridge. On iOS this is still subject to
   /// a runtime check: only an iPhone can pair with a watch.
   public let companionBridge: Bool
+  /// Browses for Macs advertising `_swiftty._tcp` (Nearby Macs). Initial
+  /// scope: iPhone and iPad (spec.connection-setup.md §1).
+  public var nearbyDiscovery: Bool { kind == .mobile }
+  /// Scans a Mac's connection code with the camera (MobileClient only,
+  /// the one target declaring camera use).
+  public var codeScanning: Bool { kind == .mobile }
+  /// Accepts a pasted connection code; needs no camera or network.
+  public var codeImport: Bool { !focusFirst }
 
   /// What a terminal surface may offer for a roaming session here.
   public var roamingSurface: SurfaceCapabilities {

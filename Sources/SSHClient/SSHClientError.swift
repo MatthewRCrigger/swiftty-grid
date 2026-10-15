@@ -7,6 +7,9 @@ public enum SSHClientError: Error, Equatable, Sendable {
   case hostKeyChanged(host: HostIdentity, expected: String, presented: String)
   /// An unknown host key was not approved by the trust decider.
   case hostKeyRejected(host: HostIdentity, fingerprint: String)
+  /// The presented key is not one a confirmed pairing code named. Fails
+  /// closed before the trust store or any credential is consulted.
+  case hostKeyMismatch(host: HostIdentity, presented: String)
   /// The trust store could not be read or updated.
   case trustStoreUnavailable
   /// The server rejected every offered credential.
@@ -35,8 +38,9 @@ public enum SSHClientError: Error, Equatable, Sendable {
   /// Trust failures always require an explicit user decision.
   public var blocksAutomaticReconnect: Bool {
     switch self {
-    case .hostKeyChanged, .hostKeyRejected, .trustStoreUnavailable,
-      .authenticationFailed, .invalidConfiguration, .invalidHelperPath:
+    case .hostKeyChanged, .hostKeyRejected, .hostKeyMismatch,
+      .trustStoreUnavailable, .authenticationFailed, .invalidConfiguration,
+      .invalidHelperPath:
       true
     default: false
     }

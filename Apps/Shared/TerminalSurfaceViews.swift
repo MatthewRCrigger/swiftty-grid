@@ -70,7 +70,11 @@ struct RoamingSurfaceView: View {
       .overlay { overlay }
       .safeAreaInset(edge: .bottom) {
         if controller.offersOrdinarySSH {
-          FallbackBanner(host: controller.model.host, app: app)
+          FallbackBanner(
+            host: controller.model.host,
+            app: app,
+            notice: controller.endpointNotice
+          )
         }
       }
       .task { controller.startIfNeeded() }
@@ -124,7 +128,7 @@ struct RoamingSurfaceView: View {
     case .failed(let problem):
       ProblemCard(problem: problem) { action in
         switch action {
-        case .retry: controller.start(.automatic)
+        case .retry: controller.start(.selected)
         case .startNewSession: controller.start(.newSession)
         case .openOrdinarySSH: app.open(controller.model.host, kind: .ordinarySSH)
         }
@@ -138,11 +142,19 @@ struct RoamingSurfaceView: View {
 struct FallbackBanner: View {
   let host: HostProfile
   let app: RoamingAppModel
+  var notice: EndpointStageNotice?
 
   var body: some View {
     VStack(alignment: .leading, spacing: 6) {
-      Text("The roaming connection can't be reached.")
-        .font(.subheadline.bold())
+      if let notice {
+        Text(EndpointStageNotice.title).font(.subheadline.bold())
+          .accessibilityIdentifier("session.endpointStage")
+        Text(notice.detail).font(.caption).foregroundStyle(.secondary)
+          .selectableIfSupported()
+      } else {
+        Text("The roaming connection can't be reached.")
+          .font(.subheadline.bold())
+      }
       Text(
         "An ordinary SSH shell is a different shell. The roaming session stays "
           + "on the Mac and can be resumed later."

@@ -88,6 +88,9 @@ cat > "$app/Contents/Info.plist" <<EOF
     </dict>
   </array>
   <key>SwifttyAssociatedDomains</key><array>$link_domains</array>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Swiftty makes this Mac discoverable to your iPhone and iPad while Connect a Device is open, so they can find it on your local network.</string>
+  <key>NSBonjourServices</key><array><string>_swiftty._tcp</string></array>
 </dict>
 </plist>
 EOF

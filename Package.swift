@@ -27,6 +27,7 @@ let package = Package(
     .library(name: "CompanionModel", targets: ["CompanionModel"]),
     .library(name: "RoamingApp", targets: ["RoamingApp"]),
     .library(name: "MuxNavigation", targets: ["MuxNavigation"]),
+    .library(name: "HostConnection", targets: ["HostConnection"]),
     .executable(name: "swiftty", targets: ["Swiftty"]),
     .executable(name: "swiftty-bench", targets: ["SwifttyBench"]),
     .executable(name: "swmux", targets: ["SwiftMuxCLI"]),
@@ -70,7 +71,7 @@ let package = Package(
       name: "Swiftty",
       dependencies: [
         "SwifttyCore", "SwifttyMac", "SwiftMuxClient", "SwiftMuxBridge",
-        "MuxNavigation", "MuxNavigationSMX",
+        "MuxNavigation", "MuxNavigationSMX", "HostConnection",
       ]
     ),
     // SwiftMux (spec.multiplexer.md): shared messages, engine bridge,
@@ -206,6 +207,11 @@ let package = Package(
     ),
     // Bounded watch/iPhone status DTOs; no SSH/RST secrets, no Swiftty.
     .target(name: "CompanionModel"),
+    // Pairing-code descriptor and Bonjour discovery contract shared by the
+    // native Mac exporter and the direct-client importer
+    // (spec.connection-setup.md). Foundation only: no UI, credentials,
+    // PTYs or network I/O.
+    .target(name: "HostConnection"),
     // Shared app model and per-platform UI for the direct clients
     // (Apps/* app targets are thin XcodeGen wrappers around this).
     .target(
@@ -213,6 +219,7 @@ let package = Package(
       dependencies: [
         "SessionCore", "ScreenProtocol", "SSHClient", "TerminalSurface",
         "CompanionModel", "SwifttyCore", "SwifttyMobile", "MuxNavigation",
+        "HostConnection",
         // AppKit surface for the native Mac client only; never Catalyst.
         .target(name: "SwifttyMac", condition: .when(platforms: [.macOS])),
         .product(name: "Crypto", package: "swift-crypto"),
@@ -256,6 +263,7 @@ let package = Package(
         "CompanionModel", "SwiftMuxClient", "SwiftMuxService", "TestSupport",
       ]
     ),
+    .testTarget(name: "HostConnectionTests", dependencies: ["HostConnection"]),
     .testTarget(
       name: "MuxAttentionTests",
       dependencies: ["MuxAttention", "SwiftMuxProtocol"]
@@ -265,7 +273,7 @@ let package = Package(
       dependencies: [
         "Swiftty", "SwifttyMac", "SwifttyCore", "TestSupport",
         "SwiftMuxService", "SwiftMuxClient", "SwiftMuxProtocol",
-        "SwiftMuxExport", "MuxNavigation", "MuxNavigationSMX",
+        "SwiftMuxExport", "MuxNavigation", "MuxNavigationSMX", "HostConnection",
       ]
     ),
     .testTarget(
@@ -280,6 +288,7 @@ let package = Package(
         "SessionCore", "ScreenProtocol", "SSHClient", "AppleTransport",
         "TerminalHost", "TerminalSurface", "SwifttyCore", "TestSupport",
         "RoamingApp", "SwiftMuxProtocol", "SwiftMuxService", "SwiftMuxClient",
+        "HostConnection", "MuxNavigation",
         .product(name: "NIOCore", package: "swift-nio"),
         .product(name: "NIOPosix", package: "swift-nio"),
         .product(name: "NIOSSH", package: "swift-nio-ssh"),

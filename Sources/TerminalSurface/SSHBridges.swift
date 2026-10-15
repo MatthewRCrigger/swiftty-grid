@@ -81,7 +81,8 @@ public struct SSHBootstrapper: RemoteBootstrapper {
   static func map(_ error: any Error) -> RemoteBootstrapError {
     guard let error = error as? SSHClientError else { return .unreachable }
     switch error {
-    case .hostKeyChanged, .hostKeyRejected, .trustStoreUnavailable:
+    case .hostKeyChanged, .hostKeyRejected, .hostKeyMismatch,
+      .trustStoreUnavailable:
       return .hostKeyRejected
     case .authenticationFailed: return .authenticationFailed
     case .bootstrapProtocol, .bootstrapFailed, .invalidHelperPath,

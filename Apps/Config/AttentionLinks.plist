@@ -29,5 +29,13 @@
 	</array>
 	<key>SwifttyAssociatedDomains</key>
 	<array/>
+	<!--
+	Nearby Macs browses only this Bonjour type (spec.connection-setup.md
+	D3), under the target's NSLocalNetworkUsageDescription.
+	-->
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_swiftty._tcp</string>
+	</array>
 </dict>
 </plist>

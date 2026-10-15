@@ -35,6 +35,9 @@ enum SSHAccessError: Error, Equatable, Sendable {
   case hostKeyChanged
   /// The user did not trust an unknown host key.
   case hostKeyRejected
+  /// The presented (or already trusted) key is not one the confirmed
+  /// pairing code named. Blocked before any credential was sent.
+  case hostKeyMismatch
   case trustStoreUnavailable
   /// The server refused the credential. For key authentication this
   /// carries the `authorized_keys` line to install on the Mac.
@@ -48,6 +51,7 @@ enum SSHAccessError: Error, Equatable, Sendable {
     case .keyUnavailable: "Key unavailable"
     case .hostKeyChanged: "Host key changed"
     case .hostKeyRejected: "Host key not trusted"
+    case .hostKeyMismatch: "Host key doesn't match the code"
     case .trustStoreUnavailable: "Trusted keys unavailable"
     case .authenticationFailed: "Authentication failed"
     case .unreachable: "Mac unreachable over SSH"
@@ -64,6 +68,10 @@ enum SSHAccessError: Error, Equatable, Sendable {
         + "Verify the Mac's key before removing the old one."
     case .hostKeyRejected:
       "The connection was closed before any credentials were sent."
+    case .hostKeyMismatch:
+      "The Mac's SSH key is not one listed in the connection code, so the "
+        + "connection was blocked before any credentials were sent. Show the "
+        + "code again on the intended Mac."
     case .trustStoreUnavailable:
       "The list of trusted host keys could not be read or written."
     case .authenticationFailed(let line?):
@@ -93,12 +101,17 @@ final class SSHAccess {
       trustStore ?? FileHostTrustStore(fileURL: RoamingStorage.knownHostsURL)
   }
 
-  func configuration(for host: HostProfile) -> SSHClient.SSHClientConfiguration
-  {
+  /// `expectedHostKeys` are fingerprints from a confirmed pairing code;
+  /// the server must present one of them.
+  func configuration(
+    for host: HostProfile,
+    expectedHostKeys: Set<String>? = nil
+  ) -> SSHClient.SSHClientConfiguration {
     SSHClient.SSHClientConfiguration(
       host: host.host,
       port: host.port,
-      username: host.username
+      username: host.username,
+      expectedHostKeyFingerprints: expectedHostKeys
     )
   }
 
@@ -136,12 +149,19 @@ final class SSHAccess {
 
   /// A connection after host-key verification (prompting for an unknown
   /// key) and authentication. A rejected password is asked for once more.
+  /// With `expectedHostKeys` (a confirmed pairing code), a presented or
+  /// already trusted key outside that set blocks before any credential.
   func connect(
     _ host: HostProfile,
-    interactive: Bool = true
+    interactive: Bool = true,
+    expectedHostKeys: Set<String>? = nil
   ) async throws(SSHAccessError) -> SSHConnection {
     if !interactive, case .password = host.auth { throw .cancelled }
-    try await settleTrust(for: host, interactive: interactive)
+    try await settleTrust(
+      for: host,
+      interactive: interactive,
+      expectedHostKeys: expectedHostKeys
+    )
     var retry = false
     var rejectedPassword: String?
     while true {
@@ -152,7 +172,8 @@ final class SSHAccess {
         return try await connect(
           host,
           credential: credential,
-          interactive: interactive
+          interactive: interactive,
+          expectedHostKeys: expectedHostKeys
         )
       } catch .authenticationFailed(let line) {
         guard case .password = host.auth, !retry else {
@@ -169,20 +190,42 @@ final class SSHAccess {
   /// (spec §5.1). The probe connection offers no credential.
   private func settleTrust(
     for host: HostProfile,
-    interactive: Bool
+    interactive: Bool,
+    expectedHostKeys: Set<String>? = nil
   ) async throws(SSHAccessError) {
     guard let identity = configuration(for: host).hostIdentity else { return }
     let known: String?
     do { known = try await trustStore.trustedKey(for: identity) } catch {
       throw .trustStoreUnavailable
     }
-    guard known == nil else { return }
-    guard interactive else { throw .hostKeyRejected }
+    if let known {
+      // A pairing code never replaces or overrides a trusted key: one that
+      // the code does not name blocks without contacting the server.
+      if let expectedHostKeys,
+        !expectedHostKeys.contains(
+          SSHPublicKeyFormat.fingerprint(openSSHPublicKey: known) ?? ""
+        )
+      {
+        throw .hostKeyMismatch
+      }
+      // Without a code, a known key is checked during sign-in, before any
+      // credential is offered. With one, the presented key is checked
+      // against both the code and the store before a credential is even
+      // asked for.
+      guard expectedHostKeys != nil else { return }
+    } else {
+      guard interactive else { throw .hostKeyRejected }
+    }
     do {
       _ = try await SSHConnection.verifyHostKey(
-        configuration: configuration(for: host),
+        configuration: configuration(
+          for: host,
+          expectedHostKeys: expectedHostKeys
+        ),
         trustStore: trustStore,
-        trustDecider: trustDecider(for: host)
+        trustDecider: interactive
+          ? trustDecider(for: host, matchesPairingCode: expectedHostKeys != nil)
+          : RejectUnknownHostKeys() as any HostTrustDecider
       )
     } catch let error as SSHClientError {
       throw await map(error, host: host)
@@ -191,15 +234,20 @@ final class SSHAccess {
     } catch { throw .unreachable }
   }
 
-  /// Asks the user about an unknown key for `host`.
-  private func trustDecider(for host: HostProfile) -> ClosureHostTrustDecider {
+  /// Asks the user about an unknown key for `host`. With a pairing code,
+  /// the verifier asks only after the key matched it.
+  private func trustDecider(
+    for host: HostProfile,
+    matchesPairingCode: Bool = false
+  ) -> ClosureHostTrustDecider {
     ClosureHostTrustDecider { [weak app] request in
       guard let app else { return .reject }
       let prompt = TrustPrompt(
         host: host,
         kind: .unknownKey,
         keyAlgorithm: request.keyType,
-        fingerprint: request.fingerprint
+        fingerprint: request.fingerprint,
+        matchesPairingCode: matchesPairingCode
       )
       return await app.requestTrust(prompt) == .trust
         ? .trustAndRemember : .reject
@@ -210,13 +258,19 @@ final class SSHAccess {
   func connect(
     _ host: HostProfile,
     credential: SSHCredential,
-    interactive: Bool = true
+    interactive: Bool = true,
+    expectedHostKeys: Set<String>? = nil
   ) async throws(SSHAccessError) -> SSHConnection {
     let decider: any HostTrustDecider =
-      interactive ? trustDecider(for: host) : RejectUnknownHostKeys()
+      interactive
+      ? trustDecider(for: host, matchesPairingCode: expectedHostKeys != nil)
+      : RejectUnknownHostKeys()
     do {
       return try await SSHConnection.connect(
-        configuration: configuration(for: host),
+        configuration: configuration(
+          for: host,
+          expectedHostKeys: expectedHostKeys
+        ),
         credential: credential,
         trustStore: trustStore,
         trustDecider: decider
@@ -260,6 +314,7 @@ final class SSHAccess {
       }
       return .hostKeyChanged
     case .hostKeyRejected: return .hostKeyRejected
+    case .hostKeyMismatch: return .hostKeyMismatch
     case .trustStoreUnavailable: return .trustStoreUnavailable
     case .authenticationFailed:
       if let credential, case let .password(password) = credential {

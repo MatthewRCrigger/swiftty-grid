@@ -17,17 +17,24 @@ public struct SSHClientConfiguration: Hashable, Sendable, Codable {
   public var username: String
   /// Bound on TCP connect plus key exchange and authentication.
   public var connectTimeout: Duration
+  /// Host-key fingerprints (OpenSSH `SHA256:` form) the server must
+  /// present, from a pairing code the user confirmed. Checked before the
+  /// trust store and before any credential, so a known key outside this
+  /// set still blocks. `nil` applies only the trust store.
+  public var expectedHostKeyFingerprints: Set<String>?
 
   public init(
     host: String,
     port: Int = 22,
     username: String,
-    connectTimeout: Duration = .seconds(20)
+    connectTimeout: Duration = .seconds(20),
+    expectedHostKeyFingerprints: Set<String>? = nil
   ) {
     self.host = host
     self.port = port
     self.username = username
     self.connectTimeout = connectTimeout
+    self.expectedHostKeyFingerprints = expectedHostKeyFingerprints
   }
 
   /// Identity host trust is scoped to; `nil` if host or port is invalid.
@@ -326,7 +333,8 @@ public final class SSHConnection: Sendable {
         let verifier = HostKeyVerifier(
           host: identity,
           store: trustStore,
-          decider: trustDecider
+          decider: trustDecider,
+          expected: configuration.expectedHostKeyFingerprints
         )
         let auth = CredentialOfferDelegate(
           username: configuration.username,

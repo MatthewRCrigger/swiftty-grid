@@ -64,6 +64,9 @@ final class RoamingAppUITests: XCTestCase {
     press(element("trust.accept"))
 
     signIn()
+    // Mac → Workspace: the chooser lists workspaces; nothing is created
+    // until New Workspace is chosen.
+    chooseNewWorkspace()
     waitForConnected()
     waitForPrompt()
 
@@ -118,6 +121,7 @@ final class RoamingAppUITests: XCTestCase {
       "no resumable session listed"
     )
     openHost("UI Box")
+    chooseExistingWorkspace()
     waitForConnected()
     typeLine("echo again-$UI_MARK")
     waitForScreen(containing: "again-kept-7")
@@ -175,6 +179,21 @@ final class RoamingAppUITests: XCTestCase {
     let allow = springboard.alerts.buttons["Allow"].firstMatch
     if allow.waitForExistence(timeout: 8) { allow.tap() }
     #endif
+  }
+
+  private func chooseNewWorkspace() {
+    let create = element("workspace.new")
+    XCTAssertTrue(create.waitForExistence(timeout: 30), "no workspace chooser")
+    press(create)
+    XCTAssertTrue(create.waitForNonExistence(timeout: 10))
+  }
+
+  /// The detached workspace, by its row in the chooser.
+  private func chooseExistingWorkspace() {
+    let row = element("workspace.open")
+    XCTAssertTrue(row.waitForExistence(timeout: 30), "no workspace listed")
+    press(row)
+    XCTAssertTrue(row.waitForNonExistence(timeout: 10))
   }
 
   private func signIn() {

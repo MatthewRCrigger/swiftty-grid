@@ -18,6 +18,8 @@ TARGETS = ["MobileClient", "MacClient", "CatalystClient", "VisionClient"]
 ENTITLEMENT = "com.apple.developer.associated-domains"
 TEAM = "TEAMID1234"
 BUNDLES = ["dev.swiftty.fixture.mobile", "dev.swiftty.fixture.mac"]
+BONJOUR = "_swiftty._tcp"
+MULTICAST = "com.apple.developer.networking.multicast"
 TOOL = '''#!/PYTHON
 import json, os, sys
 from pathlib import Path
@@ -94,6 +96,39 @@ class LinkConfigurationTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 64, result.stderr)
                 self.assertFalse(rejected.exists())
 
+    def test_generated_client_plist_carries_the_bonjour_declaration(self):
+        output = self.root / "generated"
+        self.assert_success(self.run_script("configure-links.sh", output))
+        base = self.read_plist(ROOT / "Apps/Config/AttentionLinks.plist")
+        info = self.read_plist(output / "AttentionLinks.plist")
+        self.assertEqual(base["NSBonjourServices"], [BONJOUR])
+        self.assertEqual(info["NSBonjourServices"], [BONJOUR])
+        self.assertEqual(info["CFBundleURLTypes"], base["CFBundleURLTypes"])
+        for target in TARGETS:
+            self.assertNotIn(MULTICAST, self.read_plist(output / f"{target}.entitlements"))
+
+    def test_project_declares_camera_only_for_the_scanning_client(self):
+        project = (ROOT / "Apps/project.yml").read_text()
+        blocks = {}
+        current = None
+        for line in project.splitlines():
+            if line.startswith("  ") and not line.startswith("   ") and line.rstrip().endswith(":"):
+                current = line.strip()[:-1]
+                blocks[current] = []
+            elif current is not None:
+                blocks[current].append(line)
+        camera = [name for name, lines in blocks.items()
+                  if any("NSCameraUsageDescription" in line for line in lines)]
+        self.assertEqual(camera, ["MobileClient"])
+        watch = "\n".join(blocks["WatchCompanion"])
+        for key in ["NSCameraUsageDescription", "NSLocalNetworkUsageDescription",
+                    "AttentionLinks.plist", "RoamingApp", "HostConnection"]:
+            self.assertNotIn(key, watch)
+        self.assertIn("Find and connect to your Mac", project)
+        self.assertNotIn(MULTICAST, project)
+        for entitlements in (ROOT / "Apps").glob("*/*.entitlements"):
+            self.assertNotIn(MULTICAST, entitlements.read_text())
+
     def test_native_package_preserves_literal_domains_without_real_build_or_signing(self):
         tools = self.root / "bin"
         tools.mkdir()
@@ -110,6 +145,9 @@ class LinkConfigurationTests(unittest.TestCase):
             executable.chmod(0o700)
         (self.root / "applinks:links.example.comXmode=developer").touch()
         (self.root / "applinks:links.example.comYmode=developer").touch()
+        # The script copies the app icon from the repository-relative
+        # Resources directory of its working directory.
+        (self.root / "Resources").symlink_to(ROOT / "Resources")
         for mode in ["", "developer"]:
             with self.subTest(mode=mode):
                 output = self.root / ("package " + (mode or "normal"))
@@ -127,8 +165,15 @@ class LinkConfigurationTests(unittest.TestCase):
                             ["links.example.com", "other.example.com"]]
                 self.assertEqual(self.read_plist(output / "Swiftty.entitlements"), {ENTITLEMENT: expected})
                 app = output / "Swiftty.app"
-                self.assertEqual(self.read_plist(app / "Contents/Info.plist")["SwifttyAssociatedDomains"],
+                info = self.read_plist(app / "Contents/Info.plist")
+                self.assertEqual(info["SwifttyAssociatedDomains"],
                                  ["links.example.com", "other.example.com"])
+                # Foreground discovery (spec.connection-setup.md D5): a
+                # real array, a purpose string, and no multicast entitlement.
+                self.assertEqual(info["NSBonjourServices"], [BONJOUR])
+                self.assertTrue(info["NSLocalNetworkUsageDescription"].strip())
+                self.assertEqual(info["CFBundleURLTypes"][0]["CFBundleURLSchemes"], ["swiftty"])
+                self.assertNotIn(MULTICAST, self.read_plist(output / "Swiftty.entitlements"))
                 commands = [json.loads(line) for line in calls.read_text().splitlines()]
                 self.assertEqual(sum(name == "swift" for name, _ in commands), 2)
                 self.assertEqual(sum(name == "codesign" for name, _ in commands), 5)

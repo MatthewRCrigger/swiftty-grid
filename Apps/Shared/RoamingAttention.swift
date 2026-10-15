@@ -22,6 +22,9 @@ protocol RoamingAttentionMetadataService: AttentionService {
 struct RoamingAttentionConnector: AttentionServiceConnector {
   let model: RoamingAppModel
   var interactive = true
+  /// Report SSH failures by stage (host key, sign-in, reachability)
+  /// instead of collapsing them, for screens that explain one host.
+  var detailedErrors = false
 
   func connect(
     to host: NavigationHost
@@ -34,7 +37,9 @@ struct RoamingAttentionConnector: AttentionServiceConnector {
         profile,
         interactive: interactive
       )
-    } catch { throw Self.map(error) }
+    } catch {
+      throw detailedErrors ? Self.describe(error) : Self.map(error)
+    }
     return RoamingAttentionService(
       model: model,
       host: profile,
@@ -42,11 +47,17 @@ struct RoamingAttentionConnector: AttentionServiceConnector {
     )
   }
 
+  /// The SSH stage and its nonsecret explanation.
+  static func describe(_ error: SSHAccessError) -> AttentionServiceError {
+    let message = "\(error.title). \(error.detail)"
+    return error == .unreachable ? .offline(message) : .other(message)
+  }
+
   static func map(_ error: SSHAccessError) -> AttentionServiceError {
     switch error {
     case .cancelled: .other("Sign-in was cancelled.")
-    case .hostKeyChanged, .hostKeyRejected, .trustStoreUnavailable,
-      .keyUnavailable, .authenticationFailed:
+    case .hostKeyChanged, .hostKeyRejected, .hostKeyMismatch,
+      .trustStoreUnavailable, .keyUnavailable, .authenticationFailed:
       .unauthorized
     default: .offline("The Mac could not be reached.")
     }

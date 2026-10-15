@@ -344,6 +344,7 @@ Appendix B of the spec records the design sources.
 | `TerminalHost` | RST/1 host over the SwiftMux service (owns no PTYs): `RoamingHost` QUIC listener and grants, in-process SMX client, screen exporter, session registry, bootstrap/attention service, control socket, roaming configuration |
 | `TerminalSurface` | Client: `RoamingClient`, frontend backends (roaming, ordinary SSH, local PTY), SSH and QUIC bridges |
 | `CompanionModel` | Bounded watch/iPhone status DTOs; no Swiftty, SSH or QUIC |
+| `HostConnection` | Pairing-code descriptor and `_swiftty._tcp` discovery contract (spec.connection-setup.md); Foundation only |
 | `RoamingApp` (`Apps/Shared`) | Shared app model and SwiftUI for the direct clients |
 | `swifttyd` (`Apps/swifttyd`) | No-PTY SSH helper: `bootstrap --stdio`, `status` |
 
@@ -371,6 +372,36 @@ epoch, and each attachment takes the workspace's interactive lease: a
 workspace the Mac app controls is refused (`writerBusy`) unless the client
 resumes with `takeover`. Grant expiry never ends a shell the remote client
 did not create. Firewall changes are not made automatically.
+
+### Connecting a device
+
+[spec.connection-setup.md](spec.connection-setup.md) covers client setup. To
+set up a device:
+
+1. On the Mac, open **Terminal Service › Connect a Device…**. The panel shows
+   the SSH host, port and account; the configured roaming endpoint; local
+   checks of SSH and `swifttyd`; and the SSH host-key fingerprints. Turn on
+   **Show Pairing Code** for a QR code, or **Make Discoverable While This
+   Panel Is Open** to advertise `_swiftty._tcp` on the local network. Closing
+   the panel stops advertising. The panel never turns on Remote Login or
+   changes the firewall or roaming configuration.
+2. On the iPhone or iPad, open **Connect to Mac** and choose **Nearby Macs**,
+   **Scan Mac Code**, **Paste Mac Code** or **Enter Address Manually**. The
+   app asks for Local Network access when it browses or first reaches a LAN
+   address, and asks for camera access only when you scan. A code's SSH key
+   fingerprints must match before any password is sent, and an unknown key
+   still needs an explicit Trust.
+3. After sign-in, choose a workspace, or choose **New Workspace**. Opening a
+   saved host always shows this list; nothing is created automatically.
+   Taking control of a workspace that another client holds needs your
+   confirmation.
+
+SSH and roaming use separate addresses. The device first reaches the Mac
+over SSH, then reaches the roaming endpoint that the Mac's configuration
+advertises over UDP. A `<LocalHostName>.local` endpoint works only on the
+local network or a VPN that carries it. If SSH works but that endpoint does
+not, the app shows "SSH connected; roaming endpoint unavailable" with the
+address it tried.
 
 Clients bootstrap with `ssh <mac> /usr/local/libexec/swifttyd bootstrap --stdio`
 (a no-PTY exec with a length-prefixed JSON request), receive a session grant

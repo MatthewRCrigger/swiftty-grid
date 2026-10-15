@@ -80,8 +80,13 @@ case $app in
     sources="[{ path: \"$apps/MobileClient\" }]"
     deps="- { package: Swiftty, product: RoamingApp }
       - { package: Swiftty, product: CompanionModel }"
-    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mobile
-        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Roaming SSH connects to Macs on your local network.
+    # RST_UI_BUNDLE_SUFFIX installs a separate app identity with fresh
+    # permission state (e.g. a Local Network denial run) without touching
+    # an installed client's data.
+    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mobile${RST_UI_BUNDLE_SUFFIX:-}
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Find and connect to your Mac to access terminal workspaces on your local network.
+        INFOPLIST_KEY_NSCameraUsageDescription: Scan the connection code displayed by your Mac.
+        INFOPLIST_FILE: $apps/Config/AttentionLinks.plist
         TARGETED_DEVICE_FAMILY: \"1,2\"
         SUPPORTS_MACCATALYST: NO
         INFOPLIST_KEY_UILaunchScreen_Generation: YES" ;;
@@ -152,8 +157,21 @@ schemes:
 YML
 (cd "$project" && xcodegen generate --quiet --spec project.yml)
 
+# Optional Nearby Macs fixture: RST_UI_ADVERTISE=<instance name> registers
+# _swiftty._tcp for the relayed SSH port with the system DNS-SD service,
+# as the Mac's Connect a Device panel does, for the run's duration.
+advertise_pid=""
+if [ -n "${RST_UI_ADVERTISE:-}" ]; then
+  dns-sd -R "$RST_UI_ADVERTISE" _swiftty._tcp local "$RST_REAL_SSH_PORT" \
+    txtvers=1 product=swiftty >"$workspace/advertise.log" 2>&1 &
+  advertise_pid=$!
+fi
+
 echo "Testing $app on $destination (result bundle: $workspace/result.xcresult)"
 status=0
+TEST_RUNNER_RST_UI_SCAN=${RST_UI_SCAN:-} \
+TEST_RUNNER_RST_UI_NEARBY=${RST_UI_ADVERTISE:-} \
+TEST_RUNNER_RST_UI_LOCAL_NETWORK=${RST_UI_LOCAL_NETWORK:-allow} \
 TEST_RUNNER_RST_UI_HOST=$RST_REAL_SSH_HOST \
 TEST_RUNNER_RST_UI_PORT=$RST_REAL_SSH_PORT \
 TEST_RUNNER_RST_UI_USER=$RST_REAL_SSH_USER \
@@ -163,6 +181,7 @@ TEST_RUNNER_RST_UI_FINGERPRINT=$RST_REAL_SSH_FINGERPRINT \
   -destination "$destination" -derivedDataPath "$workspace/build" \
   -resultBundlePath "$workspace/result.xcresult" -collect-test-diagnostics never \
   "$@" test >"$workspace/xcodebuild.log" 2>&1 || status=$?
+[ -z "$advertise_pid" ] || kill "$advertise_pid" 2>/dev/null || true
 grep -E "Test Case|error:|XCTAssert|failed|TEST (SUCCEEDED|FAILED)|Signing Identity" \
   "$workspace/xcodebuild.log" | grep -Ev "^ *[0-9]+ \|" | uniq | tail -60
 [ $status -eq 0 ] || echo "xcodebuild failed ($status); log: $workspace/xcodebuild.log" >&2

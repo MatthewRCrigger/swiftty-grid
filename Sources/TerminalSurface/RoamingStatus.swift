@@ -85,6 +85,9 @@ public enum RoamingTarget: Hashable, Sendable {
 /// Nonsecret reason for the latest failure, for display.
 public enum RoamingFailure: Hashable, Sendable {
   case unreachable
+  /// SSH authorized the attachment, but the grant's QUIC endpoint could
+  /// not be reached. Says nothing about why (firewall, route, policy).
+  case endpointUnreachable
   case hostKeyRejected
   case authenticationFailed
   case protocolViolation
@@ -102,7 +105,8 @@ public enum RoamingFailure: Hashable, Sendable {
 }
 
 /// Observable client status for the UI and the watch companion bridge.
-/// Contains no tokens, certificates, endpoints or terminal input.
+/// Contains no tokens, certificates or terminal input; the only endpoint
+/// is the grant's nonsecret roaming host and port, for diagnostics.
 public struct RoamingStatus: Hashable, Sendable {
   public var state: ClientConnectionState
   public var sessionID: SessionID?
@@ -118,6 +122,9 @@ public struct RoamingStatus: Hashable, Sendable {
   public var lastFailure: RoamingFailure?
   /// Consecutive reconnect attempts since the last success.
   public var reconnectAttempt: Int
+  /// The QUIC endpoint the current grant names, once SSH has authorized
+  /// one. Display only; never replaced by the SSH or discovered host.
+  public var roamingEndpoint: BootstrapEndpoint?
 
   public init(
     state: ClientConnectionState = .idle,
@@ -129,7 +136,8 @@ public struct RoamingStatus: Hashable, Sendable {
     title: String = "",
     exitStatus: Int32? = nil,
     lastFailure: RoamingFailure? = nil,
-    reconnectAttempt: Int = 0
+    reconnectAttempt: Int = 0,
+    roamingEndpoint: BootstrapEndpoint? = nil
   ) {
     self.state = state
     self.sessionID = sessionID
@@ -141,6 +149,7 @@ public struct RoamingStatus: Hashable, Sendable {
     self.exitStatus = exitStatus
     self.lastFailure = lastFailure
     self.reconnectAttempt = reconnectAttempt
+    self.roamingEndpoint = roamingEndpoint
   }
 }
 
