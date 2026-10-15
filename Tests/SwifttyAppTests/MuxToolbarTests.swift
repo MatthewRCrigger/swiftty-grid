@@ -25,6 +25,17 @@ extension MuxNativeTests {
         MuxWorkspaceToolbar.newTabItem, MuxWorkspaceToolbar.inboxItem,
       ]
     )
+    // One tab: the title shows instead of a strip with one choice, and
+    // the new-tab and inbox actions stay.
+    #expect(!c.showsTabStrip)
+    #expect(window.titleVisibility == .visible)
+    let action = try #require(toolbar.newTab.action)
+    #expect(
+      NSApp.sendAction(action, to: toolbar.newTab.target, from: toolbar.newTab)
+    )
+    #expect(await until { c.workspace?.tabs.count == 2 })
+    #expect(c.showsTabStrip)
+    #expect(window.titleVisibility == .hidden)
     window.contentView?.superview?.layoutSubtreeIfNeeded()
     let tabsRect = c.tabStrip.convert(c.tabStrip.bounds, to: nil)
     let panesRect = c.layoutView.convert(c.layoutView.bounds, to: nil)
@@ -39,11 +50,6 @@ extension MuxNativeTests {
     let point = firstButton.convert(NSPoint(x: 20, y: 12), to: frameView)
     #expect(frameView.hitTest(point)?.isDescendant(of: firstButton) == true)
 
-    let action = try #require(toolbar.newTab.action)
-    #expect(
-      NSApp.sendAction(action, to: toolbar.newTab.target, from: toolbar.newTab)
-    )
-    #expect(await until { c.workspace?.tabs.count == 2 })
     let secondTab = try #require(c.activeTab?.id)
     #expect(secondTab != firstTab)
     c.tabStrip.onSelect?(firstTab)
@@ -56,19 +62,9 @@ extension MuxNativeTests {
       c.tabStrip.buttons.first { $0.item?.id == firstTab }
     )
     #expect(await until { named.item?.name == "Renamed" })
-    // Types `text` into the open edit and presses Return; keys go back to
-    // the active pane whether or not it renamed.
-    func commit(_ text: String, on button: MuxTabButton) async {
-      type(text, into: button)
-      guard let editor = button.label.currentEditor() as? NSTextView else {
-        return
-      }
-      editor.insertNewline(nil)
-      #expect(await until { window.firstResponder is MuxPaneView })
-    }
     named.beginRename()
     #expect(named.label.stringValue == "Renamed")
-    await commit(String(repeating: "x", count: 300), on: named)
+    await commit(window, String(repeating: "x", count: 300), on: named)
     #expect(await until { window.subtitle.hasPrefix("Tab not renamed: ") })
     #expect(await until { named.label.stringValue == "Renamed" })
     // A second rename request keeps the edit already open.
@@ -76,35 +72,108 @@ extension MuxNativeTests {
     type(" Again ", into: named)
     named.beginRename()
     #expect(named.label.currentEditor()?.string == " Again ")
-    await commit(" Again ", on: named)
+    await commit(window, " Again ", on: named)
     #expect(await until { c.activeTab?.name == "Again" })
     let onRename = c.tabStrip.onRename
-    var renamed: [TabID] = []
-    var names: [String] = []
+    let log = RenameLog()
     c.tabStrip.onRename = { tab, name in
-      renamed.append(tab)
-      names.append(name)
+      log.tabs.append(tab)
+      log.names.append(name)
     }
+    try await checkRenameCommits(c, window, named, firstTab: firstTab, log: log)
+    try await checkRenameFocusLoss(
+      c,
+      window,
+      named,
+      secondTab: secondTab,
+      log: log
+    )
+    c.tabStrip.onRename = onRename
+    let secondButton = try #require(
+      c.tabStrip.buttons.first { $0.item?.id == secondTab }
+    )
+    secondButton.closeButton.performClick(nil)
+    #expect(await until { c.workspace?.tabs.count == 1 })
+
+    let originalFrame = window.frame
+    for opacity in [1.0, 0.8] {
+      var configuration = Configuration()
+      configuration.backgroundOpacity = opacity
+      c.apply(configuration)
+      window.contentView?.superview?.layoutSubtreeIfNeeded()
+      #expect(window.frame == originalFrame)
+      #expect(window.toolbar === toolbar.toolbar)
+      #expect(c.tabStrip.window === window)
+      #expect(
+        c.tabStrip.convert(c.tabStrip.bounds, to: nil).minY
+          >= c.layoutView.convert(c.layoutView.bounds, to: nil).maxY
+      )
+    }
+    let inboxAction = try #require(toolbar.item.action)
+    #expect(
+      NSApp.sendAction(inboxAction, to: toolbar.item.target, from: toolbar.item)
+    )
+    #expect(c.inboxView?.view.window != nil)
+    c.toggleInbox()
+    // Tab out of the search field never lands on, and activates, a pane.
+    c.split(.leftRight)
+    #expect(await until { c.views.count == 2 })
+    let focused = c.activePane
+    c.showSearch()
+    let searching = try #require(
+      c.searchBar?.field.currentEditor() as? NSTextView
+    )
+    searching.doCommand(by: #selector(NSResponder.insertTab(_:)))
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(c.activePane == focused)
+    #expect(
+      !(window.firstResponder is MuxPaneView)
+        || window.firstResponder === focused.flatMap { c.views[$0] }
+    )
+    c.hideSearch()
+  }
+
+  /// Types `text` into the open edit and presses Return; keys go back to
+  /// the active pane whether or not it renamed.
+  func commit(_ window: NSWindow, _ text: String, on button: MuxTabButton) async
+  {
+    type(text, into: button)
+    guard let editor = button.label.currentEditor() as? NSTextView else {
+      return
+    }
+    editor.insertNewline(nil)
+    #expect(await until { window.firstResponder is MuxPaneView })
+  }
+
+  /// Commits, unchanged edits, aborts, hidden and minimized windows, and
+  /// another window taking the keys.
+  func checkRenameCommits(
+    _ c: MuxWorkspaceController,
+    _ window: NSWindow,
+    _ named: MuxTabButton,
+    firstTab: TabID,
+    log: RenameLog
+  ) async throws {
     // An unchanged edit renames nothing, nor does Return with no typing.
     named.beginRename()
-    await commit("Again", on: named)
-    #expect(renamed.isEmpty)
+    await commit(window, "Again", on: named)
+    #expect(log.tabs.isEmpty)
     named.beginRename()
     let untyped = try #require(named.label.currentEditor() as? NSTextView)
     untyped.string = "Other"
     untyped.insertNewline(nil)
-    #expect(renamed.isEmpty)
+    #expect(log.tabs.isEmpty)
     #expect(!named.label.isSelectable)
     // An aborted edit ends the rename and gives keys back to the pane.
     named.beginRename()
     type("half", into: named)
     named.label.abortEditing()
     #expect(await until { window.firstResponder is MuxPaneView })
-    #expect(renamed.isEmpty)
+    #expect(log.tabs.isEmpty)
     named.beginRename()
     #expect(named.label.stringValue == "Again")
-    await commit("Fourth", on: named)
-    #expect(renamed == [firstTab])
+    await commit(window, "Fourth", on: named)
+    #expect(log.tabs == [firstTab])
     // A window out of sight opens no rename.
     window.orderOut(nil)
     named.beginRename()
@@ -138,7 +207,7 @@ extension MuxNativeTests {
       object: panel(floating: false)
     )
     #expect(named.label.currentEditor() == nil)
-    #expect(names.last == "Keyed")
+    #expect(log.names.last == "Keyed")
     #expect(await until { window.firstResponder is MuxPaneView })
     // A minimized window comes back, in front, for a rename.
     window.miniaturize(nil)
@@ -148,8 +217,19 @@ extension MuxNativeTests {
     #expect(window.isVisible)
     // (Key status cannot be checked here: the test runner's app is
     // inactive.) The restored edit takes typing and renames.
-    await commit("Restored", on: named)
-    #expect(names.last == "Restored")
+    await commit(window, "Restored", on: named)
+    #expect(log.names.last == "Restored")
+  }
+
+  /// Losing focus renames to the typed text; an unnamed tab's edit starts
+  /// empty.
+  func checkRenameFocusLoss(
+    _ c: MuxWorkspaceController,
+    _ window: NSWindow,
+    _ named: MuxTabButton,
+    secondTab: TabID,
+    log: RenameLog
+  ) async throws {
     // Losing focus renames to the typed text: a click elsewhere (whose
     // focus stays), Tab, the toolbar hiding, the search field taking focus,
     // or the field moving to another window. Keys go back to the active
@@ -195,7 +275,9 @@ extension MuxNativeTests {
     type("Moved", into: named)
     named.viewWillMove(toWindow: nil)
     #expect(
-      names.suffix(5) == ["Clicked", "Tabbed", "Hidden", "Searched", "Moved"]
+      log.names.suffix(5) == [
+        "Clicked", "Tabbed", "Hidden", "Searched", "Moved",
+      ]
     )
     #expect(await until { window.firstResponder is MuxPaneView })
     #expect(named.label.stringValue == "Again")
@@ -209,50 +291,10 @@ extension MuxNativeTests {
     #expect(secondButton.label.stringValue.isEmpty)
     #expect(secondButton.label.placeholderString == secondButton.item?.title)
     type("x", into: secondButton)
-    await commit("", on: secondButton)
-    #expect(names.count == 8)
+    await commit(window, "", on: secondButton)
+    #expect(log.names.count == 8)
     #expect(secondButton.label.stringValue == secondButton.item?.title)
     #expect(secondButton.label.placeholderString == nil)
-    c.tabStrip.onRename = onRename
-    secondButton.closeButton.performClick(nil)
-    #expect(await until { c.workspace?.tabs.count == 1 })
-
-    let originalFrame = window.frame
-    for opacity in [1.0, 0.8] {
-      var configuration = Configuration()
-      configuration.backgroundOpacity = opacity
-      c.apply(configuration)
-      window.contentView?.superview?.layoutSubtreeIfNeeded()
-      #expect(window.frame == originalFrame)
-      #expect(window.toolbar === toolbar.toolbar)
-      #expect(c.tabStrip.window === window)
-      #expect(
-        c.tabStrip.convert(c.tabStrip.bounds, to: nil).minY
-          >= c.layoutView.convert(c.layoutView.bounds, to: nil).maxY
-      )
-    }
-    let inboxAction = try #require(toolbar.item.action)
-    #expect(
-      NSApp.sendAction(inboxAction, to: toolbar.item.target, from: toolbar.item)
-    )
-    #expect(c.inboxView?.view.window != nil)
-    c.toggleInbox()
-    // Tab out of the search field never lands on, and activates, a pane.
-    c.split(.leftRight)
-    #expect(await until { c.views.count == 2 })
-    let focused = c.activePane
-    c.showSearch()
-    let searching = try #require(
-      c.searchBar?.field.currentEditor() as? NSTextView
-    )
-    searching.doCommand(by: #selector(NSResponder.insertTab(_:)))
-    try await Task.sleep(for: .milliseconds(100))
-    #expect(c.activePane == focused)
-    #expect(
-      !(window.firstResponder is MuxPaneView)
-        || window.firstResponder === focused.flatMap { c.views[$0] }
-    )
-    c.hideSearch()
   }
 
   @Test(.enabled(if: hasMetal))
@@ -264,6 +306,9 @@ extension MuxNativeTests {
     let strip = f.controller.tabStrip
     let toolbar = f.controller.workspaceToolbar
     let window = try #require(f.controller.window)
+    // The strip shows once the workspace has more than one tab.
+    f.controller.newTab()
+    try #require(await until { f.controller.showsTabStrip })
     window.setContentSize(NSSize(width: 420, height: 200))
     let items = (0 ..< 12)
       .map { index in
@@ -354,6 +399,13 @@ extension MuxNativeTests {
 /// A view that takes focus, standing in for anywhere a click may move it.
 private final class FocusableView: NSView {
   override var acceptsFirstResponder: Bool { true }
+}
+
+/// Tab renames recorded by a test's `onRename`.
+@MainActor
+final class RenameLog {
+  var tabs: [TabID] = []
+  var names: [String] = []
 }
 
 /// Types `text` into `button`'s open rename as a person would (an edit

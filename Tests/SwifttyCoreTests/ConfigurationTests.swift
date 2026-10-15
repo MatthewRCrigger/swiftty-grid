@@ -716,6 +716,44 @@ struct ConfigurationTests {
   }
 
   @Test
+  func `font styles parse and reach the font descriptor`() {
+    var config = Configuration.parse(
+      """
+      font-style = Retina
+      font-style-bold = false
+      font-style-italic = default
+      font-style-bold-italic = Heavy Italic
+      """
+    )
+    #expect(config.diagnostics.isEmpty)
+    let d = config.fontDescriptor(scale: 2)
+    #expect(d.regularStyle == .named("Retina"))
+    #expect(d.boldStyle == .disabled)
+    #expect(d.italicStyle == .default)
+    #expect(d.boldItalicStyle == .named("Heavy Italic"))
+    // The regular face cannot be disabled.
+    #expect(config.set("font-style", "false") != nil)
+    #expect(config.set("font-style", "") == nil)
+    #expect(config.fontStyle == .default)
+  }
+
+  @Test
+  func `missing font styles are reported`() {
+    let config = Configuration.parse(
+      "font-family = Menlo\nfont-style = Ret\nfont-style-bold = Bold"
+    )
+    #expect(config.missingFontStyles == ["Ret (Menlo)"])
+  }
+
+  @Test
+  func `macos-icon accepts Ghostty's values`() {
+    var config = Configuration()
+    #expect(config.set("macos-icon", "glass") == nil)
+    #expect(config.set("macos-icon", "") == nil)
+    #expect(config.set("macos-icon", "bogus") != nil)
+  }
+
+  @Test
   func `synthetic style reset and overrides reach the font descriptor`() {
     var config = Configuration()
     #expect(config.set("font-synthetic-style", "false") == nil)

@@ -1,59 +1,54 @@
 import AppKit
 import MuxNavigation
 import SwiftMuxProtocol
-import SwifttyMac
 import SwifttyCore
+import SwifttyMac
 
+/// One window type: every terminal window is a service-backed workspace,
+/// and a plain shell is a workspace with one tab and one pane. Adding a
+/// tab or splitting grows the same workspace; closing a window or quitting
+/// detaches, and only the End commands terminate processes.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-  private let listMuxWorkspaces:
-    @MainActor () async throws -> [WorkspaceSummary]
-  private let reportMuxAttachError: @MainActor (any Error) -> Void
-  private let openMuxWorkspace:
-    @MainActor (WorkspaceSelector?, Configuration) async throws ->
-      MuxWorkspaceController
-  private let reportMuxOpenError: @MainActor (any Error) -> Void
+  private var config: Configuration
+  let workspaces: WorkspaceCoordinator
+  private let muxUpdate = MuxUpdateController()
+  private lazy var attentionLinks = AttentionLinkRouter(
+    ownsWorkspace: { [weak self] id in
+      self?.workspaces.controller(holding: id) != nil
+    },
+    reveal: { [weak self] target, lease in
+      NSApp.activate()
+      try await self?.workspaces.reveal(target, takeover: lease)
+    }
+  )
 
   init(
     listMuxWorkspaces:
-      @escaping @MainActor () async throws -> [WorkspaceSummary] = {
-        try await MuxWorkspaceController.listWorkspaces()
+      @escaping @MainActor () async throws -> WorkspaceListing = {
+        try await MuxWorkspaceController.listing()
       },
     reportMuxAttachError: @escaping @MainActor (any Error) -> Void = {
       NSAlert(error: $0).runModal()
     },
-    openMuxWorkspace:
-      @escaping @MainActor (WorkspaceSelector?, Configuration) async throws ->
-      MuxWorkspaceController = {
-        try await MuxWorkspaceController.open($0, configuration: $1)
-      },
+    openMuxWorkspace: @escaping WorkspaceCoordinator.Open = {
+      try await MuxWorkspaceController.open($0, configuration: $1, takeover: $2)
+    },
     reportMuxOpenError: @escaping @MainActor (any Error) -> Void = {
       NSAlert(error: $0).runModal()
     }
   ) {
-    self.listMuxWorkspaces = listMuxWorkspaces
-    self.reportMuxAttachError = reportMuxAttachError
-    self.openMuxWorkspace = openMuxWorkspace
-    self.reportMuxOpenError = reportMuxOpenError
+    let config = Configuration.load()
+    self.config = config
+    workspaces = WorkspaceCoordinator(
+      configuration: config,
+      listWorkspaces: listMuxWorkspaces,
+      openWorkspace: openMuxWorkspace,
+      reportListError: reportMuxAttachError,
+      reportOpenError: reportMuxOpenError
+    )
     super.init()
   }
-
-  private var windows: [TerminalWindowController] = []
-  private var config = Configuration.load()
-  /// The one native SwiftMux workspace window (one lease at a time).
-  private var mux: MuxWorkspaceController?
-  private var muxAttachInProgress = false
-  private var muxOpenInProgress = false
-  private let muxUpdate = MuxUpdateController()
-  private lazy var attentionLinks = AttentionLinkRouter(
-    ownsWorkspace: { [weak self] id in
-      guard let mux = self?.mux else { return false }
-      return mux.holdsLease && mux.attachedWorkspace == id
-    },
-    reveal: { [weak self] target, lease in
-      try await self?.revealAttention(target, takeover: lease)
-    }
-  )
 
   /// `swiftty://attention/open?ref=…` and configured Universal Links
   /// (spec.inbox.md §4). Other URLs are rejected without
@@ -76,56 +71,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     return true
   }
 
-  /// Opens (or reuses) the SwiftMux window on `target`'s workspace and
-  /// activates the pane. `lease` is set only after the user confirmed a
-  /// takeover; without it a held workspace fails with `leaseHeld`. A
-  /// window that lost its lease (detached by another frontend) is never
-  /// reused: it reattaches, and failures reach the navigator.
-  private func revealAttention(
-    _ target: PaneTarget,
-    takeover lease: UInt64?
-  ) async throws {
-    NSApp.activate()
-    // One SwiftMux window and lease at a time: the current one is left
-    // only once the target is attached, so a refused attach (held
-    // elsewhere, before the takeover is confirmed) keeps it.
-    let previous = mux
-    _ = try await MuxWorkspaceController.reveal(
-      target,
-      in: previous,
-      configuration: config,
-      connect: { try await MuxWorkspaceController.connect() },
-      takeover: lease,
-      attached: { controller in self.install(controller, replacing: previous) }
-    )
-  }
-
-  /// Makes `controller` the SwiftMux window after it replaced `previous`.
-  private func install(
-    _ controller: MuxWorkspaceController,
-    replacing previous: MuxWorkspaceController?
-  ) {
-    if let mux, mux !== previous {
-      // Another window opened meanwhile: keep one lease.
-      self.mux = nil
-      Task {
-        await mux.detach()
-        mux.close()
-      }
-    }
-    controller.onClose = { [weak controller] in
-      if self.mux === controller { self.mux = nil }
-    }
-    // The inbox reattaching a window that lost its lease.
-    controller.onReplaced = { [weak self, weak controller] replacement in
-      self?.install(replacement, replacing: controller)
-    }
-    mux = controller
-  }
-
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.mainMenu = makeMenu()
-    newWindow(nil)
+    workspaces.launch()
     NSApp.activate()
     reportProblems()
   }
@@ -134,21 +82,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     _ sender: NSApplication
   ) -> Bool { true }
 
-  /// Quit only detaches: service-owned panes keep running and the agent
-  /// stays registered.
+  /// Quit only detaches, every window: service-owned panes keep running
+  /// and the agent stays registered.
   func applicationShouldTerminate(
     _ sender: NSApplication
   ) -> NSApplication.TerminateReply {
-    guard let mux else { return .terminateNow }
-    self.mux = nil
     Task {
-      await mux.detach()
+      await workspaces.terminate()
       sender.reply(toApplicationShouldTerminate: true)
     }
     return .terminateLater
   }
 
-  // MARK: SwiftMux
+  // MARK: Workspaces
+
+  /// New Workspace: a workspace with one shell, in its own window.
+  @objc
+  func newWorkspace(_ sender: Any?) { workspaces.create() }
+
+  /// Open Workspace…: reveals or attaches an existing workspace.
+  @objc
+  func openWorkspace(_ sender: Any?) { workspaces.chooseWorkspace() }
+
+  // MARK: SwiftMux service
 
   @objc
   func muxStageUpdate(_ sender: Any?) { muxUpdate.stage() }
@@ -156,160 +112,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   @objc
   func muxInstallUpdate(_ sender: Any?) {
     muxUpdate.install { [weak self] in
-      guard let mux = self?.mux else { return }
-      self?.mux = nil
-      await mux.detach()
-      mux.close()
+      await self?.workspaces.detachAll(closing: true)
     }
   }
 
   @objc
   func muxCancelUpdate(_ sender: Any?) { muxUpdate.cancel() }
 
-  private func openMux(_ selector: WorkspaceSelector?) {
-    if let mux {
-      mux.showWindow(nil)
-      return
-    }
-    guard !muxOpenInProgress else { return }
-    muxOpenInProgress = true
-    let config = config
-    Task {
-      defer { muxOpenInProgress = false }
-      do {
-        let controller = try await openMuxWorkspace(selector, config)
-        install(controller, replacing: nil)
-        controller.showWindow(nil)
-      } catch { reportMuxOpenError(error) }
-    }
-  }
-
-  @objc
-  func muxNewWorkspace(_ sender: Any?) { openMux(nil) }
-
-  @objc
-  func muxAttach(_ sender: Any?) {
-    guard !muxAttachInProgress else { return }
-    // Reserve before scheduling and through modal presentation, whose
-    // nested event loop can deliver the action again.
-    muxAttachInProgress = true
-    Task {
-      defer { muxAttachInProgress = false }
-      do {
-        let list = try await listMuxWorkspaces()
-        guard !list.isEmpty else {
-          let alert = NSAlert()
-          alert.messageText = "No SwiftMux workspaces"
-          alert.informativeText = "Create one with New Workspace."
-          alert.runModal()
-          return
-        }
-        let alert = NSAlert()
-        alert.messageText = "Attach to Workspace"
-        let popup = NSPopUpButton(
-          frame: NSRect(x: 0, y: 0, width: 280, height: 26)
-        )
-        for ws in list {
-          popup.addItem(
-            withTitle: "\(ws.name) — \(ws.tabCount) tabs, \(ws.paneCount) panes"
-              + (ws.isAttached ? " (attached)" : "")
-          )
-        }
-        alert.accessoryView = popup
-        alert.addButton(withTitle: "Attach")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        openMux(.id(list[popup.indexOfSelectedItem].id))
-      } catch { reportMuxAttachError(error) }
-    }
-  }
-
-  @objc
-  func muxDetach(_ sender: Any?) {
-    guard let mux else { return }
-    self.mux = nil
-    Task {
-      await mux.detach()
-      mux.close()
-    }
-  }
-
-  @objc
-  func muxNewTab(_ sender: Any?) { mux?.newTab() }
-
-  @objc
-  func muxSplitLeftRight(_ sender: Any?) { mux?.split(.leftRight) }
-
-  @objc
-  func muxSplitTopBottom(_ sender: Any?) { mux?.split(.topBottom) }
-
-  @objc
-  func muxZoom(_ sender: Any?) { mux?.toggleZoom() }
-
-  @objc
-  func muxEndPane(_ sender: Any?) { mux?.endPane() }
-
-  @objc
-  func muxCloseTab(_ sender: Any?) { mux?.closeTab() }
-
-  @objc
-  func muxRenameTab(_ sender: Any?) { mux?.beginRenamingActiveTab() }
-
-  /// Focus and resize items carry their direction in the tag.
-  @objc
-  func muxFocusPane(_ sender: NSMenuItem) {
-    Self.direction(sender.tag).map { mux?.focus($0) }
-  }
-
-  @objc
-  func muxResizePane(_ sender: NSMenuItem) {
-    Self.direction(sender.tag).map { mux?.resizeActivePane($0) }
-  }
-
-  private static let directions: [Direction] = [.left, .right, .up, .down]
-
-  private static func direction(_ tag: Int) -> Direction? {
-    directions.indices.contains(tag) ? directions[tag] : nil
-  }
-
-  @objc
-  func muxNextTab(_ sender: Any?) { mux?.cycleTab(1) }
-
-  @objc
-  func muxPreviousTab(_ sender: Any?) { mux?.cycleTab(-1) }
-
-  @objc
-  func validateMenuItem(_ item: NSMenuItem) -> Bool {
-    switch item.action {
-    case #selector(muxDetach(_:)), #selector(muxNewTab(_:)),
-      #selector(muxSplitLeftRight(_:)), #selector(muxSplitTopBottom(_:)),
-      #selector(muxZoom(_:)), #selector(muxEndPane(_:)),
-      #selector(muxNextTab(_:)), #selector(muxPreviousTab(_:)),
-      #selector(muxCloseTab(_:)), #selector(muxRenameTab(_:)),
-      #selector(muxFocusPane(_:)), #selector(muxResizePane(_:)):
-      mux != nil
-    default: true
-    }
-  }
-
-  @objc
-  func newWindow(_ sender: Any?) {
-    do {
-      let controller = try TerminalWindowController(configuration: config)
-      controller.onClose = { [weak self, weak controller] in
-        self?.windows.removeAll { $0 === controller }
-      }
-      windows.append(controller)
-      controller.showWindow(nil)
-    } catch { NSAlert(error: error).runModal() }
-  }
+  // MARK: Configuration
 
   @objc
   func reloadConfiguration(_ sender: Any?) {
     config = Configuration.load()
     NSApp.mainMenu = makeMenu()
-    for window in windows { window.apply(config) }
-    mux?.apply(config)
+    workspaces.apply(config)
     reportProblems()
   }
 
@@ -332,6 +148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let problems =
       config.diagnostics
       + config.missingThemes.map { "theme unavailable: \($0)" }
+      + config.missingFontStyles.map { "font style unavailable: \($0)" }
     guard !problems.isEmpty else { return }
     for problem in problems {
       FileHandle.standardError.write(Data("swiftty: \(problem)\n".utf8))
@@ -341,7 +158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     alert.informativeText =
       problems.prefix(10).joined(separator: "\n")
       + (problems.count > 10 ? "\n…" : "")
-    if let window = NSApp.keyWindow ?? windows.first?.window {
+    if let window = NSApp.keyWindow ?? workspaces.controllers.first?.window {
       alert.beginSheetModal(for: window)
     } else {
       alert.runModal()
@@ -350,14 +167,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   // MARK: Menus
 
+  /// Workspace commands have no target: the responder chain delivers them
+  /// to the focused window's controller, which validates them.
   private func makeMenu() -> NSMenu {
     let main = NSMenu()
-    func submenu(_ title: String, _ items: [NSMenuItem]) {
+    @discardableResult
+    func submenu(_ title: String, _ items: [NSMenuItem]) -> NSMenu {
       let item = NSMenuItem()
       let menu = NSMenu(title: title)
       items.forEach(menu.addItem)
       item.submenu = menu
       main.addItem(item)
+      return menu
     }
     submenu(
       "swiftty",
@@ -368,18 +189,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
           #selector(reloadConfiguration(_:)),
           key: ",",
           modifiers: [.command, .shift]
-        ), .separator(),
+        ), .separator(), serviceMenuItem(), .separator(),
         item("Quit swiftty", #selector(NSApplication.terminate(_:)), key: "q"),
       ]
     )
-    submenu(
-      "Shell",
-      [
-        item("New Window", #selector(newWindow(_:)), key: "n"),
-        item("Close", #selector(NSWindow.performClose(_:)), key: "w"),
-      ]
-    )
-    submenu("SwiftMux", muxMenuItems())
+    submenu("Workspace", workspaceMenuItems())
     submenu(
       "Edit",
       [
@@ -468,12 +282,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ),
       ]
     )
+    NSApp.windowsMenu = submenu("Window", windowMenuItems())
     return main
   }
 
-  /// A menu item whose shortcut is whatever `action` is bound to (the
-  /// view's key bindings handle the key itself; this only shows it).
-  private func muxMenuItems() -> [NSMenuItem] {
+  /// Helper management, apart from the terminal commands.
+  private func serviceMenuItem() -> NSMenuItem {
+    let service = NSMenuItem(
+      title: "Terminal Service",
+      action: nil,
+      keyEquivalent: ""
+    )
+    service.submenu = NSMenu(title: "Terminal Service")
+    for update in [
+      item("Stage Update…", #selector(muxStageUpdate(_:))),
+      item("Install Staged Update…", #selector(muxInstallUpdate(_:))),
+      item("Cancel Update", #selector(muxCancelUpdate(_:))),
+    ] { service.submenu?.addItem(update) }
+    return service
+  }
+
+  /// Creating, opening, growing and ending workspaces. Close Window
+  /// detaches; only the End items terminate processes.
+  private func workspaceMenuItems() -> [NSMenuItem] {
+    let workspace = MuxWorkspaceController.self
+    return [
+      item("New Workspace", #selector(newWorkspace(_:)), key: "n"),
+      item("New Tab", #selector(workspace.newTerminalTab(_:)), key: "t"),
+      item(
+        "Open Workspace…",
+        #selector(openWorkspace(_:)),
+        key: "o",
+        modifiers: [.command, .shift]
+      ), .separator(),
+      item("Split Right", #selector(workspace.splitRight(_:)), key: "d"),
+      item(
+        "Split Below",
+        #selector(workspace.splitDown(_:)),
+        key: "d",
+        modifiers: [.command, .shift]
+      ), .separator(),
+      item("Rename Tab…", #selector(workspace.renameActiveTab(_:))),
+      item(
+        "Rename Workspace…",
+        #selector(workspace.renameCurrentWorkspace(_:))
+      ), .separator(),
+      item("Close Window", #selector(NSWindow.performClose(_:)), key: "w"),
+      item(
+        "End Pane…",
+        #selector(workspace.endActivePane(_:)),
+        key: "w",
+        modifiers: [.command, .option]
+      ),
+      item(
+        "End Tab…",
+        #selector(workspace.endActiveTab(_:)),
+        key: "w",
+        modifiers: [.command, .control]
+      ), item("End Workspace…", #selector(workspace.endCurrentWorkspace(_:))),
+    ]
+  }
+
+  private func windowMenuItems() -> [NSMenuItem] {
+    let workspace = MuxWorkspaceController.self
     func arrow(_ key: Int) -> String {
       String(UnicodeScalar(UInt16(key)).map(Character.init) ?? " ")
     }
@@ -499,71 +370,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     return [
-      item(
-        "New Workspace",
-        #selector(muxNewWorkspace(_:)),
-        key: "n",
-        modifiers: [.command, .control]
-      ), item("Attach to Workspace…", #selector(muxAttach(_:))),
-      item(
-        "Detach",
-        #selector(muxDetach(_:)),
-        key: "d",
-        modifiers: [.command, .control]
-      ), .separator(), item("New Tab", #selector(muxNewTab(_:)), key: "t"),
-      item("Rename Tab…", #selector(muxRenameTab(_:))),
-      item(
-        "Close Tab",
-        #selector(muxCloseTab(_:)),
-        key: "w",
-        modifiers: [.command, .control]
-      ),
+      item("Minimize", #selector(NSWindow.performMiniaturize(_:)), key: "m"),
+      .separator(),
       item(
         "Next Tab",
-        #selector(muxNextTab(_:)),
+        #selector(workspace.selectNextTab(_:)),
         key: "]",
         modifiers: [.command, .shift]
       ),
       item(
         "Previous Tab",
-        #selector(muxPreviousTab(_:)),
+        #selector(workspace.selectPreviousTab(_:)),
         key: "[",
-        modifiers: [.command, .shift]
-      ), .separator(),
-      item("Split Left/Right", #selector(muxSplitLeftRight(_:)), key: "d"),
-      item(
-        "Split Top/Bottom",
-        #selector(muxSplitTopBottom(_:)),
-        key: "d",
         modifiers: [.command, .shift]
       ),
       item(
         "Zoom Pane",
-        #selector(muxZoom(_:)),
+        #selector(workspace.toggleZoomPane(_:)),
         key: "\r",
         modifiers: [.command, .shift]
-      ),
-      item(
-        "End Pane",
-        #selector(muxEndPane(_:)),
-        key: "w",
-        modifiers: [.command, .option]
       ), .separator(),
     ]
       + directional(
         "Focus Pane",
-        #selector(muxFocusPane(_:)),
+        #selector(workspace.focusPaneInDirection(_:)),
         [.command, .option]
       ) + [.separator()]
       + directional(
         "Resize Pane",
-        #selector(muxResizePane(_:)),
+        #selector(workspace.resizePaneInDirection(_:)),
         [.command, .control]
-      ) + [
-        .separator(), item("Stage Update…", #selector(muxStageUpdate(_:))),
-        item("Install Staged Update…", #selector(muxInstallUpdate(_:))),
-        item("Cancel Update", #selector(muxCancelUpdate(_:))),
-      ]
+      ) + [.separator()]
   }
 
   private func item(
@@ -621,87 +458,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       case .insert: nil
       }
     return key.map { ($0, mods) }
-  }
-}
-
-@MainActor
-final class TerminalWindowController: NSWindowController, NSWindowDelegate {
-  var onClose: (() -> Void)?
-  let terminal: TerminalView
-  private lazy var searchFieldEditor: SearchFieldEditor = {
-    let editor = SearchFieldEditor(frame: .zero)
-    editor.isFieldEditor = true
-    editor.terminal = terminal
-    return editor
-  }()
-
-  init(configuration: Configuration, columns: Int = 100, rows: Int = 30) throws
-  {
-    terminal = try TerminalView(configuration: configuration)
-    let window = NSWindow(
-      contentRect: NSRect(
-        origin: .zero,
-        size: terminal.preferredSize(columns: columns, rows: rows)
-      ),
-      styleMask: [.titled, .closable, .miniaturizable, .resizable],
-      backing: .buffered,
-      defer: false,
-    )
-    window.title = "swiftty"
-    window.center()
-    window.tabbingMode = .disallowed
-    super.init(window: window)
-    window.delegate = self
-    applyBackground(configuration)
-    window.makeFirstResponder(terminal)
-    terminal.onTitle = { [weak window] title in window?.title = title }
-    terminal.onExit = { [weak window] in window?.close() }
-    try terminal.start()
-  }
-
-  @available(*, unavailable)
-  required init?(coder: NSCoder) { fatalError() }
-
-  func apply(_ configuration: Configuration) {
-    terminal.apply(configuration)
-    applyBackground(configuration)
-  }
-
-  func windowWillReturnFieldEditor(_ sender: NSWindow, to client: Any?) -> Any?
-  {
-    guard let field = terminal.searchBar?.field,
-      (client as? NSSearchField) === field
-    else { return nil }
-    return searchFieldEditor
-  }
-
-  /// Restores editing focus when changing the window's glass background.
-  private func applyBackground(_ configuration: Configuration) {
-    guard let window else { return }
-    let focusedView: NSView? =
-      if let field = terminal.searchBar?.field,
-        window.firstResponder === field.currentEditor()
-      {
-        field
-      } else if let view = window.firstResponder as? NSView,
-        view === terminal || view.isDescendant(of: terminal)
-      { view } else { nil }
-    let selection = (focusedView as? NSControl)?.currentEditor()?.selectedRange
-    let reparented = TerminalWindowBackground.apply(
-      to: window,
-      content: terminal,
-      configuration: configuration
-    )
-    if reparented, let focusedView {
-      window.makeFirstResponder(focusedView)
-      if let selection, let control = focusedView as? NSControl {
-        control.currentEditor()?.selectedRange = selection
-      }
-    }
-  }
-
-  func windowWillClose(_ notification: Notification) {
-    terminal.stop()
-    onClose?()
   }
 }

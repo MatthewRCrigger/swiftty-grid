@@ -255,6 +255,91 @@ each pane's cells. The service owns sessions, pane identities, PTYs, parsers,
 history and the canonical layout. The `swmux` terminal client remains a
 secondary frontend.
 
+**One window type.** Every terminal window the app opens is a workspace
+window, and a plain shell is the smallest workspace: one tab, one pane, one
+login shell. Adding a tab or splitting grows the same workspace; it never
+restarts, transfers or recreates the original process. There is no second,
+app-owned terminal window: `TerminalView` and `TerminalSession` remain
+reusable library APIs (the roaming clients and tests use them), but a shell
+in a workspace is never an app-owned `TerminalView` session. Presentation
+helpers are shared where useful, without a second authoritative emulator.
+
+### Commands
+
+**Terms.** *Workspace* names the persistent thing a person creates, opens,
+renames and ends; *window* names only its on-screen view. Commands on the
+workspace say Workspace (the Workspace menu, New Workspace, End Workspace);
+Close Window and the Window menu act on the window and leave the workspace
+running. Tabs and panes are parts of a workspace.
+
+The window starts with minimal chrome (workspace title, the terminal, add
+and inbox controls) and shows the tab strip once there is a choice. Access
+to the workspace chooser and lifecycle commands is never hidden.
+
+| Command | Meaning |
+|---|---|
+| New Workspace (⌘N) | Create one workspace with one shell, in its own window. |
+| New Tab (⌘T) | A shell in a new tab of the focused workspace. |
+| Split Right / Split Below | A sibling shell in the current tab's split tree. |
+| Open Workspace… (⇧⌘O) | List workspaces; reveal one this app shows, or attach it in another window. Opening never creates a shell; the chooser's New Workspace button does, as ⌘N would. |
+| Rename Tab / Workspace | Metadata only. |
+| Close Window (⌘W) | Detach this window; processes keep running. |
+| End Pane / Tab / Workspace | Terminate exactly that scope, confirming while processes run. A tab's close button says it ends its processes. |
+
+Commands travel the responder chain to the key window's controller and are
+validated against that window's actual attachment (connected, controller,
+target present). A text field (search, a tab rename) and IME composition
+keep their own editing commands. Helper management (staging and installing
+updates) sits under the app menu's Terminal Service item.
+
+### Startup and discovery
+
+- **First launch** creates a one-shell workspace.
+- **Later launches** reopen the last workspace when it is free, or the only
+  free workspace when the last is unknown or gone; otherwise they offer the
+  existing workspaces before creating another. The remembered value is an
+  identity, never a copy of the split tree.
+- **Opening** a workspace this app shows reveals its window. One held by
+  another client needs an explicit takeover; declining or failing leaves the
+  current windows usable.
+- **Service unavailable** (helper missing, awaiting approval, unreachable or
+  a different running version): the app says so and offers a retry. It never
+  starts a non-persistent local shell instead.
+
+### App coordination
+
+`WorkspaceCoordinator` owns the application-level registry:
+- create, open and reveal are distinct operations, and a repeat while one
+  is pending joins it;
+- windows are keyed by service instance and workspace identity, never by
+  name; a window that lost its lease or connection matches nothing, so a
+  service-instance change invalidates stale registrations;
+- each window has its own connection and holds its workspace's lease;
+  reopening a workspace already shown reveals it rather than adding a writer;
+- configuration reload, staged-update detachment and Quit apply to every
+  window; closing one window never detaches another; attention links reveal
+  or open their target without detaching an unrelated window.
+
+The coordinator manages windows, the window controller presents one
+attachment, and the service stays authoritative for workspace and process
+state; no client-side workspace tree mirrors it.
+
+### Launch settings
+
+`WorkspaceLaunch` turns configuration into a new workspace's `LaunchSpec`
+with the rules of `Configuration.sessionConfiguration()`:
+- `command` keeps Ghostty's `shell:` expansion and `direct:` arguments;
+  unset runs the login shell;
+- `working-directory` is an explicit path, `home`, or `inherit`, which
+  resolves in the frontend (its current directory) because the agent runs
+  elsewhere;
+- the frontend's environment is snapshotted; the service still sets the
+  terminal variables it requires over it.
+
+New tabs reuse the workspace's spec; splits start a login shell in the split
+pane's directory. `scrollback-limit` is not carried: the service applies its
+own history limit to every pane.
+
 ### Layout model
 
 A workspace holds tabs, and each tab holds a typed split tree. Layouts are
@@ -351,6 +436,21 @@ The pipeline:
 - **Attention inbox:** the toolbar badge and popover are specified in
   spec.inbox.md §3.5.
 
+**Terminal parity.** A workspace pane offers what a direct terminal window
+did. Behaviour that needs the emulator runs in the service and is advertised
+in `Welcome.features` (spec.multiplexer.md §7.5); a frontend disables the
+matching menu items with a service that lacks it, rather than leaving them
+inert:
+- mouse reporting to programs (Shift still selects), button and any-motion
+  modes, and the alternate-screen wheel sending arrows;
+- `copy-on-select`, `cursor-click-to-move`, `mouse-hide-while-typing` and
+  `custom-shader` (animated shaders drive frames);
+- ⌘-click and ⌘-hover links (OSC 8, or detected URLs with `link-url`);
+- prompt jumps, scroll to top, Select Command Output, Clear Screen and Reset
+  Terminal, from menus and key bindings;
+- user key bindings, search, font zoom, theme and padding as in the direct
+  view.
+
 ### Resize and full-screen programs
 
 - **Geometry batch:** for each visible pane the app computes columns and rows
@@ -375,6 +475,14 @@ shell.
 - Only an explicit end of a pane, tab or workspace kills shells.
 - Reopening the app lists workspaces and requests fresh full frames.
 
+- A shell that exits follows the service's exit and remain-on-exit rules; no
+  empty workspace snapshot is invented.
+- Another client taking control stops this window's input and shows it
+  detached.
+- After an agent restart, workspaces are listed and identities resolved
+  again; old leases, process IDs and queued input are never reused.
+
+"Persistent" means shells outlive windows and the app while the service runs.
 A service crash, logout or reboot is not restored transparently, and no
 submitted command is ever replayed to recreate a process. The endpoint checks
 that the peer is the same user, and every lease, input and resize is fenced
@@ -399,6 +507,19 @@ are bounded.
   advance the presentation baseline early.
 - An explicit destructive action ends only the intended pane; disposing a
   view never does.
+- New Workspace makes exactly one workspace, tab and shell; a second makes
+  another workspace; New Tab and Split keep the original shell.
+- Two windows are controlled independently; commands reach only the focused
+  one, and Open Workspace never duplicates a writer or PTY.
+- Closing a window during create, open or takeover retires the pending
+  operation; a timeout after a possible create does not create again, and
+  the workspace stays listed.
+- Custom commands and directory policies match the direct-window rules.
+- The parity features above, including text-field focus and IME.
+- Helper approval, absence, unavailability and a different version are
+  recoverable, with no direct-shell fallback.
+- Configuration reload and Quit reach every window; stale service instances
+  and frames are rejected; attention links detach no unrelated window.
 
 Status and measurements for these are recorded in spec.multiplexer.md §11.
 

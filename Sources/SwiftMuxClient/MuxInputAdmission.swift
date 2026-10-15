@@ -14,7 +14,8 @@ final class MuxInputAdmission: Sendable {
   static func bytes(_ input: MuxInput) -> Int {
     switch input {
     case let .text(text), let .paste(text): text.utf8.count
-    case .key, .focus: 32
+    case .key, .focus, .mouse: 32
+    case .moveCursor: MuxInput.moveCursorBytes
     }
   }
 

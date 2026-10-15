@@ -1,10 +1,26 @@
 import AppKit
 import SwiftMuxProtocol
 
-/// Lays out pane views from the logical split tree; dividers drag.
+/// Lays out pane views from the logical split tree; dividers drag. A
+/// split tab shows its panes as cards with even gaps (the dividers) and
+/// the same margin around them; a single pane fills the window.
 @MainActor
 final class MuxLayoutView: NSView {
-  static let divider = 4
+  /// The gap between pane cards, which is also the draggable divider.
+  static let divider = 10
+  /// Space around the cards of a split tab.
+  static let margin = 10
+
+  /// The area panes are laid out in, in layout coordinates (y down).
+  static func area(_ bounds: NSRect, split: Bool) -> LayoutRect {
+    let inset = split ? margin : 0
+    return LayoutRect(
+      x: inset,
+      y: inset,
+      width: max(0, Int(bounds.width) - 2 * inset),
+      height: max(0, Int(bounds.height) - 2 * inset)
+    )
+  }
   weak var controller: MuxWorkspaceController?
   private(set) var dividers: [LayoutDivider] = []
   private var dragging: LayoutDivider?
@@ -84,11 +100,6 @@ final class MuxLayoutView: NSView {
   }
 
   override func mouseUp(with event: NSEvent) { dragging = nil }
-
-  override func draw(_ dirtyRect: NSRect) {
-    NSColor.separatorColor.setFill()
-    bounds.fill()
-  }
 }
 
 /// A split handle for assistive technologies: its value is the first

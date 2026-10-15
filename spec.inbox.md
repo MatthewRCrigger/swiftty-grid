@@ -18,7 +18,7 @@ above and is unchanged unless stated here.
 `swiftmux-agent` is the only process that owns shells, PTYs and terminal
 state. It serves:
 
-- **Local:** the native Swiftty app over authenticated per-user XPC (SMX/1),
+- **Local:** the native Swiftty app over authenticated per-user XPC (SMX/2),
   as before.
 - **Remote:** SSH bootstrap plus QUIC RST/1, hosted in the same process by
   `TerminalHost.RoamingHost`. The RST/1 host no longer spawns shells; that
@@ -244,7 +244,7 @@ closed or wrong fd 3/4.
   grant is refused before connecting. The field is optional on the wire:
   grants from older hosts omit it and are checked by exact certificate only.
 
-## 2. Leases, takeover and input (SMX/1 additions)
+## 2. Leases, takeover and input (SMX additions)
 
 ### 2.1 Per-workspace lease
 

@@ -328,6 +328,7 @@ public actor MuxService {
             ? SMX.terminalProfile : nil,
           limits: limits,
           innerTerm: configuration.innerTerm,
+          features: .supported,
         ),
       ),
       to: client.id,
@@ -856,12 +857,49 @@ public actor MuxService {
       runSearch(nil, step: forward, pane: pane, workspace: leased, reply: reply)
     case let .endSearch(pane):
       runSearch(nil, step: nil, pane: pane, workspace: leased, reply: reply)
+    case .clearScreen, .resetTerminal, .link, .commandOutput:
+      handleTerminal(command, workspace: leased, reply: reply)
     case .status, .listWorkspaces, .newWorkspace, .endWorkspace,
       .renameWorkspace, .detachActive, .endAllWorkspaces, .attach, .detach,
       .switchWorkspace, .quiesce, .setTheme, .takeover, .observeWorkspaces,
       .subscribeInbox, .inbox, .locateAttention, .markSeen, .snooze,
       .markReviewed:
       ok()  // handled by `handle`
+    }
+  }
+
+  /// Terminal control and shell-integration queries on a leased pane.
+  private func handleTerminal(
+    _ command: MuxCommand,
+    workspace leased: WorkspaceID,
+    reply: @escaping Reply,
+  ) {
+    let ok = { reply(.success(.ok)) }
+    let fail = { (e: MuxError) in reply(.failure(e)) }
+    switch command {
+    case let .clearScreen(pane), let .resetTerminal(pane):
+      guard let runtime = attachedRuntime(pane, in: leased) else {
+        return fail(MuxError(.notFound, "pane"))
+      }
+      if case .clearScreen = command {
+        runtime.clearScreen()
+      } else {
+        runtime.resetTerminal()
+      }
+      ok()
+    case let .link(pane, address, column, detectURLs):
+      guard let runtime = attachedRuntime(pane, in: leased) else {
+        return fail(MuxError(.notFound, "pane"))
+      }
+      runtime.link(at: address, column: column, detectURLs: detectURLs) {
+        reply(.success(.link($0)))
+      }
+    case let .commandOutput(pane, address):
+      guard let runtime = attachedRuntime(pane, in: leased) else {
+        return fail(MuxError(.notFound, "pane"))
+      }
+      runtime.commandOutput(at: address) { reply(.success(.commandOutput($0))) }
+    default: fail(MuxError(.invalidRequest, "not a terminal command"))
     }
   }
 
@@ -938,8 +976,8 @@ public actor MuxService {
   /// a screen, in lines or (at least one line each) pages.
   func scrollError(_ request: ScrollRequest) -> MuxError? {
     switch request {
-    case .bottom, .top: return nil
-    case let .lines(n), let .pages(n):
+    case .bottom, .top, .oldest: return nil
+    case let .lines(n), let .pages(n), let .prompt(n):
       guard limits.historyRowsPerPane >= 0, limits.maxRows >= 0 else {
         return Self.badScroll
       }

@@ -136,7 +136,7 @@ final class AttentionLinkRouter {
         headline: staleHeadline(preview.item.resolution)
       )
       alert.addButton(withTitle: "OK")
-      await present(alert)
+      _ = await present(alert)
       guard isCurrent(state, request: id) else { return }
       await navigator.didView()
       guard isCurrent(state, request: id) else { return }
@@ -239,7 +239,7 @@ final class AttentionLinkRouter {
     let alert = NSAlert()
     alert.messageText = title
     alert.informativeText = text
-    await present(alert)
+    _ = await present(alert)
   }
 
   private func chooseHost(_ hosts: [NavigationHost]) async -> NavigationHost? {

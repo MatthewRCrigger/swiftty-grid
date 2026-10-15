@@ -18,26 +18,26 @@ extension MuxNativeTests {
     var reports = 0
     weak var reentrantDelegate: AppDelegate?
     let delegate = AppDelegate(
-      openMuxWorkspace: { _, _ in
+      openMuxWorkspace: { _, _, _ in
         opens += 1
         for await _ in gate.stream { break }
         throw MuxError(.connectionLost, "held open failed")
       },
       reportMuxOpenError: { _ in
         reports += 1
-        if reports == 1 { reentrantDelegate?.muxNewWorkspace(nil) }
+        if reports == 1 { reentrantDelegate?.newWorkspace(nil) }
       }
     )
     reentrantDelegate = delegate
-    delegate.muxNewWorkspace(nil)
+    delegate.newWorkspace(nil)
     try #require(await until { opens == 1 })
-    for _ in 0 ..< 20 { delegate.muxNewWorkspace(nil) }
+    for _ in 0 ..< 20 { delegate.newWorkspace(nil) }
     await Task.yield()
     gate.continuation.finish()
     try #require(await until { reports > 0 })
     #expect(opens == 1)
     #expect(reports == 1)
-    delegate.muxNewWorkspace(nil)
+    delegate.newWorkspace(nil)
     try #require(await until { reports > 1 })
     #expect(opens == 2)
     #expect(reports == 2)
@@ -58,20 +58,20 @@ extension MuxNativeTests {
       },
       reportMuxAttachError: { _ in
         reports += 1
-        if reports == 1 { reentrantDelegate?.muxAttach(nil) }
+        if reports == 1 { reentrantDelegate?.openWorkspace(nil) }
       }
     )
     reentrantDelegate = delegate
-    delegate.muxAttach(nil)
+    delegate.openWorkspace(nil)
     try #require(await until { queries == 1 })
-    for _ in 0 ..< 20 { delegate.muxAttach(nil) }
+    for _ in 0 ..< 20 { delegate.openWorkspace(nil) }
     // Drain the main actor's admitted query jobs before observing the count.
     await Task.yield()
     gate.continuation.finish()
     try #require(await until { reports > 0 })
     #expect(queries == 1)
     #expect(reports == 1)
-    delegate.muxAttach(nil)
+    delegate.openWorkspace(nil)
     try #require(await until { reports > 1 })
     #expect(queries == 2)
     #expect(reports == 2)

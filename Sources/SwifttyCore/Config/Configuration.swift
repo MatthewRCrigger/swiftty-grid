@@ -177,6 +177,12 @@ public struct Configuration: Sendable, Equatable {
     return min(max(size, fontSizeRange.lowerBound), fontSizeRange.upperBound)
   }
 
+  /// Ghostty's `macos-icon` values.
+  static let ghosttyIcons: Set = [
+    "official", "blueprint", "chalkboard", "microchip", "glass", "holographic",
+    "paper", "retro", "xray", "custom", "custom-style",
+  ]
+
   public var fontFamily = "Menlo"
   public var fontFamilyBold: String?
   public var fontFamilyItalic: String?
@@ -187,6 +193,11 @@ public struct Configuration: Sendable, Equatable {
   public var fontSyntheticBold = true
   public var fontSyntheticItalic = true
   public var fontSyntheticBoldItalic = true
+  /// Named faces (Ghostty's `font-style`, `font-style-bold` etc.).
+  public var fontStyle = FaceStyle.default
+  public var fontStyleBold = FaceStyle.default
+  public var fontStyleItalic = FaceStyle.default
+  public var fontStyleBoldItalic = FaceStyle.default
   /// Cell adjustments: a fraction (from `10%`) or points (from `2`).
   public var adjustCellWidth = CellAdjustment()
   public var adjustCellHeight = CellAdjustment()
@@ -545,6 +556,12 @@ public struct Configuration: Sendable, Equatable {
       workingDirectory =
         value.isEmpty ? nil : (value as NSString).expandingTildeInPath
     case "window-padding-x", "window-padding-y": return setPadding(key, value)
+    case "macos-icon":
+      // Accepted so a shared Ghostty config loads cleanly; Swiftty has
+      // one icon.
+      guard value.isEmpty || Self.ghosttyIcons.contains(value) else {
+        return invalid()
+      }
     case "keybind":
       if value.isEmpty {
         keybindings = .defaults
@@ -596,6 +613,22 @@ public struct Configuration: Sendable, Equatable {
     case "font-family-italic": fontFamilyItalic = value.isEmpty ? nil : value
     case "font-family-bold-italic":
       fontFamilyBoldItalic = value.isEmpty ? nil : value
+    case "font-style", "font-style-bold", "font-style-italic",
+      "font-style-bold-italic":
+      let style: FaceStyle
+      switch value {
+      case "", "default": style = .default
+      // The regular face cannot be disabled.
+      case "false" where key == "font-style": return invalid()
+      case "false": style = .disabled
+      default: style = .named(value)
+      }
+      switch key {
+      case "font-style": fontStyle = style
+      case "font-style-bold": fontStyleBold = style
+      case "font-style-italic": fontStyleItalic = style
+      default: fontStyleBoldItalic = style
+      }
     case "font-size":
       guard
         let v = value.isEmpty ? defaults.fontSize : double(Self.fontSizeRange)
@@ -698,6 +731,27 @@ public struct Configuration: Sendable, Equatable {
       .filter { Themes.colors(named: $0, searching: themeDirectories) == nil }
   }
 
+  /// Configured face styles missing from their families, which fall
+  /// back to the default face.
+  public var missingFontStyles: [String] {
+    let resolver = FontFaceResolver(descriptor: fontDescriptor(scale: 1))
+    let styles = [
+      (fontStyle, nil), (fontStyleBold, fontFamilyBold),
+      (fontStyleItalic, fontFamilyItalic),
+      (fontStyleBoldItalic, fontFamilyBoldItalic),
+    ]
+    var missing: [String] = []
+    for (style, family) in styles {
+      guard case .named(let name) = style,
+        let font = resolver.named(family ?? fontFamily),
+        resolver.face(name, in: font) == nil
+      else { continue }
+      let entry = "\(name) (\(family ?? fontFamily))"
+      if !missing.contains(entry) { missing.append(entry) }
+    }
+    return missing
+  }
+
   public func fontDescriptor(
     scale: CGFloat,
     size: Double? = nil
@@ -710,6 +764,10 @@ public struct Configuration: Sendable, Equatable {
     d.boldFamily = fontFamilyBold
     d.italicFamily = fontFamilyItalic
     d.boldItalicFamily = fontFamilyBoldItalic
+    d.regularStyle = fontStyle
+    d.boldStyle = fontStyleBold
+    d.italicStyle = fontStyleItalic
+    d.boldItalicStyle = fontStyleBoldItalic
     d.features = fontFeatures
     d.variations = fontVariations
     d.synthesizeBold = fontSyntheticBold

@@ -4,6 +4,12 @@ import SwiftMuxClient
 import SwiftMuxProtocol
 import SwifttyCore
 
+/// A workspace list and the service instance its identities belong to.
+struct WorkspaceListing: Sendable {
+  var server: ServerInstanceID?
+  var workspaces: [WorkspaceSummary]
+}
+
 extension MuxWorkspaceController {
   static func makeWorkspaceWindow() -> NSWindow {
     let window = NSWindow(
@@ -12,16 +18,19 @@ extension MuxWorkspaceController {
       backing: .buffered,
       defer: false
     )
-    window.title = "SwiftMux"
+    window.title = "swiftty"
     window.tabbingMode = .disallowed
     window.center()
     return window
   }
 
   /// Attaches to `selector` (creating a workspace when nil) in a new window.
+  /// With `expectedLease`, takes it over from its current holder; callers
+  /// pass it only after the user confirmed.
   static func open(
     _ selector: WorkspaceSelector?,
     configuration: Configuration,
+    takeover expectedLease: UInt64? = nil,
     createConnection: @MainActor () async throws -> MuxConnection = {
       try await connect()
     },
@@ -36,6 +45,7 @@ extension MuxWorkspaceController {
         selector,
         configuration: configuration,
         connection: connection,
+        takeover: expectedLease,
         beforeReturnForTesting: beforeReturnForTesting,
       )
     } catch {
@@ -102,8 +112,10 @@ extension MuxWorkspaceController {
       // Preserve the running service and its sessions.
       throw MuxUnavailable(
         message: "The running SwiftMux service is a different version "
-          + "(\(error.message)). Reopen the Swiftty version that started "
-          + "it, or end its sessions with `swmux end-all` before updating.",
+          + "(\(error.message)). Its sessions are kept: reopen the Swiftty "
+          + "version that started it, or restart the service to use this "
+          + "one (its sessions end) with `swiftty --swiftmux-agent "
+          + "unregister` and reopen Swiftty.",
       )
     } catch {
       // A bundled agent registered under another signing team is killed
@@ -125,6 +137,15 @@ extension MuxWorkspaceController {
       try await connect()
     }
   ) async throws -> [WorkspaceSummary] {
+    try await listing(createConnection: createConnection).workspaces
+  }
+
+  /// Workspaces known to the service, with the instance they belong to.
+  static func listing(
+    createConnection: @MainActor () async throws -> MuxConnection = {
+      try await connect()
+    }
+  ) async throws -> WorkspaceListing {
     let connection = try await createConnection()
     do {
       // An interactive chooser must return control if the service stops replying.
@@ -135,8 +156,9 @@ extension MuxWorkspaceController {
       guard case let .workspaces(list) = reply else {
         throw MuxError(.invalidRequest, "unexpected workspace-list reply")
       }
+      let server = await connection.welcome?.server
       await connection.close()
-      return list
+      return WorkspaceListing(server: server, workspaces: list)
     } catch {
       await connection.close()
       throw error
@@ -144,7 +166,7 @@ extension MuxWorkspaceController {
   }
 
   /// Opens `selector` on the new `connection` and only then leaves
-  /// `current` (one SwiftMux window and lease at a time). A failed attach
+  /// `current` (the window it replaces). A failed attach
   /// (`leaseHeld` before a confirmed takeover, `staleRevision`, …)
   /// closes `connection` and leaves `current` with its window and lease.
   static func replace(

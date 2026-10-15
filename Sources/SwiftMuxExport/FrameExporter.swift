@@ -138,6 +138,14 @@ public enum FrameExporter {
     if screen.isAlternateScreen { modes.insert(.alternateScreen) }
     if screen.modes.contains(.reverseVideo) { modes.insert(.reverseVideo) }
     if screen.modes.contains(.focusEvents) { modes.insert(.focusEvents) }
+    if !screen.modes.isDisjoint(with: .mouseTracking) {
+      modes.insert(.mouseTracking)
+    }
+    if screen.modes.contains(.mouseButton) { modes.insert(.mouseButtonMotion) }
+    if screen.modes.contains(.mouseAny) { modes.insert(.mouseAnyMotion) }
+    if screen.modes.contains(.alternateScroll) {
+      modes.insert(.alternateScroll)
+    }
     if screen.modes.contains(.keypadApplication) {
       modes.insert(.keypadApplication)
     }

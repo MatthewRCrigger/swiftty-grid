@@ -92,7 +92,8 @@ private struct MuxCommandPayload {
     case let .search(_, query): try text(query)
     case .status, .listWorkspaces, .detachActive, .endAllWorkspaces, .quiesce,
       .detach, .observeWorkspaces, .subscribeInbox, .selectTab, .endTab,
-      .focusPane, .toggleZoom, .endPane, .scroll, .searchStep, .endSearch:
+      .focusPane, .toggleZoom, .endPane, .scroll, .searchStep, .endSearch,
+      .clearScreen, .resetTerminal, .link, .commandOutput:
       break
     }
   }

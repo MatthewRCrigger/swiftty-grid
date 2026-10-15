@@ -61,7 +61,7 @@ final class MuxInputQueue {
         bytes: text.utf8.count,
         limit: limits.maxPasteChunkBytes,
       )
-    case .key, .focus:
+    case .key, .focus, .mouse, .moveCursor:
       admit(.input(input, pane), bytes: 32, limit: InputBudget.byteLimit, )
     }
   }

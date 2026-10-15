@@ -25,6 +25,11 @@ public struct FontDescriptor: Hashable, Sendable {
   public var boldFamily: String?
   public var italicFamily: String?
   public var boldItalicFamily: String?
+  /// Named faces within each style's family (Ghostty's `font-style` etc.).
+  public var regularStyle = FaceStyle.default
+  public var boldStyle = FaceStyle.default
+  public var italicStyle = FaceStyle.default
+  public var boldItalicStyle = FaceStyle.default
   /// Variable-font axes by four-letter tag (Ghostty's `font-variation`).
   /// Nonfinite values are ignored.
   public var variations: [String: Double] = [:]
@@ -58,6 +63,17 @@ public struct FontDescriptor: Hashable, Sendable {
     }
     return result
   }
+}
+
+/// A face chosen by style name, such as `Retina` or `Light`.
+public enum FaceStyle: Hashable, Sendable {
+  /// The family's default face for the style.
+  case `default`
+  /// The face whose style name matches, ignoring case; the default face
+  /// when the family has none.
+  case named(String)
+  /// The regular face is used in place of this style.
+  case disabled
 }
 
 public struct FontStyle: OptionSet, Hashable, Sendable {
@@ -102,12 +118,7 @@ public final class ResolvedFont: @unchecked Sendable {
     let pixelSize = descriptor.size * descriptor.scale
     let resolver = FontFaceResolver(descriptor: descriptor)
 
-    let regular =
-      resolver.named(descriptor.family) ?? CTFontCreateUIFontForLanguage(
-        .userFixedPitch,
-        pixelSize,
-        nil
-      ) ?? CTFontCreateWithName(descriptor.family as CFString, pixelSize, nil)
+    let regular = Self.regular(resolver: resolver, pixelSize: pixelSize)
 
     let fallbackFonts = descriptor.fallbackFamilies.compactMap(resolver.named)
     let features = Self.resolvedFeatures(descriptor.features)
@@ -151,16 +162,7 @@ public final class ResolvedFont: @unchecked Sendable {
     fallbackEmboldened = (0 ..< 4)
       .map { style in fallbackStyles.map { $0[style].1 } }
     fallbacks = fallbackFaces[0]
-    let primaryStyles = [
-      (regular, false),
-      resolver.styled(regular, .traitBold, family: descriptor.boldFamily),
-      resolver.styled(regular, .traitItalic, family: descriptor.italicFamily),
-      resolver.styled(
-        regular,
-        [.traitBold, .traitItalic],
-        family: descriptor.boldItalicFamily
-      ),
-    ]
+    let primaryStyles = Self.styles(of: regular, resolver: resolver)
     // Shaped rows and grapheme clusters need the same styled cascade
     // as scalar lookup, including when no features enable row shaping.
     faces = primaryStyles.enumerated()
@@ -225,6 +227,55 @@ public final class ResolvedFont: @unchecked Sendable {
       max(-.greatestFiniteMagnitude, underline)
     )
     underlineThickness = max(1, round(CTFontGetUnderlineThickness(metrics)))
+  }
+
+  /// The configured family (else the user's fixed-pitch font) in its
+  /// configured regular style.
+  private static func regular(
+    resolver: FontFaceResolver,
+    pixelSize: CGFloat
+  ) -> CTFont {
+    let descriptor = resolver.descriptor
+    let family =
+      resolver.named(descriptor.family) ?? CTFontCreateUIFontForLanguage(
+        .userFixedPitch,
+        pixelSize,
+        nil
+      ) ?? CTFontCreateWithName(descriptor.family as CFString, pixelSize, nil)
+    guard case .named(let style) = descriptor.regularStyle else {
+      return family
+    }
+    return resolver.face(style, in: family) ?? family
+  }
+
+  /// Regular, bold, italic and bold italic faces, each with whether it
+  /// is emboldened by stroking.
+  private static func styles(
+    of regular: CTFont,
+    resolver: FontFaceResolver
+  ) -> [(CTFont, Bool)] {
+    let d = resolver.descriptor
+    return [
+      (regular, false),
+      resolver.styled(
+        regular,
+        .traitBold,
+        family: d.boldFamily,
+        style: d.boldStyle
+      ),
+      resolver.styled(
+        regular,
+        .traitItalic,
+        family: d.italicFamily,
+        style: d.italicStyle
+      ),
+      resolver.styled(
+        regular,
+        [.traitBold, .traitItalic],
+        family: d.boldItalicFamily,
+        style: d.boldItalicStyle
+      ),
+    ]
   }
 
   private static func variationSettings(

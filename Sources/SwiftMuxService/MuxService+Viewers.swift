@@ -687,7 +687,7 @@ extension MuxService {
       viewport.followTail = false
       viewport.anchorRow = address.row
       viewport.historyGeneration = address.generation
-    case .lines, .pages: relative = request
+    case .lines, .pages, .oldest, .prompt: relative = request
     }
     moveViewer(
       viewport,

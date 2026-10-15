@@ -101,7 +101,7 @@ lifecycle and reply provenance.
 [spec.multiplexer.md](spec.multiplexer.md) describes a persistent session
 service for Swiftty. A per-user LaunchAgent (`swiftmux-agent`) owns the shells,
 PTYs, terminal engines, history and workspace layouts. Frontends connect to it
-over one Mach/XPC endpoint using `SMX/1`: tagged JSON records that carry full,
+over one Mach/XPC endpoint using `SMX/2`: tagged JSON records that carry full,
 validated pane frames.
 
 - `swmux` is the terminal client. With no command it attaches to the newest
@@ -115,18 +115,38 @@ validated pane frames.
 - The service links only `SwifttyEngine`: the parser, terminal state, history,
   input encoding and PTY code, with no Metal, fonts or AppKit. `SwifttyCore`
   re-exports the engine and adds the renderer, fonts and sessions.
-- The Swiftty app's SwiftMux menu attaches a native window. Its panes render
-  service frames directly through Metal. AppKit draws the tab strip (icons,
-  titles, activity dots, double-click to rename), pane headers and draggable,
-  VoiceOver-adjustable dividers. Shortcuts: ⌃⌘N new workspace, ⌃⌘D detach,
-  ⌘T new tab, ⇧⌘] / ⇧⌘[ next/previous tab, ⌘D / ⇧⌘D split, ⌥⌘arrows focus,
-  ⌃⌘arrows resize, ⇧⌘↩ zoom, ⌥⌘W end pane, ⌃⌘W close tab. The menu also
-  attaches to a named workspace, renames tabs, and stages and installs app
-  updates without replacing the bundle under a live service.
-  Ending a running pane or tab asks first. Find (⌘F, ⌘G, ⇧⌘G) searches the
-  service-side history, and app theme changes update the colours panes
-  report to programs. Quitting the app detaches; the shells
-  keep running.
+- Every Swiftty app window is a SwiftMux workspace: a plain shell is a
+  workspace with one tab and one pane, and adding tabs or splits grows the
+  same workspace without restarting its shell. One-tab windows show a title
+  instead of the tab strip. Panes render service frames directly through
+  Metal. AppKit draws the tab strip (icons, titles, activity dots,
+  double-click to rename), pane headers and draggable, VoiceOver-adjustable
+  dividers. Shortcuts: ⌘N new workspace (in its own window), ⌘T new tab,
+  ⇧⌘O open an existing workspace, ⌘W close the window (detaches),
+  ⇧⌘] / ⇧⌘[ next/previous tab, ⌘D / ⇧⌘D split, ⌥⌘arrows focus,
+  ⌃⌘arrows resize, ⇧⌘↩ zoom, ⌥⌘W end pane, ⌃⌘W end tab. The Workspace menu also
+  renames tabs and workspaces and ends a workspace; swiftty › Terminal
+  Service stages and installs app updates without replacing the bundle under
+  a live service. Only the End commands terminate processes, and ending a
+  running pane, tab or workspace asks first. Opening a workspace already
+  shown reveals its window; one controlled elsewhere is taken over only
+  after confirmation. At launch the last workspace reopens when free;
+  otherwise existing workspaces are offered before a new one is created.
+  New workspaces follow `command` and `working-directory` (`inherit` means
+  the app's own directory); new tabs reuse the workspace's command, and
+  splits start a login shell in the split pane's directory. Find (⌘F, ⌘G,
+  ⇧⌘G) searches the service-side history, key bindings and font zoom apply
+  to panes, and app theme changes update the colours panes report to
+  programs. Panes match the direct terminal: mouse reporting to programs
+  (Shift still selects), the alternate-screen wheel, `copy-on-select`,
+  ⌘-click and ⌘-hover links (`link-url`), `cursor-click-to-move`,
+  `mouse-hide-while-typing`, `custom-shader`, prompt jumps, Select Command
+  Output, Clear Screen and Reset Terminal. The service performs the ones
+  that need the emulator; a service started by an older build lacks them,
+  so their menu items are disabled until it is updated. Quitting the app
+  detaches every window; the shells keep running. If the helper needs
+  approval or is unavailable, the app says so and offers a retry; it never
+  starts a non-persistent shell instead.
 - Panes start through `swmux-launcher`, which calls `login_tty` and then execs
   the shell. They run with `TERM=swmux-256color`; the agent compiles that
   terminfo entry into `~/Library/Application Support/SwiftMux/terminfo`.
@@ -137,12 +157,17 @@ swift build
 .build/debug/swmux new -s work     # inside Swiftty
 Scripts/package-swiftmux.sh [identity]   # Swiftty.app with the bundled agent (SMAppService)
 Scripts/install.sh [--roaming]           # package, install to /Applications, register the agent (+ swifttyd)
+Scripts/install-ios.sh --team TEAM      # iOS/iPadOS app on iPhones and iPads connected by USB
 Scripts/uninstall.sh [--purge]           # remove the app, agent and swifttyd
 ```
 
 `install.sh` signs with the first Developer ID Application identity (else
-ad-hoc), and re-registers the agent when its signing team changes: launchd
-otherwise kills it at launch with a launch-constraint violation. The bundled
+ad-hoc), and re-registers the agent when its signing team changes, or for an
+ad-hoc build when its agent binary changes: launchd otherwise refuses to start
+it (a launch-constraint violation). It then installs the iOS/iPadOS app
+(`MobileClient`) on every paired iPhone and iPad connected by USB, signed
+automatically for the Mac build's team or `--team`; `--no-devices` skips this.
+Devices must be unlocked and in Developer Mode. The bundled
 agent can also be managed directly with
 `Swiftty.app/Contents/MacOS/swiftty --swiftmux-agent register|unregister|status`.
 
@@ -202,7 +227,8 @@ https://<configured domain>/a/<locator>
   tied to the lease generation the user saw. The app marks only the linked
   occurrence seen.
 - On macOS, Swiftty handles the `swiftty` scheme (`CFBundleURLTypes`, written
-  by `Scripts/package-swiftmux.sh`). It opens or activates the SwiftMux window
+  by `Scripts/package-swiftmux.sh`). It reveals the window that holds the
+  linked workspace, or opens one (other workspaces' windows stay attached),
   and focuses the pane. Prompts appear as alerts.
 - The roaming clients (iOS/iPadOS, Catalyst, visionOS, tvOS and the Mac
   client) register the scheme through `Apps/Config/AttentionLinks.plist`. They
@@ -475,6 +501,10 @@ keybind = ctrl+shift+arrow_up=jump_to_prompt:-1
 ```
 
 Style-specific font families use `-bold`, `-italic` and `-bold-italic` suffixes.
+`font-style` (and the same suffixes) selects a named face such as `Retina`;
+`false` uses the regular face for that style, and a name the family lacks is
+reported and falls back to the default face. `macos-icon` is accepted so a
+shared Ghostty config loads, but Swiftty has a single icon.
 Cell adjustments accept points or percentages. Foreground, cursor and selection
 colors can be configured separately. Themes are searched in
 `~/.config/swiftty/themes`, `~/.config/ghostty/themes`, then the built-in

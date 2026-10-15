@@ -96,7 +96,7 @@ Decoration belongs to the frontend. The terminal client subtracts its one-cell d
 
 Inactive tabs and detached panes retain their last valid dimensions. Zoom changes the displayed pane sizes while retaining the original split tree. Default split minima are 10 columns by 2 rows. When the available area is too small, retain valid pane dimensions and show a clipped/size-constrained presentation; never resize a PTY to zero.
 
-On attachment, establish the controller lease or the observer record and the workspace snapshot at a server ordering barrier, then subscribe to visible pane frames. SMX/1 stays protocol version 1. An attach always names its role (`{selector, role}`). A second controller is refused. Hello capabilities name attach readiness, observers and viewer viewports, and the service enforces them: an observer attach or `setViewport` the hello did not negotiate is refused. A hello that omits them attaches only as the controller and is not sent `ready`.
+On attachment, establish the controller lease or the observer record and the workspace snapshot at a server ordering barrier, then subscribe to visible pane frames. The protocol version changes only when a running service of the previous version could not decode a request (version 2 changed `attach` to carry `{selector, role}`); additive requests are negotiated with hello capabilities and `ServiceFeatures`, so a stale agent is reported as a different version instead of failing to decode. An attach always names its role (`{selector, role}`). A second controller is refused. Hello capabilities name attach readiness, observers and viewer viewports, and the service enforces them: an observer attach or `setViewport` the hello did not negotiate is refused. A hello that omits them attaches only as the controller and is not sent `ready`.
 
 An attachment that asked for attach readiness is not Ready until it has installed and acknowledged a complete current owned cell frame for every required visible pane. Required panes are the subscription intersected with the visible tab, or the zoomed pane alone when the tab is zoomed. Hidden panes do not block Ready. An empty subscription while visible panes exist does not publish Ready. History fetch is not on this path. The `ready` event names the attachment, the server instance and those panes' frame and geometry revisions. The client records it only when both identities match the connection. Reattach to the same shell presents the current screen from those owned frames. It does not replay PTY bytes. A stale server instance, attachment, geometry revision, layout revision or older frame revision never replaces a newer installed frame. A complete frame resent at the installed revision (on resubscription) is accepted. Native panes render validated cell and viewport frames only. They do not parse PTY output.
 
@@ -106,7 +106,7 @@ A workspace grants one controller and at most four observers. Observers are loca
 
 ## 4. Owned frames and local messages
 
-Use one internal, versioned message contract, provisionally `SMX/1`, carried as bounded value payloads over XPC. Start with explicitly tagged Codable JSON records in `Data`; XPC supplies message boundaries. This is a debuggable initial codec, not a performance claim. Avoid remote proxies for terminal objects and avoid exposing raw Swiftty representations.
+Use one internal, versioned message contract, now `SMX/2`, carried as bounded value payloads over XPC. Start with explicitly tagged Codable JSON records in `Data`; XPC supplies message boundaries. This is a debuggable initial codec, not a performance claim. Avoid remote proxies for terminal objects and avoid exposing raw Swiftty representations.
 
 The handshake identifies protocol version, build, server instance, frontend kind, accepted terminal profile and limits. Allow only explicitly compatible versions. Authenticate the connection using OS-provided peer identity, including the expected user and shipped executable identity; do not trust a claimed PID or bundle ID inside a message. The product is local and unprivileged; it is not a security boundary against the account owner.
 
@@ -245,7 +245,7 @@ There are two terminal layers in this phase: the service emulates each pane, and
 
 ### 7.1 What the application becomes
 
-A native Swiftty workspace window attaches to the persistent service. AppKit supplies tabs, split dividers, toolbar/sidebar if useful, menus, focus and window behavior. Each visible pane uses one `MTKView` and one pane presenter/Metal renderer. Start with one workspace window and no cross-window pane sharing.
+A native Swiftty workspace window attaches to the persistent service. AppKit supplies tabs, split dividers, toolbar/sidebar if useful, menus, focus and window behavior. Each visible pane uses one `MTKView` and one pane presenter/Metal renderer. Every app terminal window is such a workspace window (a plain shell is a one-pane workspace; spec.md "SwiftMux native workspace"). Each window has its own connection and lease; there is no cross-window pane sharing.
 
 The service still owns each pane's virtual terminal. The application receives terminal cells and draws them directly; it does not create a second pane emulator or regenerate ANSI to feed a local `TerminalSession`. No server-side composed workspace bitmap or terminal-sized border grid is required.
 
@@ -302,7 +302,14 @@ For the first native release, pointer actions focus panes, select/copy text and 
 
 Use the shared frozen-frame selection/copy and asynchronous history/search policy from section 4. Visible accessibility text, selected text and IME cursor positioning come from the retained interaction presentation. Do not block a main-actor accessibility callback on IPC. Existing Swiftty mouse/search/accessibility paths require this redirection because several consult live `TerminalSession` state. [S15], [S18]
 
-Resolved hyperlinks, shell prompt navigation and application mouse reporting can be added afterward with explicit contracts. None is required to prove native attachment and persistent shells. Per-attachment viewports are specified in §4.
+Resolved hyperlinks, shell prompt navigation and application mouse reporting are added as explicit contracts, advertised in `Welcome.features` (`ServiceFeatures`) so a frontend uses them only with a service that offers them:
+
+- `mouseReporting`: frames carry `mouseTracking`, `mouseButtonMotion`, `mouseAnyMotion` and `alternateScroll` view modes; `MuxInput.mouse` carries viewport-cell events that the service encodes with the pane's authoritative modes and drops while the program is not tracking.
+- `historyJumps`: `ScrollRequest.oldest` and `.prompt(n)` (OSC 133 prompts; `notFound` when there is none).
+- `terminalControl`: `clearScreen` and `resetTerminal` (RIS of the emulator; the process keeps running).
+- `shellIntegration`: `link` (OSC 8 or, on request, a detected URL at a history address), `commandOutput` (scrolls the output into view and returns its rows and full text) and `MuxInput.moveCursor` (click-to-move arrows, written only while the shell edits a command line there; at most `MuxInput.maxCursorMoves`).
+
+Per-attachment viewports are specified in §4.
 
 ### 7.6 Workspace window
 
@@ -330,7 +337,7 @@ The ratios are illustrative. The window derives pixel rectangles from them and f
 | Activity | `MuxEvent.activity(pane)` is sent once when an unsubscribed pane in one of the attached workspace's other tabs changes, and is re-armed when the pane is subscribed again. Starting a pane is not activity. A bell in an unfocused pane also sets the dot. Showing a pane clears it. |
 | Splitters | Dragging updates the tree locally at once. `setSplitRatio` requests are coalesced: one is in flight and only the newest ratio is pending. Ratios are clamped so that every pane in each subtree stays at least 10 columns by 2 rows plus its header (`LayoutGeometry.clampedRatio`). Each divider is an accessibility splitter: increment and decrement move it 5%. |
 | Focus | Clicking a pane focuses its stable ID and routes input to it. ⌥⌘arrows move focus to the neighbouring pane by geometry. Window and tab focus changes never end processes. |
-| Keyboard | Menu key equivalents are handled before the pane sees the key, so app shortcuts never reach a shell: ⌘T new tab, ⌘D / ⇧⌘D split, ⇧⌘↩ zoom, ⇧⌘] / ⇧⌘[ next/previous tab, ⌃⌘arrows resize, ⌥⌘W end pane, ⌃⌘W close tab, ⌃⌘N new workspace, ⌃⌘D detach. Pasted text, including shortcut characters, travels only through the paste envelope (§5). |
+| Keyboard | Menu key equivalents are handled before the pane sees the key, so app shortcuts never reach a shell: ⌘N new workspace, ⌘T new tab, ⇧⌘O open workspace, ⌘W close window (detach), ⌘D / ⇧⌘D split, ⇧⌘↩ zoom, ⇧⌘] / ⇧⌘[ next/previous tab, ⌃⌘arrows resize, ⌥⌘W end pane, ⌃⌘W end tab. User key bindings run before menu key equivalents while a pane has focus. Pasted text, including shortcut characters, travels only through the paste envelope (§5). |
 
 Leaving a view comes in three kinds, and they are kept distinct. **Hide** (switching tabs) drops the views and subscriptions; the panes keep parsing output, keep their last accepted size and are measured again when shown. **Detach** (closing the window or quitting) releases the lease. **Terminate** (end pane, close tab) ends only its targets, and asks for confirmation first while any of their processes is still running. Disposing a view never terminates anything.
 
@@ -466,6 +473,21 @@ Frontend gates: the decoder, diff renderer and full client are exercised against
 | Destructive actions | "destructive actions confirm and end only their target": declining keeps the pane, disposing its view keeps its process, accepting ends only the target, and a tab whose shell already exited closes without asking. |
 | Chrome and accessibility | "headers, tab strip and splitters expose titles and controls": program titles reach the tab, icon and header; the header sits above the cell grid; the splitter is an accessibility element whose increment moves it; 40 rapid drags converge on the last ratio; keyboard resize moves the nearest divider. `WorkspaceUITests` covers sanitizing, the reference geometry and minimum-size clamping. |
 | Early-output race | Found by the reference-layout test: a split pane whose shell printed before its record was registered dropped that change notification. The flag that gates notifications then never reset, so the pane sent no further frames. The service now catches up on that output right after registering the pane, which also resets the flag. |
+
+### Unified workspace UI
+
+The app has one window type; spec.md "SwiftMux native workspace" holds the rules.
+
+| Item | Evidence |
+|---|---|
+| One-shell windows, independent workspaces, Quit detaches all | `WorkspaceCoordinatorTests` "each New Workspace is its own one-shell workspace, and Quit detaches all"; "workspace commands validate against this window's lease". |
+| Reveal without a second writer; service-instance keys | "opening a workspace this app shows reveals it without attaching again". |
+| Launch choice and settings | `WorkspaceLaunchActionTests`, `WorkspaceLaunchTests`. |
+| Unavailable service, retry, no fallback shell | `WorkspaceServiceStartupTests`. |
+| Reload to every window, stale frames, attention links | "reload, stale servers and attention links respect every window". |
+| Pending operations and open deadlines | `MuxCancellationTests`, `MuxOpenDeadlineTests`. |
+| Terminal parity (service) | `TerminalParityTests`: features in the welcome, mouse reports only while tracking, prompt jumps and oldest, command output, links, click-to-move, clear and reset. |
+| Terminal parity (pane) | `MuxPaneParityTests`: clicks reach a tracking program, copy on select and command output, ⌘-hover links, prompt jumps and clear, the custom shader. |
 
 ### Measurements
 

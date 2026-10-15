@@ -797,7 +797,7 @@ public final class TerminalView: MTKView, MTKViewDelegate {
   }
 
   /// The key and modifiers a binding is matched against.
-  static func trigger(for event: NSEvent) -> KeyEvent? {
+  package static func trigger(for event: NSEvent) -> KeyEvent? {
     guard
       let key = specialKeys[event.keyCode]
         ?? event.charactersIgnoringModifiers?.unicodeScalars.first

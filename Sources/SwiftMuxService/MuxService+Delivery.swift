@@ -339,6 +339,9 @@ extension MuxService {
         + s.utf8.reduce(0) { $0 + ($1 == 0x0A ? 1 : 0) }
     case .key: 32
     case .focus: 3
+    // An SGR report with large coordinates.
+    case .mouse: 32
+    case .moveCursor: MuxInput.moveCursorBytes
     }
   }
 

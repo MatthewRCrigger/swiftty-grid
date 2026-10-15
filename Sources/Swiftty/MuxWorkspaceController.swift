@@ -6,16 +6,23 @@ import SwiftMuxProtocol
 import SwifttyCore
 import SwifttyMac
 
-/// The native SwiftMux workspace window. Owns the single connection and
-/// the interactive lease; pane views only present and forward input.
-/// Closing the window or quitting detaches; panes keep running.
+/// A workspace window: the app's one terminal window type. A plain shell
+/// is a one-tab, one-pane workspace. Owns this window's connection and
+/// interactive lease (the service owns the workspace, its panes and
+/// processes); pane views only present and forward input. Closing the
+/// window or quitting detaches; panes keep running.
 @MainActor
 final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
-  private let connection: MuxConnection
-  private let server: ServerInstanceID
+  let connection: MuxConnection
+  /// The service instance this window's identities belong to.
+  let server: ServerInstanceID
   private let limits: MuxLimits
-  private var config: Configuration
-  private let workspaceContent = NSView()
+  /// What the service accepts beyond the original profile.
+  let features: ServiceFeatures
+  private(set) var config: Configuration
+  /// Manual zoom for this window's panes, or nil for the configured size.
+  private var fontSize: Double?
+  let workspaceContent = NSView()
   private(set) var workspace: WorkspaceSnapshot?
   /// Orders snapshots against the attach, switch and takeover replies.
   private var sequencer = LayoutSequencer()
@@ -69,11 +76,11 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private(set) var searchBar: SearchBar?
   private var appearanceObservation: NSKeyValueObservation?
   /// Attention inbox mirror, fed by its own subscription (not frames).
-  private(set) var inbox = MuxInboxModel()
+  var inbox = MuxInboxModel()
   lazy var workspaceToolbar = MuxWorkspaceToolbar(tabs: tabStrip)
-  private var inboxPopover: NSPopover?
-  private(set) var inboxView: MuxInboxViewController?
-  private var inboxReadID = UUID()
+  var inboxPopover: NSPopover?
+  var inboxView: MuxInboxViewController?
+  var inboxReadID = UUID()
 
   private init(
     connection: MuxConnection,
@@ -83,6 +90,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     self.connection = connection
     server = welcome.server
     limits = welcome.limits
+    features = welcome.features
     config = configuration
     let window = Self.makeWorkspaceWindow()
     super.init(window: window)
@@ -143,20 +151,11 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     if let selector {
       target = selector
     } else {
-      let env = ProcessInfo.processInfo.environment
+      // A timeout may follow creation: the workspace then stays listed
+      // (Open Workspace) and is never created again here.
       guard
         case let .created(ws) = try await connection.execute(
-          .newWorkspace(
-            NewWorkspaceRequest(
-              columns: 100,
-              rows: 30,
-              launch: LaunchSpec(
-                workingDirectory: FileManager.default
-                  .homeDirectoryForCurrentUser.path,
-                environment: env,
-              ),
-            ),
-          ),
+          .newWorkspace(WorkspaceLaunch.request(configuration)),
           timeout: .seconds(5),
         )
       else { throw MuxError(.invalidRequest, "unexpected reply") }
@@ -358,12 +357,16 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     detached = true
     stopPipelines()
     for view in views.values { view.reset() }
-    window?.title = "SwiftMux — detached (\(reason))"
+    showsTabs(true)
+    window?.title = "\(workspaceTitle) — detached (\(reason))"
   }
 
   // MARK: Layout
 
-  private var workspaceTitle: String { "SwiftMux — \(workspace?.name ?? "")" }
+  private var workspaceTitle: String {
+    workspace.map { DisplayText.sanitize($0.name) }.flatMap(\.nonEmpty)
+      ?? "swiftty"
+  }
 
   var activeTab: TabSnapshot? { workspace?.activeTabSnapshot }
   var activePane: PaneID? { activeTab?.activePane }
@@ -427,9 +430,9 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       views.removeValue(forKey: id)
     }
     for id in visible where views[id] == nil {
-      guard let view = try? MuxPaneView(pane: id, configuration: config) else {
-        continue
-      }
+      guard
+        let view = try? MuxPaneView(pane: id, configuration: paneConfiguration)
+      else { continue }
       view.controller = self
       let container = MuxPaneContainer(paneView: view)
       container.header.onAction = { [weak self] action in
@@ -498,7 +501,18 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     }
     let active = titles[tab.activePane].flatMap(\.nonEmpty)
     window?.title = active ?? workspaceTitle
+    showsTabs(ws.tabs.count > 1)
   }
+
+  /// A one-tab workspace shows its title, not a strip with one choice.
+  /// The new-tab and inbox controls stay either way.
+  private func showsTabs(_ shown: Bool) {
+    workspaceToolbar.tabs.isHidden = !shown
+    window?.titleVisibility = shown ? .hidden : .visible
+  }
+
+  /// Whether the tab strip is shown (tests).
+  var showsTabStrip: Bool { !workspaceToolbar.tabs.isHidden }
 
   private func markActivity(_ pane: PaneID) {
     guard !detached else { return }
@@ -526,10 +540,12 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     let scale = view.window?.backingScaleFactor ?? 2
     let cell = view.renderer.cellSize
     let o = view.renderer.options
+    let inset = MuxPaneContainer.cardInset
     return (
-      Int(((cell.width * 10 + o.paddingX * 2) / scale).rounded(.up)),
+      Int(((cell.width * 10 + o.paddingX * 2) / scale).rounded(.up))
+        + Int(inset * 2),
       Int(((cell.height * 2 + o.paddingY * 2) / scale).rounded(.up))
-        + Int(MuxPaneContainer.headerHeight)
+        + Int(MuxPaneContainer.headerHeight + inset)
     )
   }
 
@@ -540,14 +556,15 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     guard let tab = activeTab, let tree = displayedLayout else {
       return ([], [])
     }
-    let area = LayoutRect(
-      x: 0,
-      y: 0,
-      width: Int(bounds.width),
-      height: Int(bounds.height)
-    )
+    let area = MuxLayoutView.area(bounds, split: tree.panes.count > 1)
     if let zoomed = tab.zoomedPane, let view = containers[zoomed] {
-      return ([(view, bounds)], [])
+      let frame = NSRect(
+        x: area.x,
+        y: Int(bounds.height) - area.maxY,
+        width: area.width,
+        height: area.height
+      )
+      return ([(view, frame)], [])
     }
     let frames = LayoutGeometry.frames(
       tree,
@@ -579,17 +596,11 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// flight, newest ratio pending), clamped to the minimum pane size.
   func setRatio(_ ratio: Double, path: [Bool]) {
     guard let tab = activeTab, let tree = displayedLayout else { return }
-    let bounds = layoutView.bounds
     let clamped = LayoutGeometry.clampedRatio(
       ratio,
       at: path,
       of: tree,
-      in: LayoutRect(
-        x: 0,
-        y: 0,
-        width: Int(bounds.width),
-        height: Int(bounds.height)
-      ),
+      in: MuxLayoutView.area(layoutView.bounds, split: tree.panes.count > 1),
       minimum: minimumPaneSize,
       divider: MuxLayoutView.divider
     )
@@ -700,10 +711,11 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
 
   /// Queues `command` in order. Without `failed`, a failure is only
   /// logged; with it, the failure is handed back and `then` is skipped.
-  private func command(
+  func command(
     _ command: MuxCommand,
     cancelled: @escaping @Sendable () -> Bool = { false },
     failed: (@MainActor @Sendable (any Error) -> Void)? = nil,
+    replied: (@MainActor @Sendable (MuxReply) -> Void)? = nil,
     then: (@MainActor @Sendable () -> Void)? = nil,
   ) {
     guard let commands else {
@@ -729,6 +741,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
           }
         default: break
         }
+        if let replied { await replied(reply) }
         if let then { await then() }
       } catch {
         if Task.isCancelled {
@@ -775,8 +788,70 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     inputs?.paste(text, to: pane)
   }
 
-  func scroll(_ pane: PaneID, lines: Int) {
-    command(.scroll(pane: pane, .lines(lines)))
+  func scroll(_ pane: PaneID, lines: Int) { scroll(pane, .lines(lines)) }
+
+  func scroll(_ pane: PaneID, _ request: ScrollRequest) {
+    command(.scroll(pane: pane, request))
+  }
+
+  // MARK: Terminal control and shell integration
+
+  func clearScreen(_ pane: PaneID) {
+    guard holdsLease else { return }
+    command(.clearScreen(pane))
+  }
+
+  func resetTerminal(_ pane: PaneID) {
+    guard holdsLease else { return }
+    command(.resetTerminal(pane))
+  }
+
+  /// The link at a viewport cell of `frame`; nil (or no callback) when
+  /// there is none or the service cannot say.
+  func link(
+    in pane: PaneID,
+    at address: HistoryAddress,
+    column: Int,
+    found: @escaping @MainActor @Sendable (MuxLink?) -> Void
+  ) {
+    guard holdsLease, features.contains(.shellIntegration) else {
+      return found(nil)
+    }
+    command(
+      .link(
+        pane: pane,
+        at: address,
+        column: column,
+        detectURLs: config.linkURL
+      ),
+      failed: { _ in found(nil) },
+      replied: { reply in
+        if case let .link(link) = reply { found(link) } else { found(nil) }
+      }
+    )
+  }
+
+  /// The output of the command around `address` (or the latest); the
+  /// service scrolls it into view.
+  func commandOutput(
+    in pane: PaneID,
+    at address: HistoryAddress?,
+    found: @escaping @MainActor @Sendable (CommandOutput?) -> Void
+  ) {
+    guard holdsLease, features.contains(.shellIntegration) else {
+      return found(nil)
+    }
+    command(
+      .commandOutput(pane: pane, at: address),
+      failed: { _ in found(nil) },
+      replied: { reply in
+        if case let .commandOutput(output) = reply {
+          found(output)
+        } else {
+          found(nil)
+        }
+      }
+    )
   }
 
   func focus(_ pane: PaneID) {
@@ -958,6 +1033,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     tabStrip.buttons.first { $0.item?.isActive == true }?.beginRename()
   }
 
+  /// The service starts it with the workspace's launch spec.
   func newTab() { command(.newTab(name: nil, launch: nil)) }
 
   func split(_ axis: SplitAxis, pane: PaneID? = nil) {
@@ -1012,7 +1088,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     ) { [weak self] in self?.command(.endTab(snapshot.id)) }
   }
 
-  private func confirmThen(
+  func confirmThen(
     _ ask: Bool,
     _ message: String,
     _ detail: String,
@@ -1049,6 +1125,72 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       let i = ws.tabs.firstIndex(where: { $0.id == ws.activeTab })
     else { return }
     command(.selectTab(ws.tabs[(i + delta + ws.tabs.count) % ws.tabs.count].id))
+  }
+
+  /// Renames the workspace (metadata only).
+  func renameWorkspace(_ name: String) {
+    guard let id = attachedWorkspace else { return }
+    command(
+      .renameWorkspace(.id(id), name: name),
+      failed: { [weak self] error in
+        guard let self, !detached else { return }
+        window?.subtitle = DisplayText.sanitize(
+          "Workspace not renamed: \(error)"
+        )
+      }
+    )
+  }
+
+  /// Ends the workspace and every process in it, after confirmation
+  /// while any is running, then closes the window.
+  func endWorkspace() {
+    guard let ws = workspace, let id = attachedWorkspace, ws.id == id else {
+      return
+    }
+    let live = ws.panes.filter { $0.exitStatus == nil }.count
+    confirmThen(
+      live > 0,
+      "End the workspace “\(workspaceTitle)”?",
+      live == 1
+        ? "Its process is still running and will be terminated."
+        : "Its \(live) running processes will be terminated."
+    ) { [weak self] in
+      self?
+        .command(
+          .endWorkspace(.id(id)),
+          failed: { [weak self] error in
+            // Ending it detaches this window, which may stop the queue
+            // before the reply is seen.
+            guard (error as? MuxError)?.code != .notAttached else {
+              self?.close()
+              return
+            }
+            self?.notice("Workspace not ended: \(error)")
+          },
+          then: { [weak self] in self?.close() }
+        )
+    }
+  }
+
+  /// Prompts for a workspace name.
+  func beginRenamingWorkspace() {
+    guard let window, attachedWorkspace != nil else { return }
+    let alert = NSAlert()
+    alert.messageText = "Rename Workspace"
+    let field = NSTextField(
+      string: workspace.map { DisplayText.sanitize($0.name) } ?? ""
+    )
+    field.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
+    alert.accessoryView = field
+    alert.addButton(withTitle: "Rename")
+    alert.addButton(withTitle: "Cancel")
+    alert.window.initialFirstResponder = field
+    alert.beginSheetModal(for: window) { [weak self] response in
+      guard response == .alertFirstButtonReturn,
+        let name = DisplayText.plainName(field.stringValue)
+      else { return }
+      self?.renameWorkspace(name)
+    }
   }
 
   /// Releases the lease; panes, layout and history stay with the service.
@@ -1104,10 +1246,29 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     }
   }
 
+  /// The configuration panes render with: this window's zoom applied.
+  private var paneConfiguration: Configuration {
+    var c = config
+    if let fontSize { c.fontSize = fontSize }
+    return c
+  }
+
+  /// Zooms every pane in this window; nil returns to the configured size.
+  func setFontSize(_ size: Double?) {
+    fontSize = size.map(Configuration.boundedFontSize)
+    let c = paneConfiguration
+    for view in views.values { view.apply(c) }
+    geometryChanged()
+  }
+
+  func adjustFontSize(by delta: Double) {
+    setFontSize((fontSize ?? config.fontSize) + delta)
+  }
+
   /// A configuration reload: new colours reach the engines.
   func apply(_ configuration: Configuration) {
     config = configuration
-    for view in views.values { view.apply(configuration) }
+    for view in views.values { view.apply(paneConfiguration) }
     if let window {
       let focused =
         searchBar?.field.currentEditor() === window.firstResponder
@@ -1140,7 +1301,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     }
   }
 
-  func showSearch() {
+  /// Opens the search bar, searching for `text` when given.
+  func showSearch(text: String? = nil) {
     let content = workspaceContent
     if searchBar == nil {
       let bar = SearchBar()
@@ -1157,6 +1319,10 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     searchBar?.position(in: content.bounds)
     searchBar?.isHidden = false
     window?.makeFirstResponder(searchBar?.field)
+    if let text {
+      searchBar?.text = text
+      search(text)
+    }
   }
 
   private func search(_ query: String) {
@@ -1184,350 +1350,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   var inboxPageLimit = 100
   /// The last failed inbox command: shown inline while the popover is
   /// open, otherwise kept for the next time it opens.
-  private(set) var inboxMessage: String?
-
-  /// Subscribes to inbox metadata: no lease, frames or resize involved.
-  func startInbox() {
-    let connection = connection
-    Task { [weak self] in
-      do {
-        _ = try await connection.execute(.subscribeInbox(true))
-        await self?.reloadInbox()
-      } catch { self?.inboxFailed(error, alert: false) }
-    }
-  }
-
-  /// Rereads the first page of each section (after subscribing, a
-  /// `resync` or a stale or missing item).
-  func reloadInbox() async {
-    let id = UUID()
-    inboxReadID = id
-    var pages: [InboxQuery.Section: InboxPage] = [:]
-    for section in MuxInboxModel.sections {
-      do {
-        guard
-          case let .inbox(page) = try await connection.execute(
-            .inbox(InboxQuery(section: section, limit: inboxPageLimit))
-          )
-        else { throw MuxError(.invalidRequest, "unexpected inbox reply") }
-        guard inboxReadID == id, !Task.isCancelled else { return }
-        pages[section] = page
-      } catch {
-        guard inboxReadID == id, !Task.isCancelled else { return }
-        inboxFailed(error, alert: false)
-        return
-      }
-    }
-    inbox.reset(pages)
-    refreshInbox()
-  }
-
-  /// Reads the next page of every section that has one ("Load More").
-  func loadMoreInbox() async {
-    let id = UUID()
-    inboxReadID = id
-    var pages: [InboxQuery.Section: InboxPage] = [:]
-    for section in MuxInboxModel.sections {
-      guard let cursor = inbox.cursors[section] else { continue }
-      do {
-        guard
-          case let .inbox(page) = try await connection.execute(
-            .inbox(
-              InboxQuery(
-                section: section,
-                cursor: cursor,
-                limit: inboxPageLimit
-              )
-            )
-          )
-        else { throw MuxError(.invalidRequest, "unexpected inbox reply") }
-        guard inboxReadID == id, !Task.isCancelled else { return }
-        pages[section] = page
-      } catch {
-        guard inboxReadID == id, !Task.isCancelled else { return }
-        // A cursor the service no longer accepts: start over.
-        inboxFailed(error, alert: true)
-        await reloadInbox()
-        return
-      }
-    }
-    guard inboxReadID == id, !Task.isCancelled else { return }
-    for (section, page) in pages { inbox.append(page, section: section) }
-    refreshInbox()
-  }
-
-  private func refreshInbox() {
-    workspaceToolbar.update(inbox.counts)
-    if inboxPopover?.isShown == true { inboxView?.update(inbox) }
-  }
-
-  /// Reports a failed inbox command: inline while the popover is open,
-  /// otherwise as an alert when `alert` (user-initiated commands).
-  private func inboxFailed(_ error: any Error, alert: Bool) {
-    inboxProblem(MuxInboxModel.describe(error), alert: alert)
-  }
-
-  private func inboxProblem(_ message: String, alert: Bool) {
-    if isClosed {
-      if !alert { inboxMessage = message }
-      return
-    }
-    inboxMessage = message
-    if inboxPopover?.isShown == true {
-      inboxView?.show(message: message)
-    } else if alert {
-      notice(message)
-    }
-  }
-
-  /// Checks a lookup reply: a stale or missing item is reported, dropped
-  /// and the list reread. Returns the location while the item is there.
-  private func checked(
-    _ reply: MuxReply,
-    _ item: AttentionItem,
-    alert: Bool
-  ) -> AttentionLocation? {
-    guard case let .attention(location) = reply else {
-      inboxFailed(MuxError(.invalidRequest, "unexpected reply"), alert: alert)
-      return nil
-    }
-    if let problem = MuxInboxModel.describe(location.availability) {
-      inbox.forget(item.occurrence)
-      inboxProblem(problem, alert: alert)
-      Task { [weak self] in await self?.reloadInbox() }
-      return nil
-    }
-    return location
-  }
-
-  func toggleInbox() {
-    if let popover = inboxPopover, popover.isShown {
-      popover.performClose(nil)
-      return
-    }
-    let view = inboxView ?? MuxInboxViewController()
-    // A failure from while the popover was closed is shown once.
-    view.show(message: inboxMessage)
-    inboxMessage = nil
-    view.onOpen = { [weak self] item in self?.openAttention(item) }
-    view.onReview = { [weak self] item in self?.markReviewed(item) }
-    view.onSnooze = { [weak self] item, until in
-      self?.snooze(item, until: until)
-    }
-    view.onLoadMore = { [weak self] in Task { await self?.loadMoreInbox() } }
-    // Showing an item marks it seen; it never resolves it.
-    view.onShown = { [weak self] items in
-      for item in items where !item.seen { self?.markSeen(item) }
-    }
-    inboxView = view
-    let popover = inboxPopover ?? NSPopover()
-    popover.behavior = .transient
-    popover.contentViewController = view
-    inboxPopover = popover
-    view.update(inbox)
-    let content = workspaceContent
-    popover.show(
-      relativeTo: NSRect(
-        x: content.bounds.maxX - 40,
-        y: content.bounds.maxY - 2,
-        width: 1,
-        height: 1
-      ),
-      of: content,
-      preferredEdge: .minY
-    )
-  }
-
-  private func reference(_ item: AttentionItem) -> AttentionReference {
-    AttentionReference(source: item.source, occurrence: item.occurrence)
-  }
-
-  /// Runs one inbox command against `item`, reporting failures and
-  /// stale or missing items.
-  private func attention(
-    _ command: MuxCommand,
-    _ item: AttentionItem,
-    alert: Bool,
-    then: (@MainActor (AttentionLocation) -> Void)? = nil
-  ) {
-    let connection = connection
-    Task { [weak self] in
-      do {
-        let reply = try await connection.execute(command)
-        guard let self, !isClosed,
-          let location = checked(reply, item, alert: alert)
-        else { return }
-        then?(location)
-      } catch { if let self, !isClosed { inboxFailed(error, alert: alert) } }
-    }
-  }
-
-  private func markSeen(_ item: AttentionItem) {
-    attention(.markSeen(reference(item)), item, alert: false)
-  }
-
-  func markReviewed(_ item: AttentionItem) {
-    guard item.category != .needsYou else { return }
-    attention(.markReviewed(reference(item)), item, alert: true)
-  }
-
-  /// Snoozes a waiting request until `until`, or clears its snooze.
-  func snooze(_ item: AttentionItem, until: Date?) {
-    guard MuxInboxModel.canSnooze(item) else { return }
-    attention(.snooze(reference(item), until: until), item, alert: true)
-  }
-
-  /// Opens the item's pane: marks it seen, then reveals the pane in this
-  /// workspace. Another workspace is switched to, and one controlled
-  /// elsewhere is taken over only after explicit confirmation.
-  func openAttention(_ item: AttentionItem) {
-    attention(.markSeen(reference(item)), item, alert: true) {
-      [weak self] location in self?.reveal(location)
-    }
-  }
-
-  private func reveal(_ location: AttentionLocation) {
-    guard let wsID = location.workspace, let pane = location.pane else {
-      inboxProblem("This item is no longer available.", alert: true)
-      return
-    }
-    inboxPopover?.performClose(nil)
-    guard holdsLease else {
-      // Detached (another frontend took over): no commands without a
-      // lease; reattach like an attention link instead.
-      reattach(PaneTarget(workspace: wsID, tab: location.tab, pane: pane))
-      return
-    }
-    if wsID == workspace?.id {
-      guard workspace?.pane(pane) != nil else {
-        notice("That pane is no longer open.")
-        return
-      }
-      if pane != activePane { command(.focusPane(pane)) }
-      return
-    }
-    let takeOver: @MainActor (UInt64) -> Void = { [weak self] lease in
-      self?.takeOver(wsID, pane: pane, lease: lease)
-    }
-    guard location.leaseHeldElsewhere else {
-      command(
-        .switchWorkspace(.id(wsID)),
-        failed: { [weak self] error in
-          // Another frontend attached in between: ask before taking over.
-          if (error as? MuxError)?.code == .leaseHeld {
-            self?.confirmTakeover(wsID, moved: false, take: takeOver)
-          } else {
-            self?.inboxFailed(error, alert: true)
-          }
-        },
-        then: { [weak self] in self?.focusRevealed(pane) }
-      )
-      return
-    }
-    confirmTakeover(wsID, moved: false, take: takeOver)
-  }
-
-  /// Takes over `wsID` on this connection at lease generation `lease`.
-  private func takeOver(_ wsID: WorkspaceID, pane: PaneID, lease: UInt64) {
-    command(
-      .takeover(.id(wsID), expectedLease: lease),
-      failed: { [weak self] error in
-        if (error as? MuxError)?.code == .staleRevision {
-          self?
-            .confirmTakeover(wsID, moved: true) { [weak self] lease in
-              self?.takeOver(wsID, pane: pane, lease: lease)
-            }
-        } else {
-          self?.inboxFailed(error, alert: true)
-        }
-      },
-      then: { [weak self] in self?.focusRevealed(pane) }
-    )
-  }
-
-  /// Shows `target` in a new window on a new connection, replacing this
-  /// one that lost its lease (`MuxWorkspaceController.reveal`). A
-  /// workspace held elsewhere is taken over only after confirmation.
-  private func reattach(_ target: PaneTarget, takeover lease: UInt64? = nil) {
-    Task { [weak self] in
-      guard let self else { return }
-      var replacement: MuxWorkspaceController?
-      do {
-        _ = try await Self.reveal(
-          target,
-          in: self,
-          configuration: config,
-          connect: connectService,
-          takeover: lease
-        ) { controller in
-          replacement = controller
-          controller.connectService = self.connectService
-          controller.onReplaced = self.onReplaced
-          self.onReplaced?(controller)
-        }
-      } catch is CancellationError { return } catch let error as MuxError
-        where replacement == nil && !isClosed
-        && (error.code == .leaseHeld || error.code == .staleRevision)
-      {
-        confirmTakeover(target.workspace, moved: lease != nil) {
-          [weak self] lease in self?.reattach(target, takeover: lease)
-        }
-      } catch {
-        let recipient = replacement ?? self
-        if !recipient.isClosed { recipient.inboxFailed(error, alert: true) }
-      }
-    }
-  }
-
-  /// Focuses `pane` after a switch or takeover, reporting a pane that
-  /// ended in the meantime.
-  private func focusRevealed(_ pane: PaneID) {
-    command(
-      .focusPane(pane),
-      failed: { [weak self] error in self?.inboxFailed(error, alert: true) }
-    )
-  }
-
-  /// Asks before taking over `wsID` at the lease generation listed now,
-  /// then calls `take` with it. If the lease moves while asking, the
-  /// takeover fails `staleRevision` and `take`'s caller asks again.
-  private func confirmTakeover(
-    _ wsID: WorkspaceID,
-    moved: Bool,
-    take: @escaping @MainActor (UInt64) -> Void
-  ) {
-    let connection = connection
-    Task { [weak self] in
-      let summary: WorkspaceSummary
-      do {
-        guard
-          case let .workspaces(list) = try await connection.execute(
-            .listWorkspaces,
-            timeout: .seconds(5)
-          )
-        else {
-          throw MuxError(.invalidRequest, "unexpected workspace-list reply")
-        }
-        guard let found = list.first(where: { $0.id == wsID }) else {
-          throw MuxError(.notFound)
-        }
-        summary = found
-      } catch {
-        if let self, !isClosed { inboxFailed(error, alert: true) }
-        return
-      }
-      guard let self, !isClosed else { return }
-      let name = DisplayText.sanitize(summary.name)
-      confirmThen(
-        true,
-        moved
-          ? "Control of workspace “\(name)” changed while you were deciding. Take control now?"
-          : "Take control of workspace “\(name)”?",
-        "Another window or device controls it. Taking over disconnects it there; its programs keep running.",
-        button: "Take Over"
-      ) { take(summary.leaseGeneration) }
-    }
-  }
+  var inboxMessage: String?
 
   func windowWillClose(_ notification: Notification) {
     closeRequested = true

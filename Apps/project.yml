@@ -42,6 +42,9 @@ settings:
     CURRENT_PROJECT_VERSION: "1"
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     DEAD_CODE_STRIPPING: YES
+    # Resources/Assets.xcassets (iOS, watchOS and macOS images; tvOS and
+    # visionOS need layered icons and have none yet).
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
 
 # Shared Info.plist keys for direct clients. No UIBackgroundModes: the
 # clients never claim background execution (spec §9).
@@ -66,7 +69,7 @@ targets:
   MobileClient:
     type: application
     platform: iOS
-    sources: [MobileClient]
+    sources: [MobileClient, ../Resources/Assets.xcassets]
     scheme: {}
     dependencies:
       - package: Swiftty
@@ -105,6 +108,7 @@ targets:
     sources:
       - path: MacClient
         excludes: ["*.entitlements"]
+      - ../Resources/Assets.xcassets
     scheme: {}
     dependencies:
       - package: Swiftty
@@ -126,6 +130,7 @@ targets:
     sources:
       - path: CatalystClient
         excludes: ["*.entitlements"]
+      - ../Resources/Assets.xcassets
     scheme: {}
     dependencies:
       - package: Swiftty
@@ -186,7 +191,7 @@ targets:
   WatchCompanion:
     type: application
     platform: watchOS
-    sources: [WatchCompanion]
+    sources: [WatchCompanion, ../Resources/Assets.xcassets]
     scheme: {}
     dependencies:
       - package: Swiftty

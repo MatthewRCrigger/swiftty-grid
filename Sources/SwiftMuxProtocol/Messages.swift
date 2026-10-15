@@ -1,12 +1,15 @@
 import Foundation
 
-/// SMX/1: tagged Codable records carried as bounded XPC data payloads.
+/// SMX/2: tagged Codable records carried as bounded XPC data payloads.
+/// A change a running service of the previous version cannot decode bumps
+/// the version, so a stale agent is reported as a different version rather
+/// than failing to decode; additive requests use `ServiceFeatures`.
 public enum SMX {
-  public static let protocolVersion = 1
+  public static let protocolVersion = 2
   /// Read-only viewers per workspace. Not configurable.
   public static let maxObservers = 4
   /// Versions this build can talk to. Only exact matches for now.
-  public static let compatibleVersions: ClosedRange<Int> = 1 ... 1
+  public static let compatibleVersions: ClosedRange<Int> = 2 ... 2
   public static let build = "swiftmux-0.2"
   /// The one supported outer host profile for the terminal frontend.
   public static let terminalProfile = "swiftty-xterm-256color/1"
@@ -20,7 +23,7 @@ public enum SMX {
 // MARK: Errors
 
 public struct MuxError: Error, Codable, Sendable, Equatable,
-  CustomStringConvertible
+  CustomStringConvertible, LocalizedError
 {
   public enum Code: String, Codable, Sendable {
     case alreadyAttached, notAttached, staleAttachment, staleGeometry
@@ -46,6 +49,9 @@ public struct MuxError: Error, Codable, Sendable, Equatable,
   public var description: String {
     message.isEmpty ? code.rawValue : "\(code.rawValue): \(message)"
   }
+
+  /// Alerts show the code and message rather than a bridged error number.
+  public var errorDescription: String? { description }
 }
 
 // MARK: Handshake
@@ -138,6 +144,27 @@ public struct Hello: Codable, Sendable {
   }
 }
 
+/// Requests and input a service accepts beyond the original profile. A
+/// frontend uses a feature only when the welcome lists it, so it can
+/// still talk to a service started from an older build.
+public struct ServiceFeatures: OptionSet, Codable, Sendable, Equatable {
+  public var rawValue: UInt32
+  public init(rawValue: UInt32) { self.rawValue = rawValue }
+
+  /// `MuxInput.mouse` and the frame's mouse-reporting modes.
+  public static let mouseReporting = ServiceFeatures(rawValue: 1 << 0)
+  /// `ScrollRequest.oldest` and `.prompt`.
+  public static let historyJumps = ServiceFeatures(rawValue: 1 << 1)
+  /// `clearScreen` and `resetTerminal`.
+  public static let terminalControl = ServiceFeatures(rawValue: 1 << 2)
+  /// `link`, `commandOutput` and `MuxInput.moveCursor`.
+  public static let shellIntegration = ServiceFeatures(rawValue: 1 << 3)
+
+  public static let supported: ServiceFeatures = [
+    .mouseReporting, .historyJumps, .terminalControl, .shellIntegration,
+  ]
+}
+
 public struct Welcome: Codable, Sendable {
   public var protocolVersion: Int
   public var build: String
@@ -145,6 +172,8 @@ public struct Welcome: Codable, Sendable {
   public var acceptedProfile: String?
   public var limits: MuxLimits
   public var innerTerm: String
+  /// Empty when the service omitted the field (an older build).
+  public var features: ServiceFeatures
 
   public init(
     protocolVersion: Int,
@@ -152,7 +181,8 @@ public struct Welcome: Codable, Sendable {
     server: ServerInstanceID,
     acceptedProfile: String?,
     limits: MuxLimits,
-    innerTerm: String
+    innerTerm: String,
+    features: ServiceFeatures = []
   ) {
     self.protocolVersion = protocolVersion
     self.build = build
@@ -160,6 +190,39 @@ public struct Welcome: Codable, Sendable {
     self.acceptedProfile = acceptedProfile
     self.limits = limits
     self.innerTerm = innerTerm
+    self.features = features
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case protocolVersion, build, server, acceptedProfile, limits, innerTerm
+    case features
+  }
+
+  public init(from decoder: any Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    protocolVersion = try container.decode(Int.self, forKey: .protocolVersion)
+    build = try container.decode(String.self, forKey: .build)
+    server = try container.decode(ServerInstanceID.self, forKey: .server)
+    acceptedProfile = try container.decodeIfPresent(
+      String.self,
+      forKey: .acceptedProfile
+    )
+    limits = try container.decode(MuxLimits.self, forKey: .limits)
+    innerTerm = try container.decode(String.self, forKey: .innerTerm)
+    features =
+      try container.decodeIfPresent(ServiceFeatures.self, forKey: .features)
+      ?? []
+  }
+
+  public func encode(to encoder: any Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(protocolVersion, forKey: .protocolVersion)
+    try container.encode(build, forKey: .build)
+    try container.encode(server, forKey: .server)
+    try container.encodeIfPresent(acceptedProfile, forKey: .acceptedProfile)
+    try container.encode(limits, forKey: .limits)
+    try container.encode(innerTerm, forKey: .innerTerm)
+    if !features.isEmpty { try container.encode(features, forKey: .features) }
   }
 }
 
@@ -494,7 +557,7 @@ public struct GeometryBatch: Codable, Sendable, Equatable {
 
 /// Stable history address: absolute row valid for one addressing
 /// generation of one screen.
-public struct HistoryAddress: Codable, Sendable, Equatable {
+public struct HistoryAddress: Codable, Sendable, Hashable {
   public var generation: UInt64
   public var alternateScreen: Bool
   public var row: Int
@@ -513,6 +576,12 @@ public enum ScrollRequest: Codable, Sendable, Equatable {
   case bottom
   /// Show `address` as the top viewport row.
   case top(HistoryAddress)
+  /// The oldest retained row at the top (`historyJumps`).
+  case oldest
+  /// The `n`th shell prompt above (negative) or below (positive) the top
+  /// row becomes the top row (`historyJumps`). Fails with `notFound` when
+  /// there is no such prompt.
+  case prompt(Int)
 }
 
 public enum MuxCommand: Codable, Sendable, Equatable {
@@ -581,6 +650,21 @@ public enum MuxCommand: Codable, Sendable, Equatable {
   case searchStep(pane: PaneID, forward: Bool)
   case endSearch(pane: PaneID)
 
+  // Terminal control (lease required; `terminalControl`).
+  /// Clears the screen, keeping the cursor's line at the top.
+  case clearScreen(PaneID)
+  /// Full terminal reset (RIS) of the pane's emulator; the process stays.
+  case resetTerminal(PaneID)
+
+  // Shell integration (`shellIntegration`); read-only.
+  /// The link at a cell: an OSC 8 hyperlink, or with `detectURLs` a URL in
+  /// the text. Replies `link`.
+  case link(pane: PaneID, at: HistoryAddress, column: Int, detectURLs: Bool)
+  /// The output of the command around `at` (nil: the most recent with
+  /// output), from OSC 133 marks. Scrolls it into view; replies
+  /// `commandOutput`.
+  case commandOutput(pane: PaneID, at: HistoryAddress?)
+
   /// Admitted at the update barrier: status, leaving, ending sessions
   /// and toggling quiescence. Everything that changes the workspace
   /// graph or starts work is refused.
@@ -589,8 +673,9 @@ public enum MuxCommand: Codable, Sendable, Equatable {
     case .status, .listWorkspaces, .detachActive, .detach, .endWorkspace,
       .endAllWorkspaces, .quiesce, .endPane, .endTab, .setGeometry,
       .setSubscriptions, .setViewport, .scroll, .searchStep, .endSearch,
-      .setTheme, .observeWorkspaces, .subscribeInbox, .inbox, .locateAttention,
-      .markSeen, .snooze, .markReviewed:
+      .clearScreen, .resetTerminal, .link, .commandOutput, .setTheme,
+      .observeWorkspaces, .subscribeInbox, .inbox, .locateAttention, .markSeen,
+      .snooze, .markReviewed:
       true
     default: false
     }
@@ -656,6 +741,47 @@ public enum MuxReply: Codable, Sendable, Equatable {
   case search(SearchResult)
   case inbox(InboxPage)
   case attention(AttentionLocation)
+  case link(MuxLink?)
+  case commandOutput(CommandOutput?)
+}
+
+/// A link found by `MuxCommand.link`.
+public struct MuxLink: Codable, Sendable, Equatable {
+  public var url: String
+  /// Cells it covers, as history addresses (same generation as the query).
+  public var start: HistoryAddress
+  public var startColumn: Int
+  public var end: HistoryAddress
+  public var endColumn: Int
+
+  public init(
+    url: String,
+    start: HistoryAddress,
+    startColumn: Int,
+    end: HistoryAddress,
+    endColumn: Int
+  ) {
+    self.url = url
+    self.start = start
+    self.startColumn = startColumn
+    self.end = end
+    self.endColumn = endColumn
+  }
+}
+
+/// A command's output found by `MuxCommand.commandOutput`: whole rows
+/// from `start` through `end`, and their text (which may extend beyond
+/// the rows a frame shows).
+public struct CommandOutput: Codable, Sendable, Equatable {
+  public var start: HistoryAddress
+  public var end: HistoryAddress
+  public var text: String
+
+  public init(start: HistoryAddress, end: HistoryAddress, text: String) {
+    self.start = start
+    self.end = end
+    self.text = text
+  }
 }
 
 // MARK: Input
@@ -676,15 +802,56 @@ public enum MuxKey: Codable, Sendable, Hashable {
   case function(Int)
 }
 
+public struct MuxMouse: Codable, Sendable, Hashable {
+  public enum Action: String, Codable, Sendable { case press, release, motion }
+  public enum Button: String, Codable, Sendable {
+    case left, middle, right, none, wheelUp, wheelDown, wheelLeft, wheelRight
+  }
+
+  public var action: Action
+  public var button: Button
+  public var column: Int
+  public var row: Int
+  public var modifiers: MuxKeyModifiers
+
+  public init(
+    _ action: Action,
+    _ button: Button,
+    column: Int,
+    row: Int,
+    modifiers: MuxKeyModifiers = []
+  ) {
+    self.action = action
+    self.button = button
+    self.column = column
+    self.row = row
+    self.modifiers = modifiers
+  }
+}
+
 /// Semantic input; the service encodes it using authoritative pane modes.
 public enum MuxInput: Codable, Sendable, Hashable {
   case text(String)
   case key(MuxKey, MuxKeyModifiers)
   case focus(Bool)
+  /// A pointer event, encoded only while the pane's program enabled mouse
+  /// reporting (`mouseReporting`). Coordinates are viewport cells.
+  case mouse(MuxMouse)
+  /// Click-to-move: arrow keys that move the shell's cursor to the cell,
+  /// sent only while the shell edits a command line there (OSC 133;
+  /// `shellIntegration`). Nothing is written otherwise.
+  case moveCursor(HistoryAddress, column: Int)
   /// One bounded paste (at most `maxPasteChunkBytes`), admitted or
   /// refused whole and bracketed per the pane's modes. Larger pastes use
   /// the `pasteBegin`/`pasteChunk`/`pasteEnd` records.
   case paste(String)
+}
+
+extension MuxInput {
+  /// Arrow presses a `moveCursor` may write, and their reserved bytes
+  /// (three per press, the longest arrow encoding).
+  public static let maxCursorMoves = 1024
+  public static let moveCursorBytes = 3 * maxCursorMoves
 }
 
 public enum InputPayload: Codable, Sendable, Equatable {

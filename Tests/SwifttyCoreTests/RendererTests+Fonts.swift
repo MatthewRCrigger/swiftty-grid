@@ -379,6 +379,18 @@ extension RendererTests {
   }
 
   @Test
+  func `named font styles select faces and disabled styles use regular`() {
+    let config = Configuration.parse(
+      "font-family = Menlo\nfont-style = Bold\nfont-style-italic = false"
+    )
+    let font = ResolvedFont(descriptor: config.fontDescriptor(scale: 2))
+    #expect(
+      CTFontCopyName(font.faces[0], kCTFontStyleNameKey) as String? == "Bold"
+    )
+    #expect(font.faces[2] == font.faces[0])
+  }
+
+  @Test
   func `disabling synthesis preserves native font styles`() {
     let config = Configuration.parse(
       "font-family = Menlo\nfont-synthetic-style = false"

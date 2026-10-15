@@ -49,6 +49,17 @@ for exe in swiftty swiftmux-agent swmux-launcher swmux; do
 done
 cp -R "$bin/swiftty_SwifttyCore.bundle" "$app/Contents/Resources/"
 
+# The app icon, from the asset catalog's macOS images.
+icons=Resources/Assets.xcassets/AppIcon.appiconset
+iconset=$(mktemp -d)/AppIcon.iconset
+mkdir -p "$iconset"
+for size in 16 32 128 256 512; do
+  cp "$icons/mac-${size}x${size}-1x.png" "$iconset/icon_${size}x${size}.png"
+  cp "$icons/mac-${size}x${size}-2x.png" "$iconset/icon_${size}x${size}@2x.png"
+done
+iconutil -c icns -o "$app/Contents/Resources/AppIcon.icns" "$iconset"
+rm -rf -- "${iconset%/*}"
+
 link_domains=""
 for domain in $domains; do
   link_domains="$link_domains<string>$domain</string>"
@@ -62,6 +73,7 @@ cat > "$app/Contents/Info.plist" <<EOF
   <key>CFBundleIdentifier</key><string>$bundle_id</string>
   <key>CFBundleName</key><string>Swiftty</string>
   <key>CFBundleExecutable</key><string>swiftty</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.2</string>
   <key>CFBundleVersion</key><string>1</string>

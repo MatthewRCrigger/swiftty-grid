@@ -11,7 +11,7 @@ struct MuxTabItem: Equatable {
   var hasActivity: Bool
   /// The tab's stored name, which a rename edits; nil for an unnamed tab
   /// (the service's number), which shows its program instead.
-  var name: String? = nil
+  var name: String?
 }
 
 enum MuxIcons {
@@ -260,7 +260,8 @@ final class MuxTabButton: NSGlassEffectView, NSTextFieldDelegate {
     label.delegate = self
     label.onAbort = { [weak self] in self?.cancelRename() }
     label.setAccessibilityElement(false)
-    closeButton.image = MuxIcons.image("xmark", "Close tab")
+    closeButton.image = MuxIcons.image("xmark", "End tab")
+    closeButton.toolTip = "End Tab (terminates its processes)"
     closeButton.isBordered = false
     closeButton.bezelStyle = .accessoryBarAction
     closeButton.target = self
@@ -432,7 +433,7 @@ final class MuxTabButton: NSGlassEffectView, NSTextFieldDelegate {
     } else {
       label.stringValue = item.title
     }
-    closeButton.setAccessibilityLabel("Close tab \(item.title)")
+    closeButton.setAccessibilityLabel("End tab \(item.title)")
     setAccessibilityLabel(item.title + (item.hasActivity ? ", new output" : ""))
   }
 
@@ -459,26 +460,48 @@ struct MuxPaneHeaderState: Equatable {
   var hasExited: Bool
 }
 
-/// A pane's header (title, active marker, actions) above its Metal view.
+/// A pane's header (icon, title, actions) above its Metal view.
+/// In a split tab the pane is a rounded card: header on top, the terminal
+/// inset below it. A single pane fills its area with no header.
 @MainActor
 final class MuxPaneContainer: NSView {
-  static let headerHeight: CGFloat = 22
+  static let headerHeight: CGFloat = 30
+  static let cornerRadius: CGFloat = 10
+  /// Space between the card's edge and its terminal (sides and bottom).
+  static let cardInset: CGFloat = 6
   let paneView: MuxPaneView
   let header = MuxPaneHeader()
   var showsHeader = true {
     didSet {
       header.isHidden = !showsHeader
-      if oldValue != showsHeader { needsLayout = true }
+      if oldValue != showsHeader {
+        needsLayout = true
+        needsDisplay = true
+      }
     }
   }
 
   init(paneView: MuxPaneView) {
     self.paneView = paneView
     super.init(frame: .zero)
+    wantsLayer = true
+    layer?.cornerCurve = .continuous
     addSubview(header)
     addSubview(paneView)
     setAccessibilityElement(true)
     setAccessibilityRole(.group)
+  }
+
+  override var wantsUpdateLayer: Bool { true }
+
+  override func updateLayer() {
+    guard let layer else { return }
+    layer.cornerRadius = showsHeader ? Self.cornerRadius : 0
+    layer.masksToBounds = showsHeader
+    layer.borderWidth = showsHeader ? 1 : 0
+    layer.borderColor = NSColor.separatorColor.cgColor
+    layer.backgroundColor =
+      showsHeader ? NSColor.labelColor.withAlphaComponent(0.04).cgColor : nil
   }
 
   @available(*, unavailable)
@@ -487,6 +510,7 @@ final class MuxPaneContainer: NSView {
   override func layout() {
     super.layout()
     let h = showsHeader ? min(Self.headerHeight, bounds.height) : 0
+    let inset = showsHeader ? Self.cardInset : 0
     header.frame = NSRect(
       x: 0,
       y: bounds.height - h,
@@ -496,10 +520,10 @@ final class MuxPaneContainer: NSView {
     // Re-adding a removed pane view (tests) must restore its frame.
     if paneView.superview === self {
       paneView.frame = NSRect(
-        x: 0,
-        y: 0,
-        width: bounds.width,
-        height: bounds.height - h
+        x: inset,
+        y: inset,
+        width: max(0, bounds.width - 2 * inset),
+        height: max(0, bounds.height - h - inset)
       )
     }
   }
@@ -520,10 +544,11 @@ final class MuxPaneContainer: NSView {
 }
 
 @MainActor
-final class MuxPaneHeader: NSGlassEffectView {
+final class MuxPaneHeader: NSView {
   enum Action { case splitRight, splitDown, zoom, close }
   var onAction: ((Action) -> Void)?
-  private let marker = NSView()
+  /// The program's icon, chosen locally from its title (`MuxIcons`).
+  private let icon = NSImageView()
   private let label = NSTextField(labelWithString: "")
   private let dot = MuxActivityDot()
   private(set) var actionButtons: [Action: NSButton] = [:]
@@ -539,9 +564,11 @@ final class MuxPaneHeader: NSGlassEffectView {
       guard state != oldValue else { return }
       label.stringValue =
         state.hasExited ? "\(state.title) (exited)" : state.title
+      // The active pane reads at full strength, the others dimmed.
       label.textColor = state.isActive ? .labelColor : .secondaryLabelColor
+      icon.contentTintColor = label.textColor
+      icon.image = MuxIcons.image(MuxIcons.symbol(for: state.title), "")
       dot.isHidden = !state.hasActivity
-      marker.isHidden = !state.isActive
       actionButtons[.zoom]?.image = MuxIcons.image(
         state.isZoomed
           ? "arrow.down.right.and.arrow.up.left"
@@ -555,16 +582,11 @@ final class MuxPaneHeader: NSGlassEffectView {
 
   override init(frame: NSRect) {
     super.init(frame: frame)
-    style = .regular
-    cornerRadius = 6
-    effectIsInteractive = true
-    let content = NSView(frame: bounds)
-    content.autoresizingMask = [.width, .height]
-    contentView = content
-    marker.wantsLayer = true
-    marker.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
-    marker.translatesAutoresizingMaskIntoConstraints = false
-    label.font = .systemFont(ofSize: 11)
+    // Part of the card: no band or separator of its own.
+    icon.translatesAutoresizingMaskIntoConstraints = false
+    icon.symbolConfiguration = .init(pointSize: 12, weight: .regular)
+    icon.setAccessibilityElement(false)
+    label.font = .systemFont(ofSize: 12, weight: .semibold)
     label.lineBreakMode = .byTruncatingTail
     label.translatesAutoresizingMaskIntoConstraints = false
     label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -590,13 +612,12 @@ final class MuxPaneHeader: NSGlassEffectView {
       actionButtons[action] = b
       buttons.addArrangedSubview(b)
     }
-    for v in [marker, label, dot, buttons] as [NSView] { content.addSubview(v) }
+    for v in [icon, label, dot, buttons] as [NSView] { addSubview(v) }
     NSLayoutConstraint.activate([
-      marker.leadingAnchor.constraint(equalTo: leadingAnchor),
-      marker.topAnchor.constraint(equalTo: topAnchor),
-      marker.bottomAnchor.constraint(equalTo: bottomAnchor),
-      marker.widthAnchor.constraint(equalToConstant: 3),
-      label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+      icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+      icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+      icon.widthAnchor.constraint(equalToConstant: 16),
+      label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
       label.centerYAnchor.constraint(equalTo: centerYAnchor),
       dot.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 4),
       dot.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -604,10 +625,9 @@ final class MuxPaneHeader: NSGlassEffectView {
         greaterThanOrEqualTo: dot.trailingAnchor,
         constant: 6
       ),
-      buttons.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+      buttons.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
       buttons.centerYAnchor.constraint(equalTo: centerYAnchor),
     ])
-    marker.isHidden = true
     dot.isHidden = true
     setAccessibilityElement(false)
   }

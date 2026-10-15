@@ -19,12 +19,43 @@ struct FontFaceResolver {
     } ? font : nil
   }
 
+  /// The face of `font`'s family whose style name is `style`.
+  func face(_ style: String, in font: CTFont) -> CTFont? {
+    let attributes: [CFString: Any] = [
+      kCTFontFamilyNameAttribute: CTFontCopyFamilyName(font),
+      kCTFontStyleNameAttribute: style,
+    ]
+    let match = CTFontCreateWithFontDescriptor(
+      CTFontDescriptorCreateWithAttributes(attributes as CFDictionary),
+      pixelSize,
+      nil
+    )
+    // CoreText substitutes the closest face when no style matches.
+    guard
+      CTFontCopyFamilyName(match) as String == CTFontCopyFamilyName(font)
+        as String,
+      let name = CTFontCopyName(match, kCTFontStyleNameKey) as String?,
+      name.caseInsensitiveCompare(style) == .orderedSame
+    else { return nil }
+    return match
+  }
+
   func styled(
     _ regular: CTFont,
     _ traits: CTFontSymbolicTraits,
-    family: String? = nil
+    family: String? = nil,
+    style: FaceStyle = .default
   ) -> (CTFont, Bool) {
-    if let family, let font = named(family) { return (font, false) }
+    let familyFont = family.flatMap(named)
+    switch style {
+    case .disabled: return (regular, false)
+    case .named(let name):
+      if let font = face(name, in: familyFont ?? regular) {
+        return (font, false)
+      }
+    case .default: break
+    }
+    if let familyFont { return (familyFont, false) }
     if let font = CTFontCreateCopyWithSymbolicTraits(
       regular,
       pixelSize,

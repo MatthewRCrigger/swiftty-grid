@@ -100,7 +100,7 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
   let pane: PaneID
   weak var controller: MuxWorkspaceController?
   let renderer: MetalRenderer
-  private var config: Configuration
+  private(set) var config: Configuration
 
   /// Newest imported presentation not yet admitted for drawing.
   private var pending: MuxPresentation?
@@ -108,12 +108,36 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
   /// selection, IME placement and accessibility.
   private(set) var presented: MuxPresentation?
   /// Set while a selection freezes the presentation used for interaction.
-  private var frozen: MuxPresentation?
-  private(set) var selection: FrozenSelection?
-  private var selectionDragged = false
+  var frozen: MuxPresentation?
+  var selection: FrozenSelection? {
+    didSet {
+      if selection != outputSelection?.selection { outputSelection = nil }
+    }
+  }
+  var selectionDragged = false
   private var retryScheduled = false
   private var localSequence: UInt64 = 0
-  private var scrollAccumulator: CGFloat = 0
+  var scrollAccumulator: CGFloat = 0
+  var horizontalScrollAccumulator: CGFloat = 0
+  var pendingAnchor: ((row: Int, column: Int), MuxPresentation)?
+  /// A left-button gesture reported to the program, not selecting.
+  var reportsLeftGesture = false
+  /// The last reported pointer cell and button, so motion is sent only
+  /// when it moves to another cell.
+  var lastReported: (row: Int, column: Int, button: MuxMouse.Button)?
+  /// Command output to select once a frame shows it (the service scrolls
+  /// it into view first).
+  var pendingOutput: CommandOutput?
+  /// A command-output selection and its full text, which may extend
+  /// beyond the rows the frozen frame shows.
+  var outputSelection: (selection: FrozenSelection, text: String)?
+  /// The cell a context menu was opened on, for Select Command Output.
+  var menuAddress: HistoryAddress?
+  var hoverEvent: NSEvent?
+  var hoverModifiers: NSEvent.ModifierFlags = []
+  /// The link last found under the pointer, and the cell queried for it.
+  var hoveredLink: MuxLink?
+  var linkQuery: (row: Int, column: Int)?
   var markedText = ""
   private var markedSelection = NSRange(location: NSNotFound, length: 0)
   private var interpretingEvent: NSEvent?
@@ -142,6 +166,7 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
     delegate = self
     renderer.options = configuration.renderOptions(scale: 2)
     layer?.isOpaque = configuration.backgroundOpacity >= 1
+    loadShader()
     setAccessibilityRole(.textArea)
     setAccessibilityLabel("Terminal pane")
   }
@@ -192,15 +217,48 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
     var options = config.renderOptions(scale: scale)
     options.preedit = renderer.options.preedit
     options.preeditSelection = renderer.options.preeditSelection
+    options.underlinedSpan = renderer.options.underlinedSpan
     renderer.options = options
     layer?.isOpaque = config.backgroundOpacity >= 1
+    updateFrameDriving()
     controller?.geometryChanged()
   }
 
   func apply(_ configuration: Configuration) {
+    let shaderChanged = configuration.customShader != config.customShader
     config = configuration
+    if shaderChanged { loadShader() }
     applyScale()
+    refreshHover()
     needsDisplay = true
+  }
+
+  /// `custom-shader`, as the direct view loads it.
+  private func loadShader() {
+    do {
+      try renderer.setPostProcessShader(
+        config.customShader.map {
+          try String(contentsOfFile: $0, encoding: .utf8)
+        }
+      )
+    } catch {
+      FileHandle.standardError.write(
+        Data("swiftty: custom-shader: \(error)\n".utf8)
+      )
+      try? renderer.setPostProcessShader(nil)
+    }
+    updateFrameDriving()
+  }
+
+  /// A shader that animates needs frames without new output.
+  private func updateFrameDriving() {
+    let rate = window?.screen?.maximumFramesPerSecond ?? 60
+    if preferredFramesPerSecond != rate { preferredFramesPerSecond = rate }
+    let animating = renderer.isAnimating && window != nil
+    if animating == isPaused {
+      isPaused = !animating
+      enableSetNeedsDisplay = !animating
+    }
   }
 
   override func setFrameSize(_ newSize: NSSize) {
@@ -250,6 +308,7 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
     }
     pending = presentation
     if frozen == nil { needsDisplay = true }
+    selectPendingOutput(in: presentation)
   }
 
   /// Rebind/reattach/server change: drop every cached presentation.
@@ -261,6 +320,13 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
     pendingAnchor = nil
     selectionDragged = false
     scrollAccumulator = 0
+    horizontalScrollAccumulator = 0
+    reportsLeftGesture = false
+    lastReported = nil
+    pendingOutput = nil
+    hoveredLink = nil
+    linkQuery = nil
+    renderer.options.underlinedSpan = nil
     cancelComposition()
     needsDisplay = true
   }
@@ -296,7 +362,11 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
     switch result {
     case .submitted:
       if frozen == nil {
+        let tracking = presented?.frame.modes.contains(.mouseTracking)
         presented = candidate
+        if tracking != candidate.frame.modes.contains(.mouseTracking) {
+          window?.invalidateCursorRects(for: self)
+        }
         if pending?.frame.identity.revision == candidate.frame.identity.revision
         {
           pending = nil
@@ -329,6 +399,13 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
   }
 
   override func keyDown(with event: NSEvent) {
+    if config.mouseHideWhileTyping { NSCursor.setHiddenUntilMouseMoves(true) }
+    if !hasMarkedText(), let binding = binding(for: event) {
+      let performed = perform(binding.action)
+      if binding.consumesInput, !binding.requiresPerformable || performed {
+        return
+      }
+    }
     if event.modifierFlags.contains(.command) {
       super.keyDown(with: event)
       return
@@ -387,11 +464,18 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
     }
   }
 
+  /// The selected text; a command-output selection copies all of it.
+  var selectedText: String? {
+    guard let selection, let frame = frozen?.frame else { return nil }
+    if let output = outputSelection, output.selection == selection {
+      return output.text
+    }
+    return selection.text(in: frame)
+  }
+
   @objc
   func copy(_ sender: Any?) {
-    guard let selection, let frame = frozen?.frame else { return }
-    let text = selection.text(in: frame)
-    guard !text.isEmpty else { return }
+    guard let text = selectedText, !text.isEmpty else { return }
     NSPasteboard.general.clearContents()
     NSPasteboard.general.setString(text, forType: .string)
   }
@@ -429,90 +513,19 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
 
   @objc
   func validateMenuItem(_ item: NSMenuItem) -> Bool {
+    let features = controller?.features ?? []
+    let writable = controller?.holdsLease == true
     switch item.action {
-    case #selector(copy(_:)): selection != nil
-    default: true
+    case #selector(copy(_:)): return selection != nil
+    case #selector(jumpToPreviousPrompt(_:)), #selector(jumpToNextPrompt(_:)):
+      return features.contains(.historyJumps)
+        && presented?.frame.modes.contains(.alternateScreen) == false
+    case #selector(clearScreen(_:)), #selector(resetTerminal(_:)):
+      return writable && features.contains(.terminalControl)
+    case #selector(selectCommandOutput(_:)):
+      return writable && features.contains(.shellIntegration)
+    default: return true
     }
-  }
-
-  // MARK: Pointer
-
-  private func cell(for event: NSEvent) -> (row: Int, column: Int) {
-    let p = convert(event.locationInWindow, from: nil)
-    let scale = window?.backingScaleFactor ?? 2
-    let x = (p.x * scale - renderer.options.paddingX) / renderer.cellSize.width
-    let y =
-      ((bounds.height - p.y) * scale - renderer.options.paddingY)
-      / renderer.cellSize.height
-    return (Int(y.rounded(.down)), Int(x.rounded(.down)))
-  }
-
-  override func mouseDown(with event: NSEvent) {
-    window?.makeFirstResponder(self)
-    controller?.focus(pane)
-    // Bind the gesture to the presentation actually shown.
-    guard let base = frozen ?? presented else { return }
-    let unit: FrozenSelection.Unit =
-      switch event.clickCount {
-      case 2: .word
-      case 3...: .line
-      default: .cell
-      }
-    let at = cell(for: event)
-    selectionDragged = unit != .cell
-    if unit == .cell {
-      selection = nil
-      frozen = nil
-      needsDisplay = true
-      pendingAnchor = (at, base)
-      return
-    }
-    frozen = base
-    selection = FrozenSelection(anchor: at, head: at, unit: unit)
-    needsDisplay = true
-  }
-
-  private var pendingAnchor: ((row: Int, column: Int), MuxPresentation)?
-
-  override func mouseDragged(with event: NSEvent) {
-    let at = cell(for: event)
-    if selection == nil, let (anchor, base) = pendingAnchor {
-      frozen = base
-      selection = FrozenSelection(anchor: anchor, head: at, unit: .cell)
-    }
-    selection?.head = at
-    selectionDragged = true
-    needsDisplay = true
-  }
-
-  override func mouseUp(with event: NSEvent) {
-    pendingAnchor = nil
-    if !selectionDragged { clearSelection() }
-  }
-
-  /// Ends selection and resumes current frames.
-  func clearSelection() {
-    guard selection != nil || frozen != nil || pendingAnchor != nil else {
-      return
-    }
-    selection = nil
-    frozen = nil
-    pendingAnchor = nil
-    selectionDragged = false
-    needsDisplay = true
-  }
-
-  override func scrollWheel(with event: NSEvent) {
-    let delta =
-      event.hasPreciseScrollingDeltas
-      ? event.scrollingDeltaY
-        / max(1, renderer.cellSize.height / (window?.backingScaleFactor ?? 2))
-      : event.scrollingDeltaY
-    scrollAccumulator += delta
-    let lines = Int(scrollAccumulator.rounded(.towardZero))
-    guard lines != 0 else { return }
-    scrollAccumulator -= CGFloat(lines)
-    controller?.scroll(pane, lines: lines)
   }
 
   // MARK: Accessibility
@@ -521,10 +534,7 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
     (frozen ?? presented).map { $0.frame.lines.joined(separator: "\n") }
   }
 
-  override func accessibilitySelectedText() -> String? {
-    guard let selection, let frame = frozen?.frame else { return nil }
-    return selection.text(in: frame)
-  }
+  override func accessibilitySelectedText() -> String? { selectedText }
 
   // MARK: Composition
 

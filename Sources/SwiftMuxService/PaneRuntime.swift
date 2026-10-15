@@ -416,31 +416,89 @@ final class PaneRuntime: @unchecked Sendable {
         return
       }
       var bytes: [UInt8] = []
-      let terminalInput: TerminalInput =
+      let terminalInputs: [TerminalInput] =
         switch input {
-        case let .text(s): .text(s)
+        case let .text(s): [.text(s)]
         case let .key(key, mods):
-          .key(KeyEvent(Self.key(key), modifiers: Self.modifiers(mods)))
-        case let .focus(f): .focus(f)
-        case let .paste(s): .paste(s)
+          [.key(KeyEvent(Self.key(key), modifiers: Self.modifiers(mods)))]
+        case let .focus(f): [.focus(f)]
+        case let .paste(s): [.paste(s)]
+        case let .mouse(m):
+          // Reported only while the program asks; the frontend's view of
+          // the modes may be a frame behind.
+          state.modes.isDisjoint(with: .mouseTracking)
+            ? [] : [.mouse(Self.mouse(m))]
+        case let .moveCursor(address, column):
+          cursorMoves(to: address, column: column).map(TerminalInput.key)
         }
       // Enhanced keyboard reporting is disabled in this profile.
-      InputEncoder.encode(
-        terminalInput,
-        modes: state.modes,
-        keyboardFlags: 0,
-        into: &bytes,
-      )
-      if case .focus = input {
-      } else if state.viewportOffset != 0 {
+      for terminalInput in terminalInputs {
+        InputEncoder.encode(
+          terminalInput,
+          modes: state.modes,
+          keyboardFlags: 0,
+          into: &bytes,
+        )
+      }
+      switch input {
+      case .focus, .mouse: break
+      case .moveCursor where bytes.isEmpty: break
+      default:
+        guard state.viewportOffset != 0 else { break }
         state.scrollViewportToBottom()
         advanceViewport()
         noteChange()
       }
       adjust(by: bytes.count - estimate)
+      guard !bytes.isEmpty else { return }
       writer.appendInput(bytes)
       flush()
     }
+  }
+
+  /// Arrow keys moving the shell's cursor to a cell of its command line,
+  /// or none when the address is stale or outside it.
+  private func cursorMoves(
+    to address: HistoryAddress,
+    column: Int
+  ) -> [KeyEvent] {
+    guard address.generation == state.addressingGeneration,
+      address.alternateScreen == state.isAlternateScreen,
+      let moves = state.promptCursorMoves(
+        to: TerminalPoint(row: address.row, column: column)
+      ), moves.magnitude <= MuxInput.maxCursorMoves
+    else { return [] }
+    return Array(
+      repeating: KeyEvent(moves < 0 ? .left : .right),
+      count: Int(moves.magnitude)
+    )
+  }
+
+  static func mouse(_ m: MuxMouse) -> MouseEvent {
+    let action: MouseEvent.Action =
+      switch m.action {
+      case .press: .press
+      case .release: .release
+      case .motion: .motion
+      }
+    let button: MouseEvent.Button =
+      switch m.button {
+      case .left: .left
+      case .middle: .middle
+      case .right: .right
+      case .none: .none
+      case .wheelUp: .wheelUp
+      case .wheelDown: .wheelDown
+      case .wheelLeft: .wheelLeft
+      case .wheelRight: .wheelRight
+      }
+    return MouseEvent(
+      action,
+      button,
+      column: max(0, m.column),
+      row: max(0, m.row),
+      modifiers: modifiers(m.modifiers)
+    )
   }
 
   func pasteBegin(id: UInt64, estimate: Int) {
@@ -677,6 +735,12 @@ final class PaneRuntime: @unchecked Sendable {
         )
         state.scrollViewport(by: overflow ? (n < 0 ? .min : .max) : lines)
       case .bottom: state.scrollViewportToBottom()
+      case .oldest: state.scrollViewport(by: .max)
+      case let .prompt(n):
+        guard state.jumpToPrompt(n) else {
+          completion(MuxError(.notFound, "no such prompt"))
+          return
+        }
       case let .top(address):
         guard address.generation == state.addressingGeneration,
           address.alternateScreen == state.isAlternateScreen,
@@ -748,6 +812,107 @@ final class PaneRuntime: @unchecked Sendable {
           matchCount: state.searchMatches.count,
           selected: state.searchSelected,
         ),
+      )
+    }
+  }
+
+  // MARK: Terminal control and shell integration
+
+  /// Clears the screen, keeping the cursor's line, as the direct view's
+  /// Clear Screen does.
+  func clearScreen() {
+    queue.async { [self] in
+      guard !finished else { return }
+      state.clearScreenKeepingCursorLine()
+      advanceViewport()
+      noteChange()
+    }
+  }
+
+  /// Full reset (RIS) of the emulator; the process keeps running.
+  func resetTerminal() {
+    queue.async { [self] in
+      guard !finished else { return }
+      parser = Parser()
+      state.reset()
+      publishStatus()
+      advanceViewport()
+      noteChange()
+    }
+  }
+
+  private func point(_ address: HistoryAddress, column: Int) -> TerminalPoint? {
+    guard address.generation == state.addressingGeneration,
+      address.alternateScreen == state.isAlternateScreen,
+      state.contains(absoluteRow: address.row)
+    else { return nil }
+    return TerminalPoint(row: address.row, column: column)
+  }
+
+  private func address(_ row: Int) -> HistoryAddress {
+    HistoryAddress(
+      generation: state.addressingGeneration,
+      alternateScreen: state.isAlternateScreen,
+      row: row
+    )
+  }
+
+  func link(
+    at address: HistoryAddress,
+    column: Int,
+    detectURLs: Bool,
+    completion: @escaping @Sendable (MuxLink?) -> Void,
+  ) {
+    queue.async { [self] in
+      guard let p = point(address, column: column),
+        let link = state.link(at: p, detectURLs: detectURLs)
+      else { return completion(nil) }
+      completion(
+        MuxLink(
+          url: link.url,
+          start: self.address(link.range.start.row),
+          startColumn: link.range.start.column,
+          end: self.address(link.range.end.row),
+          endColumn: link.range.end.column
+        )
+      )
+    }
+  }
+
+  /// The output around `address`, or the most recent command with
+  /// output; scrolled into view as the direct view's selection is.
+  func commandOutput(
+    at address: HistoryAddress?,
+    completion: @escaping @Sendable (CommandOutput?) -> Void,
+  ) {
+    queue.async { [self] in
+      let click = address.flatMap { point($0, column: 0) }
+      let prompts = state.promptRows()
+      var output = state.commandOutputRange(
+        at: click ?? TerminalPoint(row: prompts.last ?? 0, column: 0)
+      )
+      if output == nil, click == nil {
+        // Fresh prompts and commands without output are skipped.
+        for boundary in prompts.reversed() {
+          output = state.commandOutputRange(
+            at: TerminalPoint(row: boundary - 1, column: 0)
+          )
+          if output != nil { break }
+        }
+      }
+      guard let range = output else { return completion(nil) }
+      let before = state.viewportOffset
+      state.scrollToShow(row: range.start.row)
+      if state.viewportOffset != before {
+        advanceViewport()
+        noteChange()
+      }
+      completion(
+        CommandOutput(
+          start: self.address(range.start.row),
+          end: self.address(range.end.row),
+          text: state.text(from: range.start, to: range.end)
+        )
       )
     }
   }
@@ -940,6 +1105,8 @@ final class PaneRuntime: @unchecked Sendable {
           let (lines, overflow) = n.multipliedReportingOverflow(by: page)
           state.scrollViewport(by: overflow ? (n < 0 ? .min : .max) : lines)
         case .bottom: state.scrollViewportToBottom()
+        case .oldest: state.scrollViewport(by: .max)
+        case let .prompt(n): state.jumpToPrompt(n)
         case .top: break
         }
       } else if !anchored {

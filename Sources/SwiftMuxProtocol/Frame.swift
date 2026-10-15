@@ -186,8 +186,9 @@ public struct FrameCursor: Codable, Sendable, Equatable {
   }
 }
 
-/// Modes a frontend may consult; enhanced keyboard and mouse reporting
-/// are absent from the first profile.
+/// Modes a frontend may consult; enhanced keyboard reporting is absent
+/// from this profile. Mouse modes are set only by a service offering
+/// `ServiceFeatures.mouseReporting`.
 public struct SupportedViewModes: OptionSet, Codable, Sendable, Hashable {
   public var rawValue: UInt32
   public init(rawValue: UInt32) { self.rawValue = rawValue }
@@ -197,6 +198,14 @@ public struct SupportedViewModes: OptionSet, Codable, Sendable, Hashable {
   public static let reverseVideo = SupportedViewModes(rawValue: 1 << 3)
   public static let focusEvents = SupportedViewModes(rawValue: 1 << 4)
   public static let keypadApplication = SupportedViewModes(rawValue: 1 << 5)
+  /// The program receives clicks (any of modes 9, 1000, 1002, 1003).
+  public static let mouseTracking = SupportedViewModes(rawValue: 1 << 6)
+  /// …and motion while a button is held (1002).
+  public static let mouseButtonMotion = SupportedViewModes(rawValue: 1 << 7)
+  /// …and all motion (1003).
+  public static let mouseAnyMotion = SupportedViewModes(rawValue: 1 << 8)
+  /// The wheel sends arrow keys on the alternate screen (1007).
+  public static let alternateScroll = SupportedViewModes(rawValue: 1 << 9)
 }
 
 public struct HistoryWindow: Codable, Sendable, Equatable {

@@ -16,7 +16,12 @@
 #   --replace-dev-agent  remove a `swmux agent install` LaunchAgent first;
 #                      its running sessions end
 #   --restart-agent    re-register a running agent whose signing team
-#                      changed; its running sessions end
+#                      changed, or (ad-hoc builds) whose binary changed;
+#                      its running sessions end
+#   --team TEAM        team for the iOS/iPadOS app (default: the Mac build's
+#                      signing team); see Scripts/install-ios.sh
+#   --no-devices       skip installing the iOS/iPadOS app on iPhones and
+#                      iPads connected by USB
 #
 # Safe to run inside Swiftty: the running app is replaced in place, not quit.
 set -eu
@@ -30,9 +35,18 @@ bind=0.0.0.0
 port=51222
 replace_dev=0
 restart_agent=0
+team=""
+devices=1
 while [ $# -gt 0 ]; do
   case "$1" in
-    --identity | --dest | --host | --bind | --port)
+    # --option=value is the same as --option value.
+    --identity=* | --dest=* | --host=* | --bind=* | --port=* | --team=*)
+      value=${1#*=}
+      option=${1%%=*}
+      shift
+      set -- "$option" "$value" "$@"
+      continue ;;
+    --identity | --dest | --host | --bind | --port | --team)
       option=$1
       if [ $# -lt 2 ]; then
         echo "install.sh: $option requires a value" >&2; exit 64
@@ -46,12 +60,14 @@ while [ $# -gt 0 ]; do
         --host) host=$2 ;;
         --bind) bind=$2 ;;
         --port) port=$2 ;;
+        --team) team=$2 ;;
       esac
       shift 2 ;;
     --roaming) roaming=1; shift ;;
     --replace-dev-agent) replace_dev=1; shift ;;
     --restart-agent) restart_agent=1; shift ;;
-    -h | --help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --no-devices) devices=0; shift ;;
+    -h | --help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "install.sh: unknown option $1" >&2; exit 64 ;;
   esac
 done
@@ -81,6 +97,9 @@ domain="gui/$(id -u)"
 
 team_of() {
   codesign -dv "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p' | sed 's/^not set$//'
+}
+cdhash_of() {
+  codesign -dvvv "$1" 2>&1 | sed -n 's/^CDHash=//p'
 }
 agent_info=$(launchctl print "$domain/$label" 2>/dev/null || true)
 registered_team=$(printf '%s\n' "$agent_info" \
@@ -128,18 +147,31 @@ bin=$(swift build -c release --show-bin-path)
 
 # launchd pins the registered agent to the signing team it had when
 # registered (a launch constraint); a different team is killed at spawn
-# with "Launch Constraint Violation" until the agent is re-registered.
+# with "Launch Constraint Violation" until the agent is re-registered. An
+# ad-hoc build has no team and is pinned to its agent's cdhash instead,
+# which changes with every build: launchd then refuses to spawn it
+# (EX_CONFIG, "needs LWCR update") once the running agent exits.
 agent_info=$(launchctl print "$domain/$label" 2>/dev/null || true)
 registered_team=$(printf '%s\n' "$agent_info" \
   | sed -n 's/.*"team-identifier" => "\(.*\)".*/\1/p' | head -n 1)
 new_team=$(team_of "$built/Contents/MacOS/swiftmux-agent")
+installed_agent="$app/Contents/MacOS/swiftmux-agent"
+reason=""
+if [ -n "$agent_info" ]; then
+  if [ "$registered_team" != "$new_team" ]; then
+    reason="registered for team '${registered_team:-none}', the new build is '${new_team:-none}'"
+  elif [ -z "$new_team" ] && { [ ! -f "$installed_agent" ] \
+    || [ "$(cdhash_of "$installed_agent")" != "$(cdhash_of "$built/Contents/MacOS/swiftmux-agent")" ]; }; then
+    reason="an ad-hoc build, pinned to the previous agent binary"
+  fi
+fi
 reregister=0
-if [ -n "$agent_info" ] && [ "$registered_team" != "$new_team" ]; then
+if [ -n "$reason" ]; then
   if printf '%s\n' "$agent_info" | grep -q 'state = running' \
     && [ "$restart_agent" -eq 0 ]; then
-    echo "install.sh: the running SwiftMux agent is registered for team" \
-      "'${registered_team:-none}', the new build is '${new_team:-none}'." >&2
-    echo "  Re-run with --restart-agent (its running sessions end)." >&2
+    echo "install.sh: the running SwiftMux agent is $reason." >&2
+    echo "  Re-run with --restart-agent (its running sessions end), or sign" >&2
+    echo "  with a Developer ID identity (--identity) to keep it across builds." >&2
     exit 1
   fi
   reregister=1
@@ -156,7 +188,7 @@ sudo_if_needed "$dest" /usr/bin/python3 -I Scripts/install-app.py "$built" "$app
 echo "installed $app"
 
 if [ "$reregister" -eq 1 ]; then
-  echo "re-registering the SwiftMux agent (team '${registered_team:-none}' -> '${new_team:-none}')"
+  echo "re-registering the SwiftMux agent ($reason)"
   "$app/Contents/MacOS/swiftty" --swiftmux-agent unregister >/dev/null || true
   launchctl bootout "$domain/$label" 2>/dev/null || true
 fi
@@ -235,4 +267,16 @@ if [ "$roaming" -eq 1 ]; then
   i=0
   until "$helper" status 2>/dev/null || [ $i -ge 50 ]; do sleep 0.2; i=$((i + 1)); done
   "$helper" status || echo "note: roaming is not serving yet; enable SwiftMux in the app"
+fi
+
+# The iOS/iPadOS app, on iPhones and iPads connected by USB. The Mac
+# install above is complete whether or not this succeeds.
+if [ "$devices" -eq 1 ]; then
+  [ -n "$team" ] || team=$new_team
+  if [ -z "$team" ]; then
+    echo "note: skipping iPhone/iPad install: an ad-hoc build has no team; pass --team"
+  elif ! Scripts/install-ios.sh --team "$team"; then
+    echo "install.sh: the Mac app is installed, but the iPhone/iPad install failed" >&2
+    exit 1
+  fi
 fi
