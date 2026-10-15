@@ -666,9 +666,20 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     DispatchQueue.main.async { [weak self] in
       MainActor.assumeIsolated {
         self?.geometryScheduled = false
+        self?.refreshStatusSize()
         self?.sendGeometry()
       }
     }
+  }
+
+  /// The status bar's size follows the active pane as it is laid out.
+  private func refreshStatusSize() {
+    guard let pane = activePane, let view = views[pane] else { return }
+    let size = view.gridSize
+    var status = statusBar.status
+    status.columns = size.columns
+    status.rows = size.rows
+    statusBar.status = status
   }
 
   private func sendGeometry() {
