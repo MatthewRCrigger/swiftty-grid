@@ -105,7 +105,8 @@ class InstallTests(unittest.TestCase):
         self.environment = dict(os.environ)
         self.environment.update(INSTALL_FIXTURE_ROOT=str(self.root),
                                 PATH=str(self.tools) + os.pathsep + self.environment["PATH"])
-        self.environment.pop("NOTARY_PROFILE", None)
+        for name in ["NOTARY_PROFILE", "NOTARY_KEY_ID"]:
+            self.environment.pop(name, None)
 
     def create_app(self, path, marker):
         executables = path / "Contents/MacOS"
@@ -121,8 +122,10 @@ class InstallTests(unittest.TestCase):
 
     def install(self, *arguments, **environment):
         return subprocess.run(
+            # These tests cover the Mac install; --no-devices keeps a
+            # resolved team from reaching for USB-connected iPhones/iPads.
             ["/bin/sh", str(self.repo / "Scripts/install.sh"), "--identity", "-",
-             "--dest", str(self.destination), *arguments],
+             "--dest", str(self.destination), "--no-devices", *arguments],
             env={**self.environment, **environment}, capture_output=True, text=True, timeout=15,
         )
 

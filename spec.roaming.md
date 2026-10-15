@@ -56,8 +56,7 @@ No Mosh, tssh, tsshd, trzsz, or ZMODEM interoperability is claimed. No additiona
 |---|---|---|
 | iPhone client | iOS 27.0 | Full client: SSH shell/exec, roaming terminal, SFTP |
 | iPad client | iPadOS 27.0 | Full client: SSH shell/exec, roaming terminal, SFTP |
-| Native Mac client | macOS 27.0 | Full client plus optional app-local PTY |
-| Mac Catalyst client | Mac Catalyst 27.0, running on macOS 27.x | Full remote client using the UIKit-derived frontend; no app-local PTY |
+| Mac client | Mac Catalyst 27.0, running on macOS 27.x | Full remote client using the UIKit-derived frontend; no app-local PTY (local shells are Swiftty.app's, Appendix A) |
 | Spatial client | visionOS 27.0 | Full remote client in a native window; immersive presentation deferred |
 | Television client | tvOS 27.0 | SSH shell/exec and roaming terminal; keyboard/focus-oriented UI; no SFTP in v1 |
 | Watch companion | watchOS 27.0 with paired iOS 27.x app | Read-only, timestamped session status and optional bounded text preview; no direct SSH, QUIC, SFTP, or shell input |
@@ -377,7 +376,7 @@ When a mobile/spatial/TV scene becomes backgrounded or unavailable, stop accepti
 
 Use available background time only for bounded cleanup, then stop networking. No audio, VoIP, location, or background-task workaround is part of this design. iOS may suspend or terminate the process; Apple's background mechanisms provide limited or scheduled runtime, not an indefinitely running terminal. [S14]
 
-For native macOS and Mac Catalyst, loss of window focus alone MUST NOT be treated as process suspension. Honor explicit disconnect, termination, sleep, and network-loss events; preserve the host session and prevent stale input. Each platform adapter maps its actual lifecycle events into the common state machine and validates them on that platform. No Apple client receives an indefinite-background-execution guarantee.
+For the Mac Catalyst client, loss of window focus alone MUST NOT be treated as process suspension. Honor explicit disconnect, termination, sleep, and network-loss events; preserve the host session and prevent stale input. Each platform adapter maps its actual lifecycle events into the common state machine and validates them on that platform. No Apple client receives an indefinite-background-execution guarantee.
 
 On foreground return or recovery from sleep, reconnect as needed and obtain a complete current screen before enabling input. On cold launch, reauthenticate with SSH and resume by session ID. Distinguish “temporarily unreachable” from an authenticated “session no longer exists.” A client attaches only to a workspace the user chose or explicitly created; a remembered session ID is a convenience for resuming, never permission to create a replacement ([spec.connection-setup.md](spec.connection-setup.md) §1.3).
 
@@ -428,7 +427,6 @@ Sources/
   CompanionModel/    bounded watch/iPhone status DTOs; no SSH/RST secrets
 Apps/
   MobileClient/      iOS/iPadOS full client and iPhone companion bridge
-  MacClient/         native macOS full client; optional local PTY
   CatalystClient/    UIKit-derived full remote client
   VisionClient/      windowed visionOS full remote client
   TVClient/          tvOS SSH/roaming terminal; no SFTP
@@ -492,14 +490,14 @@ All tests below are release gates for their applicable platform profile unless l
 | A7 | Resize repeatedly during alternate-screen use and reconnect | Correct final dimensions, cursor, buffer, and revision ordering |
 | A8 | Run shell editing, `vim`, `less`, `top`, Unicode, combining marks, and wide characters | Server snapshot and client cell model agree for the supported profile |
 | A9 | Trigger terminal queries and malicious clipboard/graphics/control sequences | Replies occur once on the host; unsupported side effects are blocked and buffers remain bounded |
-| A10 | Background/unavailable-scene tests for mobile/spatial/TV clients; sleep and separate relaunch tests for native Mac/Catalyst | Warm or SSH-authorized cold reattachment to the same retained shell; losing Mac window focus alone does not detach; no claim of continued execution while suspended |
+| A10 | Background/unavailable-scene tests for mobile/spatial/TV clients; sleep and separate relaunch tests for the Catalyst Mac client | Warm or SSH-authorized cold reattachment to the same retained shell; losing Mac window focus alone does not detach; no claim of continued execution while suspended |
 | A11 | Present wrong SSH key, wrong TLS pin, expired capability, old attachment epoch, or early input | Fail closed; no shell input accepted |
 | A12 | Restart helper or reboot Mac | Client reports session loss; it never replays commands into a new shell automatically |
 | A13 | Block UDP while leaving SSH reachable | Honest ordinary-SSH fallback; old roaming session is not presented as resumed |
 | A14 | Interrupt SFTP after arbitrary requests; alter prefix; lose rename response | Correct resume or explicit restart/conflict; never falsely report a completed verified file |
 | A15 | Concurrent file transfer and interactive typing | Bounded queues; bulk transfer can yield; no deadlock or cross-stream application blockage |
 | A16 | Fuzz bootstrap, message decoder, decompressor, terminal parser, input state machine, and companion payload decoder | No unbounded allocation, crash, unauthorized operation, or invalid state transition |
-| A17 | Exercise platform-specific profiles | Catalyst desktop input/file access, visionOS window/input/accessibility, and tvOS focus/keyboard/trust prompts pass; tvOS exposes no SFTP; local PTY remains native-macOS-only; all direct clients use identical RST semantics |
+| A17 | Exercise platform-specific profiles | Catalyst desktop input/file access, visionOS window/input/accessibility, and tvOS focus/keyboard/trust prompts pass; tvOS exposes no SFTP; no direct client has a local PTY; all direct clients use identical RST semantics |
 | A18 | Pair physical Apple Watch and iPhone; force unreachable/stale state, lifecycle changes, malformed previews, and opt-out | Companion remains read-only; timestamps stay honest; no network credentials or RST lease exposed; bounds enforced; preview privacy honored; phone is not kept alive or logged in by watch refresh |
 | A19 | Attempt attachment from two client platforms | The existing one-writer policy is enforced; rejected or replaced attachment cannot replay stale input; watch refresh creates no attachment |
 
@@ -509,7 +507,7 @@ Measure typing latency, data usage, CPU, wakeups, and memory separately. Do not 
 
 ## 14. Implementation gates and independent-development record
 
-**Gate 0 — prove the Apple OS 27 platform boundary.** Resolve Swift 6.4 dependencies with the 27.0 deployment targets in §2.1; establish separate build paths for every included profile and pass applicable A0 checks. Demonstrate SSH host verification, no-PTY bootstrap, an independent host PTY, a pinned QUIC connection, multiple snapshot streams with cancellation, and terminal snapshot extraction through the adapter selected in Appendix A. Verify certificate/Keychain integration on every direct-client platform, including physical-device runs and distinct native Mac/Catalyst destinations. Verify the separate watch/iPhone companion path without adding SSH/QUIC to the watch target. Do not add older-platform compatibility work. If a required Network API is unsuitable on the supported 27.x systems, revise this specification before replacing it with custom UDP security.
+**Gate 0 — prove the Apple OS 27 platform boundary.** Resolve Swift 6.4 dependencies with the 27.0 deployment targets in §2.1; establish separate build paths for every included profile and pass applicable A0 checks. Demonstrate SSH host verification, no-PTY bootstrap, an independent host PTY, a pinned QUIC connection, multiple snapshot streams with cancellation, and terminal snapshot extraction through the adapter selected in Appendix A. Verify certificate/Keychain integration on every direct-client platform, including physical-device runs and the Mac Catalyst destination. Verify the separate watch/iPhone companion path without adding SSH/QUIC to the watch target. Do not add older-platform compatibility work. If a required Network API is unsuitable on the supported 27.x systems, revise this specification before replacing it with custom UDP security.
 
 **Gate 1 — first vertical slice.** One configured host, one shell, full snapshot display, semantic keyboard input, resize, and explicit detach/reattach. Match server/client cell models. No prediction, deltas, or feature expansion.
 
@@ -615,7 +613,6 @@ The product comprises:
 | Product | v1 profile |
 |---|---|
 | iOS 27 / iPadOS 27 | Full SSH, SFTP, and roaming-terminal client |
-| Native macOS 27 | Full remote client and optional local PTY backend |
 | Mac Catalyst 27 on macOS 27 | Full remote client using a UIKit-derived frontend; no local PTY |
 | visionOS 27 | Full remote client in a native window |
 | tvOS 27 | SSH and roaming terminal; focus/keyboard UI; no SFTP |
@@ -813,8 +810,7 @@ Separate reusable model/input/snapshot code from platform-specific views or proc
 | Target | Required integration |
 |---|---|
 | iOS/iPadOS | Existing mobile frontend plus external SSH/RST backends, document access, touch/hardware keyboard, and lifecycle recovery |
-| Native macOS | Existing AppKit frontend or extracted reusable library; full remote features; optional local PTY; Mac sleep/relaunch handling |
-| Mac Catalyst | Adapt the UIKit frontend for desktop menus, shortcuts, pointer/window behavior, document access, and entitlement checks; no local PTY or embedded launchd agent |
+| Mac Catalyst | Adapt the UIKit frontend for desktop menus, shortcuts, pointer/window behavior, document access, entitlement checks, and Mac sleep (IOKit power notifications)/quit handling; no local PTY or embedded launchd agent |
 | visionOS | Windowed native frontend sharing rendering/frame logic; validate text/keyboard input, focus, accessibility, resizing, and document access; immersive scenes deferred |
 | tvOS | Focus-first shell/roaming frontend; tested external keyboard/text entry; explicit trust prompts; disable touch-only, clipboard, SFTP, and local-process actions that the profile does not provide |
 | watchOS | Independent SwiftUI status/optional text-preview UI through the paired iPhone; no Swiftty frame import, host credentials, direct networking, or command execution |
@@ -825,7 +821,7 @@ The watch companion follows the main spec's 16 KiB payload limit, one pending re
 
 #### A.6.3 Lifecycle, files, and release evidence
 
-Keep per-platform input, file-access, and lifecycle adapters instead of assuming identical UIKit behavior. Losing a Mac/Catalyst window's focus is not a disconnect event; sleep, termination, and network loss still need recovery. Mobile/spatial/TV unavailable scenes follow their validated suspension policy. The watch never keeps the phone alive. SFTP applies only to full clients, with the same resume/integrity requirements and platform-specific document access.
+Keep per-platform input, file-access, and lifecycle adapters instead of assuming identical UIKit behavior. Losing a Mac window's focus is not a disconnect event; sleep, termination, and network loss still need recovery. Mobile/spatial/TV unavailable scenes follow their validated suspension policy. The watch never keeps the phone alive. SFTP applies only to full clients, with the same resume/integrity requirements and platform-specific document access.
 
 The 27.0 baseline does not remove optional-capability or later-27.x availability checks. Before claiming support, pass each destination's build, simulator where applicable, physical hardware, input, trust, snapshot, and lifecycle gates. Test native Mac and Catalyst separately; test visionOS/tvOS and a paired watch/iPhone on physical devices. Record exact runtimes, entitlements, and dependency revisions. Upstream platform declarations and simulator tests alone are not release evidence.
 
@@ -864,7 +860,7 @@ Gates apply according to the capability matrix: direct-terminal gates exclude wa
 | Safety policy | Remote clipboard/URL actions disabled; malformed and oversized snapshots rejected before rendering |
 | Resource behavior | Blocked network does not exhaust snapshot storage, UI queues, terminal queues, or input bounds |
 | SFTP independence | On full clients only, transfer bytes bypass terminal parsing and interrupted transfer resumes under the original integrity rules; tvOS/watchOS expose no SFTP UI |
-| Platform input and lifecycle | Catalyst desktop handling, visionOS window/focus/input, and tvOS focus/keyboard verified; native Mac/Catalyst focus loss alone does not detach; A17 passes |
+| Platform input and lifecycle | Catalyst desktop handling, visionOS window/focus/input, and tvOS focus/keyboard verified; Mac (Catalyst) focus loss alone does not detach; A17 passes |
 | Watch companion | Physical paired-device testing, explicit stale/capture-time display, 16 KiB bounds, one pending refresh, opt-in preview, and no credentials/input/login/host attachment; A18 passes |
 | Cross-platform ownership | One host writer across direct-client types; stale epochs cannot inject input; watch refresh acquires no lease; A19 passes |
 

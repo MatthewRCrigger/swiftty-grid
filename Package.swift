@@ -220,7 +220,7 @@ let package = Package(
         "SessionCore", "ScreenProtocol", "SSHClient", "TerminalSurface",
         "CompanionModel", "SwifttyCore", "SwifttyMobile", "MuxNavigation",
         "HostConnection",
-        // AppKit surface for the native Mac client only; never Catalyst.
+        // AppKit surface for native macOS builds (the SwiftPM test host).
         .target(name: "SwifttyMac", condition: .when(platforms: [.macOS])),
         .product(name: "Crypto", package: "swift-crypto"),
       ],

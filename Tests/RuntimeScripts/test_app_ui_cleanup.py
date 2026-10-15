@@ -85,7 +85,7 @@ class AppUICleanupTests(unittest.TestCase):
             if name.startswith("FIXTURE_") and name != "FIXTURE_DIRECTORY":
                 self.environment.pop(name)
 
-    def invoke(self, destination="platform=macOS", arguments=(), **settings):
+    def invoke(self, destination="platform=macOS,variant=Mac Catalyst", arguments=(), **settings):
         for name in ["calls.jsonl", "stop.count", "source.resumed", "generated.yml"]:
             (self.directory / name).unlink(missing_ok=True)
         workspace = self.directory / "workspace with 'quotes'"
@@ -166,7 +166,6 @@ class AppUICleanupTests(unittest.TestCase):
 
     def test_destination_and_xcodebuild_arguments_are_preserved(self):
         destinations = [
-            ("platform=macOS", "MacClient"),
             ("platform=macOS,variant=Mac Catalyst", "CatalystClient"),
             ("platform=iOS Simulator,id=fixture", "MobileClient"),
             ("platform=iOS,id=fixture", "MobileClient"),

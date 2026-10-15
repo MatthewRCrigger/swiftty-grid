@@ -66,7 +66,7 @@ extension MainActorIntegrationTests {
       let defaults = try #require(UserDefaults(suiteName: suite))
       defer { defaults.removePersistentDomain(forName: suite) }
       let app = RoamingAppModel(
-        profile: .profile(for: .mac),
+        profile: .profile(for: .catalyst),
         store: HostProfileStore(
           fileURL: directory.appendingPathComponent("hosts.json")
         ),
@@ -166,7 +166,7 @@ extension MainActorIntegrationTests {
       defer { defaults.removePersistentDomain(forName: suite) }
       let fixture = try await TransferFixture.make()
       let app = RoamingAppModel(
-        profile: .profile(for: .mac),
+        profile: .profile(for: .catalyst),
         store: HostProfileStore(
           fileURL: fixture.local.appendingPathComponent("hosts.json")
         ),

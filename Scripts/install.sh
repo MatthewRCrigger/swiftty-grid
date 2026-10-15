@@ -7,7 +7,7 @@
 # usage: Scripts/install.sh [options]
 #   --identity ID      signing identity; default: match a running agent,
 #                      else the first Developer ID identity or ad-hoc. See
-#                      Scripts/package-swiftmux.sh for NOTARY_PROFILE etc.
+#                      Scripts/notarize.sh for NOTARY_PROFILE etc.
 #   --dest DIR         install directory (default /Applications)
 #   --roaming          also set up remote clients:
 #     --host NAME      advertised host (default `scutil --get LocalHostName`.local)
@@ -210,12 +210,8 @@ if [ "$roaming" -eq 1 ]; then
   codesign --force --options runtime "$timestamp" --sign "$identity" \
     --identifier "$bundle_id.swifttyd" "$signed"
   codesign --verify --strict --verbose=1 "$signed"
-  # A bare executable cannot be stapled; Gatekeeper fetches its ticket online.
-  if [ -n "${NOTARY_PROFILE:-}" ] && [ "$identity" != "-" ]; then
-    zip=.build/package/swifttyd-notarize.zip
-    rm -f -- "$zip"
-    ditto -c -k "$signed" "$zip"
-    xcrun notarytool submit "$zip" --keychain-profile "$NOTARY_PROFILE" --wait
+  if [ -n "${NOTARY_PROFILE:-}${NOTARY_KEY_ID:-}" ] && [ "$identity" != "-" ]; then
+    Scripts/notarize.sh "$signed"
   fi
   sudo mkdir -p "$(dirname "$helper")"
   sudo install -m 0755 -o root -g wheel "$signed" "$helper"

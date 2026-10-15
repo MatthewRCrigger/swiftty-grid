@@ -115,15 +115,6 @@ public struct HostListView: View {
           .accessibilityIdentifier("hosts.connect")
         }
       }
-      if model.profile.localPTY {
-        ToolbarItem(placement: .automatic) {
-          Button {
-            model.openLocalShell()
-          } label: {
-            Label("Local Shell", systemImage: "terminal")
-          }
-        }
-      }
     }
     #if !os(tvOS)
     .adaptiveSheet(item: $browsing) { host in

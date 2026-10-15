@@ -14,7 +14,7 @@
 #   The evidence records the associated domains each target was given:
 #   none when the variable is unset.
 # - Builds each app with CODE_SIGNING_ALLOWED=NO for: iOS Simulator,
-#   macOS, Mac Catalyst, visionOS Simulator, tvOS Simulator and watchOS
+#   Mac Catalyst, visionOS Simulator, tvOS Simulator and watchOS
 #   Simulator.
 # - Builds the swifttyd helper with SwiftPM.
 # - Writes an evidence file with toolchain/SDK versions, destinations and
@@ -113,7 +113,7 @@ else
 fi
 record_evidence echo
 record_evidence echo "## Universal Links (SWIFTTY_LINK_DOMAINS=${SWIFTTY_LINK_DOMAINS:-})"
-for target in MobileClient MacClient CatalystClient VisionClient; do
+for target in MobileClient CatalystClient VisionClient; do
   entitlements="$repository_root/Apps/Config/Generated/$target.entitlements"
   if domains=$(/usr/bin/python3 -I - "$entitlements" <<'PY'
 import plistlib, sys
@@ -171,7 +171,6 @@ build() {
 }
 
 build MobileClient "generic/platform=iOS Simulator"
-build MacClient "generic/platform=macOS"
 build CatalystClient "generic/platform=macOS,variant=Mac Catalyst"
 build VisionClient "generic/platform=visionOS Simulator"
 build TVClient "generic/platform=tvOS Simulator"

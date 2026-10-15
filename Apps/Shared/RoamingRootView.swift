@@ -65,7 +65,7 @@ public struct RoamingRootView: View {
       // Suspension pauses bulk SFTP work; a Mac window losing focus does
       // not (spec §10).
       switch model.profile.kind {
-      case .mac, .catalyst: break
+      case .catalyst: break
       case .mobile, .vision, .tv:
         model.transferPolicy.setSuspended(phase == .background)
       }
@@ -80,11 +80,11 @@ public struct RoamingRootView: View {
   }
 
   /// Hide terminal content from app-switcher snapshots on platforms that
-  /// take them. A Mac (native or Catalyst) window losing focus is not a
+  /// take them. A Mac window losing focus is not a
   /// suspension, so it stays visible there (spec §9).
   private var hidesContent: Bool {
     switch model.profile.kind {
-    case .mac, .catalyst: false
+    case .catalyst: false
     case .mobile, .vision, .tv:
       scenePhase != .active && model.activeSession != nil
     }

@@ -249,8 +249,7 @@ https://<configured domain>/a/<locator>
   #    application/json at /.well-known/apple-app-site-association.
   #    It claims only /a/<locator> (one component, no query or fragment).
   Scripts/make-aasa.sh -o apple-app-site-association TEAMID1234 \
-    com.chr33s.swiftty dev.swiftty.roaming.mobile dev.swiftty.roaming.mac \
-    dev.swiftty.roaming.catalyst dev.swiftty.roaming.vision
+    com.chr33s.swiftty dev.chr33s.swiftty.roaming
   Scripts/make-aasa.sh --check apple-app-site-association   # re-validate rule order
 
   # 2. Native macOS app: Info.plist SwifttyAssociatedDomains plus the
@@ -261,7 +260,7 @@ https://<configured domain>/a/<locator>
 
   # 3. Roaming clients: XcodeGen's preGenCommand (Scripts/configure-links.sh)
   #    writes Apps/Config/Generated/ with the domain list and per-target
-  #    entitlements for MobileClient, MacClient, CatalystClient and
+  #    entitlements for MobileClient, CatalystClient and
   #    VisionClient. tvOS stays swiftty:// only.
   SWIFTTY_LINK_DOMAINS=links.example.com Scripts/build-platforms.sh
   ```
@@ -372,6 +371,45 @@ epoch, and each attachment takes the workspace's interactive lease: a
 workspace the Mac app controls is refused (`writerBusy`) unless the client
 resumes with `takeover`. Grant expiry never ends a shell the remote client
 did not create. Firewall changes are not made automatically.
+
+### Xcode Cloud, TestFlight and releases
+
+The roaming clients are one universal-purchase app, `dev.chr33s.swiftty.roaming`:
+`MobileClient` (iOS/iPadOS, embedding `WatchCompanion` as
+`dev.chr33s.swiftty.roaming.watchkitapp`), `CatalystClient` (macOS), `VisionClient`
+and `TVClient` are platforms of one App Store Connect app, so testers see a
+single TestFlight entry. Swiftty.app is the Mac terminal and host; Mac users
+reach remote sessions through the Catalyst build.
+
+`Apps/ci_scripts/ci_post_clone.sh` drives Xcode Cloud: it installs XcodeGen,
+generates `Apps/RoamingClients.xcodeproj` and copies `Package.resolved` into
+it (Xcode Cloud never resolves packages itself). Create one Xcode Cloud
+product for the app, pointed at `Apps/RoamingClients.xcodeproj`, with
+`SWIFTTY_TEAM_ID` (and optionally `SWIFTTY_LINK_DOMAINS`) in the workflow
+environment, and one workflow with an archive action per platform, each
+with a TestFlight post-action:
+
+| Scheme | Archive platform |
+|---|---|
+| `MobileClient` | iOS |
+| `CatalystClient` | macOS |
+| `VisionClient` | visionOS |
+| `TVClient` | tvOS |
+
+tvOS and visionOS need layered icons (`Apps/TVClient/Assets.xcassets` with
+the Top Shelf images, `Apps/VisionClient/Assets.xcassets`); regenerate them
+from `icon.svg` with `xcrun swift Scripts/gen-platform-icons.swift`.
+
+Swiftty.app is unsandboxed (it owns local PTYs) and is distributed with
+Developer ID. `.github/workflows/release-mac.yml` runs on the self-hosted
+runner for a pushed `v<version>` tag (or manually, as a
+`mac-v<version>-<build>` prerelease): `Scripts/package-swiftmux.sh` builds and
+signs it, then `Scripts/release-mac-github.sh` notarizes it (`Scripts/notarize.sh`,
+shared with the package and install scripts) and uploads a zip and SHA-256 to
+the release, or to an existing draft for the tag. It needs the runner to hold the Developer
+ID certificate in an unlocked keychain, the repository variable
+`DEVELOPER_ID_IDENTITY`, and an App Store Connect API key as the secrets
+`NOTARY_KEY_ID`, `NOTARY_ISSUER_ID` and `NOTARY_KEY` (the `.p8` contents).
 
 ### Connecting a device
 

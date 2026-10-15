@@ -7,8 +7,6 @@ import SwifttyCore
 public enum PlatformKind: String, Hashable, Sendable, CaseIterable {
   /// iPhone and iPad (iOS/iPadOS 27).
   case mobile
-  /// Native AppKit-hosted macOS app.
-  case mac
   /// UIKit-derived Mac Catalyst app.
   case catalyst
   /// Windowed visionOS app.
@@ -16,12 +14,11 @@ public enum PlatformKind: String, Hashable, Sendable, CaseIterable {
   /// Focus-first tvOS app.
   case tv
 
-  /// The product this binary was compiled as.
+  /// The product this binary was compiled as. Native macOS builds exist
+  /// only for the SwiftPM test host and behave as the desktop client.
   public static var current: PlatformKind {
-    #if targetEnvironment(macCatalyst)
+    #if os(macOS) || targetEnvironment(macCatalyst)
       .catalyst
-    #elseif os(macOS)
-      .mac
     #elseif os(visionOS)
       .vision
     #elseif os(tvOS)
@@ -52,8 +49,6 @@ public struct PlatformProfile: Hashable, Sendable {
   public let roamingTerminal: Bool
   /// SFTP browsing and regular-file transfer (full clients only).
   public let sftp: Bool
-  /// App-local PTY backend (native macOS only; never Catalyst).
-  public let localPTY: Bool
   /// Local copy/paste through the system pasteboard.
   public let clipboard: Bool
   /// Platform document import/export for SFTP.
@@ -82,7 +77,7 @@ public struct PlatformProfile: Hashable, Sendable {
 
   /// What a terminal surface may offer for an ordinary SSH session here.
   /// Remote clipboard writes and URL opening stay off for remote content
-  /// (spec §12); local process actions only exist with a local PTY.
+  /// (spec §12), and there is no local process to act on.
   public var sshSurface: SurfaceCapabilities {
     var caps = SurfaceCapabilities.full
     caps.remoteClipboardWrites = false
@@ -94,41 +89,30 @@ public struct PlatformProfile: Hashable, Sendable {
     return caps
   }
 
-  /// The local-PTY surface, or `nil` where no local PTY exists.
-  public var localSurface: SurfaceCapabilities? {
-    localPTY ? .full : nil
-  }
-
   public static func profile(for kind: PlatformKind) -> PlatformProfile {
     switch kind {
     case .mobile:
       PlatformProfile(
         kind: kind, tier: .fullClient, sshShell: true, roamingTerminal: true,
-        sftp: true, localPTY: false, clipboard: true, documentAccess: true,
+        sftp: true, clipboard: true, documentAccess: true,
         focusFirst: false, companionBridge: true
-      )
-    case .mac:
-      PlatformProfile(
-        kind: kind, tier: .fullClient, sshShell: true, roamingTerminal: true,
-        sftp: true, localPTY: true, clipboard: true, documentAccess: true,
-        focusFirst: false, companionBridge: false
       )
     case .catalyst:
       PlatformProfile(
         kind: kind, tier: .fullClient, sshShell: true, roamingTerminal: true,
-        sftp: true, localPTY: false, clipboard: true, documentAccess: true,
+        sftp: true, clipboard: true, documentAccess: true,
         focusFirst: false, companionBridge: false
       )
     case .vision:
       PlatformProfile(
         kind: kind, tier: .fullClient, sshShell: true, roamingTerminal: true,
-        sftp: true, localPTY: false, clipboard: true, documentAccess: true,
+        sftp: true, clipboard: true, documentAccess: true,
         focusFirst: false, companionBridge: false
       )
     case .tv:
       PlatformProfile(
         kind: kind, tier: .terminalOnly, sshShell: true, roamingTerminal: true,
-        sftp: false, localPTY: false, clipboard: false, documentAccess: false,
+        sftp: false, clipboard: false, documentAccess: false,
         focusFirst: true, companionBridge: false
       )
     }

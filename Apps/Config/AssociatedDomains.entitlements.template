@@ -4,7 +4,7 @@
 <dict>
 	<!--
 	REFERENCE ONLY: the entitlement Scripts/configure-links.sh adds to
-	Config/Generated/<Target>.entitlements (MobileClient, MacClient,
+	Config/Generated/<Target>.entitlements (MobileClient,
 	CatalystClient, VisionClient) when SWIFTTY_LINK_DOMAINS is set, one
 	applinks:<domain> entry per domain (spec.inbox.md §4.4). No target
 	references this file, and nothing is added when the variable is unset.

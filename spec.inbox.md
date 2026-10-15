@@ -642,7 +642,7 @@ every piece is generated from configuration and can be checked locally.
   - `AttentionLinkRouter` shows each state as an `NSAlert`.
   - `MuxWorkspaceController.reveal(pane:tab:)` focuses the pane.
   - A per-install "This Mac" host ID is kept in UserDefaults.
-- **Roaming clients (iOS/iPadOS, Catalyst, visionOS, tvOS, MacClient):**
+- **Roaming clients (iOS/iPadOS, Catalyst, visionOS, tvOS):**
   - The `swiftty` scheme comes from `Apps/Config/AttentionLinks.plist`.
   - `.onOpenURL`, web-activity and Handoff-activity routing live in
     `Apps/Shared/AttentionLinkViews.swift`.
@@ -659,8 +659,8 @@ every piece is generated from configuration and can be checked locally.
     writes `Apps/Config/Generated/` (gitignored):
     - `AttentionLinks.plist`, with `SwifttyAssociatedDomains` set to the
       domains;
-    - `<Target>.entitlements` for MobileClient, MacClient, CatalystClient
-      and VisionClient. Each holds the target's own
+    - `<Target>.entitlements` for MobileClient, CatalystClient and
+      VisionClient. Each holds the target's own
       `Apps/<Target>/<Target>.entitlements` keys (or an empty dictionary)
       and, only when domains are set, the associated-domains key.
 

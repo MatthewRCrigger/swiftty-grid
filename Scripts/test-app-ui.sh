@@ -6,11 +6,10 @@
 #
 # destination selects the app:
 #   'platform=iOS Simulator,id=<udid>'       MobileClient
-#   'platform=macOS'                         MacClient
 #   'platform=macOS,variant=Mac Catalyst'    CatalystClient
 #   'platform=iOS,id=<device-udid>'          MobileClient on a physical device
 #                                            (set RST_PUBLIC_HOST)
-# Mac and device destinations sign with Apple Development for team $RST_UI_TEAM
+# Mac Catalyst and device destinations sign with Apple Development for team $RST_UI_TEAM
 # (default 72KB9YQR7B) using locally installed profiles; nothing is
 # provisioned. Extra args go to xcodebuild, e.g.
 #   -only-testing:AppUITests/RoamingAppUITests/testRejectUnknownHostKey
@@ -35,7 +34,6 @@ case $destination in
   # A physical iPhone or iPad: needs RST_PUBLIC_HOST=<this Mac's LAN IP>
   # so the device reaches swifttyd and the SSH relay over the network.
   *"platform=iOS,"*) platform=iOS; app=MobileClient; device=YES ;;
-  *macOS*) platform=macOS; app=MacClient ;;
   *) echo "unsupported destination: $destination" >&2; exit 2 ;;
 esac
 
@@ -67,7 +65,7 @@ if [ $device = YES ] && [ -z "${RST_PUBLIC_HOST:-}" ]; then
   echo "physical devices need RST_PUBLIC_HOST=<this Mac's LAN address>" >&2
   exit 2
 fi
-if [ $platform = macOS ] || [ $catalyst = YES ] || [ $device = YES ]; then
+if [ $catalyst = YES ] || [ $device = YES ]; then
   signing="CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: $team
         CODE_SIGN_IDENTITY: Apple Development"
@@ -83,7 +81,7 @@ case $app in
     # RST_UI_BUNDLE_SUFFIX installs a separate app identity with fresh
     # permission state (e.g. a Local Network denial run) without touching
     # an installed client's data.
-    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mobile${RST_UI_BUNDLE_SUFFIX:-}
+    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty.roaming${RST_UI_BUNDLE_SUFFIX:-}
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: Find and connect to your Mac to access terminal workspaces on your local network.
         INFOPLIST_KEY_NSCameraUsageDescription: Scan the connection code displayed by your Mac.
         INFOPLIST_FILE: $apps/Config/AttentionLinks.plist
@@ -93,18 +91,12 @@ case $app in
   CatalystClient)
     sources="[{ path: \"$apps/CatalystClient\", excludes: [\"*.entitlements\"] }]"
     deps="- { package: Swiftty, product: RoamingApp }"
-    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.catalyst
+    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty.roaming
         SUPPORTS_MACCATALYST: YES
         DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
         TARGETED_DEVICE_FAMILY: \"2,6\"
         CODE_SIGN_ENTITLEMENTS: $apps/CatalystClient/CatalystClient.entitlements
         INFOPLIST_KEY_UILaunchScreen_Generation: YES" ;;
-  MacClient)
-    sources="[{ path: \"$apps/MacClient\", excludes: [\"*.entitlements\"] }]"
-    deps="- { package: Swiftty, product: RoamingApp }"
-    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mac
-        CODE_SIGN_ENTITLEMENTS: $apps/MacClient/MacClient.entitlements
-        ENABLE_HARDENED_RUNTIME: YES" ;;
 esac
 
 project="$workspace/project"

@@ -24,13 +24,7 @@ struct LiveTerminalSurface: View {
     case let ssh as SSHShellController:
       SSHSurfaceView(controller: ssh, app: app)
     default:
-      #if os(macOS) && !targetEnvironment(macCatalyst)
-        if let local = controller as? LocalShellController {
-          LocalSurfaceView(controller: local)
-        }
-      #else
-        EmptyView()
-      #endif
+      EmptyView()
     }
   }
 
@@ -42,12 +36,6 @@ struct LiveTerminalSurface: View {
       created = RoamingTerminalController(model: model, app: app)
     case .ordinarySSH:
       created = SSHShellController(model: model, app: app)
-    case .localShell:
-      #if os(macOS) && !targetEnvironment(macCatalyst)
-        created = LocalShellController(model: model)
-      #else
-        created = SSHShellController(model: model, app: app)
-      #endif
     }
     model.controller = created
     return created
@@ -239,40 +227,6 @@ struct SSHSurfaceView: View {
   }
 }
 
-// MARK: - Local shell
-
-#if os(macOS) && !targetEnvironment(macCatalyst)
-  struct LocalSurfaceView: View {
-    let controller: LocalShellController
-
-    var body: some View {
-      VStack(spacing: 0) {
-        if let notice = controller.inputNotice {
-          HStack {
-            Label(notice, systemImage: "exclamationmark.triangle")
-            Spacer()
-            Button("Dismiss", systemImage: "xmark") { controller.dismissInputNotice() }
-          }
-          .font(.caption)
-          .padding(8)
-          .glassPanel(cornerRadius: 0, tint: .yellow.opacity(0.2))
-        }
-        TerminalDisplayView(
-          session: controller.backend.session,
-          capabilities: controller.model.capabilities,
-          prepare: { controller.attach($0) }
-        )
-        .glassSurface()
-        .overlay {
-          if case .failed(let problem) = controller.phase {
-            ProblemCard(problem: problem) { _ in }
-          }
-        }
-      }
-    }
-  }
-#endif
-
 // MARK: - Shared pieces
 
 struct ProgressCard: View {
@@ -359,7 +313,7 @@ struct ProblemCard: View {
     }
   }
 #elseif os(macOS)
-  /// Hosts the AppKit `TerminalView` (native macOS).
+  /// Hosts the AppKit `TerminalView` (native macOS: the SwiftPM test host).
   struct TerminalDisplayView: NSViewRepresentable {
     let session: TerminalSession
     let capabilities: SurfaceCapabilities

@@ -66,14 +66,11 @@ public enum TerminalKind: Hashable, Sendable {
   /// An ordinary SSH shell. A *different* shell from any roaming session;
   /// it ends with its connection and is never resumed (spec §9).
   case ordinarySSH
-  /// App-local PTY (native macOS only).
-  case localShell
 
   public var displayName: String {
     switch self {
     case .roaming: "Roaming session"
     case .ordinarySSH: "Ordinary SSH shell"
-    case .localShell: "Local shell"
     }
   }
 }
@@ -153,7 +150,6 @@ public final class TerminalScreenModel: Identifiable {
       switch kind {
       case .roaming: profile.roamingSurface
       case .ordinarySSH: profile.sshSurface
-      case .localShell: profile.localSurface ?? profile.sshSurface
       }
     self.stateObservedAt = now
     self.companionObservedAt = now
@@ -297,6 +293,12 @@ extension CompanionConnectionState {
       case .userClosed: .userClosed
       }
   }
+}
+
+/// Completion flag for `RoamingAppModel.detachBeforeExit()`.
+@MainActor
+private final class TerminationDetach {
+  var done = false
 }
 
 /// Shared application model for every direct client.
@@ -493,7 +495,6 @@ public final class RoamingAppModel {
     {
       return
     }
-    if kind == .localShell, !profile.localPTY { return }
     close()
     let session = TerminalScreenModel(host: host, profile: profile, kind: kind)
     session.onChange = { [weak self] model in
@@ -503,12 +504,6 @@ public final class RoamingAppModel {
     }
     activeSession = session
     onSessionObservation?(session.companionObservation)
-  }
-
-  /// Opens an app-local shell (native macOS only).
-  public func openLocalShell() {
-    guard profile.localPTY else { return }
-    open(.localMachine, kind: .localShell)
   }
 
   /// Closes the active terminal view. `.detach` keeps a roaming host
@@ -546,6 +541,28 @@ public final class RoamingAppModel {
     else { return }
     session.controller = nil
     await controller.close(.detach)
+  }
+
+  /// `detachForTermination()` for a quit the platform cannot defer (Mac
+  /// Catalyst's `applicationWillTerminate`): runs the main run loop until
+  /// the detach finishes, at most the client's detach deadline plus one
+  /// second, so the process does not exit before the detach is sent.
+  public func detachBeforeExit() {
+    guard activeSession?.controller != nil else { return }
+    let finished = TerminationDetach()
+    Task {
+      await detachForTermination()
+      finished.done = true
+    }
+    let deadline = RoamingClientConfiguration(initialGrid: GridSize(columns: 1, rows: 1))
+      .detachDeadline + .seconds(1)
+    let parts = deadline.components
+    let bound = Date.now.addingTimeInterval(
+      Double(parts.seconds) + Double(parts.attoseconds) / 1e18
+    )
+    while !finished.done, Date.now < bound {
+      _ = RunLoop.main.run(mode: .default, before: min(bound, .now.addingTimeInterval(0.05)))
+    }
   }
 
   /// Opens `workspace` on `host` from an attention link: the next start
@@ -824,16 +841,6 @@ public final class RoamingAppModel {
       UserDefaults.standard.set(data, forKey: settingsKey)
     }
   }
-}
-
-extension HostProfile {
-  /// Stand-in profile for the app-local shell; never used for SSH.
-  public static let localMachine = HostProfile(
-    id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
-    nickname: "This Mac",
-    host: "localhost",
-    username: "local"
-  )
 }
 
 /// Remembered roaming session per saved host, so a cold launch can resume

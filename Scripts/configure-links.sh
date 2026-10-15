@@ -10,7 +10,7 @@
 # Writes:
 #   AttentionLinks.plist   Apps/Config/AttentionLinks.plist with
 #                          SwifttyAssociatedDomains set to the domains.
-#   <Target>.entitlements  for MobileClient, MacClient, CatalystClient and
+#   <Target>.entitlements  for MobileClient, CatalystClient and
 #                          VisionClient: the target's own entitlements
 #                          (Apps/<Target>/<Target>.entitlements, or an
 #                          empty dictionary) plus, only when domains are
@@ -56,7 +56,7 @@ plutil -replace SwifttyAssociatedDomains -json "$domains_json" "$info.tmp"
 plutil -lint -s "$info.tmp"
 mv "$info.tmp" "$info"
 
-for target in MobileClient MacClient CatalystClient VisionClient; do
+for target in MobileClient CatalystClient VisionClient; do
   file="$out/$target.entitlements"
   base="$repository_root/Apps/$target/$target.entitlements"
   if [ -f "$base" ]; then

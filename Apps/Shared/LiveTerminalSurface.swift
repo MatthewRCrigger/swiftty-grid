@@ -9,18 +9,13 @@ import SwifttyCore
 import Synchronization
 import TerminalSurface
 
-#if os(macOS) && !targetEnvironment(macCatalyst)
-import AppKit
-import SwifttyMac
-#endif
-
 // The live terminal surfaces behind `TerminalScreen` (replacing the
 // former placeholder): one MainActor controller per opened
 // `TerminalScreenModel`, owning the display session and its backend.
 
 extension TerminalSurfaceFactory {
   /// Real surfaces for `app`'s sessions: a roaming presentation fed by
-  /// `RoamingClient`, an ordinary SSH shell, or (native macOS) a local PTY.
+  /// `RoamingClient`, or an ordinary SSH shell.
   public static func live(_ app: RoamingAppModel) -> TerminalSurfaceFactory {
     TerminalSurfaceFactory { [weak app] model in
       guard let app else { return AnyView(EmptyView()) }
@@ -149,8 +144,10 @@ final class RoamingTerminalController: TerminalSurfaceController {
   private var monitor: NWPathMonitor?
   @ObservationIgnored
   private var pathSeen = false
+  #if os(macOS) || targetEnvironment(macCatalyst)
   @ObservationIgnored
-  private var observers: [any NSObjectProtocol] = []
+  private var powerMonitor: SystemPowerMonitor?
+  #endif
   /// The workspace this screen attaches to, once chosen.
   @ObservationIgnored
   private(set) var intent: WorkspaceIntent?
@@ -332,11 +329,11 @@ final class RoamingTerminalController: TerminalSurfaceController {
   // MARK: Lifecycle
 
   /// Mobile, spatial and TV scenes detach in the background and
-  /// reattach in the foreground. A Mac (native or Catalyst) window
-  /// losing focus is not a suspension (spec §9).
+  /// reattach in the foreground. A Mac window losing focus is not a
+  /// suspension; sleep is (spec §9, `SystemPowerMonitor`).
   func scenePhaseChanged(_ phase: ScenePhase) {
     switch model.profile.kind {
-    case .mac, .catalyst: return
+    case .catalyst: return
     case .mobile, .vision, .tv: break
     }
     switch phase {
@@ -374,26 +371,11 @@ final class RoamingTerminalController: TerminalSurfaceController {
     }
     monitor.start(queue: DispatchQueue(label: "dev.swiftty.roaming.path"))
     self.monitor = monitor
-    #if os(macOS) && !targetEnvironment(macCatalyst)
-    // Native macOS: sleep detaches, wake reattaches; focus does not.
-    let center = NSWorkspace.shared.notificationCenter
-    observers.append(
-      center.addObserver(
-        forName: NSWorkspace.willSleepNotification,
-        object: nil,
-        queue: .main
-      ) { [weak self] _ in
-        MainActor.assumeIsolated { self?.serial { await $0.enterBackground() } }
-      }
-    )
-    observers.append(
-      center.addObserver(
-        forName: NSWorkspace.didWakeNotification,
-        object: nil,
-        queue: .main
-      ) { [weak self] _ in
-        MainActor.assumeIsolated { self?.serial { await $0.wake() } }
-      }
+    #if os(macOS) || targetEnvironment(macCatalyst)
+    // A Mac: sleep detaches, wake reattaches; focus does not.
+    powerMonitor = SystemPowerMonitor(
+      onSleep: { [weak self] in self?.serial { await $0.enterBackground() } },
+      onWake: { [weak self] in self?.serial { await $0.wake() } }
     )
     #endif
   }
@@ -415,12 +397,10 @@ final class RoamingTerminalController: TerminalSurfaceController {
     slot.set(nil)
     pump.close()
     monitor?.cancel()
-    #if os(macOS) && !targetEnvironment(macCatalyst)
-    for observer in observers {
-      NSWorkspace.shared.notificationCenter.removeObserver(observer)
-    }
+    #if os(macOS) || targetEnvironment(macCatalyst)
+    powerMonitor?.invalidate()
+    powerMonitor = nil
     #endif
-    observers = []
     display.semanticInputHandler = nil
     display.gridProposalHandler = nil
     if let client {
@@ -719,92 +699,3 @@ final class SSHShellController: TerminalSurfaceController {
 
   func dismissInputNotice() { inputNotice = nil }
 }
-
-// MARK: - Local shell (native macOS only)
-
-#if os(macOS) && !targetEnvironment(macCatalyst)
-/// The app-local PTY (spec §A.3.A). Its lifetime is the app's.
-@MainActor
-@Observable
-final class LocalShellController: TerminalSurfaceController {
-  let model: TerminalScreenModel
-  let backend: LocalPTYBackend
-  private(set) var phase: SurfacePhase = .preparing("Starting shell")
-  private(set) var inputNotice: String?
-  @ObservationIgnored
-  private var refusalRelay: InputRefusalRelay?
-  @ObservationIgnored
-  private var started = false
-
-  init(model: TerminalScreenModel) {
-    self.model = model
-    let session = TerminalSession(
-      configuration: Configuration().sessionConfiguration()
-    )
-    backend = LocalPTYBackend(session: session)
-    let relay = InputRefusalRelay { [weak self] refusal in
-      guard let self else { return }
-      switch refusal {
-      case .backpressure:
-        inputNotice =
-          "Input was not sent because the local shell is busy. Try again."
-      case .invalid:
-        inputNotice =
-          "Input was not sent because it exceeds the supported input limits."
-      case .closed, .notActive:
-        inputNotice = "Input was not sent because the local shell is not ready."
-      }
-    }
-    refusalRelay = relay
-    backend.onInputRefusal = { reason in relay.report(reason) }
-    model.previewLines = { [session] in session.withState { $0.screenLines } }
-  }
-
-  /// Starts the shell once `view` hosts the session, keeping the
-  /// view's own event handling behind the backend's exit tracking.
-  func attach(_ view: TerminalView) {
-    guard !started else { return }
-    started = true
-    backend.onEvent = backend.session.onEvent
-    backend.onLifecycleChange = { [weak self] lifecycle in
-      DispatchQueue.main.async {
-        MainActor.assumeIsolated { self?.apply(lifecycle) }
-      }
-    }
-    do {
-      try backend.start(Configuration().sessionConfiguration())
-      phase = .running
-    } catch {
-      phase = .failed(
-        SurfaceProblem(
-          title: "Shell could not start",
-          detail: "The local shell failed to launch.",
-          actions: []
-        )
-      )
-    }
-  }
-
-  private func apply(_ lifecycle: SurfaceLifecycle) {
-    model.observe(lifecycle)
-    if case let .exited(status) = lifecycle {
-      phase = .failed(
-        SurfaceProblem(
-          title: "Shell exited",
-          detail: status.map { "The shell exited with status \($0)." }
-            ?? "The shell exited.",
-          actions: []
-        )
-      )
-    }
-  }
-
-  func close(_ mode: RoamingCloseMode) async {
-    refusalRelay?.close()
-    refusalRelay = nil
-    await backend.close()
-  }
-
-  func dismissInputNotice() { inputNotice = nil }
-}
-#endif

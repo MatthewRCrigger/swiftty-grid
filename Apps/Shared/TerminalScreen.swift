@@ -125,7 +125,6 @@ struct TerminalSurfacePlaceholder: View {
       ("Scrollback", caps.scrollback),
       ("Search", caps.search),
       ("SFTP", model.profile.sftp),
-      ("Local shell", model.profile.localPTY),
     ]
     return VStack(alignment: .leading, spacing: 4) {
       ForEach(entries, id: \.0) { name, enabled in

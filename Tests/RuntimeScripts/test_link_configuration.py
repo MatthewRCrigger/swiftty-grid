@@ -14,10 +14,10 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-TARGETS = ["MobileClient", "MacClient", "CatalystClient", "VisionClient"]
+TARGETS = ["MobileClient", "CatalystClient", "VisionClient"]
 ENTITLEMENT = "com.apple.developer.associated-domains"
 TEAM = "TEAMID1234"
-BUNDLES = ["dev.swiftty.fixture.mobile", "dev.swiftty.fixture.mac"]
+BUNDLES = ["dev.swiftty.fixture.mobile", "dev.swiftty.fixture.catalyst"]
 BONJOUR = "_swiftty._tcp"
 MULTICAST = "com.apple.developer.networking.multicast"
 TOOL = '''#!/PYTHON
@@ -39,7 +39,8 @@ class LinkConfigurationTests(unittest.TestCase):
         self.root = Path(directory.name)
         self.environment = dict(os.environ)
         for key in ["SWIFTTY_LINK_DOMAINS", "SWIFTTY_LINK_MODE",
-                    "SWIFTTY_PROVISIONING_PROFILE", "NOTARY_PROFILE"]:
+                    "SWIFTTY_PROVISIONING_PROFILE", "NOTARY_PROFILE",
+                    "NOTARY_KEY_ID"]:
             self.environment.pop(key, None)
 
     def run_script(self, name, *arguments, **environment):

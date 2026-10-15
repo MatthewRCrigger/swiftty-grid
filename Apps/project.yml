@@ -5,6 +5,13 @@
 # Generate with Scripts/build-platforms.sh (the .xcodeproj is not
 # committed). `swifttyd` is a SwiftPM executable and is not built here.
 #
+# Universal purchase: MobileClient, CatalystClient, VisionClient and
+# TVClient share one bundle ID, so they are the iOS, macOS (Mac Catalyst),
+# visionOS and tvOS platforms of a single App Store Connect app and a
+# single TestFlight entry; the watch app's ID extends it. The native macOS
+# terminal (Swiftty.app, Scripts/package-swiftmux.sh) is SwiftPM-built,
+# unsandboxed and distributed separately with Developer ID.
+#
 # Universal Links are configured at generation time: set
 # SWIFTTY_LINK_DOMAINS (comma-separated) before running xcodegen and the
 # preGenCommand writes Config/Generated/ (spec.inbox.md §4.4).
@@ -15,7 +22,7 @@ options:
   # entitlements from SWIFTTY_LINK_DOMAINS (no associated domains when
   # unset). Runs from this directory.
   preGenCommand: ../Scripts/configure-links.sh
-  bundleIdPrefix: dev.swiftty.roaming
+  bundleIdPrefix: dev.chr33s.swiftty.roaming
   createIntermediateGroups: true
   deploymentTarget:
     iOS: "27.0"
@@ -42,8 +49,16 @@ settings:
     CURRENT_PROJECT_VERSION: "1"
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     DEAD_CODE_STRIPPING: YES
-    # Resources/Assets.xcassets (iOS, watchOS and macOS images; tvOS and
-    # visionOS need layered icons and have none yet).
+    # Automatic signing for Xcode Cloud archives (Apps/ci_scripts). XcodeGen
+    # substitutes SWIFTTY_TEAM_ID at generation time; when it is unset the
+    # literal reference expands to an empty team and local unsigned builds
+    # are unaffected.
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ${SWIFTTY_TEAM_ID}
+    # Resources/Assets.xcassets (iOS, watchOS and macOS images). tvOS and
+    # visionOS need layered icons: Apps/TVClient/Assets.xcassets and
+    # Apps/VisionClient/Assets.xcassets, generated from icon.svg by
+    # Scripts/gen-platform-icons.swift.
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
 
 # Shared Info.plist keys for direct clients. No UIBackgroundModes: the
@@ -91,7 +106,7 @@ targets:
       base:
         <<: *directClientSettings
         INFOPLIST_FILE: Config/Generated/AttentionLinks.plist
-        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mobile
+        PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty.roaming
         # Scan Mac Code; the only target that uses the camera.
         INFOPLIST_KEY_NSCameraUsageDescription: >-
           Scan the connection code displayed by your Mac.
@@ -107,27 +122,6 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: >-
           UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown
           UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
-
-  # Native macOS full client; the only target with an app-local PTY.
-  MacClient:
-    type: application
-    platform: macOS
-    sources:
-      - path: MacClient
-        excludes: ["*.entitlements"]
-      - ../Resources/Assets.xcassets
-    scheme: {}
-    dependencies:
-      - package: Swiftty
-        product: RoamingApp
-    settings:
-      base:
-        <<: *directClientSettings
-        INFOPLIST_FILE: Config/Generated/AttentionLinks.plist
-        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mac
-        CODE_SIGN_ENTITLEMENTS: Config/Generated/MacClient.entitlements
-        ENABLE_HARDENED_RUNTIME: YES
-        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
 
   # UIKit-derived full remote client, built only as a Mac Catalyst
   # destination. No local PTY; never the swifttyd agent.
@@ -146,8 +140,12 @@ targets:
       base:
         <<: *directClientSettings
         INFOPLIST_FILE: Config/Generated/AttentionLinks.plist
-        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.catalyst
+        PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty.roaming
         SUPPORTS_MACCATALYST: YES
+        # Mac Catalyst only: it shares the universal-purchase ID with
+        # MobileClient, so an iOS build of this target could replace the
+        # real iOS app (with its watch app) in App Store Connect.
+        SUPPORTED_PLATFORMS: macosx
         DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
         SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
@@ -169,7 +167,7 @@ targets:
       base:
         <<: *directClientSettings
         INFOPLIST_FILE: Config/Generated/AttentionLinks.plist
-        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.vision
+        PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty.roaming
         CODE_SIGN_ENTITLEMENTS: Config/Generated/VisionClient.entitlements
         TARGETED_DEVICE_FAMILY: "7"
 
@@ -186,8 +184,9 @@ targets:
     settings:
       base:
         <<: *directClientSettings
-        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.tv
+        PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty.roaming
         TARGETED_DEVICE_FAMILY: "3"
+        ASSETCATALOG_COMPILER_APPICON_NAME: App Icon & Top Shelf Image
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
 
   # Read-only watch companion. Links ONLY CompanionModel and the
@@ -207,9 +206,9 @@ targets:
         product: MuxNavigation
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mobile.watchkitapp
+        PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty.roaming.watchkitapp
         TARGETED_DEVICE_FAMILY: "4"
         INFOPLIST_KEY_CFBundleDisplayName: Roaming SSH
-        INFOPLIST_KEY_WKCompanionAppBundleIdentifier: dev.swiftty.roaming.mobile
+        INFOPLIST_KEY_WKCompanionAppBundleIdentifier: dev.chr33s.swiftty.roaming
         INFOPLIST_KEY_WKRunsIndependentlyOfCompanionApp: NO
         SKIP_INSTALL: YES

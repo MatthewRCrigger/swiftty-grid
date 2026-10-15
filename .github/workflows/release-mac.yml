@@ -1,0 +1,58 @@
+name: Release Swiftty.app
+
+# Builds Swiftty.app (the unsandboxed native macOS terminal with the
+# SwiftMux agent), signs it with Developer ID, notarizes it and publishes
+# it as a GitHub release. The roaming clients ship through Xcode Cloud and
+# TestFlight instead (Apps/ci_scripts).
+#
+# A pushed tag v<major>[.<minor>[.<patch>]] (e.g. v0.3 or v0.3.1) releases
+# that tag; other v* tags do not start a release. A manual run creates a
+# mac-v<version>-<build> prerelease at the selected commit.
+#
+# Runner setup: the Developer ID Application certificate and private key
+# in a keychain the runner's user can sign with, unlocked.
+#   vars.DEVELOPER_ID_IDENTITY  e.g. "Developer ID Application: Name (TEAMID)"
+#   secrets.NOTARY_KEY_ID, NOTARY_ISSUER_ID, NOTARY_KEY
+#                               App Store Connect API key (.p8 contents),
+#                               used by Scripts/notarize.sh
+
+on:
+  push:
+    # Only the versions package-swiftmux.sh accepts.
+    tags: ['v[0-9]+', 'v[0-9]+.[0-9]+', 'v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: CFBundleShortVersionString
+        required: true
+        default: '0.2'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-mac-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: [self-hosted, macOS, ARM64, swiftty]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package and sign
+        env:
+          IDENTITY: ${{ vars.DEVELOPER_ID_IDENTITY }}
+          SWIFTTY_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
+          SWIFTTY_BUILD: ${{ github.run_number }}
+        run: |
+          [ -n "$IDENTITY" ] || { echo "set the DEVELOPER_ID_IDENTITY repository variable" >&2; exit 64; }
+          SWIFTTY_VERSION=${SWIFTTY_VERSION#v} Scripts/package-swiftmux.sh "$IDENTITY" .build/package
+      - name: Notarize and publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: Scripts/release-mac-github.sh .build/package/Swiftty.app
