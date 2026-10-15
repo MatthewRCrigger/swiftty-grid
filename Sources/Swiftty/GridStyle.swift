@@ -34,6 +34,10 @@ enum Grid {
   static let accentOn = hex(0x000000)
   /// Live · running · focus.
   static let live = hex(0x44daff)
+  /// Nominal · exit 0.
+  static let success = hex(0x74e29f)
+  /// Alarm · non-zero exit.
+  static let danger = hex(0xff655a)
 
   /// `type-label`: 12px · 600, tracked caps-style label face.
   static func labelFont(_ size: CGFloat = 12) -> NSFont {

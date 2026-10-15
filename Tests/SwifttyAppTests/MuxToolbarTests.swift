@@ -423,3 +423,30 @@ private func type(_ text: String, into button: MuxTabButton) {
     editor.insertText(text, replacementRange: editor.selectedRange())
   }
 }
+
+@Suite
+struct GridStatusTests {
+  @Test
+  func `status text is machine state in fixed form`() {
+    var status = GridStatus(
+      theme: "GRID",
+      tab: "shell",
+      columns: 120,
+      rows: 38,
+      exitStatus: nil
+    )
+    #expect(status.sizeText == "120x38")
+    #expect(status.exitText == "running")
+    status.exitStatus = 0
+    #expect(status.exitText == "exit 0")
+    status.exitStatus = 7
+    #expect(status.exitText == "exit 7")
+  }
+
+  @Test
+  func `clock is 24 hour with seconds`() {
+    let text = GridStatus.clock(Date())
+    #expect(text.count == 8)
+    #expect(text.filter { $0 == ":" }.count == 2)
+  }
+}

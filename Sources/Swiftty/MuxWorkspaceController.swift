@@ -23,6 +23,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// Manual zoom for this window's panes, or nil for the configured size.
   private var fontSize: Double?
   let workspaceContent = NSView()
+  let statusBar = GridStatusBar()
   private(set) var workspace: WorkspaceSnapshot?
   /// Orders snapshots against the attach, switch and takeover replies.
   private var sequencer = LayoutSequencer()
@@ -107,11 +108,15 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     layoutView.translatesAutoresizingMaskIntoConstraints = false
     layoutView.controller = self
     content.addSubview(layoutView)
+    content.addSubview(statusBar)
     NSLayoutConstraint.activate([
       layoutView.topAnchor.constraint(equalTo: content.topAnchor),
       layoutView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
       layoutView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-      layoutView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+      layoutView.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+      statusBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+      statusBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+      statusBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
     ])
     TerminalWindowBackground.apply(
       to: window,
@@ -501,6 +506,14 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     }
     let active = titles[tab.activePane].flatMap(\.nonEmpty)
     window?.title = active ?? workspaceTitle
+    let size = views[tab.activePane]?.gridSize ?? (columns: 0, rows: 0)
+    statusBar.status = GridStatus(
+      theme: config.theme?.dark ?? "default",
+      tab: active ?? workspaceTitle,
+      columns: size.columns,
+      rows: size.rows,
+      exitStatus: ws.pane(tab.activePane)?.exitStatus
+    )
     showsTabs(ws.tabs.count > 1)
   }
 

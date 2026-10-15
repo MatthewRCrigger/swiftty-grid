@@ -82,7 +82,6 @@ final class MuxTabStrip: GridFlatView {
   override init(frame: NSRect) {
     super.init(frame: frame)
     translatesAutoresizingMaskIntoConstraints = false
-    strokeColor = Grid.line300
     let content = NSView(frame: bounds)
     content.autoresizingMask = [.width, .height]
     contentView = content
@@ -236,11 +235,7 @@ final class MuxTabButton: GridFlatView, NSTextFieldDelegate {
       label.font = Grid.labelFont()
       // Selected is a solid accent fill with accent-on ink; the others
       // are a line-300 hairline with secondary ink.
-      fillColor = item.isActive ? Grid.accent : nil
-      strokeColor = item.isActive ? Grid.accent : Grid.line300
-      label.textColor = item.isActive ? Grid.accentOn : Grid.ink200
-      icon.contentTintColor = label.textColor
-      closeButton.contentTintColor = label.textColor
+      applyColors()
       dot.isHidden = !item.hasActivity
       showTitle()
       needsDisplay = true
@@ -255,7 +250,7 @@ final class MuxTabButton: GridFlatView, NSTextFieldDelegate {
     content.autoresizingMask = [.width, .height]
     contentView = content
     icon.translatesAutoresizingMaskIntoConstraints = false
-    icon.symbolConfiguration = .init(pointSize: 11, weight: .regular)
+    icon.symbolConfiguration = .init(pointSize: 11, weight: .light)
     icon.setAccessibilityElement(false)
     label.translatesAutoresizingMaskIntoConstraints = false
     label.lineBreakMode = .byTruncatingTail
@@ -300,6 +295,38 @@ final class MuxTabButton: GridFlatView, NSTextFieldDelegate {
   required init?(coder: NSCoder) { fatalError() }
 
   override var mouseDownCanMoveWindow: Bool { false }
+
+  private var hovering = false { didSet { applyColors() } }
+
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+    for area in trackingAreas { removeTrackingArea(area) }
+    addTrackingArea(
+      NSTrackingArea(
+        rect: bounds,
+        options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+        owner: self
+      )
+    )
+  }
+
+  override func mouseEntered(with event: NSEvent) { hovering = true }
+
+  override func mouseExited(with event: NSEvent) { hovering = false }
+
+  /// Selected: solid accent. Others: line-300 hairline and ink-200 text,
+  /// brightening to line-100 and ink-100 under the pointer.
+  private func applyColors() {
+    guard let item else { return }
+    let ink: NSColor =
+      item.isActive ? Grid.accentOn : (hovering ? Grid.ink100 : Grid.ink200)
+    fillColor = item.isActive ? Grid.accent : nil
+    strokeColor =
+      item.isActive ? Grid.accent : (hovering ? Grid.line100 : Grid.line300)
+    label.textColor = ink
+    icon.contentTintColor = ink
+    closeButton.contentTintColor = ink
+  }
 
   override func mouseDown(with event: NSEvent) {
     guard let item else { return }
@@ -589,7 +616,7 @@ final class MuxPaneHeader: NSView {
     super.init(frame: frame)
     // Part of the card: no band or separator of its own.
     icon.translatesAutoresizingMaskIntoConstraints = false
-    icon.symbolConfiguration = .init(pointSize: 12, weight: .regular)
+    icon.symbolConfiguration = .init(pointSize: 12, weight: .light)
     icon.setAccessibilityElement(false)
     label.font = Grid.labelFont()
     label.lineBreakMode = .byTruncatingTail
