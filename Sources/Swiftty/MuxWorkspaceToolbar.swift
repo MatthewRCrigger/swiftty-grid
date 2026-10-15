@@ -18,6 +18,10 @@ final class MuxWorkspaceToolbar: NSObject, NSToolbarDelegate {
     super.init()
     tabs.label = "Workspace Tabs"
     tabs.view = tabStrip
+    // A flat view reports its full intrinsic width as its minimum; the
+    // strip scrolls, so it may shrink to a few tabs.
+    tabs.minSize = NSSize(width: 102, height: 30)
+    tabs.maxSize = NSSize(width: 10_000, height: 30)
     tabs.isBordered = false
     tabs.isNavigational = true
     tabs.visibilityPriority = .high

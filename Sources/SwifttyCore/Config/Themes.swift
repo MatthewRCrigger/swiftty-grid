@@ -13,6 +13,30 @@ public enum Themes {
     foreground = #ffffff
     cursor-color = #ffffff
     """,
+    "GRID": """
+    background = #000000
+    foreground = #e4f2f8
+    cursor-color = #f4be4f
+    cursor-text = #000000
+    selection-background = #4d3f18
+    selection-foreground = #e4f2f8
+    palette = 0=#0c1013
+    palette = 1=#ff655a
+    palette = 2=#74e29f
+    palette = 3=#f4be4f
+    palette = 4=#2286a7
+    palette = 5=#d5b2ff
+    palette = 6=#44daff
+    palette = 7=#a8bcc6
+    palette = 8=#4a5a63
+    palette = 9=#ff655a
+    palette = 10=#74e29f
+    palette = 11=#f4be4f
+    palette = 12=#44daff
+    palette = 13=#d5b2ff
+    palette = 14=#44daff
+    palette = 15=#e4f2f8
+    """,
     "Swiftty Light": """
     background = #fafafa
     foreground = #383a42

@@ -57,7 +57,7 @@ final class MuxActivityDot: NSView {
   required init?(coder: NSCoder) { fatalError() }
 
   override func updateLayer() {
-    layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+    layer?.backgroundColor = Grid.live.cgColor
   }
 
   override var wantsUpdateLayer: Bool { true }
@@ -68,7 +68,7 @@ final class MuxActivityDot: NSView {
 /// The window-level tab strip: icon, title, activity marker and close
 /// button per tab. Double-click renames; narrow windows scroll horizontally.
 @MainActor
-final class MuxTabStrip: NSGlassEffectContainerView {
+final class MuxTabStrip: GridFlatView {
   var onSelect: ((TabID) -> Void)?
   var onClose: ((TabID) -> Void)?
   var onRename: ((TabID, String) -> Void)?
@@ -81,6 +81,8 @@ final class MuxTabStrip: NSGlassEffectContainerView {
 
   override init(frame: NSRect) {
     super.init(frame: frame)
+    translatesAutoresizingMaskIntoConstraints = false
+    strokeColor = Grid.line300
     let content = NSView(frame: bounds)
     content.autoresizingMask = [.width, .height]
     contentView = content
@@ -209,7 +211,7 @@ final class MuxTabLabel: NSTextField {
 }
 
 @MainActor
-final class MuxTabButton: NSGlassEffectView, NSTextFieldDelegate {
+final class MuxTabButton: GridFlatView, NSTextFieldDelegate {
   weak var strip: MuxTabStrip?
   private let icon = NSImageView()
   let label = MuxTabLabel(labelWithString: "")
@@ -231,12 +233,14 @@ final class MuxTabButton: NSGlassEffectView, NSTextFieldDelegate {
       if oldValue?.id != item?.id { cancelRename() }
       guard let item, item != oldValue else { return }
       icon.image = MuxIcons.image(item.symbol, "")
-      label.font =
-        item.isActive
-        ? .systemFont(ofSize: 12, weight: .semibold) : .systemFont(ofSize: 12)
-      tintColor =
-        item.isActive
-        ? .selectedContentBackgroundColor.withAlphaComponent(0.18) : nil
+      label.font = Grid.labelFont()
+      // Selected is a solid accent fill with accent-on ink; the others
+      // are a line-300 hairline with secondary ink.
+      fillColor = item.isActive ? Grid.accent : nil
+      strokeColor = item.isActive ? Grid.accent : Grid.line300
+      label.textColor = item.isActive ? Grid.accentOn : Grid.ink200
+      icon.contentTintColor = label.textColor
+      closeButton.contentTintColor = label.textColor
       dot.isHidden = !item.hasActivity
       showTitle()
       needsDisplay = true
@@ -246,9 +250,7 @@ final class MuxTabButton: NSGlassEffectView, NSTextFieldDelegate {
   init() {
     super.init(frame: .zero)
     translatesAutoresizingMaskIntoConstraints = false
-    style = .regular
-    cornerRadius = 6
-    effectIsInteractive = true
+    cornerRadius = Grid.chipRadius
     let content = NSView(frame: bounds)
     content.autoresizingMask = [.width, .height]
     contentView = content
@@ -466,7 +468,7 @@ struct MuxPaneHeaderState: Equatable {
 @MainActor
 final class MuxPaneContainer: NSView {
   static let headerHeight: CGFloat = 30
-  static let cornerRadius: CGFloat = 10
+  static let cornerRadius: CGFloat = Grid.panelRadius
   /// Space between the card's edge and its terminal (sides and bottom).
   static let cardInset: CGFloat = 6
   let paneView: MuxPaneView
@@ -496,12 +498,14 @@ final class MuxPaneContainer: NSView {
 
   override func updateLayer() {
     guard let layer else { return }
+    // Round panel profile: 2px border, 8px corners, surface-1 fill. The
+    // active pane's frame is the accent; the rest sit at line-200.
     layer.cornerRadius = showsHeader ? Self.cornerRadius : 0
     layer.masksToBounds = showsHeader
-    layer.borderWidth = showsHeader ? 1 : 0
-    layer.borderColor = NSColor.separatorColor.cgColor
-    layer.backgroundColor =
-      showsHeader ? NSColor.labelColor.withAlphaComponent(0.04).cgColor : nil
+    layer.borderWidth = showsHeader ? Grid.panelStroke : 0
+    layer.borderColor =
+      (header.state.isActive ? Grid.accent : Grid.line200).cgColor
+    layer.backgroundColor = showsHeader ? Grid.surface1.cgColor : nil
   }
 
   @available(*, unavailable)
@@ -535,6 +539,7 @@ final class MuxPaneContainer: NSView {
 
   func update(_ state: MuxPaneHeaderState) {
     header.state = state
+    needsDisplay = true
     setAccessibilityLabel(
       "Pane \(state.title)" + (state.isActive ? ", active" : "")
         + (state.hasExited ? ", exited" : "")
@@ -565,7 +570,7 @@ final class MuxPaneHeader: NSView {
       label.stringValue =
         state.hasExited ? "\(state.title) (exited)" : state.title
       // The active pane reads at full strength, the others dimmed.
-      label.textColor = state.isActive ? .labelColor : .secondaryLabelColor
+      label.textColor = state.isActive ? Grid.ink100 : Grid.ink300
       icon.contentTintColor = label.textColor
       icon.image = MuxIcons.image(MuxIcons.symbol(for: state.title), "")
       dot.isHidden = !state.hasActivity
@@ -586,7 +591,7 @@ final class MuxPaneHeader: NSView {
     icon.translatesAutoresizingMaskIntoConstraints = false
     icon.symbolConfiguration = .init(pointSize: 12, weight: .regular)
     icon.setAccessibilityElement(false)
-    label.font = .systemFont(ofSize: 12, weight: .semibold)
+    label.font = Grid.labelFont()
     label.lineBreakMode = .byTruncatingTail
     label.translatesAutoresizingMaskIntoConstraints = false
     label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
