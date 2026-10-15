@@ -138,6 +138,9 @@ final class RoamingTerminalController: TerminalSurfaceController {
   private let lifecycleQueue = ClientLifecycleQueue()
   @ObservationIgnored
   private var closed = false
+  /// The detach or terminate begun by `beginClose(_:)`.
+  @ObservationIgnored
+  private var closing: Task<Void, Never>?
   @ObservationIgnored
   private var started = false
   @ObservationIgnored
@@ -355,11 +358,12 @@ final class RoamingTerminalController: TerminalSurfaceController {
     serial { await $0.proposeGrid(columns: next.columns, rows: next.rows) }
   }
 
+  @discardableResult
   private func serial(
     _ operation: @escaping @Sendable (RoamingClient) async -> Void
-  ) {
-    guard !closed else { return }
-    lifecycleQueue.enqueue(operation)
+  ) -> Task<Void, Never>? {
+    guard !closed else { return nil }
+    return lifecycleQueue.enqueue(operation)
   }
 
   private func observeSystem() {
@@ -389,8 +393,8 @@ final class RoamingTerminalController: TerminalSurfaceController {
     serial { await $0.pathChanged() }
   }
 
-  func close(_ mode: RoamingCloseMode) async {
-    guard !closed else { return }
+  func beginClose(_ mode: RoamingCloseMode) -> Task<Void, Never> {
+    if let closing { return closing }
     closed = true
     runTask?.cancel()
     let pendingLifecycle = lifecycleQueue.use(nil)
@@ -403,11 +407,17 @@ final class RoamingTerminalController: TerminalSurfaceController {
     #endif
     display.semanticInputHandler = nil
     display.gridProposalHandler = nil
-    if let client {
+    let client = client
+    // An already-dispatched detach finishes first. Neither it nor the
+    // close needs the main actor.
+    let closing = Task.detached(priority: .high) {
+      guard let client else { return }
       await pendingLifecycle?.value
       await client.close(mode)
       await client.setStatusHandler(nil)
     }
+    self.closing = closing
+    return closing
   }
 
   // MARK: Messages
@@ -528,7 +538,7 @@ final class SSHShellController: TerminalSurfaceController {
   @ObservationIgnored
   private var backend: SSHStreamBackend?
   @ObservationIgnored
-  private var connection: SSHConnection?
+  private(set) var connection: SSHConnection?
   @ObservationIgnored
   private var runTask: Task<Void, Never>?
   @ObservationIgnored
@@ -670,31 +680,33 @@ final class SSHShellController: TerminalSurfaceController {
     }
   }
 
-  func close(_ mode: RoamingCloseMode) async {
-    guard !closed else {
-      await cleanupTask?.value
-      return
-    }
+  func beginClose(_ mode: RoamingCloseMode) -> Task<Void, Never> {
     closed = true
     runTask?.cancel()
-    releaseResources()
-    await cleanupTask?.value
+    return releaseResources()
   }
 
-  private func releaseResources() {
-    guard cleanupTask == nil else { return }
+  /// Also waits for setup still unwinding on the main actor.
+  func close(_ mode: RoamingCloseMode) async {
+    await beginClose(mode).value
+    await runTask?.value
+  }
+
+  @discardableResult
+  private func releaseResources() -> Task<Void, Never> {
+    if let cleanupTask { return cleanupTask }
     refusalRelay?.close()
     refusalRelay = nil
     let backend = backend
     let connection = connection
-    let setupTask = runTask
     self.backend = nil
     self.connection = nil
-    cleanupTask = Task {
+    let cleanup = Task.detached(priority: .high) {
       await backend?.close()
       await connection?.close()
-      await setupTask?.value
     }
+    cleanupTask = cleanup
+    return cleanup
   }
 
   func dismissInputNotice() { inputNotice = nil }

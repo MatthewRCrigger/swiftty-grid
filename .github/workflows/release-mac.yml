@@ -7,7 +7,8 @@ name: Release Swiftty.app
 #
 # A pushed tag v<major>[.<minor>[.<patch>]] (e.g. v0.3 or v0.3.1) releases
 # that tag; other v* tags do not start a release. A manual run creates a
-# mac-v<version>-<build> prerelease at the selected commit.
+# mac-v<version>-<build> prerelease at the selected commit, even when it
+# is started from a tag.
 #
 # Runner setup: the Developer ID Application certificate and private key
 # in a keychain the runner's user can sign with, unlocked.
@@ -42,7 +43,7 @@ jobs:
       - name: Package and sign
         env:
           IDENTITY: ${{ vars.DEVELOPER_ID_IDENTITY }}
-          SWIFTTY_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
+          SWIFTTY_VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
           SWIFTTY_BUILD: ${{ github.run_number }}
         run: |
           [ -n "$IDENTITY" ] || { echo "set the DEVELOPER_ID_IDENTITY repository variable" >&2; exit 64; }
@@ -53,6 +54,6 @@ jobs:
           NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
           NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
           NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
-          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
           RELEASE_COMMIT: ${{ github.sha }}
         run: Scripts/release-mac-github.sh .build/package/Swiftty.app

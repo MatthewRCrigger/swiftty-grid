@@ -18,7 +18,7 @@ struct LiveTerminalSurface: View {
   let app: RoamingAppModel
 
   var body: some View {
-    switch controller {
+    switch Self.controller(for: model, app: app) {
     case let roaming as RoamingTerminalController:
       RoamingSurfaceView(controller: roaming, app: app)
     case let ssh as SSHShellController:
@@ -28,8 +28,14 @@ struct LiveTerminalSurface: View {
     }
   }
 
-  private var controller: any TerminalSurfaceController {
+  /// `model`'s controller, created on first display. A closed screen
+  /// still on its way out gets none.
+  static func controller(
+    for model: TerminalScreenModel,
+    app: RoamingAppModel
+  ) -> (any TerminalSurfaceController)? {
     if let existing = model.controller { return existing }
+    guard !model.isClosed else { return nil }
     let created: any TerminalSurfaceController
     switch model.kind {
     case .roaming:

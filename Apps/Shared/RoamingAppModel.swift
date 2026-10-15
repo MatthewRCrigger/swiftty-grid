@@ -79,9 +79,18 @@ public enum TerminalKind: Hashable, Sendable {
 /// it lives exactly as long as the screen.
 @MainActor
 protocol TerminalSurfaceController: AnyObject {
-  /// Ends the attachment or channel. `.detach` keeps a roaming host
-  /// session for a later resume; `.terminate` destroys it.
+  /// Stops main-actor work at once and starts ending the attachment or
+  /// channel: `.detach` keeps a roaming host session for a later resume;
+  /// `.terminate` destroys it. The returned work never needs the main
+  /// actor, so a quit that blocks the main queue can wait for it. Later
+  /// calls return the same work.
+  func beginClose(_ mode: RoamingCloseMode) -> Task<Void, Never>
+  /// `beginClose(_:)`, waiting for it to finish.
   func close(_ mode: RoamingCloseMode) async
+}
+
+extension TerminalSurfaceController {
+  func close(_ mode: RoamingCloseMode) async { await beginClose(mode).value }
 }
 
 /// State of the one terminal a client app shows at a time (spec §2: one
@@ -136,6 +145,10 @@ public final class TerminalScreenModel: Identifiable {
   /// The live backend, created by the surface factory on first display.
   @ObservationIgnored
   var controller: (any TerminalSurfaceController)?
+  /// Set when the app closes this screen: a screen still on its way out
+  /// never starts another backend.
+  @ObservationIgnored
+  var isClosed = false
 
   public init(
     host: HostProfile,
@@ -295,12 +308,6 @@ extension CompanionConnectionState {
   }
 }
 
-/// Completion flag for `RoamingAppModel.detachBeforeExit()`.
-@MainActor
-private final class TerminationDetach {
-  var done = false
-}
-
 /// Shared application model for every direct client.
 @MainActor
 @Observable
@@ -388,6 +395,9 @@ public final class RoamingAppModel {
   private var passwords: [UUID: (host: HostProfile, value: String)] = [:]
   @ObservationIgnored
   private var sshAccess: SSHAccess?
+  /// Closes still in flight; a quit waits for them (spec §9).
+  @ObservationIgnored
+  private var closing: [UUID: Task<Void, Never>] = [:]
 
   public init(
     profile: PlatformProfile = .current,
@@ -510,9 +520,16 @@ public final class RoamingAppModel {
   /// shell for a later resume (spec §4); `.terminate` destroys it.
   public func close(_ mode: RoamingCloseMode = .detach) {
     guard let session = activeSession else { return }
+    session.isClosed = true
     if let controller = session.controller {
       session.controller = nil
-      Task { await controller.close(mode) }
+      let id = UUID()
+      let work = controller.beginClose(mode)
+      closing[id] = work
+      Task { [weak self] in
+        await work.value
+        self?.closing[id] = nil
+      }
     }
     if mode == .terminate { forgetSession(for: session.host) }
     session.transition(to: .userClosed)
@@ -534,35 +551,32 @@ public final class RoamingAppModel {
       )
   }
 
-  /// Bounded detach of the active session before the app quits; the
-  /// helper also retains sessions whose detach never arrives (spec §9).
-  public func detachForTermination() async {
-    guard let session = activeSession, let controller = session.controller
-    else { return }
-    session.controller = nil
-    await controller.close(.detach)
-  }
+  /// How long a quit waits for closes: the roaming detach bound, plus a
+  /// second for the channel and connection closes that follow.
+  static let terminationWait =
+    RoamingClientConfiguration.defaultDetachDeadline + .seconds(1)
 
-  /// `detachForTermination()` for a quit the platform cannot defer (Mac
-  /// Catalyst's `applicationWillTerminate`): runs the main run loop until
-  /// the detach finishes, at most the client's detach deadline plus one
-  /// second, so the process does not exit before the detach is sent.
+  /// A quit the platform cannot defer (Mac Catalyst's
+  /// `applicationWillTerminate`): detaches the active session, then waits
+  /// up to `terminationWait` for it and for every close still in flight.
+  /// The helper also retains sessions whose detach never arrives (spec §9).
   public func detachBeforeExit() {
-    guard activeSession?.controller != nil else { return }
-    let finished = TerminationDetach()
-    Task {
-      await detachForTermination()
-      finished.done = true
+    close(.detach)
+    guard !closing.isEmpty else { return }
+    let finished = DispatchGroup()
+    for work in closing.values {
+      finished.enter()
+      // The blocked main thread donates no priority; awaiting at high
+      // priority escalates the close instead.
+      Task.detached(priority: .high) {
+        await work.value
+        finished.leave()
+      }
     }
-    let deadline = RoamingClientConfiguration(initialGrid: GridSize(columns: 1, rows: 1))
-      .detachDeadline + .seconds(1)
-    let parts = deadline.components
-    let bound = Date.now.addingTimeInterval(
-      Double(parts.seconds) + Double(parts.attoseconds) / 1e18
+    let (seconds, attoseconds) = Self.terminationWait.components
+    _ = finished.wait(
+      timeout: .now() + Double(seconds) + Double(attoseconds) / 1e18
     )
-    while !finished.done, Date.now < bound {
-      _ = RunLoop.main.run(mode: .default, before: min(bound, .now.addingTimeInterval(0.05)))
-    }
   }
 
   /// Opens `workspace` on `host` from an attention link: the next start
@@ -572,9 +586,7 @@ public final class RoamingAppModel {
     _ host: HostProfile,
     workspace: SessionID,
     target: ResumeTarget
-  ) {
-    openWorkspace(host, intent: .resume(workspace, target))
-  }
+  ) { openWorkspace(host, intent: .resume(workspace, target)) }
 
   /// Attaches the one active roaming terminal to the workspace the user
   /// chose. The previous terminal is detached through the ordinary close,

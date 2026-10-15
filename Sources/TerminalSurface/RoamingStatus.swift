@@ -49,9 +49,12 @@ public struct RoamingClientConfiguration: Sendable {
   /// treated as failed.
   public var maxOutboundRecords: Int
 
+  /// `detachDeadline` unless configured otherwise.
+  public static let defaultDetachDeadline: Duration = .seconds(2)
+
   public init(
     initialGrid: GridSize = GridSize(columns: 80, rows: 24),
-    detachDeadline: Duration = .seconds(2),
+    detachDeadline: Duration = defaultDetachDeadline,
     attachTimeout: Duration = .seconds(15),
     heartbeatInterval: Duration = RSTLimits.heartbeatInterval,
     livenessTick: Duration = .milliseconds(250),

@@ -146,6 +146,10 @@ targets:
         # MobileClient, so an iOS build of this target could replace the
         # real iOS app (with its watch app) in App Store Connect.
         SUPPORTED_PLATFORMS: macosx
+        # Default archives and generic macOS destinations must also use
+        # UIKit's Catalyst SDK variant rather than native AppKit.
+        SDKROOT: macosx
+        SDK_VARIANT: iosmac
         DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
         SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
