@@ -1,5 +1,5 @@
 #!/bin/sh
-# Removes what Scripts/install.sh installed: Swiftty.app, its SwiftMux
+# Removes what Scripts/install.sh installed: Swiftty GRID.app, its SwiftMux
 # LaunchAgent registration (or a `swmux agent install` development agent)
 # and the swifttyd bootstrap helper. Unregistering the agent ends every
 # SwiftMux session, so it asks first.
@@ -33,7 +33,7 @@ done
 
 label=com.chr33s.swiftty.swiftmux
 bundle_id=com.chr33s.swiftty
-app="$dest/Swiftty.app"
+app="$dest/Swiftty GRID.app"
 helper=/usr/local/libexec/swifttyd
 dev_plist="$HOME/Library/LaunchAgents/$label.plist"
 

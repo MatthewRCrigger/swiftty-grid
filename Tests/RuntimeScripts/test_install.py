@@ -42,7 +42,7 @@ elif name == 'codesign':
         if failure == 'verify': sys.exit(43)
         if failure == 'publish': (root/'applications with spaces').chmod(0o500)
         if failure == 'race':
-            competitor = root/'applications with spaces/Swiftty.app'
+            competitor = root/'applications with spaces/Swiftty GRID.app'
             competitor.mkdir()
             (competitor/'competing').write_text('competing installation')
 elif name == 'ditto':
@@ -96,11 +96,11 @@ class InstallTests(unittest.TestCase):
                      ["swift", "codesign", "launchctl", "pgrep", "ditto", "open", "sudo"])]:
             path.write_text(TOOL.replace("/PYTHON", sys.executable))
             path.chmod(0o700)
-        self.built = self.repo / ".build/package/Swiftty.app"
+        self.built = self.repo / ".build/package/Swiftty GRID.app"
         self.create_app(self.built, "new")
         self.destination = self.root / "applications with spaces"
         self.destination.mkdir()
-        self.app = self.destination / "Swiftty.app"
+        self.app = self.destination / "Swiftty GRID.app"
         self.create_app(self.app, "old")
         self.environment = dict(os.environ)
         self.environment.update(INSTALL_FIXTURE_ROOT=str(self.root),

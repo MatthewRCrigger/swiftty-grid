@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds, signs and installs Swiftty.app, registers its bundled SwiftMux
+# Builds, signs and installs Swiftty GRID.app, registers its bundled SwiftMux
 # LaunchAgent (SMAppService) and, with --roaming, installs the swifttyd
 # bootstrap helper and writes the roaming configuration (spec.inbox.md §1).
 # Remote Login and firewall policy are reported, never changed.
@@ -88,7 +88,7 @@ fi
 
 label=com.chr33s.swiftty.swiftmux
 bundle_id=com.chr33s.swiftty
-app="$dest/Swiftty.app"
+app="$dest/Swiftty GRID.app"
 helper=/usr/local/libexec/swifttyd
 dev_plist="$HOME/Library/LaunchAgents/$label.plist"
 roaming_dir="$HOME/Library/Application Support/SwiftMux/roaming"
@@ -142,7 +142,7 @@ if [ -f "$dev_plist" ]; then
 fi
 
 Scripts/package-swiftmux.sh "$identity" .build/package
-built=.build/package/Swiftty.app
+built=".build/package/Swiftty GRID.app"
 bin=$(swift build -c release --show-bin-path)
 
 # launchd pins the registered agent to the signing team it had when

@@ -21,7 +21,7 @@ mise run format-check
 mise run test-internal
 mise run bench-storage
 mise run compare <ghostty-src> <corpus-dir>
-mise run package-swiftmux [identity]   # Swiftty.app with the SwiftMux agent
+mise run package-swiftmux [identity]   # Swiftty GRID.app with the SwiftMux agent
 mise run install [--roaming]           # see SwiftMux below
 mise run uninstall [--purge] [-y]
 ```
@@ -155,7 +155,7 @@ validated pane frames.
 swift build
 .build/debug/swmux agent install   # development LaunchAgent for this build
 .build/debug/swmux new -s work     # inside Swiftty
-Scripts/package-swiftmux.sh [identity]   # Swiftty.app with the bundled agent (SMAppService)
+Scripts/package-swiftmux.sh [identity]   # Swiftty GRID.app with the bundled agent (SMAppService)
 Scripts/install.sh [--roaming]           # package, install to /Applications, register the agent (+ swifttyd)
 Scripts/install-ios.sh --team TEAM      # iOS/iPadOS app on iPhones and iPads connected by USB
 Scripts/uninstall.sh [--purge]           # remove the app, agent and swifttyd
@@ -169,7 +169,7 @@ it (a launch-constraint violation). It then installs the iOS/iPadOS app
 automatically for the Mac build's team or `--team`; `--no-devices` skips this.
 Devices must be unlocked and in Developer Mode. The bundled
 agent can also be managed directly with
-`Swiftty.app/Contents/MacOS/swiftty --swiftmux-agent register|unregister|status`.
+`Swiftty GRID.app/Contents/MacOS/swiftty --swiftmux-agent register|unregister|status`.
 
 Installation uses Python 3 to copy the new app into a private sibling directory,
 check its bundle/executables and verify its signature and expected signing team

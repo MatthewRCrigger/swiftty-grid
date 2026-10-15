@@ -142,7 +142,7 @@ final class MuxUpdateController {
   private static func chooseBundle() -> URL? {
     let panel = NSOpenPanel()
     panel.allowedContentTypes = [.applicationBundle]
-    panel.message = "Choose the updated Swiftty.app"
+    panel.message = "Choose the updated Swiftty GRID.app"
     guard panel.runModal() == .OK else { return nil }
     return panel.url
   }

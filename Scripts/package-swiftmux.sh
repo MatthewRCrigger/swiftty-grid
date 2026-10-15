@@ -1,5 +1,5 @@
 #!/bin/sh
-# Assembles Swiftty.app with the SwiftMux LaunchAgent, PTY launcher and
+# Assembles Swiftty GRID.app with the SwiftMux LaunchAgent, PTY launcher and
 # swmux client, then signs it. SMAppService registers the bundled agent
 # when the app first enables SwiftMux.
 #
@@ -39,7 +39,7 @@ applinks=$("$(dirname "$0")/link-domains.sh" --entitlements)
 swift build -c release
 bin=$(swift build -c release --show-bin-path)
 
-app="$out/Swiftty.app"
+app="$out/Swiftty GRID.app"
 rm -rf -- "${app:?}"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" \
   "$app/Contents/Library/LaunchAgents"
@@ -71,7 +71,8 @@ cat > "$app/Contents/Info.plist" <<EOF
 <plist version="1.0">
 <dict>
   <key>CFBundleIdentifier</key><string>$bundle_id</string>
-  <key>CFBundleName</key><string>Swiftty</string>
+  <key>CFBundleName</key><string>Swiftty GRID</string>
+  <key>CFBundleDisplayName</key><string>Swiftty GRID</string>
   <key>CFBundleExecutable</key><string>swiftty</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>

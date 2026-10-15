@@ -87,7 +87,7 @@ class UninstallTests(unittest.TestCase):
         runner = (ROOT / "Scripts/uninstall-command.py").read_text()
         (self.root / "uninstall-command.py").write_text(runner)
         self.destination = self.root / "install with 'quotes'"
-        self.app = self.destination / "Swiftty.app"
+        self.app = self.destination / "Swiftty GRID.app"
         self.app_binary = self.app / "Contents/MacOS/swiftty"
         self.app_binary.parent.mkdir(parents=True)
         self.user_home = self.root / "user"

@@ -100,8 +100,8 @@ def atomic_publish(parent_fd, staged_name, destination_name, replacing):
 
 
 def install_app(source, destination, expected_team):
-    if destination.name != "Swiftty.app":
-        raise ValueError("destination must be named Swiftty.app")
+    if destination.name != "Swiftty GRID.app":
+        raise ValueError("destination must be named Swiftty GRID.app")
     parent = destination.parent.resolve(strict=True)
     parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     staging = None
@@ -132,7 +132,7 @@ def install_app(source, destination, expected_team):
 
 def main():
     if len(sys.argv) != 4 or sys.platform != "darwin":
-        print("usage: install-app.py SOURCE Swiftty.app EXPECTED_TEAM (macOS)", file=sys.stderr)
+        print("usage: install-app.py SOURCE 'Swiftty GRID.app' EXPECTED_TEAM (macOS)", file=sys.stderr)
         return 64
     for signum in INTERRUPTS:
         signal.signal(signum, interrupt)

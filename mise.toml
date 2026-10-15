@@ -35,11 +35,11 @@ description = "Launch the swiftty macOS app"
 run = "swift run -c release swiftty"
 
 [tasks.package-swiftmux]
-description = "Assemble and sign Swiftty.app with the SwiftMux agent: mise run package-swiftmux [identity]"
+description = "Assemble and sign Swiftty GRID.app with the SwiftMux agent: mise run package-swiftmux [identity]"
 run = "Scripts/package-swiftmux.sh"
 
 [tasks.install]
-description = "Install Swiftty.app, register the SwiftMux agent and install the iOS/iPadOS app on USB-connected devices; --roaming adds swifttyd, --no-devices skips devices: mise run install [options]"
+description = "Install Swiftty GRID.app, register the SwiftMux agent and install the iOS/iPadOS app on USB-connected devices; --roaming adds swifttyd, --no-devices skips devices: mise run install [options]"
 run = "Scripts/install.sh"
 
 [tasks.install-ios]
@@ -47,7 +47,7 @@ description = "Install the iOS/iPadOS app on iPhones and iPads connected by USB:
 run = "Scripts/install-ios.sh"
 
 [tasks.uninstall]
-description = "Remove Swiftty.app, the SwiftMux agent and swifttyd: mise run uninstall [--purge] [-y]"
+description = "Remove Swiftty GRID.app, the SwiftMux agent and swifttyd: mise run uninstall [--purge] [-y]"
 run = "Scripts/uninstall.sh"
 
 [tasks.bench-swiftmux]

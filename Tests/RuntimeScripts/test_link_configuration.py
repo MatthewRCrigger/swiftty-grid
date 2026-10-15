@@ -126,7 +126,7 @@ class LinkConfigurationTests(unittest.TestCase):
                 expected = [f"applinks:{domain}{suffix}" for domain in
                             ["links.example.com", "other.example.com"]]
                 self.assertEqual(self.read_plist(output / "Swiftty.entitlements"), {ENTITLEMENT: expected})
-                app = output / "Swiftty.app"
+                app = output / "Swiftty GRID.app"
                 self.assertEqual(self.read_plist(app / "Contents/Info.plist")["SwifttyAssociatedDomains"],
                                  ["links.example.com", "other.example.com"])
                 commands = [json.loads(line) for line in calls.read_text().splitlines()]
