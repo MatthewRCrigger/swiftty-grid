@@ -55,7 +55,9 @@ settings:
     # are unaffected.
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: ${SWIFTTY_TEAM_ID}
-    # Resources/Assets.xcassets (iOS, watchOS and macOS images). tvOS and
+    # Resources/Assets.xcassets (iOS and macOS images). watchOS has its own
+    # Apps/WatchCompanion/Assets.xcassets: actool flags a watchOS icon slot
+    # as an unassigned child when compiling for macOS (Catalyst). tvOS and
     # visionOS need layered icons: Apps/TVClient/Assets.xcassets and
     # Apps/VisionClient/Assets.xcassets, generated from icon.svg by
     # Scripts/gen-platform-icons.swift.
@@ -132,7 +134,8 @@ targets:
       - path: CatalystClient
         excludes: ["*.entitlements"]
       - ../Resources/Assets.xcassets
-    scheme: {}
+    # Scheme defined under `schemes:` below so the archive can be named
+    # "Swiftty" rather than after the target.
     dependencies:
       - package: Swiftty
         product: RoamingApp
@@ -161,6 +164,13 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Config/Generated/CatalystClient.entitlements
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        # Mac Catalyst links with a hard-coded
+        # `-L$(TOOLCHAIN_DIR)/usr/lib/swift/maccatalyst`. When the Xcode 27
+        # IDE has the Metal toolchain installed it puts that toolchain first,
+        # so TOOLCHAIN_DIR resolves to Metal.xctoolchain, which has no Swift
+        # libraries, and every link step warns "Search path ... not found".
+        # Pin the Swift toolchain; this target compiles no Metal shaders.
+        TOOLCHAINS: com.apple.dt.toolchain.XcodeDefault
 
   # Windowed visionOS full remote client.
   VisionClient:
@@ -205,7 +215,7 @@ targets:
   WatchCompanion:
     type: application
     platform: watchOS
-    sources: [WatchCompanion, ../Resources/Assets.xcassets]
+    sources: [WatchCompanion]
     scheme: {}
     dependencies:
       - package: Swiftty
@@ -220,3 +230,22 @@ targets:
         INFOPLIST_KEY_WKCompanionAppBundleIdentifier: dev.chr33s.swiftty
         INFOPLIST_KEY_WKRunsIndependentlyOfCompanionApp: NO
         SKIP_INSTALL: YES
+schemes:
+  # Same as the generated target scheme, plus an archive name: Xcode names
+  # archives after the scheme, so without this the Organizer shows
+  # "CatalystClient" instead of "Swiftty".
+  CatalystClient:
+    build:
+      targets:
+        CatalystClient: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
+      customArchiveName: Swiftty
