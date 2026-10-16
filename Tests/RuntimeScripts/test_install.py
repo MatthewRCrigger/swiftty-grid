@@ -60,7 +60,23 @@ elif name == 'ditto':
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         while True: time.sleep(0.1)
     shutil.copytree(source, destination, dirs_exist_ok=True)
-elif name == 'sudo': sys.exit(subprocess.run(args).returncode)
+elif name == 'sudo':
+    if args[0] == 'install':
+        shutil.copyfile(args[-2], args[-1])
+        Path(args[-1]).chmod(0o755)
+    else: sys.exit(subprocess.run(args).returncode)
+elif name == 'socketfilterfw':
+    if args[0] == os.environ.get('INSTALL_FIXTURE_FIREWALL_FAILURE'): sys.exit(45)
+    if args[0] == '--getglobalstate':
+        state = os.environ.get('INSTALL_FIXTURE_FIREWALL_ENABLED', '1')
+        print('Firewall is '+('enabled' if state == '1' else 'disabled')+'. (State = '+state+')')
+    elif args[0] == '--getblockall':
+        print('Firewall has block all state set to '+os.environ.get('INSTALL_FIXTURE_BLOCKALL', 'disabled')+'.')
+    elif args[0] == '--getappblocked':
+        print('Incoming connection to '+args[1]+' is '+os.environ.get('INSTALL_FIXTURE_APP_STATE', 'permitted')+'.')
+    elif args[0] not in ['--add', '--unblockapp']: raise RuntimeError(args)
+elif name == 'nc': sys.exit(1)
+elif name == 'swifttyd': print('ready')
 elif name == 'open': pass
 else: raise RuntimeError(name)
 '''
@@ -86,6 +102,13 @@ class InstallTests(unittest.TestCase):
         source = (ROOT / "Scripts/install.sh").read_text()
         source = source.replace('dev_plist="$HOME/Library/LaunchAgents/$label.plist"',
                                 'dev_plist=' + shlex.quote(str(self.root / "absent-dev-agent.plist")))
+        # Keep roaming setup and every privileged operation inside the fixture.
+        source = source.replace('helper=/usr/local/libexec/swifttyd',
+                                'helper=' + shlex.quote(str(self.root / "libexec/swifttyd")))
+        source = source.replace('roaming_dir="$HOME/Library/Application Support/SwiftMux/roaming"',
+                                'roaming_dir=' + shlex.quote(str(self.root / "roaming")))
+        source = source.replace('firewall=/usr/libexec/ApplicationFirewall/socketfilterfw',
+                                'firewall=' + shlex.quote(str(self.root / "bin/socketfilterfw")))
         (scripts / "install.sh").write_text(source)
         helper = ROOT / "Scripts/install-app.py"
         if helper.exists():
@@ -93,11 +116,15 @@ class InstallTests(unittest.TestCase):
         self.tools = self.root / "bin"
         self.tools.mkdir()
         for path in [scripts / "package-swiftmux.sh", *(self.tools / name for name in
-                     ["swift", "codesign", "launchctl", "pgrep", "ditto", "open", "sudo"])]:
+                     ["swift", "codesign", "launchctl", "pgrep", "ditto", "open", "sudo",
+                      "socketfilterfw", "nc"])]:
             path.write_text(TOOL.replace("/PYTHON", sys.executable))
             path.chmod(0o700)
         self.built = self.repo / ".build/package/Swiftty.app"
         self.create_app(self.built, "new")
+        products = self.repo / "products"
+        products.mkdir()
+        (products / "swifttyd").write_text(TOOL.replace("/PYTHON", sys.executable))
         self.destination = self.root / "applications with spaces"
         self.destination.mkdir()
         self.app = self.destination / "Swiftty.app"
@@ -274,6 +301,86 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 64, result.stderr)
                 self.assertEqual(self.calls(), [])
                 self.assert_prior_app()
+
+    def test_firewall_option_requires_roaming_before_any_commands(self):
+        result = self.install("--configure-firewall")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("--configure-firewall requires --roaming", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_missing_firewall_tool_fails_before_installation(self):
+        (self.tools / "socketfilterfw").unlink()
+        result = self.install("--roaming", "--configure-firewall")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("firewall tool unavailable", result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assert_prior_app()
+
+    def test_roaming_leaves_firewall_untouched_by_default(self):
+        result = self.install("--roaming", "--host", "test.local")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(name == "socketfilterfw" for name, _ in self.calls()))
+        self.assertIn("nothing is changed", result.stdout)
+        self.assertIn("--roaming --configure-firewall", result.stdout)
+
+    def test_firewall_exception_targets_installed_agent_and_is_reapplied(self):
+        # The firewall always receives the installed executable's absolute path,
+        # including when --dest names a relative directory with spaces.
+        alias = self.repo / "alias directory"
+        alias.symlink_to(self.destination, target_is_directory=True)
+        for _ in range(2):
+            result = self.install("--roaming", "--host", "test.local", "--configure-firewall",
+                                  "--dest", alias.name)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("macOS firewall exception configured for SwiftMux", result.stdout)
+            self.assertNotIn("nothing is changed", result.stdout)
+            self.assertIn("remote reachability is not verified", result.stdout)
+        agent = str((self.app / "Contents/MacOS/swiftmux-agent").resolve())
+        expected = [["--getglobalstate"], ["--getblockall"], ["--add", agent],
+                    ["--unblockapp", agent], ["--getappblocked", agent]]
+        calls = self.calls()
+        self.assertEqual([args for name, args in calls if name == "socketfilterfw"], expected * 2)
+        privileged = [args for name, args in calls
+                      if name == "sudo" and Path(args[0]).name == "socketfilterfw"]
+        tool = str(self.tools / "socketfilterfw")
+        self.assertEqual(privileged, [[tool, "--add", agent], [tool, "--unblockapp", agent]] * 2)
+        verify = next(i for i, (name, args) in enumerate(calls)
+                      if name == "codesign" and "--verify" in args)
+        configure = next(i for i, (name, args) in enumerate(calls)
+                         if name == "socketfilterfw" and "--add" in args)
+        self.assertLess(verify, configure)
+
+    def test_firewall_reports_disabled_and_block_all_without_changing_global_policy(self):
+        result = self.install("--roaming", "--host", "test.local", "--configure-firewall",
+                              INSTALL_FIXTURE_FIREWALL_ENABLED="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("macOS firewall is off", result.stdout)
+        result = self.install("--roaming", "--configure-firewall", INSTALL_FIXTURE_BLOCKALL="enabled")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Block all incoming connections overrides the SwiftMux exception", result.stdout)
+        self.assertFalse(any(name == "socketfilterfw" and args[0].startswith("--set")
+                             for name, args in self.calls()))
+
+    def test_firewall_command_failures_are_not_reported_as_success(self):
+        for operation in ["--getglobalstate", "--getblockall", "--add", "--unblockapp", "--getappblocked"]:
+            with self.subTest(operation=operation):
+                (self.root / "calls.jsonl").unlink(missing_ok=True)
+                result = self.install("--roaming", "--host", "test.local", "--configure-firewall",
+                                      INSTALL_FIXTURE_FIREWALL_FAILURE=operation)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn("install.sh:", result.stderr)
+                self.assertNotIn("macOS firewall exception configured", result.stdout)
+                firewall_calls = [args for name, args in self.calls() if name == "socketfilterfw"]
+                self.assertEqual(firewall_calls[-1][0], operation)
+
+    def test_firewall_denied_or_unrecognized_exception_is_not_reported_as_success(self):
+        for state in ["blocked", "unknown"]:
+            with self.subTest(state=state):
+                result = self.install("--roaming", "--host", "test.local", "--configure-firewall",
+                                      INSTALL_FIXTURE_APP_STATE=state)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn("exception was not verified", result.stderr)
+                self.assertNotIn("macOS firewall exception configured", result.stdout)
 
     def test_repeated_interruption_joins_the_owned_copy_worker_and_preserves_previous_app(self):
         with tempfile.TemporaryFile() as output:

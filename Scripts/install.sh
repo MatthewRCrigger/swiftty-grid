@@ -2,7 +2,7 @@
 # Builds, signs and installs Swiftty.app, registers its bundled SwiftMux
 # LaunchAgent (SMAppService) and, with --roaming, installs the swifttyd
 # bootstrap helper and writes the roaming configuration (spec.inbox.md §1).
-# Remote Login and firewall policy are reported, never changed.
+# Remote Login is reported, never changed. Firewall changes are opt-in.
 #
 # usage: Scripts/install.sh [options]
 #   --identity ID      signing identity; default: match a running agent,
@@ -13,6 +13,8 @@
 #     --host NAME      advertised host (default `scutil --get LocalHostName`.local)
 #     --bind ADDR      QUIC/UDP bind address (default 0.0.0.0)
 #     --port N         UDP port (default 51222)
+#   --configure-firewall  with --roaming, allow SwiftMux through the macOS
+#                      firewall (uses sudo; leaves global policy unchanged)
 #   --replace-dev-agent  remove a `swmux agent install` LaunchAgent first;
 #                      its running sessions end
 #   --restart-agent    re-register a running agent whose signing team
@@ -30,6 +32,8 @@ cd "$(dirname "$0")/.."
 identity=""
 dest=/Applications
 roaming=0
+configure_firewall=0
+firewall=/usr/libexec/ApplicationFirewall/socketfilterfw
 host=""
 bind=0.0.0.0
 port=51222
@@ -64,13 +68,23 @@ while [ $# -gt 0 ]; do
       esac
       shift 2 ;;
     --roaming) roaming=1; shift ;;
+    --configure-firewall) configure_firewall=1; shift ;;
     --replace-dev-agent) replace_dev=1; shift ;;
     --restart-agent) restart_agent=1; shift ;;
     --no-devices) devices=0; shift ;;
-    -h | --help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "install.sh: unknown option $1" >&2; exit 64 ;;
   esac
 done
+
+if [ "$configure_firewall" -eq 1 ]; then
+  if [ "$roaming" -ne 1 ]; then
+    echo "install.sh: --configure-firewall requires --roaming" >&2; exit 64
+  fi
+  if [ ! -x "$firewall" ]; then
+    echo "install.sh: macOS firewall tool unavailable: $firewall" >&2; exit 1
+  fi
+fi
 
 case "$dest" in
   '' | -*) echo "install.sh: --dest must name a directory" >&2; exit 64 ;;
@@ -251,7 +265,44 @@ if [ "$roaming" -eq 1 ]; then
   if ! nc -z localhost 22 >/dev/null 2>&1; then
     echo "note: Remote Login looks off; enable it in System Settings > General > Sharing"
   fi
-  echo "note: allow UDP $port through any firewall yourself; nothing is changed"
+  if [ "$configure_firewall" -eq 1 ]; then
+    # The bundled agent owns the QUIC listener; swifttyd only relays SSH
+    # bootstrap requests. Reapply after replacement, including repeat installs.
+    # socketfilterfw accepts executables, not individual UDP port rules.
+    firewall_agent="$(cd "$app/Contents/MacOS" && pwd -P)/swiftmux-agent"
+    firewall_state=$(LC_ALL=C "$firewall" --getglobalstate) || {
+      echo "install.sh: cannot read macOS firewall state" >&2; exit 1
+    }
+    blockall_state=$(LC_ALL=C "$firewall" --getblockall) || {
+      echo "install.sh: cannot read macOS firewall block-all state" >&2; exit 1
+    }
+    if ! sudo "$firewall" --add "$firewall_agent" \
+      || ! sudo "$firewall" --unblockapp "$firewall_agent"; then
+      echo "install.sh: could not configure the macOS firewall for SwiftMux" >&2; exit 1
+    fi
+    app_state=$(LC_ALL=C "$firewall" --getappblocked "$firewall_agent") || {
+      echo "install.sh: cannot verify the SwiftMux firewall exception" >&2; exit 1
+    }
+    case "$app_state" in
+      *" is permitted.") ;;
+      *)
+        echo "install.sh: SwiftMux firewall exception was not verified: $app_state" >&2
+        exit 1 ;;
+    esac
+    echo "macOS firewall exception configured for SwiftMux"
+    printf '%s\n' "$firewall_state" "$blockall_state"
+    case "$firewall_state" in
+      *"State = 0)"*) echo "note: macOS firewall is off; the exception applies when it is enabled" ;;
+    esac
+    case "$blockall_state" in
+      *"block all state set to enabled."*)
+        echo "note: Block all incoming connections overrides the SwiftMux exception; review System Settings > Network > Firewall > Options" ;;
+    esac
+    echo "note: other firewalls and routers may still need to allow the configured roaming UDP port; remote reachability is not verified"
+  else
+    echo "note: allow UDP $port through any firewall yourself; nothing is changed"
+    echo "  To configure the macOS firewall, re-run with --roaming --configure-firewall."
+  fi
 fi
 
 if [ "$running" -eq 1 ]; then

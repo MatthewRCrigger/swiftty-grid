@@ -370,7 +370,18 @@ are SwiftMux workspace IDs, the grant's server instance is the service
 epoch, and each attachment takes the workspace's interactive lease: a
 workspace the Mac app controls is refused (`writerBusy`) unless the client
 resumes with `takeover`. Grant expiry never ends a shell the remote client
-did not create. Firewall changes are not made automatically.
+did not create.
+
+To allow incoming connections to the bundled `swiftmux-agent` through the
+macOS firewall, run `Scripts/install.sh --roaming --configure-firewall`.
+This uses `sudo` to add and unblock the installed agent, verifies its exception,
+and reapplies it on repeat installs. The exception covers the executable,
+rather than a single UDP port. Setup reports whether the firewall is disabled
+or **Block all incoming connections** overrides the exception; global firewall
+settings stay unchanged. Other firewalls, routers and managed network policies
+may still need to allow the configured roaming UDP port. A configured exception
+does not verify reachability from another device. Without `--configure-firewall`,
+setup leaves firewall policy unchanged.
 
 ### Xcode Cloud, TestFlight and releases
 
