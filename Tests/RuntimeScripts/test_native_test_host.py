@@ -32,8 +32,9 @@ private func entry(
   _ handler: @escaping @Sendable (UnsafeRawBufferPointer) -> Void
 ) async throws -> Bool {
   guard let configuration,
-        let json = try JSONSerialization.jsonObject(with: Data(configuration)) as? [String: Int],
-        json["eventStreamVersion"] == 0 else {
+        let json = try JSONSerialization.jsonObject(with: Data(configuration)) as? [String: Any],
+        json["eventStreamVersion"] as? Int == 0,
+        json["parallel"] as? Bool == false else {
     throw NSError(domain: "missing schema configuration", code: 1)
   }
   let scenario = ProcessInfo.processInfo.environment["SWIFTTY_HOST_SCENARIO"]!

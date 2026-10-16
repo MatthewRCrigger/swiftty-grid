@@ -7,7 +7,13 @@ import Testing
 import TestSupport
 
 /// Hot paths must not touch the heap once warmed up (spec §13).
-@Suite(.serialized)
+@Suite(
+  .serialized,
+  .enabled(
+    if: !_isDebugAssertConfiguration(),
+    "Allocation budgets require optimized code; CI checks them in Release."
+  )
+)
 struct AllocationTests {
   @Test(
     .enabled(if: MTLCreateSystemDefaultDevice() != nil),

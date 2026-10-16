@@ -6,6 +6,13 @@ import Testing
 import TestSupport
 
 extension RendererTests {
+  /// The system's variable font is available on fresh Macs without the
+  /// separately installed SF Pro developer download.
+  private static func systemFontFamily() throws -> String {
+    let font = try #require(CTFontCreateUIFontForLanguage(.system, 26, nil))
+    return CTFontCopyFamilyName(font) as String
+  }
+
   @Test(.enabled(if: device != nil), arguments: [0, 1, 2])
   func
     `font changes rebuild clean shaped and grapheme rows like a fresh renderer`(
@@ -114,7 +121,7 @@ extension RendererTests {
   func `configured fallback fonts use native styles`(_ style: FontStyle) throws
   {
     var descriptor = FontDescriptor()
-    descriptor.fallbackFamilies = ["SF Pro"]
+    descriptor.fallbackFamilies = [try Self.systemFontFamily()]
     descriptor.features = ["ss01"]
     let font = ResolvedFont(descriptor: descriptor)
     let scalar: Unicode.Scalar = "₺"
@@ -182,7 +189,7 @@ extension RendererTests {
     throws
   {
     var descriptor = FontDescriptor(family: "Monaco")
-    descriptor.fallbackFamilies = ["SF Pro"]
+    descriptor.fallbackFamilies = [try Self.systemFontFamily()]
     let font = ResolvedFont(descriptor: descriptor)
     #expect(font.emboldened[1])
     let manager = CoreTextFontManager()
@@ -239,7 +246,7 @@ extension RendererTests {
   @Test
   func `configured fallback fonts receive features and variations`() throws {
     var descriptor = FontDescriptor()
-    descriptor.fallbackFamilies = ["SF Pro"]
+    descriptor.fallbackFamilies = [try Self.systemFontFamily()]
     descriptor.features = ["ss01=2"]
     descriptor.variations = ["wdth": 120]
     let font = ResolvedFont(descriptor: descriptor)
@@ -270,7 +277,7 @@ extension RendererTests {
     )
     #expect(CFEqual(cascadeFont, fallback))
     // The lira sign is absent from Menlo, so both renderer paths must
-    // resolve it through the configured SF Pro fallback.
+    // resolve it through the configured system font fallback.
     let scalar: Unicode.Scalar = "₺"
     let manager = CoreTextFontManager()
     #expect(manager.glyph(for: scalar, in: font) == nil)
@@ -314,7 +321,7 @@ extension RendererTests {
   func `later font features override earlier settings`(_ feature: String) throws
   {
     let config = Configuration.parse(
-      "font-family = SF Pro\nfont-feature = liga\nfont-feature = \(feature)"
+      "font-family = \(try Self.systemFontFamily())\nfont-feature = liga\nfont-feature = \(feature)"
     )
     let font = ResolvedFont(descriptor: config.fontDescriptor(scale: 2))
     #expect(!font.shapes)
@@ -332,7 +339,7 @@ extension RendererTests {
   @Test(arguments: ["\"ss01\", \"cv01\"", "'ss01', 'cv01'", "\"ss01, cv01\""])
   func `quoted feature lists preserve each tag`(_ list: String) throws {
     let config = Configuration.parse(
-      "font-family = SF Pro\nfont-feature = \(list)"
+      "font-family = \(try Self.systemFontFamily())\nfont-feature = \(list)"
     )
     let font = ResolvedFont(descriptor: config.fontDescriptor(scale: 2))
     let settings = try #require(

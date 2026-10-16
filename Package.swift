@@ -263,7 +263,10 @@ let package = Package(
         "CompanionModel", "SwiftMuxClient", "SwiftMuxService", "TestSupport",
       ]
     ),
-    .testTarget(name: "HostConnectionTests", dependencies: ["HostConnection"]),
+    .testTarget(
+      name: "HostConnectionTests",
+      dependencies: ["HostConnection", "TestSupport"]
+    ),
     .testTarget(
       name: "MuxAttentionTests",
       dependencies: ["MuxAttention", "SwiftMuxProtocol"]

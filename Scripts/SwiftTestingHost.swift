@@ -91,7 +91,11 @@ struct SwiftTestingHost {
       do {
         // Pin the JSON schema used by the completion audit. Static storage
         // keeps this buffer valid across the asynchronous ABI call.
-        let configuration: StaticString = #"{"eventStreamVersion":0}"#
+        // Suites share AppKit state and some synchronously wait for dispatch
+        // callbacks. Run them serially so small CI runners cannot starve those
+        // callbacks behind unrelated tests on the cooperative thread pool.
+        let configuration: StaticString =
+          #"{"eventStreamVersion":0,"parallel":false}"#
         let bytes = UnsafeRawBufferPointer(
           start: configuration.utf8Start,
           count: configuration.utf8CodeUnitCount,

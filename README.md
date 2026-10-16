@@ -26,6 +26,10 @@ mise run install [--roaming]           # see SwiftMux below
 mise run uninstall [--purge] [-y]
 ```
 
+The native host runs tests serially because suites share AppKit state and use
+blocking dispatch handoffs. Allocation budgets run only with optimized code;
+`Scripts/test-native.sh -c release` checks them alongside the rest of the suite.
+
 `mise.toml` sets `SDKROOT` for swift.org toolchains. Build the UIKit frontend
 with Xcode; the package's AppKit executable scheme is macOS-only:
 
@@ -412,14 +416,17 @@ the Top Shelf images, `Apps/VisionClient/Assets.xcassets`); regenerate them
 from `icon.svg` with `xcrun swift Scripts/gen-platform-icons.swift`.
 
 Swiftty.app is unsandboxed (it owns local PTYs) and is distributed with
-Developer ID. `.github/workflows/release-mac.yml` runs on the self-hosted
-runner for a pushed `v<version>` tag (or manually, as a
+Developer ID. `.github/workflows/release-mac.yml` runs on the Namespace
+`namespace-profile-mac` runner for a pushed `v<version>` tag (or manually, as a
 `mac-v<version>-<build>` prerelease): `Scripts/package-swiftmux.sh` builds and
 signs it, then `Scripts/release-mac-github.sh` notarizes it (`Scripts/notarize.sh`,
 shared with the package and install scripts) and uploads a zip and SHA-256 to
-the release, or to an existing draft for the tag. It needs the runner to hold the Developer
-ID certificate in an unlocked keychain, the repository variable
-`DEVELOPER_ID_IDENTITY`, and an App Store Connect API key as the secrets
+the release, or to an existing draft for the tag. The Namespace `mac` profile must
+provide Apple Silicon, macOS 27, Xcode 27 and Swift 6.4. The workflow imports the
+Developer ID certificate and private key into a temporary keychain from the
+base64 `MACOS_CERTIFICATE_P12` secret and its `MACOS_CERTIFICATE_PASSWORD` secret,
+then removes the keychain after the release, including on failure. It also needs
+the repository variable `DEVELOPER_ID_IDENTITY` and an App Store Connect API key as the secrets
 `NOTARY_KEY_ID`, `NOTARY_ISSUER_ID` and `NOTARY_KEY` (the `.p8` contents).
 
 ### Connecting a device
@@ -538,9 +545,10 @@ operation; run them in Release without internal checks.
 Swift formatting follows the pinned Swift Collections configuration: two-space
 indentation, 80-column wrapping, and unindented conditional-compilation bodies.
 `mise run format-check` also validates documentation comments. Generated Unicode
-tables retain their generator's layout. CI requires a self-hosted Apple Silicon
-runner labeled `swiftty`, with Swift 6.4, Xcode 27, all supported platform SDKs,
-Python 3, and the test tools from `mise.toml` on `PATH`.
+tables retain their generator's layout. CI and release builds use the Namespace
+`namespace-profile-mac` runner with Apple Silicon, macOS 27, Swift 6.4 and Xcode 27.
+The shared macOS setup action verifies the toolchain and installs ripgrep and
+tmux for native tests.
 
 ## Configuration
 

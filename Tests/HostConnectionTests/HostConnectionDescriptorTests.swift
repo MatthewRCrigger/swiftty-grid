@@ -1,6 +1,7 @@
 import Foundation
 import HostConnection
 import Testing
+import TestSupport
 
 /// Pairing-code codec bounds (spec.connection-setup.md acceptance T6).
 struct HostConnectionDescriptorTests {
@@ -148,11 +149,15 @@ struct HostConnectionDescriptorTests {
     }
   }
 
-  @Test(arguments: [
-    "My\u{7}Mac", "Mac\nBook", "https://evil.example", "Mac`id`", "Mac$(id)",
-    " Mac", "Mac\u{202E}", String(repeating: "M", count: 65),
-  ])
-  func rejectsInjectedNames(_ name: String) {
+  @Test(
+    arguments: [
+      "My\u{7}Mac", "Mac\nBook", "https://evil.example", "Mac`id`", "Mac$(id)",
+      " Mac", "Mac\u{202E}", String(repeating: "M", count: 65),
+    ]
+    .map(TestFixture.init)
+  )
+  func rejectsInjectedNames(_ fixture: TestFixture<String>) {
+    let name = fixture.value
     #expect(throws: HostConnectionDescriptor.DecodingError.invalidName) {
       try HostConnectionDescriptor.decode(json(object(name: name)))
     }

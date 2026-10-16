@@ -10,9 +10,11 @@ name: Release Swiftty.app
 # mac-v<version>-<build> prerelease at the selected commit, even when it
 # is started from a tag.
 #
-# Runner setup: the Developer ID Application certificate and private key
-# in a keychain the runner's user can sign with, unlocked.
+# The Namespace profile "mac" must use arm64 macOS 27 with Xcode 27 / Swift 6.4.
+# Signing uses a temporary keychain, removed even when a later step fails.
 #   vars.DEVELOPER_ID_IDENTITY  e.g. "Developer ID Application: Name (TEAMID)"
+#   secrets.MACOS_CERTIFICATE_P12       base64 certificate AND private key (.p12)
+#   secrets.MACOS_CERTIFICATE_PASSWORD  password for that .p12
 #   secrets.NOTARY_KEY_ID, NOTARY_ISSUER_ID, NOTARY_KEY
 #                               App Store Connect API key (.p8 contents),
 #                               used by Scripts/notarize.sh
@@ -31,15 +33,52 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: release-mac-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   release:
-    runs-on: [self-hosted, macOS, ARM64, swiftty]
+    runs-on: namespace-profile-mac
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-macos
+      - name: Import signing certificate
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          IDENTITY: ${{ vars.DEVELOPER_ID_IDENTITY }}
+        run: |
+          : "${MACOS_CERTIFICATE_P12:?set the MACOS_CERTIFICATE_P12 repository secret}"
+          : "${IDENTITY:?set the DEVELOPER_ID_IDENTITY repository variable}"
+          umask 077
+          certificate="$RUNNER_TEMP/swiftty-signing.p12"
+          keychain="$RUNNER_TEMP/swiftty-signing.keychain-db"
+          trap 'rm -f "$certificate"' EXIT
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$certificate"
+          keychain_password=$(openssl rand -base64 32)
+          original_keychains=()
+          security list-keychains -d user > "$RUNNER_TEMP/swiftty-keychains.txt"
+          while IFS= read -r line; do
+            if [[ "$line" =~ ^[[:space:]]*\"(.*)\"[[:space:]]*$ ]]; then
+              original_keychains+=("${BASH_REMATCH[1]}")
+            else
+              echo "cannot parse the user keychain search list" >&2; exit 1
+            fi
+          done < "$RUNNER_TEMP/swiftty-keychains.txt"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -f pkcs12 -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" ${original_keychains[@]+"${original_keychains[@]}"}
+          security find-identity -v -p codesigning "$keychain" | grep -F -- "$IDENTITY" > /dev/null
       - name: Package and sign
         env:
           IDENTITY: ${{ vars.DEVELOPER_ID_IDENTITY }}
@@ -57,3 +96,12 @@ jobs:
           RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
           RELEASE_COMMIT: ${{ github.sha }}
         run: Scripts/release-mac-github.sh .build/package/Swiftty.app
+      - name: Remove signing keychain
+        if: always()
+        run: |
+          keychain="$RUNNER_TEMP/swiftty-signing.keychain-db"
+          rm -f "$RUNNER_TEMP/swiftty-signing.p12"
+          rm -f "$RUNNER_TEMP/swiftty-keychains.txt"
+          if [ -f "$keychain" ]; then
+            security delete-keychain "$keychain"
+          fi

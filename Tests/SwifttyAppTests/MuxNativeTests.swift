@@ -225,10 +225,15 @@ struct MuxNativeTests {
     let left = try #require(
       await waitPresented(firstView) { $0.grid.columns < full.grid.columns }
     )
-    let right = try #require(
-      await waitPresented(otherView) { $0.grid.columns < full.grid.columns }
+    // The new pane first publishes its initial launch geometry. Wait for
+    // the frame resized to the split, rather than accepting that first frame
+    // merely because it happens to be narrower than the original window.
+    _ = try #require(
+      await waitPresented(otherView) {
+        $0.grid.columns < full.grid.columns
+          && abs(left.grid.columns - $0.grid.columns) <= 2
+      }
     )
-    #expect(abs(left.grid.columns - right.grid.columns) <= 2)
     // A divider ratio change resizes the panes.
     c.setRatio(0.25, path: [])
     let narrowed = await waitPresented(firstView) {
