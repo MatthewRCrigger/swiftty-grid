@@ -14,7 +14,7 @@ public enum UITesting {
   static let storageDirectory: URL? = {
     guard isEnabled else { return nil }
     let directory = FileManager.default.temporaryDirectory
-      .appending(path: "RoamingSSH-UITests", directoryHint: .isDirectory)
+      .appending(path: "Swiftty-UITests", directoryHint: .isDirectory)
     try? FileManager.default.removeItem(at: directory)
     return directory
   }()

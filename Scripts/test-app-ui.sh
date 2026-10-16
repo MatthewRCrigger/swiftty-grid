@@ -81,7 +81,7 @@ case $app in
     # RST_UI_BUNDLE_SUFFIX installs a separate app identity with fresh
     # permission state (e.g. a Local Network denial run) without touching
     # an installed client's data.
-    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty.roaming${RST_UI_BUNDLE_SUFFIX:-}
+    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty${RST_UI_BUNDLE_SUFFIX:-}
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: Find and connect to your Mac to access terminal workspaces on your local network.
         INFOPLIST_KEY_NSCameraUsageDescription: Scan the connection code displayed by your Mac.
         INFOPLIST_FILE: $apps/Config/AttentionLinks.plist
@@ -91,7 +91,7 @@ case $app in
   CatalystClient)
     sources="[{ path: \"$apps/CatalystClient\", excludes: [\"*.entitlements\"] }]"
     deps="- { package: Swiftty, product: RoamingApp }"
-    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty.roaming
+    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty
         SUPPORTS_MACCATALYST: YES
         DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
         TARGETED_DEVICE_FAMILY: \"2,6\"
@@ -124,7 +124,7 @@ targets:
     settings:
       base:
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
-        INFOPLIST_KEY_CFBundleDisplayName: Roaming SSH
+        INFOPLIST_KEY_CFBundleDisplayName: Swiftty
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
         SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
         $app_settings

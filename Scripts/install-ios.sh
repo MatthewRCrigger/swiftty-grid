@@ -105,7 +105,7 @@ printf '%s\n' "$connected" | while read -r udid name; do
   [ -n "$udid" ] || continue
   if xcrun devicectl device install app --quiet --device "$udid" "$app" \
     >"$work/install-$udid.log" 2>&1; then
-    echo "installed Roaming SSH on $name"
+    echo "installed Swiftty on $name"
   else
     echo "install-ios.sh: install on $name failed:" >&2
     tail -3 "$work/install-$udid.log" >&2

@@ -14,7 +14,7 @@ enum RoamingStorage {
     #else
     let base = URL.applicationSupportDirectory
     #endif
-    return base.appending(path: "RoamingSSH", directoryHint: .isDirectory)
+    return base.appending(path: "Swiftty", directoryHint: .isDirectory)
   }
 
   /// Trusted SSH host keys (public keys only).
@@ -93,7 +93,7 @@ enum SSHAccessError: Error, Equatable, Sendable {
 final class SSHAccess {
   private weak var app: RoamingAppModel?
   let trustStore: FileHostTrustStore
-  let keyStore = KeychainEd25519KeyStore(service: "dev.chr33s.swiftty.roaming.ssh-key")
+  let keyStore = KeychainEd25519KeyStore(service: "dev.chr33s.swiftty.ssh-key")
 
   init(app: RoamingAppModel, trustStore: FileHostTrustStore? = nil) {
     self.app = app

@@ -200,7 +200,7 @@ struct NearbyMacsView: View {
         Label("Local Network access is off", systemImage: "hand.raised")
           .font(.headline)
         Text(
-          "Allow Roaming SSH in Settings › Privacy & Security › Local Network, "
+          "Allow Swiftty in Settings › Privacy & Security › Local Network, "
             + "then try again. You can still enter an address or scan a code."
         )
         .font(.footnote).foregroundStyle(.secondary)

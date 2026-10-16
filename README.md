@@ -249,7 +249,7 @@ https://<configured domain>/a/<locator>
   #    application/json at /.well-known/apple-app-site-association.
   #    It claims only /a/<locator> (one component, no query or fragment).
   Scripts/make-aasa.sh -o apple-app-site-association TEAMID1234 \
-    com.chr33s.swiftty dev.chr33s.swiftty.roaming
+    com.chr33s.swiftty dev.chr33s.swiftty
   Scripts/make-aasa.sh --check apple-app-site-association   # re-validate rule order
 
   # 2. Native macOS app: Info.plist SwifttyAssociatedDomains plus the
@@ -374,9 +374,9 @@ did not create. Firewall changes are not made automatically.
 
 ### Xcode Cloud, TestFlight and releases
 
-The roaming clients are one universal-purchase app, `dev.chr33s.swiftty.roaming`:
+The roaming clients are one universal-purchase app, `dev.chr33s.swiftty`:
 `MobileClient` (iOS/iPadOS, embedding `WatchCompanion` as
-`dev.chr33s.swiftty.roaming.watchkitapp`), `CatalystClient` (macOS), `VisionClient`
+`dev.chr33s.swiftty.watchkitapp`), `CatalystClient` (macOS), `VisionClient`
 and `TVClient` are platforms of one App Store Connect app, so testers see a
 single TestFlight entry. Swiftty.app is the Mac terminal and host; Mac users
 reach remote sessions through the Catalyst build.

@@ -27,23 +27,11 @@ public struct HostProfileStore: Sendable {
 
   public init(fileURL: URL) { self.fileURL = fileURL }
 
-  /// `Application Support/RoamingSSH/hosts.json`. tvOS offers no durable
+  /// `Application Support/Swiftty/hosts.json`. tvOS offers no durable
   /// local storage to apps, so there the list lives in Caches and may be
   /// purged by the system (spec §2.3: no durable local file workflow).
   public static func defaultURL() -> URL {
-    if let override = UITesting.storageDirectory {
-      return override.appending(
-        path: "hosts.json",
-        directoryHint: .notDirectory
-      )
-    }
-    #if os(tvOS)
-    let base = URL.cachesDirectory
-    #else
-    let base = URL.applicationSupportDirectory
-    #endif
-    return base.appending(path: "RoamingSSH", directoryHint: .isDirectory)
-      .appending(path: "hosts.json", directoryHint: .notDirectory)
+    RoamingStorage.directory.appending(path: "hosts.json", directoryHint: .notDirectory)
   }
 
   /// Loads saved hosts; a missing file is an empty list.
