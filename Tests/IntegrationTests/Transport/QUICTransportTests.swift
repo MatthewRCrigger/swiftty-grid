@@ -1104,6 +1104,84 @@ struct QUICTransportTests {
   }
 
   @Test
+  func `an empty snapshot stream returns its credit without delivery`()
+    async throws
+  {
+    let (listener, accepted) = try await startListener()
+    defer { listener.stop() }
+    let client = try await connector()
+      .connectQUIC(
+        host: "127.0.0.1",
+        port: listener.port,
+        pin: loopbackIdentity.pin,
+      )
+    defer { client.close() }
+    let inbox = Inbox()
+    client.start(inbox.handler)
+    try await client.sendControl(
+      ControlRecord.encode(.ping(epoch: 1, nonce: 1)),
+    )
+    try await eventually { accepted.count == 1 }
+    let (server, _) = try #require(accepted.all.first)
+
+    // A snapshot abandoned before its write ends as an empty stream.
+    _ = try await server.sendRawStreamForTesting([], finish: true)
+    try await transportEventually {
+      client.snapshotDiagnosticsForTesting.contains("released=1,")
+    }
+    let good = snapshotPayload(bodyLength: 32, fill: 0x44)
+    try await server.sendSnapshot(good, stream: 1)
+    try await eventually { !inbox.snapshots.isEmpty }
+    #expect(inbox.snapshots == [good])
+    #expect(!client.isClosed)
+    #expect(!server.isClosed)
+  }
+
+  @Test
+  func `superseded snapshot streams retire once the client releases them`()
+    async throws
+  {
+    let (listener, accepted) = try await startListener()
+    defer { listener.stop() }
+    let client = try await connector()
+      .connectQUIC(
+        host: "127.0.0.1",
+        port: listener.port,
+        pin: loopbackIdentity.pin,
+      )
+    defer { client.close() }
+    let inbox = Inbox()
+    client.start(inbox.handler)
+    try await client.sendControl(
+      ControlRecord.encode(.ping(epoch: 1, nonce: 1)),
+    )
+    try await eventually { accepted.count == 1 }
+    let (server, _) = try #require(accepted.all.first)
+    server.enableSnapshotReadDiagnosticsForTesting()
+
+    let limit = QUICRSTConnection.maxTrackedOutbound
+    for id in 1 ... UInt64(limit + 2) {
+      try await server.sendSnapshot(
+        snapshotPayload(bodyLength: 32, fill: UInt8(id)),
+        stream: id
+      )
+      server.cancelSnapshot(stream: id)
+    }
+    try await transportEventually {
+      client.snapshotDiagnosticsForTesting.contains("released=\(limit + 2),")
+    }
+    try await transportEventually {
+      server.snapshotDiagnosticsForTesting.contains("retiring=0,")
+    }
+    #expect(server.snapshotDiagnosticsForTesting.contains("outbound retire,"))
+    let good = snapshotPayload(bodyLength: 32, fill: 0x55)
+    try await server.sendSnapshot(good, stream: 100)
+    try await transportEventually { inbox.snapshots.last == good }
+    #expect(!client.isClosed)
+    #expect(!server.isClosed)
+  }
+
+  @Test
   func `oversized and overlong snapshot streams are discarded`() async throws {
     let (listener, accepted) = try await startListener()
     defer { listener.stop() }
@@ -1308,7 +1386,7 @@ struct QUICTransportTests {
 
 extension QUICTransportTests {
   @Test(arguments: [false, true], [false, true])
-  func resetBeforeClientProcessesReadinessReturnsSnapshotCredit(
+  func cancellationBeforeClientProcessesReadinessReturnsSnapshotCredit(
     cancelAtAdoption: Bool,
     separateFIN: Bool
   ) async throws {
@@ -1330,7 +1408,7 @@ extension QUICTransportTests {
     let (server, _) = try #require(accepted.all.first)
     client.enableSnapshotReadDiagnosticsForTesting()
     server.enableSnapshotReadDiagnosticsForTesting()
-    let wire = SnapshotResetWriter()
+    let wire = SnapshotCancellationWriter()
     @Sendable
     func cancelSnapshot() {
       wire.cancel()
@@ -1341,7 +1419,7 @@ extension QUICTransportTests {
         Issue.record(
           Comment(
             rawValue: """
-              queued reset stage=\(stage), snapshot lengths=\(inbox.snapshots.map(\.count))
+              queued cancellation stage=\(stage), snapshot lengths=\(inbox.snapshots.map(\.count))
               separate FIN=\(separateFIN), wire=\(wire.progress)
               client: \(client.snapshotDiagnosticsForTesting)
               server: \(server.snapshotDiagnosticsForTesting)
@@ -1396,10 +1474,23 @@ extension QUICTransportTests {
     }
     if !cancelAtAdoption { cancelSnapshot() }
     _ = await send.result
+    // Cancellation resumes the waiter before Network finishes the stream.
+    // Hold readiness until the native finish has actually been submitted.
+    try await step("native finish") {
+      try await transportEventually(.seconds(2)) {
+        server.snapshotDiagnosticsForTesting.contains("outbound finish,")
+      }
+    }
     releaseGate()
-    try await step("reset credit") {
+    try await step("cancellation credit") {
       try await transportEventually(.seconds(2)) {
         client.snapshotDiagnosticsForTesting.contains("released=1,")
+      }
+    }
+    // The server cancels its finished stream only after the client released it.
+    try await step("native retirement") {
+      try await transportEventually(.seconds(2)) {
+        server.snapshotDiagnosticsForTesting.contains("outbound retire,")
       }
     }
     let good = snapshotPayload(bodyLength: 100, fill: 2)
@@ -1417,7 +1508,7 @@ extension QUICTransportTests {
       Issue.record(
         Comment(
           rawValue: """
-            queued reset snapshot lengths=\(inbox.snapshots.map(\.count))
+            queued cancellation snapshot lengths=\(inbox.snapshots.map(\.count))
             client: \(client.snapshotDiagnosticsForTesting)
             server: \(server.snapshotDiagnosticsForTesting)
             """
@@ -1431,7 +1522,7 @@ extension QUICTransportTests {
 
 }
 
-private final class SnapshotResetWriter: Sendable {
+private final class SnapshotCancellationWriter: Sendable {
   private let state = Mutex(
     (allowFIN: true, bodyCallback: false, finSubmitted: false)
   )

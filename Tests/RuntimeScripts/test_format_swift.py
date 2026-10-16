@@ -19,6 +19,9 @@ args = sys.argv[1:]
 with open(os.environ['FORMAT_CALLS'], 'a') as stream:
     stream.write(json.dumps([name, args]) + '\n')
 fault = os.environ.get('FORMAT_FAULT', '')
+if name == 'xcrun':
+    print(os.environ['FORMAT_XCODE_FORMATTER'])
+    sys.exit(0)
 if name == 'rg':
     if fault == 'partial-discovery':
         sys.stdout.buffer.write(b'Sources/first.swift\0')
@@ -157,6 +160,26 @@ class FormatSwiftTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.format_commands(), [
             ["lint", "--strict", "--configuration", ".swift-format", "Package.swift"]])
+        self.assert_cleaned()
+
+    def test_xcode_formatter_is_used_when_it_is_missing_from_path(self):
+        formatter = self.root / "Xcode toolchain" / "swift-format"
+        formatter.parent.mkdir()
+        (self.root / "bin/swift-format").rename(formatter)
+        xcrun = self.root / "bin/xcrun"
+        xcrun.write_text(TOOL.replace("/PYTHON", sys.executable))
+        xcrun.chmod(0o700)
+        result = subprocess.run(
+            ["/bin/sh", str(self.script), "check"], cwd=self.root,
+            env={**os.environ, "PATH": str(self.root / "bin") + ":/usr/bin:/bin",
+                 "TMPDIR": str(self.root / "temporary"), "FORMAT_CALLS": str(self.calls),
+                 "FORMAT_REAL_RG": self.real_rg, "FORMAT_XCODE_FORMATTER": str(formatter)},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.commands()[0], ["xcrun", ["--find", "swift-format"]])
+        self.assertEqual(len(self.format_commands()), 2)
+        self.assertEqual(self.format_commands()[1][4:], ["Package.swift"])
         self.assert_cleaned()
 
     def test_native_discovery_with_a_missing_root_never_formats_its_partial_results(self):

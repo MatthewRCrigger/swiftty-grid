@@ -294,6 +294,8 @@ UInt32BE    encodedLength
 Byte[]      encoded snapshot JSON
 ```
 
+A sender that abandons a snapshot before writing its record ends the stream with an empty FIN instead; the receiver releases that stream without delivering anything.
+
 Compression is independent per snapshot, without a cross-snapshot dictionary. Bound lengths before allocation and during decompression. RFC 1950 is the required framing, not an unspecified “deflate” variant. [S12]
 
 | Message | Purpose |
