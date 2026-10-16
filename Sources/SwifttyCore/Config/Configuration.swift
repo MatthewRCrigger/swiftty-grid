@@ -70,6 +70,17 @@ public struct ThemeSelection: Sendable, Equatable {
   public var light: String
   public var dark: String
 
+  /// The built-in themes, following the appearance.
+  public static let `default` = ThemeSelection(
+    light: "Swiftty Light",
+    dark: "Swiftty Dark"
+  )
+
+  public init(light: String, dark: String) {
+    self.light = light
+    self.dark = dark
+  }
+
   init?(parsing value: String) {
     let value = value.trimmingCharacters(in: .whitespaces)
     guard !value.isEmpty else { return nil }
@@ -202,9 +213,10 @@ public struct Configuration: Sendable, Equatable {
   public var adjustCellWidth = CellAdjustment()
   public var adjustCellHeight = CellAdjustment()
 
+  /// nil uses `ThemeSelection.default`.
   public var theme: ThemeSelection?
   public var colors = ColorSet()
-  public var backgroundOpacity = 0.8
+  public var backgroundOpacity = 0.5
   /// Glass behind a translucent background; zero disables it.
   public var backgroundBlur = 20
   public var minimumContrast = 1.0
@@ -710,17 +722,15 @@ public struct Configuration: Sendable, Equatable {
   // MARK: Derived values
 
   /// The terminal palette for `scheme`: built-in defaults, then the
-  /// theme, then colors set directly.
+  /// theme (the default theme when unset), then colors set directly.
   public func palette(for scheme: ColorScheme = .dark) -> Palette {
     var palette = Palette.standard
-    if let theme {
-      palette =
-        Themes.colors(
-          named: theme.name(for: scheme),
-          searching: themeDirectories
-        )?
-        .applied(to: palette) ?? palette
-    }
+    palette =
+      Themes.colors(
+        named: (theme ?? .default).name(for: scheme),
+        searching: themeDirectories
+      )?
+      .applied(to: palette) ?? palette
     return colors.applied(to: palette)
   }
 

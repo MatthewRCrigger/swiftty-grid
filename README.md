@@ -550,7 +550,7 @@ and ignored. macOS reads `$XDG_CONFIG_HOME/swiftty/config` (default
 `~/.config/swiftty/config`); Settings opens it and Shift-Cmd-, reloads it.
 iOS reads `Documents/config`.
 
-Terminal windows use Liquid Glass by default, with `background-opacity = 0.8`
+Terminal windows use Liquid Glass by default, with `background-opacity = 0.5`
 and `background-blur = true`. Set `background-opacity = 1` for an opaque
 terminal or `background-blur = false` for translucency without glass.
 
@@ -588,7 +588,9 @@ shared Ghostty config loads, but Swiftty has a single icon.
 Cell adjustments accept points or percentages. Foreground, cursor and selection
 colors can be configured separately. Themes are searched in
 `~/.config/swiftty/themes`, `~/.config/ghostty/themes`, then the built-in
-`Swiftty Dark` and `Swiftty Light` themes.
+`Swiftty Dark` and `Swiftty Light` themes (Blackboard dark and light). Without
+`theme`, the palette follows the appearance as
+`light:Swiftty Light,dark:Swiftty Dark`.
 
 Includes load in declaration order and override earlier settings; nested includes
 join the end of the queue. Each file loads once. `config-file =` clears pending

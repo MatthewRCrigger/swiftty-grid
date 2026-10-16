@@ -6,34 +6,56 @@ import Foundation
 public enum Themes {
   /// Maximum UTF-8 bytes read from one theme file.
   public static let maxFileBytes = 64 * 1024
-  /// Built-in themes, as theme-file text.
+  /// Built-in themes, as theme-file text: Blackboard, forked for each
+  /// appearance.
   public static let builtIn: [String: String] = [
     "Swiftty Dark": """
-    background = #282c34
-    foreground = #ffffff
-    cursor-color = #ffffff
+    background = #0C1021
+    foreground = #F8F8F8
+    cursor-color = #FFFFFF
+    cursor-text = #0C1021
+    selection-background = #253B76
+    selection-foreground = #F8F8F8
+    palette = 0=#0C1021
+    palette = 1=#BF392A
+    palette = 2=#61CE3C
+    palette = 3=#FBDE2D
+    palette = 4=#8DA6CE
+    palette = 5=#FF6400
+    palette = 6=#BECDE6
+    palette = 7=#F8F8F8
+    palette = 8=#7F90AA
+    palette = 9=#D74E41
+    palette = 10=#D8FA3C
+    palette = 11=#FBDE2D
+    palette = 12=#D5E0F3
+    palette = 13=#FF6400
+    palette = 14=#FFFFFF
+    palette = 15=#FFFFFF
     """,
     "Swiftty Light": """
-    background = #fafafa
-    foreground = #383a42
-    cursor-color = #383a42
-    selection-background = #c8d6f0
-    palette = 0=#383a42
-    palette = 1=#e45649
-    palette = 2=#50a14f
-    palette = 3=#c18401
-    palette = 4=#4078f2
-    palette = 5=#a626a4
-    palette = 6=#0184bc
-    palette = 7=#a0a1a7
-    palette = 8=#696c77
-    palette = 9=#e45649
-    palette = 10=#50a14f
-    palette = 11=#c18401
-    palette = 12=#4078f2
-    palette = 13=#a626a4
-    palette = 14=#0184bc
-    palette = 15=#fafafa
+    background = #F8FAFD
+    foreground = #1E2840
+    cursor-color = #0C1021
+    cursor-text = #F8FAFD
+    selection-background = #C6D6EE
+    selection-foreground = #1E2840
+    palette = 0=#0C1021
+    palette = 1=#B03028
+    palette = 2=#2E7D1B
+    palette = 3=#8F6F00
+    palette = 4=#3D639C
+    palette = 5=#BF4D00
+    palette = 6=#35708E
+    palette = 7=#5B6B88
+    palette = 8=#5B6B88
+    palette = 9=#922921
+    palette = 10=#1F6410
+    palette = 11=#705700
+    palette = 12=#2A4E86
+    palette = 13=#9E3F00
+    palette = 14=#245B77
+    palette = 15=#1E2840
     """,
   ]
 

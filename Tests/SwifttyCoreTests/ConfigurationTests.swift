@@ -147,8 +147,8 @@ struct ConfigurationTests {
     #expect(config.theme?.light == "Swiftty Light")
     #expect(config.theme?.dark == "Swiftty Dark")
     #expect(config.missingThemes.isEmpty)
-    #expect(config.palette(for: .light).background == 0xFAFAFA)
-    #expect(config.palette(for: .dark).background == 0x282C34)
+    #expect(config.palette(for: .light).background == 0xF8FAFD)
+    #expect(config.palette(for: .dark).background == 0x0C1021)
   }
 
   @Test(arguments: [
@@ -681,6 +681,10 @@ struct ConfigurationTests {
     expected.colors[255] = 0xFEDCBA
     #expect(colors.applied(to: .standard) == expected)
     var config = Configuration()
+    expected = config.palette()
+    expected.foreground = 0x123456
+    expected.colors[0] = 0xABCDEF
+    expected.colors[255] = 0xFEDCBA
     config.colors = colors
     #expect(config.palette() == expected)
   }
@@ -1022,7 +1026,7 @@ struct ConfigurationTests {
     #expect(dark.foreground == 0xEEEEEE)
     #expect(dark.colors[2] == 0x00FF00)  // the config overrides the theme
     #expect(config.fontSize == 13)  // themes only carry colors
-    #expect(config.palette(for: .light).background == 0xFAFAFA)
+    #expect(config.palette(for: .light).background == 0xF8FAFD)
     #expect(config.missingThemes.isEmpty)
     config.theme = ThemeSelection(parsing: "Nope")
     #expect(config.missingThemes == ["Nope"])

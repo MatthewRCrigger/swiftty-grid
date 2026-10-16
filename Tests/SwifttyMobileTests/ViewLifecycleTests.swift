@@ -563,6 +563,7 @@ struct ViewLifecycleTests {
   {
     let session = TerminalSession(columns: 10, rows: 3)
     let view = try TerminalUIView(session: session)
+    view.apply(Configuration.parse("theme=Swiftty Dark"))
     view.traitOverrides.userInterfaceStyle = .dark
     view.updateTraitsIfNeeded()
     #expect(view.traitCollection.userInterfaceStyle == .dark)

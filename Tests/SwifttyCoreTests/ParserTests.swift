@@ -915,7 +915,7 @@ struct ParserTests {
     vt.feed("\(ESC)]11;?\u{07}")
     #expect(
       TestFixture(vt.takeOutput())
-        == TestFixture("\(ESC)]11;rgb:2828/2c2c/3434\u{07}")
+        == TestFixture("\(ESC)]11;rgb:0c0c/1010/2121\u{07}")
     )
     vt.feed("\(ESC)]4;1;rgb:ff/00/80\(ESC)\\\(ESC)]4;1;?\(ESC)\\")
     #expect(
