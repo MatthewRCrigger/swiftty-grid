@@ -74,7 +74,7 @@ directClientSettings: &directClientSettings
     network.
   INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
   INFOPLIST_KEY_CFBundleDisplayName: Swiftty
-  INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: YES
+  INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
   # Attention deep links (spec.inbox.md §4.4): registers the `swiftty`
   # URL scheme, merged into the generated Info.plist, with no Universal
   # Link domains. Targets that support Universal Links instead use
