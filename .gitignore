@@ -1,4 +1,4 @@
-.build/
+.build*/
 .claude/worktrees/
 .env*
 !.env.example

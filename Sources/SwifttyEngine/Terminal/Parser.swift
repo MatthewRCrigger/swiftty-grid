@@ -334,7 +334,7 @@ public struct Parser: ~Copyable {
     guard let base = buffer.baseAddress, !buffer.isEmpty else { return 0 }
     defer {
       terminal.refreshSearchIfNeeded()
-      terminal._checkInvariants()
+      terminal._checkInvariants(screenOnly: true)
     }
     let n = buffer.count
     var i = 0

@@ -134,9 +134,18 @@ struct GridStorage: ~Copyable {
       && rows + history.count + freeCount == allocated
   }
 
-  func checkInvariants() -> Bool {
+  /// `screenOnly` skips history and free rows, keeping the cost independent
+  /// of scrollback size.
+  func checkInvariants(screenOnly: Bool = false) -> Bool {
     let allocated = min(capacity, chunkCount * Self.chunkRows)
     guard checkBounds() else { return false }
+    func checkExtent(_ id: Int) -> Bool {
+      let end = Int(extents[id])
+      guard end >= 0 && end <= columns else { return false }
+      let row = physical(Int32(id))
+      for x in end ..< columns where !row[x].isBlank { return false }
+      return true
+    }
     #if SWIFTTY_INTERNAL_CHECKS
     checkOwners.update(repeating: 0, count: allocated)
     func claim(_ id: Int32) -> Bool {
@@ -153,14 +162,13 @@ struct GridStorage: ~Copyable {
     }
     #endif
     for y in 0 ..< rows where !claim(rowMap[y]) { return false }
+    if screenOnly {
+      for y in 0 ..< rows where !checkExtent(Int(rowMap[y])) { return false }
+      return true
+    }
     for i in 0 ..< history.count where !claim(history.id(i)) { return false }
     for i in 0 ..< freeCount where !claim(free[i]) { return false }
-    for id in 0 ..< allocated {
-      let end = Int(extents[id])
-      guard end >= 0 && end <= columns else { return false }
-      let row = physical(Int32(id))
-      for x in end ..< columns where !row[x].isBlank { return false }
-    }
+    for id in 0 ..< allocated where !checkExtent(id) { return false }
     return true
   }
 

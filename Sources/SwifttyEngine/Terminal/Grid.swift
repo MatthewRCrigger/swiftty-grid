@@ -524,7 +524,9 @@ public struct Grid: ~Copyable {
     )
   }
 
-  func checkInvariants() -> Bool { storage.checkInvariants() }
+  func checkInvariants(screenOnly: Bool = false) -> Bool {
+    storage.checkInvariants(screenOnly: screenOnly)
+  }
 
   @inline(__always)
   func _checkInvariants() {

@@ -12,11 +12,14 @@ extension TerminalState {
     return true
   }
 
+  /// `screenOnly` skips scrollback so per-parse checks stay O(screen); a
+  /// full check over history would make parsing quadratic in output size.
   @inline(__always)
-  func _checkInvariants() {
+  func _checkInvariants(screenOnly: Bool = false) {
     #if SWIFTTY_INTERNAL_CHECKS
     precondition(
-      grid.checkInvariants() && inactiveGrid.checkInvariants(),
+      grid.checkInvariants(screenOnly: screenOnly)
+        && inactiveGrid.checkInvariants(screenOnly: screenOnly),
       "invalid row ownership or extent"
     )
     func checkCells(_ cells: UnsafeBufferPointer<Cell>) -> String? {
@@ -75,6 +78,7 @@ extension TerminalState {
         "screen row \(y): \(active ?? inactive ?? "")"
       )
     }
+    if screenOnly { return }
     for i in 0 ..< grid.historyCount {
       let error = checkCells(grid.historyLine(i).cells)
       precondition(error == nil, "history row \(i): \(error ?? "")")
