@@ -7,7 +7,7 @@
 # - Generates Apps/project.yml with XcodeGen. The project must sit beside
 #   the spec because Xcode resolves the local package path (`..`) and the
 #   entitlements paths relative to the project directory, so it is written
-#   to Apps/RoamingClients.xcodeproj, which is gitignored (*.xcodeproj) and
+#   to Apps/Swiftty.xcodeproj, which is gitignored (*.xcodeproj) and
 #   never committed. Derived data, logs and evidence go to a temp dir.
 # - XcodeGen's preGenCommand runs Scripts/configure-links.sh, which writes
 #   Apps/Config/Generated/ from SWIFTTY_LINK_DOMAINS (spec.inbox.md §4.4).
@@ -40,7 +40,7 @@ echo "Workspace: $work"
 xcodegen generate --quiet \
   --spec "$repository_root/Apps/project.yml" \
   --project "$repository_root/Apps" || { echo "xcodegen failed" >&2; exit 1; }
-project="$repository_root/Apps/RoamingClients.xcodeproj"
+project="$repository_root/Apps/Swiftty.xcodeproj"
 
 # Resolve package dependencies once so per-target builds share the result.
 xcodebuild -resolvePackageDependencies -project "$project" \

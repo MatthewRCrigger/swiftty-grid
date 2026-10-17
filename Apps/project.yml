@@ -15,7 +15,7 @@
 # Universal Links are configured at generation time: set
 # SWIFTTY_LINK_DOMAINS (comma-separated) before running xcodegen and the
 # preGenCommand writes Config/Generated/ (spec.inbox.md §4.4).
-name: RoamingClients
+name: Swiftty
 
 options:
   # Writes Config/Generated/AttentionLinks.plist and the per-target

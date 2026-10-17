@@ -398,9 +398,9 @@ single TestFlight entry. Swiftty.app is the Mac terminal and host; Mac users
 reach remote sessions through the Catalyst build.
 
 `Apps/ci_scripts/ci_post_clone.sh` drives Xcode Cloud: it installs XcodeGen,
-generates `Apps/RoamingClients.xcodeproj` and copies `Package.resolved` into
+generates `Apps/Swiftty.xcodeproj` and copies `Package.resolved` into
 it (Xcode Cloud never resolves packages itself). Create one Xcode Cloud
-product for the app, pointed at `Apps/RoamingClients.xcodeproj`, with
+product for the app, pointed at `Apps/Swiftty.xcodeproj`, with
 `SWIFTTY_TEAM_ID` (and optionally `SWIFTTY_LINK_DOMAINS`) in the workflow
 environment, and one workflow with an archive action per platform, each
 with a TestFlight post-action:

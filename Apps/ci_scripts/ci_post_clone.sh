@@ -1,7 +1,7 @@
 #!/bin/sh
 # Xcode Cloud: runs after the clone, before package resolution and the
 # build/archive action. Xcode Cloud finds ci_scripts beside the project it
-# builds (Apps/RoamingClients.xcodeproj), which is generated, not
+# builds (Apps/Swiftty.xcodeproj), which is generated, not
 # committed, so this generates it from Apps/project.yml.
 #
 # Workflow environment (Xcode Cloud > Workflow > Environment):
@@ -32,6 +32,6 @@ xcodegen generate --quiet \
 # Xcode Cloud disables automatic package resolution, so the generated
 # workspace needs the committed pins (the project's only remote packages
 # come from the local Swiftty package).
-swiftpm="$repository_root/Apps/RoamingClients.xcodeproj/project.xcworkspace/xcshareddata/swiftpm"
+swiftpm="$repository_root/Apps/Swiftty.xcodeproj/project.xcworkspace/xcshareddata/swiftpm"
 mkdir -p "$swiftpm"
 cp "$repository_root/Package.resolved" "$swiftpm/Package.resolved"

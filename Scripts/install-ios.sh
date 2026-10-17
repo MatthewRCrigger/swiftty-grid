@@ -81,7 +81,7 @@ if [ -z "$(printf '%s' "$connected" | tr -d '[:space:]')" ]; then
   exit 0
 fi
 
-project=Apps/RoamingClients.xcodeproj
+project=Apps/Swiftty.xcodeproj
 xcodegen generate --quiet --spec Apps/project.yml --project Apps
 derived=.build/ios
 log=.build/ios-build.log
