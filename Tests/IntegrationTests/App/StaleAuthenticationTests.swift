@@ -15,7 +15,7 @@ extension MainActorIntegrationTests {
         .appendingPathComponent("snapshot-retry-" + UUID().uuidString)
       defer { try? FileManager.default.removeItem(at: directory) }
       let app = RoamingAppModel(
-        store: HostProfileStore(
+        store: ConnectionStore(
           fileURL: directory.appendingPathComponent("hosts.json")
         )
       )
@@ -58,7 +58,7 @@ extension MainActorIntegrationTests {
       defer { try? FileManager.default.removeItem(at: directory) }
       do {
         let app = RoamingAppModel(
-          store: HostProfileStore(
+          store: ConnectionStore(
             fileURL: directory.appendingPathComponent("hosts.json")
           )
         )
@@ -148,7 +148,7 @@ extension MainActorIntegrationTests {
       }
       do {
         let app = RoamingAppModel(
-          store: HostProfileStore(
+          store: ConnectionStore(
             fileURL: directory.appendingPathComponent("hosts.json")
           ),
           resumeStore: SessionResumeStore(defaults: defaults),

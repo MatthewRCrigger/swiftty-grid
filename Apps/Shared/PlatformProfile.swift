@@ -66,6 +66,12 @@ public struct PlatformProfile: Hashable, Sendable {
   public var codeScanning: Bool { kind == .mobile }
   /// Accepts a pasted connection code; needs no camera or network.
   public var codeImport: Bool { !focusFirst }
+  /// Imports OpenSSH private keys from a file or an explicit paste
+  /// (spec.ssh-identity.md §3.2: not on tvOS in the first release).
+  public var keyImport: Bool { kind != .tv }
+  /// iCloud Keychain identities and CloudKit profile/metadata sync
+  /// (spec.ssh-identity.md §3.2: not on tvOS in the first release).
+  public var cloudSync: Bool { kind != .tv }
 
   /// What a terminal surface may offer for a roaming session here.
   public var roamingSurface: SurfaceCapabilities {

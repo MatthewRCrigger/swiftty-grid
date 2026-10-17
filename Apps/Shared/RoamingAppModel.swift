@@ -1,8 +1,13 @@
 import CompanionModel
 import Foundation
+
+#if canImport(CloudKit) && !os(watchOS)
+import CloudKit
+#endif
 import MuxNavigation
 import Observation
 import SSHClient
+import SSHIdentity
 import ScreenProtocol
 import SessionCore
 import SwifttyCore
@@ -313,7 +318,11 @@ extension CompanionConnectionState {
 @Observable
 public final class RoamingAppModel {
   public let profile: PlatformProfile
+  /// Saved hosts visible on this device (local-only, or bound to the
+  /// current iCloud account).
   public private(set) var hosts: [HostProfile] = []
+  /// The committed non-secret connection state (spec.ssh-identity.md §5).
+  public private(set) var connections = ConnectionSnapshot()
   public private(set) var lastError: String?
   /// The single active terminal, if any.
   public private(set) var activeSession: TerminalScreenModel?
@@ -361,7 +370,7 @@ public final class RoamingAppModel {
   public let transferPolicy = TransferPausePolicy()
 
   @ObservationIgnored
-  private let store: HostProfileStore
+  let store: ConnectionStore
   /// A failed load must not be overwritten by a later save of the
   /// in-memory list. Cleared only by a load that reads the file.
   @ObservationIgnored
@@ -399,26 +408,71 @@ public final class RoamingAppModel {
   @ObservationIgnored
   private var closing: [UUID: Task<Void, Never>] = [:]
 
+  /// SSH identities: generation, import, migration and resolution.
+  @ObservationIgnored
+  public private(set) var identityStore: SSHIdentityStore!
+  /// Opt-in CloudKit metadata sync, when the build is configured for it.
+  @ObservationIgnored
+  public private(set) var sync: ConnectionSyncCoordinator?
+  @ObservationIgnored
+  private var accountObserver: (any NSObjectProtocol)?
+
   public init(
     profile: PlatformProfile = .current,
-    store: HostProfileStore = HostProfileStore(
-      fileURL: HostProfileStore.defaultURL()
+    store: ConnectionStore = ConnectionStore(
+      fileURL: ConnectionStore.defaultURL()
     ),
     resumeStore: SessionResumeStore = SessionResumeStore(
       defaults: UITesting.defaults ?? .standard
-    )
+    ),
+    secrets: (any IdentitySecretStore)? = nil,
+    legacyKeys: (any LegacyKeySource)? = nil,
+    cloud: (any ConnectionCloudDatabase)? = nil
   ) {
     self.profile = profile
     self.store = store
     self.resumeStore = resumeStore
     self.companionSettings = Self.loadCompanionSettings()
     self.resumableHosts = Set(resumeStore.all().keys)
+    self.identityStore = SSHIdentityStore(
+      app: self,
+      secrets: secrets ?? IdentityKeychainConfiguration.secretStore(),
+      legacy: legacyKeys ?? IdentityKeychainConfiguration.legacyKeySource()
+    )
+    if let cloud = cloud ?? CloudKitConnectionDatabase.configured(),
+      profile.cloudSync
+    {
+      let sync = ConnectionSyncCoordinator(app: self, database: cloud)
+      self.sync = sync
+      // An iCloud identity needs a verified current account (§8.4).
+      identityStore.verifyICloudAccount = { [weak sync] in
+        guard let sync else { return false }
+        return (try? await sync.database.accountID()) != nil
+      }
+      #if canImport(CloudKit) && !os(watchOS)
+      accountObserver = NotificationCenter.default.addObserver(
+        forName: .CKAccountChanged,
+        object: nil,
+        queue: .main
+      ) { [weak sync] _ in
+        MainActor.assumeIsolated { sync?.accountDidChange() }
+      }
+      #endif
+    }
   }
 
   /// SSH connection services: trust store, credentials, prompts.
   var ssh: SSHAccess {
     if let sshAccess { return sshAccess }
-    let access = SSHAccess(app: self)
+    // Trusted host keys live beside the connection snapshot (in production
+    // both are in `RoamingStorage.directory`).
+    let access = SSHAccess(
+      app: self,
+      trustStore: FileHostTrustStore(
+        fileURL: store.fileURL.deletingLastPathComponent()
+          .appending(path: "known_hosts.json", directoryHint: .notDirectory)
+      )
+    )
     sshAccess = access
     return access
   }
@@ -427,17 +481,67 @@ public final class RoamingAppModel {
 
   public func load() {
     do {
-      let loaded = try store.load()
-      let identities = Set(loaded)
-      let changed = hosts.filter { !identities.contains($0) }
-      hosts = loaded
-      for host in changed { invalidateConnectionPrompts(for: host) }
+      let loaded = try store.loadSnapshot()
+      apply(loaded)
       savedHostsReadable = true
       lastError = nil
     } catch {
       savedHostsReadable = false
       lastError = "Saved hosts could not be read."
+      return
     }
+    // Version-1 labels move to stable identities before any new identity
+    // write or sync (spec.ssh-identity.md §9); interrupted identity
+    // operations resume.
+    if !connections.migration.completed || !connections.intents.isEmpty
+      || !connections.migration.pendingCleanup.isEmpty
+    {
+      identityStore.startRecovery()
+    }
+  }
+
+  /// Installs a committed snapshot and invalidates prompts for hosts whose
+  /// saved profile changed.
+  private func apply(_ snapshot: ConnectionSnapshot) {
+    let visible = snapshot.visibleHosts
+    let identities = Set(visible)
+    let changed = hosts.filter { !identities.contains($0) }
+    connections = snapshot
+    hosts = visible
+    for host in changed { invalidateConnectionPrompts(for: host) }
+  }
+
+  /// Applies `mutate` to a copy of the snapshot and commits it atomically.
+  /// The in-memory state advances only after the write succeeds; a store
+  /// that could not be read is never overwritten.
+  @discardableResult
+  func commitConnections(
+    notifySync: Bool = true,
+    _ mutate: (inout ConnectionSnapshot) throws(ConnectionStore.StoreError) -> Void
+  ) -> Bool {
+    guard savedHostsReadable else {
+      lastError = "Saved hosts could not be read."
+      return false
+    }
+    var next = connections
+    do {
+      try mutate(&next)
+      guard next != connections else { return true }
+      try store.commit(next)
+    } catch .tooManyHosts {
+      lastError = "You can save up to \(ConnectionStore.maxHosts) hosts."
+      return false
+    } catch .tooManyIdentities {
+      lastError = "You can save up to \(ConnectionStore.maxIdentities) keys."
+      return false
+    } catch {
+      lastError = "Saved hosts could not be written."
+      return false
+    }
+    apply(next)
+    lastError = nil
+    if notifySync { sync?.localChange() }
+    return true
   }
 
   /// Adds or replaces `host` (matched by id) after validation.
@@ -447,21 +551,18 @@ public final class RoamingAppModel {
     _ host: HostProfile
   ) throws(HostProfile.ValidationError) -> Bool {
     try host.validate()
-    var next = hosts
-    var changed = false
-    if let index = next.firstIndex(where: { $0.id == host.id }) {
-      changed = next[index] != host
-      next[index] = host
-    } else {
-      next.append(host)
+    return commitConnections { snapshot throws(ConnectionStore.StoreError) in
+      if !snapshot.hosts.contains(where: { $0.id == host.id }),
+        snapshot.hosts.count >= ConnectionStore.maxHosts
+      {
+        throw .tooManyHosts
+      }
+      snapshot.upsertHost(host)
     }
-    guard persist(next) else { return false }
-    if changed { invalidateConnectionPrompts(for: host) }
-    return true
   }
 
   public func delete(_ host: HostProfile) {
-    guard persist(hosts.filter { $0.id != host.id }) else { return }
+    guard commitConnections({ $0.deleteHost(host.id) }) else { return }
     if activeSession?.host.id == host.id { close() }
     invalidateConnectionPrompts(for: host)
     forgetSession(for: host)
@@ -477,21 +578,26 @@ public final class RoamingAppModel {
     for id in ids { cancelTrust(id) }
   }
 
-  @discardableResult
-  private func persist(_ next: [HostProfile]) -> Bool {
-    guard savedHostsReadable else {
-      lastError = "Saved hosts could not be read."
-      return false
+  // MARK: Identities
+
+  /// SSH identities visible on this device, by name.
+  public var identities: [SSHIdentityMetadata] {
+    connections.visibleIdentities.sorted {
+      $0.name.localizedStandardCompare($1.name) == .orderedAscending
     }
-    do {
-      try store.save(next)
-      hosts = next
-      lastError = nil
-      return true
-    } catch {
-      lastError = "Saved hosts could not be written."
-      return false
+  }
+
+  public func identity(_ id: UUID) -> SSHIdentityMetadata? {
+    connections.identity(id)
+  }
+
+  /// The sign-in summary shown under a host.
+  public func authSummary(for host: HostProfile) -> String {
+    guard case .key(let id) = host.auth else { return host.auth.summary }
+    guard let identity = identity(id), !identity.isDeleted else {
+      return "SSH key (deleted or unavailable)"
     }
+    return "Key \u{201C}\(identity.name)\u{201D}"
   }
 
   // MARK: Session

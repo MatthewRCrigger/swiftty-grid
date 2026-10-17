@@ -21,6 +21,7 @@ let package = Package(
     .library(name: "SessionCore", targets: ["SessionCore"]),
     .library(name: "ScreenProtocol", targets: ["ScreenProtocol"]),
     .library(name: "SSHClient", targets: ["SSHClient"]),
+    .library(name: "SSHIdentity", targets: ["SSHIdentity"]),
     .library(name: "AppleTransport", targets: ["AppleTransport"]),
     .library(name: "TerminalHost", targets: ["TerminalHost"]),
     .library(name: "TerminalSurface", targets: ["TerminalSurface"]),
@@ -177,6 +178,15 @@ let package = Package(
         ), .product(name: "Crypto", package: "swift-crypto"),
       ]
     ),
+    // SSH identities (spec.ssh-identity.md): metadata, Keychain storage,
+    // read-only resolution and bounded OpenSSH key import. Client-only:
+    // never linked by the engine, SwiftMux, swifttyd or the watch.
+    .target(
+      name: "SSHIdentity",
+      dependencies: [
+        "SSHClient", .product(name: "Crypto", package: "swift-crypto"),
+      ]
+    ),
     // Network framework QUIC, TLS identity and pinning policy.
     .target(
       name: "AppleTransport",
@@ -219,7 +229,7 @@ let package = Package(
       dependencies: [
         "SessionCore", "ScreenProtocol", "SSHClient", "TerminalSurface",
         "CompanionModel", "SwifttyCore", "SwifttyMobile", "MuxNavigation",
-        "HostConnection",
+        "HostConnection", "SSHIdentity",
         // AppKit surface for native macOS builds (the SwiftPM test host).
         .target(name: "SwifttyMac", condition: .when(platforms: [.macOS])),
         .product(name: "Crypto", package: "swift-crypto"),
@@ -268,6 +278,14 @@ let package = Package(
       dependencies: ["HostConnection", "TestSupport"]
     ),
     .testTarget(
+      name: "SSHIdentityTests",
+      dependencies: [
+        "SSHIdentity", "SSHClient",
+        .product(name: "Crypto", package: "swift-crypto"),
+      ],
+      resources: [.copy("Fixtures")]
+    ),
+    .testTarget(
       name: "MuxAttentionTests",
       dependencies: ["MuxAttention", "SwiftMuxProtocol"]
     ),
@@ -291,7 +309,7 @@ let package = Package(
         "SessionCore", "ScreenProtocol", "SSHClient", "AppleTransport",
         "TerminalHost", "TerminalSurface", "SwifttyCore", "TestSupport",
         "RoamingApp", "SwiftMuxProtocol", "SwiftMuxService", "SwiftMuxClient",
-        "HostConnection", "MuxNavigation",
+        "HostConnection", "MuxNavigation", "SSHIdentity",
         .product(name: "NIOCore", package: "swift-nio"),
         .product(name: "NIOPosix", package: "swift-nio"),
         .product(name: "NIOSSH", package: "swift-nio-ssh"),

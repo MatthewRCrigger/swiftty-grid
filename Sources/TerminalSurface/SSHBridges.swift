@@ -10,12 +10,26 @@ public let defaultHelperPath = "/usr/local/libexec/swifttyd"
 /// How to reach and authenticate to the Mac over SSH.
 public struct SSHEndpoint: Sendable {
   public var configuration: SSHClient.SSHClientConfiguration
-  public var credential: SSHCredential
+  /// A fixed credential, or one resolved again for every connection so an
+  /// application-held key is released between bootstraps
+  /// (spec.ssh-identity.md §6.1).
+  public var credentialSource: CredentialSource
   public var trustStore: any HostTrustStore
   /// Asked only for an unknown key. Automatic reconnects should use
   /// `RejectUnknownHostKeys` so they never prompt.
   public var trustDecider: any HostTrustDecider
   public var helperPath: String
+
+  public enum CredentialSource: Sendable {
+    case fixed(SSHCredential)
+    case resolved(@Sendable () async throws -> SSHCredential)
+  }
+
+  /// A `.resolved` credential could not be produced. Fails closed before
+  /// any connection is made.
+  public struct CredentialUnavailable: Error, Hashable, Sendable {
+    public init() {}
+  }
 
   public init(
     configuration: SSHClient.SSHClientConfiguration,
@@ -24,8 +38,24 @@ public struct SSHEndpoint: Sendable {
     trustDecider: any HostTrustDecider = RejectUnknownHostKeys(),
     helperPath: String = defaultHelperPath
   ) {
+    self.init(
+      configuration: configuration,
+      credentialSource: .fixed(credential),
+      trustStore: trustStore,
+      trustDecider: trustDecider,
+      helperPath: helperPath
+    )
+  }
+
+  public init(
+    configuration: SSHClient.SSHClientConfiguration,
+    credentialSource: CredentialSource,
+    trustStore: any HostTrustStore,
+    trustDecider: any HostTrustDecider = RejectUnknownHostKeys(),
+    helperPath: String = defaultHelperPath
+  ) {
     self.configuration = configuration
-    self.credential = credential
+    self.credentialSource = credentialSource
     self.trustStore = trustStore
     self.trustDecider = trustDecider
     self.helperPath = helperPath
@@ -34,7 +64,15 @@ public struct SSHEndpoint: Sendable {
   func connect(
     eventLoopGroup: (any EventLoopGroup)?
   ) async throws -> SSHConnection {
-    try await SSHConnection.connect(
+    let credential: SSHCredential
+    switch credentialSource {
+    case .fixed(let fixed): credential = fixed
+    case .resolved(let resolve):
+      do { credential = try await resolve() } catch is CancellationError {
+        throw CancellationError()
+      } catch { throw CredentialUnavailable() }
+    }
+    return try await SSHConnection.connect(
       configuration: configuration,
       credential: credential,
       trustStore: trustStore,
@@ -79,6 +117,9 @@ public struct SSHBootstrapper: RemoteBootstrapper {
   }
 
   static func map(_ error: any Error) -> RemoteBootstrapError {
+    if error is SSHEndpoint.CredentialUnavailable {
+      return .credentialUnavailable
+    }
     guard let error = error as? SSHClientError else { return .unreachable }
     switch error {
     case .hostKeyChanged, .hostKeyRejected, .hostKeyMismatch,

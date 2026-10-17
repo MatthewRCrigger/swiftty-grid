@@ -295,7 +295,7 @@ extension MainActorIntegrationTests {
       do {
         let defaults = try #require(UserDefaults(suiteName: suite))
         let app = RoamingAppModel(
-          store: HostProfileStore(
+          store: ConnectionStore(
             fileURL: directory.appendingPathComponent("hosts.json")
           ),
           resumeStore: SessionResumeStore(defaults: defaults),

@@ -36,7 +36,7 @@ extension MainActorIntegrationTests {
       )
       let domain = UUID().uuidString
       let app = RoamingAppModel(
-        store: HostProfileStore(
+        store: ConnectionStore(
           fileURL: directory.appendingPathComponent("hosts.json")
         ),
         resumeStore: SessionResumeStore(

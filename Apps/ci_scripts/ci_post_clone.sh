@@ -9,6 +9,9 @@
 #                         automatic signing (required).
 #   SWIFTTY_LINK_DOMAINS  optional Universal Link domains; see
 #                         Scripts/configure-links.sh.
+#   SWIFTTY_CLOUDKIT_CONTAINER
+#                         optional provisioned CloudKit container for
+#                         opt-in metadata sync; see the same script.
 set -eu
 
 repository_root=${CI_PRIMARY_REPOSITORY_PATH:-$(CDPATH='' cd "$(dirname "$0")/../.." && pwd)}

@@ -30,6 +30,9 @@ public enum RemoteBootstrapError: Error, Hashable, Sendable {
   case hostKeyRejected
   /// SSH authentication failed.
   case authenticationFailed
+  /// The selected client key could not be read (deleted, not on this
+  /// device, or the device is locked). No credential was offered.
+  case credentialUnavailable
   /// The helper answered with malformed or unexpected output.
   case protocolViolation
 }

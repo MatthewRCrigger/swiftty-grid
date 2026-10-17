@@ -46,7 +46,7 @@ The following feature table describes the full-client profile. §2.1 narrows it 
 | Plain SSH fallback when the helper or UDP is unavailable | Automatic conversion of a roaming session into a plain SSH session |
 | Unicode text, common terminal attributes, alternate screen, keyboard/paste | Terminal graphics, remote clipboard writes, speculative echo |
 
-A direct client may manage several saved sessions, but **only one roaming terminal is actively attached per client application at a time in the minimal UI**. Each server session permits one controlling client across all platforms. New platforms do not enable concurrent writers or automatic cross-device credential synchronization. The watchOS companion does not attach to RST/1 or acquire a writer lease.
+A direct client may manage several saved sessions, but **only one roaming terminal is actively attached per client application at a time in the minimal UI**. Each server session permits one controlling client across all platforms. New platforms do not enable concurrent writers or automatic cross-device credential synchronization. [spec.ssh-identity.md](spec.ssh-identity.md) supersedes the device-only credential exclusion for iPhone, iPad, Mac Catalyst and visionOS: SSH identities stay device-only by default, and syncing one through iCloud Keychain, or syncing profiles and public metadata through CloudKit, is an explicit per-identity or per-setting opt-in. The watchOS companion does not attach to RST/1 or acquire a writer lease.
 
 No Mosh, tssh, tsshd, trzsz, or ZMODEM interoperability is claimed. No additional file-transfer utility is required on macOS: Remote Login provides SSH and SFTP. [S2]
 

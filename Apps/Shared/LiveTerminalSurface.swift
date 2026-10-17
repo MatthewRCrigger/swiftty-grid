@@ -225,14 +225,14 @@ final class RoamingTerminalController: TerminalSurfaceController {
       await old.close(.detach)
     }
     guard !closed, !Task.isCancelled else { return }
-    let credential: SSHCredential
+    let endpoint: SSHEndpoint
     do {
       // Interactive trust and credential check; the client's own SSH
       // bootstraps then run without prompts.
       let probe = try await app.ssh.connect(host)
       await probe.close()
       guard !closed, !Task.isCancelled else { return }
-      credential = try await app.ssh.credential(for: host)
+      endpoint = try await app.ssh.bootstrapEndpoint(for: host)
     } catch {
       guard !closed else { return }
       phase = .failed(Self.problem(for: error))
@@ -241,9 +241,7 @@ final class RoamingTerminalController: TerminalSurfaceController {
     guard !closed, !Task.isCancelled else { return }
 
     let client = RoamingClient(
-      bootstrapper: SSHBootstrapper(
-        endpoint: app.ssh.endpoint(for: host, credential: credential)
-      ),
+      bootstrapper: SSHBootstrapper(endpoint: endpoint),
       connector: QUICGrantConnector(),
       sink: display,
       configuration: RoamingClientConfiguration(initialGrid: grid)
@@ -476,6 +474,15 @@ final class RoamingTerminalController: TerminalSurfaceController {
       SurfaceProblem(
         title: "Authentication failed",
         detail: "The server rejected the credentials.",
+        actions: [.retry]
+      )
+    case .credentialUnavailable:
+      SurfaceProblem(
+        title: "Key unavailable",
+        detail:
+          "The selected SSH key could not be read: it was deleted, is not on this "
+          + "device, or the device is locked. The session is kept on the Mac; no "
+          + "credentials were sent.",
         actions: [.retry]
       )
     case .protocolViolation:

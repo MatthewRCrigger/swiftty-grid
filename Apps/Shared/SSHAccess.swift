@@ -1,6 +1,7 @@
 import Crypto
 import Foundation
 import SSHClient
+import SSHIdentity
 import TerminalSurface
 
 /// Where the app keeps non-secret state: trusted host public keys,
@@ -28,8 +29,14 @@ enum RoamingStorage {
 enum SSHAccessError: Error, Equatable, Sendable {
   /// The user dismissed a password or trust prompt.
   case cancelled
-  /// The Keychain key could not be read or created.
-  case keyUnavailable
+  /// The selected SSH identity cannot authenticate on this device. Fails
+  /// closed: no key is generated and no password is asked for.
+  case keyUnavailable(IdentityResolutionError)
+  /// A version-1 key label that migration could not find; the host must
+  /// be assigned an identity explicitly.
+  case keyNeedsRepair
+  /// A sign-in method written by a newer version of the app.
+  case unsupportedAuthMethod
   /// The host presented a key different from the trusted one. Blocked
   /// until the user removes the old key deliberately (spec §5.1).
   case hostKeyChanged
@@ -49,6 +56,8 @@ enum SSHAccessError: Error, Equatable, Sendable {
     switch self {
     case .cancelled: "Sign-in cancelled"
     case .keyUnavailable: "Key unavailable"
+    case .keyNeedsRepair: "Choose a key"
+    case .unsupportedAuthMethod: "Sign-in method not supported"
     case .hostKeyChanged: "Host key changed"
     case .hostKeyRejected: "Host key not trusted"
     case .hostKeyMismatch: "Host key doesn't match the code"
@@ -61,8 +70,32 @@ enum SSHAccessError: Error, Equatable, Sendable {
   var detail: String {
     switch self {
     case .cancelled: "No credentials were sent."
-    case .keyUnavailable:
-      "The Keychain key for this host could not be read or created."
+    case .keyUnavailable(let reason):
+      switch reason {
+      case .unknownIdentity, .deleted:
+        "The SSH key selected for this host was deleted or is not on this "
+          + "device. Edit the host to choose another key. No credentials were sent."
+      case .unavailableOnThisDevice:
+        "The selected key is stored only on another device. Choose a key "
+          + "saved on this device. No credentials were sent."
+      case .awaitingKeyMaterial:
+        "The selected key is not available on this device. iCloud Keychain may "
+          + "be off, delayed or unable to deliver it. No credentials were sent."
+      case .protectedDataUnavailable:
+        "Unlock this device to use the selected key. No credentials were sent."
+      case .integrityConflict:
+        "The stored key does not match the selected key's fingerprint, so it "
+          + "was not used. No credentials were sent."
+      case .unsupported:
+        "The Keychain could not be read. No credentials were sent."
+      case .cancelled: "No credentials were sent."
+      }
+    case .keyNeedsRepair:
+      "This host used a key that was not found during the update. Edit the host "
+        + "to choose or import a key. No credentials were sent."
+    case .unsupportedAuthMethod:
+      "This host was saved by a newer version of Swiftty. Update the app or "
+        + "edit the host. No credentials were sent."
     case .hostKeyChanged:
       "The key presented differs from the trusted key, so the connection was blocked. "
         + "Verify the Mac's key before removing the old one."
@@ -92,13 +125,16 @@ enum SSHAccessError: Error, Equatable, Sendable {
 @MainActor
 final class SSHAccess {
   private weak var app: RoamingAppModel?
-  let trustStore: FileHostTrustStore
-  let keyStore = KeychainEd25519KeyStore(service: "dev.chr33s.swiftty.ssh-key")
+  /// Records local trust decisions for opt-in trust sync.
+  let trustStore: any HostTrustStore
+  /// The underlying file store, written directly only by sync.
+  let trustFile: FileHostTrustStore
 
   init(app: RoamingAppModel, trustStore: FileHostTrustStore? = nil) {
     self.app = app
-    self.trustStore =
-      trustStore ?? FileHostTrustStore(fileURL: RoamingStorage.knownHostsURL)
+    let file = trustStore ?? FileHostTrustStore(fileURL: RoamingStorage.knownHostsURL)
+    self.trustFile = file
+    self.trustStore = SyncedHostTrustStore(base: file, app: app)
   }
 
   /// `expectedHostKeys` are fingerprints from a confirmed pairing code;
@@ -116,12 +152,14 @@ final class SSHAccess {
   }
 
   /// The credential for `host`: a password from memory or a prompt, or
-  /// the Keychain key named by the profile (created on first use).
+  /// exactly the SSH identity the profile selects. Resolution is read-only:
+  /// a missing key is an error, never a reason to create one.
   func credential(
     for host: HostProfile,
     retry: Bool = false,
     rejectedPassword: String? = nil
   ) async throws(SSHAccessError) -> SSHCredential {
+    let host = await migrated(host)
     switch host.auth {
     case .password:
       guard let app, let password = await app.password(
@@ -129,22 +167,46 @@ final class SSHAccess {
       )
       else { throw .cancelled }
       return .password(password)
-    case .keychainKey(let label):
+    case .key(let id):
+      guard let app else { throw .cancelled }
       do {
-        return .ed25519(try await keyStore.loadOrCreateKey(label: label))
-      } catch { throw .keyUnavailable }
+        return .ed25519(try await app.identityStore.resolve(id).privateKey)
+      } catch .cancelled {
+        throw .cancelled
+      } catch { throw .keyUnavailable(error) }
+    case .legacyKey: throw .keyNeedsRepair
+    case .unsupported: throw .unsupportedAuthMethod
     }
   }
 
-  /// The `authorized_keys` line for a key-authenticated host.
-  func publicKeyLine(for host: HostProfile) async -> String? {
-    guard case .keychainKey(let label) = host.auth,
-      let key = try? await keyStore.loadOrCreateKey(label: label)
+  /// `host` as saved after any version-1 label migration in flight. Right
+  /// after an upgrade, a connection waits for that pass rather than
+  /// reporting a key that is about to migrate as needing repair.
+  func migrated(_ host: HostProfile) async -> HostProfile {
+    guard case .legacyKey = host.auth, let app,
+      !app.connections.migration.completed || app.identityStore.isRecovering
+    else { return host }
+    await app.identityStore.recover()
+    return app.hosts.first { $0.id == host.id } ?? host
+  }
+
+  /// The bootstrap endpoint for `host`'s roaming client. A key host
+  /// resolves its identity per bootstrap; only a password is fetched now.
+  func bootstrapEndpoint(
+    for host: HostProfile
+  ) async throws(SSHAccessError) -> SSHEndpoint {
+    let host = await migrated(host)
+    if let source = keySource(for: host) { return endpoint(for: host, source: source) }
+    return endpoint(for: host, credential: try await credential(for: host))
+  }
+
+  /// The `authorized_keys` line for a key-authenticated host, from public
+  /// metadata only: displaying it never reads or creates a private key.
+  func publicKeyLine(for host: HostProfile) -> String? {
+    guard case .key(let id) = host.auth,
+      let identity = app?.identity(id), !identity.isDeleted
     else { return nil }
-    return SSHEd25519Key.authorizedKeysLine(
-      for: key.publicKey,
-      comment: "roaming-ssh"
-    )
+    return identity.authorizedKeysLine
   }
 
   /// A connection after host-key verification (prompting for an unknown
@@ -156,7 +218,13 @@ final class SSHAccess {
     interactive: Bool = true,
     expectedHostKeys: Set<String>? = nil
   ) async throws(SSHAccessError) -> SSHConnection {
+    let host = await migrated(host)
     if !interactive, case .password = host.auth { throw .cancelled }
+    switch host.auth {
+    case .legacyKey: throw .keyNeedsRepair
+    case .unsupported: throw .unsupportedAuthMethod
+    case .password, .key: break
+    }
     try await settleTrust(
       for: host,
       interactive: interactive,
@@ -283,12 +351,34 @@ final class SSHAccess {
   }
 
   /// The bootstrap endpoint for automatic roaming (re)connects. The host
-  /// key must already be trusted: reconnects never prompt.
+  /// key must already be trusted: reconnects never prompt. A key-signed
+  /// host resolves its identity again for every bootstrap, so the app does
+  /// not hold the private key between them and a deleted or changed
+  /// identity stops future attempts.
   func endpoint(for host: HostProfile, credential: SSHCredential) -> SSHEndpoint
   {
+    endpoint(for: host, source: keySource(for: host) ?? .fixed(credential))
+  }
+
+  /// A per-bootstrap identity lookup for a key host, else `nil`.
+  private func keySource(for host: HostProfile) -> SSHEndpoint.CredentialSource? {
+    guard case .key(let id) = host.auth, let store = app?.identityStore else {
+      return nil
+    }
+    return .resolved { @Sendable in
+      do throws(IdentityResolutionError) {
+        return .ed25519(try await store.resolve(id).privateKey)
+      } catch { throw SSHAccessError.keyUnavailable(error) }
+    }
+  }
+
+  private func endpoint(
+    for host: HostProfile,
+    source: SSHEndpoint.CredentialSource
+  ) -> SSHEndpoint {
     SSHEndpoint(
       configuration: configuration(for: host),
-      credential: credential,
+      credentialSource: source,
       trustStore: trustStore,
       trustDecider: RejectUnknownHostKeys()
     )
@@ -320,9 +410,7 @@ final class SSHAccess {
       if let credential, case let .password(password) = credential {
         app?.forgetRejectedPassword(password, for: host)
       }
-      return .authenticationFailed(
-        publicKeyLine: await publicKeyLine(for: host)
-      )
+      return .authenticationFailed(publicKeyLine: publicKeyLine(for: host))
     default: return .unreachable
     }
   }

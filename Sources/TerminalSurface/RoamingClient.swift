@@ -597,8 +597,10 @@ public actor RoamingClient {
       let failure = Self.failure(for: error)
       noteFailure(failure)
       switch failure {
-      // A changed host key or failed login blocks automatic retries.
-      case .hostKeyRejected, .authenticationFailed: return .stop
+      // A changed host key, failed login or unreadable key blocks
+      // automatic retries.
+      case .hostKeyRejected, .authenticationFailed, .credentialUnavailable:
+        return .stop
       default: return .retry
       }
     }
@@ -1230,6 +1232,7 @@ public actor RoamingClient {
     switch error as? RemoteBootstrapError {
     case .hostKeyRejected: .hostKeyRejected
     case .authenticationFailed: .authenticationFailed
+    case .credentialUnavailable: .credentialUnavailable
     case .protocolViolation: .protocolViolation
     case .unreachable, nil: .unreachable
     }
@@ -1241,6 +1244,7 @@ public actor RoamingClient {
     switch failure {
     case .hostKeyRejected: .hostKeyRejected
     case .authenticationFailed: .authenticationFailed
+    case .credentialUnavailable: .credentialUnavailable
     case .protocolViolation: .protocolViolation
     default: .unreachable
     }

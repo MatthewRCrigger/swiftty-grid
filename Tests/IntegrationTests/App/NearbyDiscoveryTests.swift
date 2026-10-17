@@ -250,7 +250,7 @@ extension MainActorIntegrationTests {
       #expect(candidate.expectedHostKeys == [print])
       #expect(candidate.suggestedNickname == "Studio")
       let app = RoamingAppModel(
-        store: HostProfileStore(
+        store: ConnectionStore(
           fileURL: FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathComponent("hosts.json")

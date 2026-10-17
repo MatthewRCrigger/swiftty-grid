@@ -18,7 +18,7 @@ extension MainActorIntegrationTests {
       let parent = directory.appendingPathComponent("file")
       try Data([1]).write(to: parent)
       let app = RoamingAppModel(
-        store: HostProfileStore(
+        store: ConnectionStore(
           fileURL: parent.appendingPathComponent("hosts.json")
         )
       )
@@ -38,7 +38,7 @@ extension MainActorIntegrationTests {
       let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString)
       defer { try? FileManager.default.removeItem(at: directory) }
-      let store = HostProfileStore(
+      let store = ConnectionStore(
         fileURL: directory.appendingPathComponent("hosts.json")
       )
       let first = HostProfile(
@@ -50,7 +50,7 @@ extension MainActorIntegrationTests {
       let original = try Data(contentsOf: store.fileURL)
       var duplicate = first
       duplicate.host = "second.local"
-      #expect(throws: HostProfileStore.StoreError.self) {
+      #expect(throws: ConnectionStore.StoreError.self) {
         try store.save([first, duplicate])
       }
       #expect(try Data(contentsOf: store.fileURL) == original)
@@ -99,7 +99,7 @@ extension MainActorIntegrationTests {
             host: "fd00::5",
             port: 2222,
             username: "me",
-            auth: .keychainKey(label: "phone")
+            auth: .legacyKey(label: "phone")
           ),
         ]
       )
@@ -141,7 +141,7 @@ extension MainActorIntegrationTests {
         withIntermediateDirectories: true
       )
       defer { try? FileManager.default.removeItem(at: directory) }
-      let store = HostProfileStore(
+      let store = ConnectionStore(
         fileURL: directory.appendingPathComponent("hosts.json")
       )
       let first = HostProfile(

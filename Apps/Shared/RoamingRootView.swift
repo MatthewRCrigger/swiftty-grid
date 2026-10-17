@@ -30,6 +30,27 @@ public struct RoamingRootView: View {
               }
             }
           }
+          ToolbarItem(placement: .automatic) {
+            Menu {
+              NavigationLink {
+                SSHKeysView(model: model)
+              } label: {
+                Label("SSH Keys", systemImage: "key")
+              }
+              .accessibilityIdentifier("settings.keys")
+              if model.profile.cloudSync {
+                NavigationLink {
+                  SyncSettingsView(model: model)
+                } label: {
+                  Label("iCloud Sync", systemImage: "icloud")
+                }
+                .accessibilityIdentifier("settings.sync")
+              }
+            } label: {
+              Label("Settings", systemImage: "gearshape")
+            }
+            .accessibilityIdentifier("settings")
+          }
           if model.profile.companionBridge {
             ToolbarItem(placement: .automatic) {
               NavigationLink {
@@ -52,6 +73,7 @@ public struct RoamingRootView: View {
     .attentionLinks(model)
     .task {
       model.load()
+      model.sync?.refresh()
       if inbox == nil {
         inbox = RoamingInboxModel(model: model)
         inbox?.refresh(interactive: false)
@@ -62,6 +84,9 @@ public struct RoamingRootView: View {
       // Foreground recovery fetches the inbox again (no push delivery);
       // never prompting for a password in the background.
       if phase == .active { inbox?.refresh(interactive: false) }
+      // Foreground-only metadata sync (spec.ssh-identity.md §8.2).
+      model.sync?.setActive(phase == .active)
+      if phase == .active { model.sync?.refresh() }
       // Suspension pauses bulk SFTP work; a Mac window losing focus does
       // not (spec §10).
       switch model.profile.kind {

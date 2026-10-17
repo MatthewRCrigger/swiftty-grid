@@ -54,7 +54,8 @@ public enum SSHPublicKeyFormat {
     return "SHA256:" + trimmed
   }
 
-  static func keyBlob(openSSHPublicKey line: String) -> [UInt8]? {
+  /// The decoded key blob of a `"<type> <base64>"` line.
+  public static func keyBlob(openSSHPublicKey line: String) -> [UInt8]? {
     let parts = line.split(separator: " ", omittingEmptySubsequences: true)
     guard parts.count >= 2, let data = Data(base64Encoded: String(parts[1]))
     else { return nil }
@@ -66,7 +67,7 @@ public enum SSHPublicKeyFormat {
   }
 
   /// Key algorithm name, such as `ssh-ed25519`.
-  static func keyType(openSSHPublicKey line: String) -> String {
+  public static func keyType(openSSHPublicKey line: String) -> String {
     String(line.split(separator: " ").first ?? "")
   }
 }
@@ -176,6 +177,11 @@ public actor FileHostTrustStore: HostTrustStore {
       try save(keys)
       return openSSHPublicKey
     }
+  }
+
+  /// Every trusted key, for opt-in trust sync.
+  public func entries() throws -> [HostIdentity: String] {
+    try Self.fileAccess.withLock { try load() }
   }
 
   public func removeTrustedKey(for host: HostIdentity) throws {

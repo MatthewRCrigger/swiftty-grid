@@ -265,7 +265,8 @@ workspace. Connectivity is never tested by sending a create request.
 | Panel | `ConnectDeviceTests`: the panel's QR, rendered to pixels and scanned with CoreImage, decodes to the exported descriptor. A real `DNSServiceRegister` resolves with `dns-sd -L` to the chosen port and TXT, and is withdrawn on stop. |
 
 Excluded: another native window unification, renderer parity rewrites, a
-cloud device directory, account or credential sync, a pairing server,
+cloud device directory, account or credential sync (opt-in SSH identity and
+profile sync is specified separately in spec.ssh-identity.md), a pairing server,
 automatic key installation, raw network scanning, firewall or router
 automation, NAT traversal, built-in VPN integration, multi-route QUIC
 negotiation, tablet layout-editor parity, and additional concurrent mobile

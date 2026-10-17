@@ -75,7 +75,7 @@ extension MainActorIntegrationTests {
       let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString)
       let app = RoamingAppModel(
-        store: HostProfileStore(
+        store: ConnectionStore(
           fileURL: directory.appendingPathComponent("hosts.json")
         ),
         resumeStore: SessionResumeStore(
@@ -293,7 +293,7 @@ extension MainActorIntegrationTests {
   struct WorkspaceIntentTests {
     func app() throws -> RoamingAppModel {
       RoamingAppModel(
-        store: HostProfileStore(
+        store: ConnectionStore(
           fileURL: FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathComponent("hosts.json")

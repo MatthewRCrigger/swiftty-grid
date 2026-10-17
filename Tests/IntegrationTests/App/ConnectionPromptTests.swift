@@ -166,7 +166,7 @@ extension MainActorIntegrationTests {
         .appendingPathComponent(UUID().uuidString)
       defer { try? FileManager.default.removeItem(at: directory) }
       let app = RoamingAppModel(
-        store: HostProfileStore(
+        store: ConnectionStore(
           fileURL: directory.appendingPathComponent("hosts.json")
         )
       )

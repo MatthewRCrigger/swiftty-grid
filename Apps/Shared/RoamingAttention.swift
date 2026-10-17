@@ -57,7 +57,8 @@ struct RoamingAttentionConnector: AttentionServiceConnector {
     switch error {
     case .cancelled: .other("Sign-in was cancelled.")
     case .hostKeyChanged, .hostKeyRejected, .hostKeyMismatch,
-      .trustStoreUnavailable, .keyUnavailable, .authenticationFailed:
+      .trustStoreUnavailable, .keyUnavailable, .keyNeedsRepair,
+      .unsupportedAuthMethod, .authenticationFailed:
       .unauthorized
     default: .offline("The Mac could not be reached.")
     }

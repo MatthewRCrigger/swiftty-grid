@@ -343,6 +343,7 @@ Appendix B of the spec records the design sources.
 | `SessionCore` | IDs, limits, input ledger (client queue, host admission), lifecycle, backoff, transfer manifests |
 | `ScreenProtocol` | RST/1 messages, framing, RFC 1950 snapshots, validation, snapshot scheduler, bootstrap envelope and attention metadata, `RSTConnection` |
 | `SSHClient` | SwiftNIO SSH: host trust, password/Ed25519, exec, shell, SFTP v3 subset, resumable verified transfers |
+| `SSHIdentity` | SSH identities (spec.ssh-identity.md): UUID metadata, Keychain storage policies, read-only resolution, bounded unencrypted OpenSSH Ed25519 import; client-only |
 | `AppleTransport` | Network framework QUIC (ALPN `rst/1`, TLS 1.3, no 0-RTT), SPKI and exact-certificate pinning, host identity |
 | `TerminalHost` | RST/1 host over the SwiftMux service (owns no PTYs): `RoamingHost` QUIC listener and grants, in-process SMX client, screen exporter, session registry, bootstrap/attention service, control socket, roaming configuration |
 | `TerminalSurface` | Client: `RoamingClient`, frontend backends (roaming, ordinary SSH, local PTY), SSH and QUIC bridges |
@@ -513,6 +514,40 @@ Watch runs.
 `Scripts/test-handover.sh <iphone-udid> [switches] [team-id]` runs A2: a standalone app
 on the phone keeps one roaming session open while you toggle Wi-Fi, and the
 retained shell on the Mac logs one line per switch.
+
+### SSH keys and iCloud sync
+
+[spec.ssh-identity.md](spec.ssh-identity.md) makes an SSH key a reusable
+identity. **Settings › SSH Keys** (or **New Key** in the host editor)
+generates an Ed25519 key or imports an unencrypted OpenSSH Ed25519 private key
+from a file or an explicit paste; passphrase-protected keys are refused. Hosts
+select a key by UUID, so renaming never breaks them. Add the shown public key
+to `~/.ssh/authorized_keys` on the Mac yourself. Signing in only reads the
+selected key: a missing, locked, deleted or mismatched key fails closed, never
+generates a replacement and never falls back to a password.
+
+Keys are device-only by default (`WhenUnlockedThisDeviceOnly`, never
+synchronized). A key created or imported as **iCloud Keychain** is
+synchronizable (`WhenUnlocked`); the policy is fixed per key, with explicit
+**Create iCloud Copy** and **Withdraw from iCloud** actions that make a new key.
+Items use service `dev.chr33s.swiftty.ssh-identity.v1` and the access group
+`$(AppIdentifierPrefix)dev.chr33s.swiftty`.
+
+**Settings › iCloud Sync** separately opts in to syncing host profiles and
+public key metadata, and trusted host keys, through the private CloudKit
+database (zone `SwifttyConnectionsV1`). Both are off by default and only appear
+when the clients are generated with `SWIFTTY_CLOUDKIT_CONTAINER` set to a
+provisioned container (Scripts/configure-links.sh). Sync runs in the
+foreground only, never carries private keys or passwords, and keeps another
+iCloud account's data hidden after an account switch. tvOS keeps local key
+sign-in and generation, without import or sync.
+
+`hosts.json` is now a version-2 snapshot of all non-secret connection state.
+The first launch of this version migrates version-1 key labels to identities
+(device-only, same key, same fingerprint), keeps the original file as
+`hosts.v1.json`, and removes each legacy Keychain item only after its
+replacement is verified. Earlier builds cannot read the version-2 file and
+refuse to overwrite it.
 
 ## API and storage contracts
 

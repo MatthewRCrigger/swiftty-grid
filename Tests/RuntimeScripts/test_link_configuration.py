@@ -20,6 +20,9 @@ TEAM = "TEAMID1234"
 BUNDLES = ["dev.swiftty.fixture.mobile", "dev.swiftty.fixture.catalyst"]
 BONJOUR = "_swiftty._tcp"
 MULTICAST = "com.apple.developer.networking.multicast"
+# spec.ssh-identity.md §10: one access group for entitlements and runtime.
+ACCESS_GROUP = "$(AppIdentifierPrefix)dev.chr33s.swiftty"
+KEYCHAIN = {"keychain-access-groups": [ACCESS_GROUP]}
 TOOL = '''#!/PYTHON
 import json, os, sys
 from pathlib import Path
@@ -40,7 +43,7 @@ class LinkConfigurationTests(unittest.TestCase):
         self.environment = dict(os.environ)
         for key in ["SWIFTTY_LINK_DOMAINS", "SWIFTTY_LINK_MODE",
                     "SWIFTTY_PROVISIONING_PROFILE", "NOTARY_PROFILE",
-                    "NOTARY_KEY_ID"]:
+                    "NOTARY_KEY_ID", "SWIFTTY_CLOUDKIT_CONTAINER"]:
             self.environment.pop(key, None)
 
     def run_script(self, name, *arguments, **environment):
@@ -72,11 +75,12 @@ class LinkConfigurationTests(unittest.TestCase):
                 domains = ["links.example.com", "other.example.com"]
                 info = self.read_plist(output / "AttentionLinks.plist")
                 base_info = self.read_plist(ROOT / "Apps/Config/AttentionLinks.plist")
-                self.assertEqual(info, {**base_info, "SwifttyAssociatedDomains": domains})
+                self.assertEqual(info, {**base_info, "SwifttyAssociatedDomains": domains,
+                                        "SwifttyKeychainAccessGroup": ACCESS_GROUP})
                 suffix = "?mode=developer" if mode else ""
                 for target in TARGETS:
                     base = ROOT / f"Apps/{target}/{target}.entitlements"
-                    expected = self.read_plist(base) if base.exists() else {}
+                    expected = {**(self.read_plist(base) if base.exists() else {}), **KEYCHAIN}
                     expected[ENTITLEMENT] = [f"applinks:{domain}{suffix}" for domain in domains]
                     self.assertEqual(self.read_plist(output / f"{target}.entitlements"), expected)
 
@@ -88,7 +92,9 @@ class LinkConfigurationTests(unittest.TestCase):
         for target in TARGETS:
             base = ROOT / f"Apps/{target}/{target}.entitlements"
             self.assertEqual(self.read_plist(output / f"{target}.entitlements"),
-                             self.read_plist(base) if base.exists() else {})
+                             {**(self.read_plist(base) if base.exists() else {}), **KEYCHAIN})
+        self.assertNotIn("SwifttyCloudKitContainer",
+                         self.read_plist(output / "AttentionLinks.plist"))
         for setting in [{"SWIFTTY_LINK_DOMAINS": "invalid_domain.example"},
                         {"SWIFTTY_LINK_DOMAINS": "links.example.com", "SWIFTTY_LINK_MODE": "invalid"}]:
             with self.subTest(setting=setting):
@@ -96,6 +102,27 @@ class LinkConfigurationTests(unittest.TestCase):
                 result = self.run_script("configure-links.sh", rejected, **setting)
                 self.assertEqual(result.returncode, 64, result.stderr)
                 self.assertFalse(rejected.exists())
+
+    def test_cloudkit_is_opt_in_and_never_shells_container(self):
+        output = self.root / "cloud"
+        container = "iCloud.dev.chr33s.swiftty"
+        self.assert_success(self.run_script(
+            "configure-links.sh", output, SWIFTTY_CLOUDKIT_CONTAINER=container))
+        info = self.read_plist(output / "AttentionLinks.plist")
+        self.assertEqual(info["SwifttyCloudKitContainer"], container)
+        for target in TARGETS:
+            entitlements = self.read_plist(output / f"{target}.entitlements")
+            self.assertEqual(entitlements["com.apple.developer.icloud-container-identifiers"],
+                             [container])
+            self.assertEqual(entitlements["com.apple.developer.icloud-services"], ["CloudKit"])
+            self.assertEqual(entitlements["keychain-access-groups"], [ACCESS_GROUP])
+        for value in ["iCloud.dev.chr33s.shell", "dev.chr33s.swiftty", "iCloud.bad name"]:
+            with self.subTest(value=value):
+                rejected = self.root / "rejected-cloud"
+                result = self.run_script("configure-links.sh", rejected,
+                                         SWIFTTY_CLOUDKIT_CONTAINER=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((rejected / "MobileClient.entitlements").exists())
 
     def test_generated_client_plist_carries_the_bonjour_declaration(self):
         output = self.root / "generated"

@@ -93,6 +93,8 @@ public enum RoamingFailure: Hashable, Sendable {
   case endpointUnreachable
   case hostKeyRejected
   case authenticationFailed
+  /// The client key could not be read; no credential was offered.
+  case credentialUnavailable
   case protocolViolation
   case attachRejected(RSTErrorCode)
   case bootstrapRejected(BootstrapErrorCode)
@@ -164,6 +166,8 @@ public enum RoamingClientError: Error, Hashable, Sendable {
   case unreachable
   case hostKeyRejected
   case authenticationFailed
+  /// The client key could not be read; no credential was offered.
+  case credentialUnavailable
   case protocolViolation
   case rejected(BootstrapErrorCode)
   /// The requested session no longer exists.

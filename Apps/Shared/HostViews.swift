@@ -40,7 +40,8 @@ public struct HostListView: View {
             Text(host.nickname).font(.headline)
             Text(host.endpointSummary).font(.subheadline.monospaced())
               .foregroundStyle(.secondary)
-            Text(host.auth.summary).font(.caption).foregroundStyle(.secondary)
+            Text(model.authSummary(for: host)).font(.caption)
+              .foregroundStyle(.secondary)
             if model.resumableHosts.contains(host.id) {
               // Resuming still needs fresh SSH sign-in.
               Label(
@@ -213,8 +214,33 @@ extension View {
   }
 }
 
+/// How the editor's sign-in picker is set.
+enum AuthSelection: Hashable {
+  case password
+  case key(UUID)
+  /// A reference this editor cannot change into a choice (an unresolved
+  /// version-1 label or a newer variant), kept until the user picks one.
+  case preserved(AuthMethodReference)
+
+  init(_ auth: AuthMethodReference?) {
+    switch auth {
+    case .password?, nil: self = .password
+    case .key(let id)?: self = .key(id)
+    case let other?: self = .preserved(other)
+    }
+  }
+
+  var reference: AuthMethodReference {
+    switch self {
+    case .password: .password
+    case .key(let id): .key(identityID: id)
+    case .preserved(let auth): auth
+    }
+  }
+}
+
 /// Add/edit form for a saved host. Collects no secrets: passwords are
-/// prompted at connect time and keys are referenced by Keychain label.
+/// prompted at connect time and keys are referenced by identity UUID.
 public struct HostEditorView: View {
   let model: RoamingAppModel
   let original: HostProfile?
@@ -233,9 +259,9 @@ public struct HostEditorView: View {
   @State
   private var username: String
   @State
-  private var usesKey: Bool
+  private var auth: AuthSelection
   @State
-  private var keyLabel: String
+  private var creatingKey: KeyCreationMode?
   @State
   private var error: String?
   @State
@@ -270,13 +296,7 @@ public struct HostEditorView: View {
     _username = State(
       initialValue: host?.username ?? candidate?.username ?? ""
     )
-    if case .keychainKey(let label) = host?.auth {
-      _usesKey = State(initialValue: true)
-      _keyLabel = State(initialValue: label)
-    } else {
-      _usesKey = State(initialValue: false)
-      _keyLabel = State(initialValue: "")
-    }
+    _auth = State(initialValue: AuthSelection(host?.auth))
   }
 
   public var body: some View {
@@ -328,16 +348,8 @@ public struct HostEditorView: View {
             .accessibilityIdentifier("host.username")
         }
         .listRowBackground(Color.clear)
-        Section("Authentication") {
-          Toggle("Use Keychain key", isOn: $usesKey)
-          if usesKey {
-            TextField("Key label", text: $keyLabel).plainEntry()
-          } else {
-            Text("You will be asked for the password when connecting.")
-              .font(.footnote).foregroundStyle(.secondary)
-          }
-        }
-        .listRowBackground(Color.clear)
+        authenticationSection
+          .listRowBackground(Color.clear)
         if candidate != nil, !matchingHosts.isEmpty {
           Section {
             Picker("Save as", selection: $replacing) {
@@ -396,8 +408,64 @@ public struct HostEditorView: View {
       host: host.trimmingCharacters(in: .whitespaces),
       port: Int(port.trimmingCharacters(in: .whitespaces)) ?? 0,
       username: username.trimmingCharacters(in: .whitespaces),
-      auth: usesKey ? .keychainKey(label: keyLabel) : .password
+      auth: auth.reference
     )
+  }
+
+  /// Password or one saved SSH identity, by UUID. An identity that is
+  /// missing on this device stays selected and explained; it never turns
+  /// into Password.
+  private var authenticationSection: some View {
+    Section {
+      Picker("Sign in with", selection: $auth) {
+        Text("Password").tag(AuthSelection.password)
+        ForEach(model.identities) { identity in
+          Text("Key \u{201C}\(identity.name)\u{201D}").tag(AuthSelection.key(identity.id))
+        }
+        if case .key(let id) = auth, !model.identities.contains(where: { $0.id == id }) {
+          Text("Deleted or unavailable key").tag(auth)
+        }
+        if case .preserved(let reference) = auth {
+          Text(reference.summary).tag(auth)
+        }
+      }
+      .accessibilityIdentifier("host.auth")
+      Menu("New Key", systemImage: "key.badge.plus") {
+        Button("Generate Key…") { creatingKey = .generate }
+          .accessibilityIdentifier("host.key.generate")
+        if model.profile.keyImport {
+          Button("Import Key…") { creatingKey = .importKey }
+        }
+      }
+      .accessibilityIdentifier("host.key.new")
+    } header: {
+      Text("Authentication")
+    } footer: {
+      switch auth {
+      case .password:
+        Text("You will be asked for the password when connecting.")
+      case .key(let id):
+        if let identity = model.identity(id), !identity.isDeleted {
+          Text(identity.fingerprint).font(.caption.monospaced())
+        } else {
+          Text("This key was deleted or is not on this device. Choose another key.")
+        }
+      case .preserved(.legacyKey):
+        Text(
+          "This key was not found when Swiftty updated its key storage. Choose or "
+            + "import a key."
+        )
+      case .preserved:
+        Text("Saved by a newer version of Swiftty.")
+      }
+    }
+    .adaptiveSheet(item: $creatingKey) { mode in
+      KeyCreationView(model: model, mode: mode) { created in
+        if let created { auth = .key(created.id) }
+        creatingKey = nil
+      }
+      .macSheetFrame(width: 480, height: 460)
+    }
   }
 
   /// Verify, trust, sign in, save; then the workspace chooser.
@@ -434,7 +502,7 @@ public struct HostEditorView: View {
       host: host.trimmingCharacters(in: .whitespaces),
       port: Int(port.trimmingCharacters(in: .whitespaces)) ?? 0,
       username: username.trimmingCharacters(in: .whitespaces),
-      auth: usesKey ? .keychainKey(label: keyLabel) : .password
+      auth: auth.reference
     )
     do {
       guard try model.save(profile) else {
