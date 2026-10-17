@@ -58,7 +58,7 @@ notes=$(printf '%s\n\n%s' \
 
 # The app must be Developer ID-signed under the hardened runtime.
 codesign --verify --strict --deep --verbose=1 "$app"
-codesign -dv "$app" 2>&1 | grep -q '^Authority=Developer ID Application' || {
+codesign -dvv "$app" 2>&1 | grep -q '^Authority=Developer ID Application' || {
   echo "release-mac-github: $app is not signed with a Developer ID identity" >&2
   exit 65
 }

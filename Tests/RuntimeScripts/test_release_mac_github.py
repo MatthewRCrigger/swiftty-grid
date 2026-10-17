@@ -29,7 +29,8 @@ environment = os.environ
 with open(environment["RELEASE_FIXTURE_TOOLS"], "a") as stream:
     stream.write(json.dumps([name] + args) + "\n")
 if name == "codesign":
-    if "-dv" in args: print("Authority=Developer ID Application: Fixture", file=sys.stderr)
+    # Like codesign, Authority lines need at least -dvv.
+    if "-dvv" in args: print("Authority=Developer ID Application: Fixture", file=sys.stderr)
 elif name == "curl":
     method = args[args.index("--request") + 1]
     url = urlparse(args[-1])
