@@ -13,7 +13,17 @@ package enum TerminalWindowBackground {
     let windowFrame = window.frame
     let translucent = configuration.backgroundOpacity < 1
     window.isOpaque = !translucent
-    window.backgroundColor = translucent ? .clear : .windowBackgroundColor
+    // Opaque: the theme's own background, so the titlebar carries no
+    // system tint over it.
+    let dark = window.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    let rgb = configuration.palette(for: dark ? .dark : .light).background
+    let themed = NSColor(
+      srgbRed: CGFloat((rgb >> 16) & 0xFF) / 255,
+      green: CGFloat((rgb >> 8) & 0xFF) / 255,
+      blue: CGFloat(rgb & 0xFF) / 255,
+      alpha: 1
+    )
+    window.backgroundColor = translucent ? .clear : themed
     if translucent, configuration.backgroundBlur > 0 {
       if let glass = window.contentView as? NSGlassEffectView,
         content.superview === glass.contentView
@@ -45,7 +55,7 @@ package enum TerminalWindowBackground {
       content.removeFromSuperview()
       content.translatesAutoresizingMaskIntoConstraints = true
       window.styleMask.remove(.fullSizeContentView)
-      window.titlebarAppearsTransparent = false
+      window.titlebarAppearsTransparent = true
       window.contentView = content
     }
     window.setFrame(windowFrame, display: false)

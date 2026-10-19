@@ -488,6 +488,11 @@ struct MuxPaneHeaderState: Equatable {
   var hasActivity: Bool
   var isZoomed: Bool
   var hasExited: Bool
+  /// How the program ended; nil while it runs.
+  var exitStatus: Int32? = nil
+  /// 1-based place among the tab's panes, and their count (0: none).
+  var index = 0
+  var count = 0
 }
 
 /// A pane's header (icon, title, actions) above its Metal view.
@@ -531,8 +536,15 @@ final class MuxPaneContainer: NSView {
     layer.cornerRadius = showsHeader ? Self.cornerRadius : 0
     layer.masksToBounds = showsHeader
     layer.borderWidth = showsHeader ? Grid.panelStroke : 0
-    layer.borderColor =
-      (header.state.isActive ? Grid.accent : Grid.line200).cgColor
+    // Exit status is the frame's colour: green for 0, red otherwise. A
+    // running pane is amber when active, line-200 when not.
+    let frame: NSColor =
+      switch header.state.exitStatus {
+      case 0?: Grid.success
+      case .some: Grid.danger
+      case nil: header.state.isActive ? Grid.accent : Grid.line200
+      }
+    layer.borderColor = frame.cgColor
     layer.backgroundColor = showsHeader ? Grid.surface1.cgColor : nil
   }
 
@@ -584,6 +596,8 @@ final class MuxPaneHeader: NSView {
   private let icon = NSImageView()
   private let label = NSTextField(labelWithString: "")
   private let dot = MuxActivityDot()
+  private let leader = GridLeader()
+  private let counter = NSTextField(labelWithString: "")
   private(set) var actionButtons: [Action: NSButton] = [:]
 
   var state = MuxPaneHeaderState(
@@ -591,7 +605,10 @@ final class MuxPaneHeader: NSView {
     isActive: false,
     hasActivity: false,
     isZoomed: false,
-    hasExited: false
+    hasExited: false,
+    exitStatus: nil,
+    index: 0,
+    count: 0
   ) {
     didSet {
       guard state != oldValue else { return }
@@ -605,6 +622,9 @@ final class MuxPaneHeader: NSView {
       icon.contentTintColor = label.textColor
       icon.image = MuxIcons.image(MuxIcons.symbol(for: state.title), "")
       dot.isHidden = !state.hasActivity
+      counter.stringValue =
+        state.count > 0
+        ? String(format: "%03d | %03d", state.index, state.count) : ""
       actionButtons[.zoom]?.image = MuxIcons.image(
         state.isZoomed
           ? "arrow.down.right.and.arrow.up.left"
@@ -648,7 +668,13 @@ final class MuxPaneHeader: NSView {
       actionButtons[action] = b
       buttons.addArrangedSubview(b)
     }
-    for v in [icon, label, dot, buttons] as [NSView] { addSubview(v) }
+    counter.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+    counter.textColor = Grid.ink300
+    counter.translatesAutoresizingMaskIntoConstraints = false
+    counter.setAccessibilityElement(false)
+    leader.translatesAutoresizingMaskIntoConstraints = false
+    leader.setAccessibilityElement(false)
+    for v in [icon, label, dot, leader, counter, buttons] as [NSView] { addSubview(v) }
     NSLayoutConstraint.activate([
       icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
       icon.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -657,10 +683,12 @@ final class MuxPaneHeader: NSView {
       label.centerYAnchor.constraint(equalTo: centerYAnchor),
       dot.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 4),
       dot.centerYAnchor.constraint(equalTo: centerYAnchor),
-      buttons.leadingAnchor.constraint(
-        greaterThanOrEqualTo: dot.trailingAnchor,
-        constant: 6
-      ),
+      leader.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 8),
+      leader.centerYAnchor.constraint(equalTo: centerYAnchor),
+      leader.heightAnchor.constraint(equalToConstant: 8),
+      counter.leadingAnchor.constraint(equalTo: leader.trailingAnchor, constant: 8),
+      counter.centerYAnchor.constraint(equalTo: centerYAnchor),
+      buttons.leadingAnchor.constraint(equalTo: counter.trailingAnchor, constant: 8),
       buttons.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
       buttons.centerYAnchor.constraint(equalTo: centerYAnchor),
     ])

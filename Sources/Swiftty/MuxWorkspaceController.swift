@@ -492,6 +492,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     )
     guard let tab = ws.activeTabSnapshot else { return }
     let split = tab.layout.panes.count > 1
+    let order = tab.layout.panes
     for (id, container) in containers {
       container.showsHeader = split
       container.update(
@@ -500,7 +501,10 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
           isActive: id == tab.activePane,
           hasActivity: activity.contains(id),
           isZoomed: tab.zoomedPane == id,
-          hasExited: ws.pane(id)?.exitStatus != nil
+          hasExited: ws.pane(id)?.exitStatus != nil,
+          exitStatus: ws.pane(id)?.exitStatus,
+          index: (order.firstIndex(of: id) ?? 0) + 1,
+          count: order.count
         )
       )
     }
