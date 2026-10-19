@@ -109,11 +109,18 @@ public struct QUICRSTConnector: Sendable {
       limits: limits
     )
     connection.attachGroupHandlers()
+    // Why Network framework is waiting (no usable path, local network
+    // access denied, DNS), reported if the handshake then times out.
+    let waitingReason = Mutex<String?>(nil)
 
     group.stateUpdateHandler = { [weak connection] newState in
       switch newState {
-      case .ready: waiter.resolve(nil)
+      case .ready:
+        // A wait that ended in a path is no reason for a later timeout.
+        waitingReason.withLock { $0 = nil }
+        waiter.resolve(nil)
       case let .waiting(error):
+        waitingReason.withLock { $0 = String(describing: error) }
         // Retrying cannot fix a TLS failure (pin, ALPN, version).
         if case .tls = error { waiter.resolve(error) }
       case let .failed(error): waiter.resolve(error)
@@ -170,9 +177,23 @@ public struct QUICRSTConnector: Sendable {
       connection.close()
       group.cancel()
       if verdict.rejection != nil { throw RSTTransportError.pinMismatch }
-      if let error = error as? RSTTransportError { throw error }
+      if let error = error as? RSTTransportError {
+        throw Self.timeout(error, waiting: waitingReason.withLock { $0 })
+      }
       throw RSTTransportError.handshake(String(describing: error))
     }
+  }
+
+  /// A handshake timeout names the path state Network framework was
+  /// waiting in, when it reported one; other errors pass through.
+  static func timeout(
+    _ error: RSTTransportError,
+    waiting: String?
+  ) -> RSTTransportError {
+    guard error == .handshake("timed out"), let waiting, !waiting.isEmpty else {
+      return error
+    }
+    return .handshake("timed out while waiting for a network path: \(waiting)")
   }
 }
 
