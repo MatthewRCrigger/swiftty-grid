@@ -13,7 +13,8 @@ final class MuxLayoutView: NSView {
 
   /// The area panes are laid out in, in layout coordinates (y down).
   static func area(_ bounds: NSRect, split: Bool) -> LayoutRect {
-    let inset = split ? margin : 0
+    // A lone pane keeps the frame a split pane has, so it gets the margin too.
+    let inset = margin
     return LayoutRect(
       x: inset,
       y: inset,

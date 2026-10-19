@@ -533,19 +533,19 @@ final class MuxPaneContainer: NSView {
     guard let layer else { return }
     // Round panel profile: 2px border, 8px corners, surface-1 fill. The
     // active pane's frame is the accent; the rest sit at line-200.
-    layer.cornerRadius = showsHeader ? Self.cornerRadius : 0
-    layer.masksToBounds = showsHeader
-    layer.borderWidth = showsHeader ? Grid.panelStroke : 0
+    layer.cornerRadius = Self.cornerRadius
+    layer.masksToBounds = true
+    layer.borderWidth = Grid.panelStroke
     // Exit status is the frame's colour: green for 0, red otherwise. A
     // running pane is amber when active, line-200 when not.
     let frame: NSColor =
       switch header.state.exitStatus {
       case 0?: Grid.success
       case .some: Grid.danger
-      case nil: header.state.isActive ? Grid.accent : Grid.line200
+      case nil: header.state.isActive && showsHeader ? Grid.accent : Grid.line200
       }
     layer.borderColor = frame.cgColor
-    layer.backgroundColor = showsHeader ? Grid.surface1.cgColor : nil
+    layer.backgroundColor = Grid.surface1.cgColor
   }
 
   @available(*, unavailable)
@@ -554,7 +554,8 @@ final class MuxPaneContainer: NSView {
   override func layout() {
     super.layout()
     let h = showsHeader ? min(Self.headerHeight, bounds.height) : 0
-    let inset = showsHeader ? Self.cardInset : 0
+    let inset = Self.cardInset
+    let top = showsHeader ? 0 : inset
     header.frame = NSRect(
       x: 0,
       y: bounds.height - h,
@@ -567,7 +568,7 @@ final class MuxPaneContainer: NSView {
         x: inset,
         y: inset,
         width: max(0, bounds.width - 2 * inset),
-        height: max(0, bounds.height - h - inset)
+        height: max(0, bounds.height - h - inset - top)
       )
     }
   }
