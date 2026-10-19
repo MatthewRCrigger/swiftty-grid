@@ -170,8 +170,7 @@ fi
 # until it restarts. A restart ends its sessions, so it needs --restart-agent.
 stale_agent=0
 if [ -z "$reason" ] && [ -n "$agent_info" ] && [ -f "$installed_agent" ] \
-  && printf '%s\n' "$agent_info" | grep -q 'state = running' \
-  && [ "$(cdhash_of "$installed_agent")" != "$(cdhash_of "$built/Contents/MacOS/swiftmux-agent")" ]; then
+  && printf '%s\n' "$agent_info" | grep -q 'state = running'; then
   if [ "$restart_agent" -eq 1 ]; then
     reason="running from the bundle this install replaces"
   else
