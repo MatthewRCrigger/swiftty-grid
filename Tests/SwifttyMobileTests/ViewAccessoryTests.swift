@@ -5,6 +5,27 @@ import UIKit
 
 extension ViewLifecycleTests {
   @Test
+  func `esc ctrl alt and tab are SF Symbols with spoken names`() throws {
+    let bar = TerminalAccessoryBar()
+    func button(_ label: String, in view: UIView) -> UIButton? {
+      if let button = view as? UIButton, button.accessibilityLabel == label {
+        return button
+      }
+      return view.subviews.lazy.compactMap { button(label, in: $0) }.first
+    }
+    for key in [AccessoryKey.escape, .control, .alt, .tab] {
+      let symbol = try #require(key.symbolName)
+      #expect(UIImage(systemName: symbol) != nil, "missing \(symbol)")
+      let found = try #require(button(key.accessibilityName, in: bar))
+      #expect(found.configuration?.image != nil)
+      #expect(found.configuration?.title == nil)
+    }
+    // Arrows and symbols keep their text.
+    #expect(AccessoryKey.up.symbolName == nil)
+    #expect(button(AccessoryKey.up.title, in: bar) != nil)
+  }
+
+  @Test
   func
     `releasing an earlier accessory key preserves the newest held key repeat`()
     async throws

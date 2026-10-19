@@ -32,8 +32,10 @@ public struct TerminalScreen: View {
 
   public var body: some View {
     VStack(spacing: 0) {
-      statusBar
-      Divider()
+      if showsStatusBar {
+        statusBar
+        Divider()
+      }
       if let factory {
         factory.make(model)
           // Native renderers and surface tasks belong to this model's
@@ -44,18 +46,65 @@ public struct TerminalScreen: View {
       }
     }
     .navigationTitle(model.host.nickname)
+    #if os(iOS) && !targetEnvironment(macCatalyst)
+    // iPhone and iPad: the host name sits in the top row beside Back, and
+    // Close joins the session actions, so the terminal starts higher.
+    .navigationBarTitleDisplayMode(.inline)
+    .toolbar {
+      ToolbarItem(placement: .principal) { titleWithStatus }
+      ToolbarItem(placement: .primaryAction) {
+        Button("Close", systemImage: "xmark", action: onClose)
+          .accessibilityIdentifier("terminal.close")
+      }
+    }
+    #else
     .toolbar {
       ToolbarItem(placement: .cancellationAction) {
         Button("Close", action: onClose)
           .accessibilityIdentifier("terminal.close")
       }
     }
+    #endif
+  }
+
+  /// iPhone and iPad show the connection state as a dot beside the title
+  /// (`titleWithStatus`); the bar then remains only for what the dot
+  /// cannot say.
+  private static let statusInTitle: Bool = {
+    #if os(iOS) && !targetEnvironment(macCatalyst)
+    true
+    #else
+    false
+    #endif
+  }()
+
+  private var showsStatusBar: Bool {
+    !Self.statusInTitle || model.kind != .roaming
+      || model.pendingInputCount > 0 || !model.acceptsInput
+  }
+
+  /// The host name with a state dot: green connected, orange on the way,
+  /// red failed. The dot carries the state text for VoiceOver and tests.
+  private var titleWithStatus: some View {
+    HStack(spacing: 6) {
+      Circle()
+        .fill(model.connectionState.indicatorColor)
+        .frame(width: 8, height: 8)
+        .accessibilityElement()
+        .accessibilityLabel(stateText)
+        .accessibilityIdentifier("terminal.status")
+      Text(model.host.nickname).font(.headline).lineLimit(1)
+    }
   }
 
   private var statusBar: some View {
     HStack(spacing: 12) {
-      Label(stateText, systemImage: model.connectionState.symbol)
-        .foregroundStyle(model.connectionState.acceptsInput ? .primary : .secondary)
+      if !Self.statusInTitle {
+        Label(stateText, systemImage: model.connectionState.symbol)
+          .foregroundStyle(
+            model.connectionState.acceptsInput ? .primary : .secondary
+          )
+      }
       if model.kind != .roaming {
         Text(model.kind.displayName)
           .foregroundStyle(.secondary)
@@ -76,7 +125,7 @@ public struct TerminalScreen: View {
     .padding(.vertical, 8)
     .glassPanel(cornerRadius: 0)
     .accessibilityElement(children: .combine)
-    .accessibilityIdentifier("terminal.status")
+    .accessibilityIdentifier(Self.statusInTitle ? "terminal.details" : "terminal.status")
   }
 
   /// Honest state text: a reconnect attempt is not a lost session, and an
@@ -150,6 +199,17 @@ extension ClientConnectionState {
     case .sessionExited: "Session exited"
     case .sessionLost: "Session lost"
     case .userClosed: "Closed"
+    }
+  }
+
+  /// The title dot: green connected, orange connecting, red failed, grey
+  /// when not connected by choice.
+  var indicatorColor: Color {
+    switch self {
+    case .active: .green
+    case .sshBootstrap, .attaching, .reconnecting, .suspect: .orange
+    case .sessionLost, .sessionExited: .red
+    case .idle, .backgroundDetached, .userClosed: .secondary
     }
   }
 

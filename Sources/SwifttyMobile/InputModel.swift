@@ -279,6 +279,28 @@ public enum AccessoryKey: Hashable, Sendable {
     }
   }
 
+  /// SF Symbol drawn instead of `title`, for keys with a standard glyph.
+  public var symbolName: String? {
+    switch self {
+    case .escape: "escape"
+    case .control: "control"
+    case .alt: "option"
+    case .tab: "arrow.right.to.line"
+    default: nil
+    }
+  }
+
+  /// What VoiceOver says for the key.
+  public var accessibilityName: String {
+    switch self {
+    case .escape: "Escape"
+    case .control: "Control"
+    case .alt: "Alt"
+    case .tab: "Tab"
+    default: title
+    }
+  }
+
   /// The sticky modifier this key toggles.
   public var modifier: KeyModifiers? {
     switch self {
