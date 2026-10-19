@@ -165,6 +165,19 @@ if [ -n "$agent_info" ]; then
     reason="an ad-hoc build, pinned to the previous agent binary"
   fi
 fi
+# Replacing the bundle moves the image a running agent was started from, so
+# it can no longer find its launcher and new tabs fail with a spawn error
+# until it restarts. A restart ends its sessions, so it needs --restart-agent.
+stale_agent=0
+if [ -z "$reason" ] && [ -n "$agent_info" ] && [ -f "$installed_agent" ] \
+  && printf '%s\n' "$agent_info" | grep -q 'state = running' \
+  && [ "$(cdhash_of "$installed_agent")" != "$(cdhash_of "$built/Contents/MacOS/swiftmux-agent")" ]; then
+  if [ "$restart_agent" -eq 1 ]; then
+    reason="running from the bundle this install replaces"
+  else
+    stale_agent=1
+  fi
+fi
 reregister=0
 if [ -n "$reason" ]; then
   if printf '%s\n' "$agent_info" | grep -q 'state = running' \
@@ -193,6 +206,11 @@ if [ "$reregister" -eq 1 ]; then
   launchctl bootout "$domain/$label" 2>/dev/null || true
 fi
 status=$("$app/Contents/MacOS/swiftty" --swiftmux-agent register || true)
+if [ "$stale_agent" -eq 1 ]; then
+  echo "note: the running SwiftMux agent started from the replaced bundle; new tabs" >&2
+  echo "  may fail until it restarts. Re-run with --restart-agent (its running" >&2
+  echo "  sessions end)." >&2
+fi
 echo "SwiftMux agent: $status"
 case "$status" in
   *requiresApproval*)
