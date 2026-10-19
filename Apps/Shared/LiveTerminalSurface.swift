@@ -582,7 +582,12 @@ final class SSHShellController: TerminalSurfaceController {
       }
     }
     refusalRelay = relay
-    session.inputHandler = { _ in relay.report(.notActive(.idle)) }
+    session.inputHandler = { input in
+      // The view reports focus as soon as it appears, often before the
+      // shell opens; that is not the user's input, so it raises no notice.
+      if case .focus = input { return }
+      relay.report(.notActive(.idle))
+    }
     model.previewLines = { [session] in session.withState { $0.screenLines } }
   }
 

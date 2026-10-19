@@ -85,6 +85,12 @@ extension MainActorIntegrationTests {
     @Test
     func directViewRefusalShowsNoticeWithoutEndingShell() async throws {
       try await withController { server, app, controller in
+        // The view reports focus as it appears; that is not a refusal.
+        controller.session.send(.focus(true))
+        await withCheckedContinuation { continuation in
+          DispatchQueue.main.async { continuation.resume() }
+        }
+        #expect(controller.inputNotice == nil)
         controller.session.send(.text("early"))
         #expect(
           try await eventually {

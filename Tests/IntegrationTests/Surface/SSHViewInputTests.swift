@@ -45,6 +45,24 @@ struct SSHViewInputTests {
     await backend.close()
   }
 
+  /// A refused focus report is dropped silently; typed input still
+  /// reports its refusal.
+  @Test
+  func refusedFocusReportsRaiseNoRefusal() async {
+    let session = TerminalSession(columns: 20, rows: 4)
+    let channel = FakeByteChannel()
+    let backend = SSHStreamBackend(channel: channel, session: session)
+    let refusals = Mutex<[InputRefusal]>([])
+    backend.onInputRefusal = { reason in refusals.withLock { $0.append(reason) }
+    }
+    backend.start()
+    await backend.close()
+    session.send(.focus(false))
+    #expect(refusals.withLock { $0 }.isEmpty)
+    session.send(.text("x"))
+    #expect(refusals.withLock { $0 } == [.closed])
+  }
+
   @Test
   func viewInputIsAdmittedBeforeSessionQueue() async {
     let session = TerminalSession(columns: 20, rows: 4)

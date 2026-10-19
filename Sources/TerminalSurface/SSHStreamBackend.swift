@@ -112,6 +112,9 @@ public final class SSHStreamBackend: TerminalSurfaceBackend {
     session.inputHandler = { [weak self] input in
       guard let self else { return }
       if case let .refused(reason) = submitInput(input) {
+        // A dropped focus report is the view's, not something the user
+        // typed; reporting it would raise a misleading notice.
+        if case .focus = input { return }
         let handler = state.withLock { $0.onInputRefusal }
         handler?(reason)
       }

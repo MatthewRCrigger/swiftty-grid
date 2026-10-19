@@ -200,9 +200,21 @@ public final class CloudKitConnectionDatabase: ConnectionCloudDatabase {
     case .unknownItem: return .recordMissing
     case .batchRequestFailed: return .retryAfter(nil)
     case .invalidArguments, .constraintViolation, .serverRejectedRequest:
-      return .invalidRecord(String(error.code.rawValue))
+      return .invalidRecord(reason(error))
     default: return .other(error.code.rawValue)
     }
+  }
+
+  /// The code and CloudKit's own explanation (such as a record type
+  /// missing from the production schema), on one bounded line. It names
+  /// schema elements only, never field values.
+  static func reason(_ error: CKError) -> String {
+    let code = String(error.code.rawValue)
+    let detail = (error.userInfo[NSLocalizedDescriptionKey] as? String)?
+      .split(whereSeparator: \.isNewline).joined(separator: " ")
+      .trimmingCharacters(in: .whitespaces) ?? ""
+    guard !detail.isEmpty else { return code }
+    return code + ": " + String(detail.prefix(160))
   }
 }
 #else
