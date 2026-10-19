@@ -414,30 +414,17 @@ extension MuxPaneView {
     guard !reportsMouse else { return nil }
     let c = cell(for: event)
     menuAddress = address(row: c.row, in: frozen ?? presented)
+    // Workspace items act on the focused pane, so the clicked one takes
+    // focus first.
+    window?.makeFirstResponder(self)
+    let workspace = MuxWorkspaceController.self
     let menu = NSMenu()
-    if selection != nil {
-      menu.addItem(
-        withTitle: "Copy",
-        action: #selector(copy(_:)),
-        keyEquivalent: ""
-      )
-    }
-    menu.addItem(
-      withTitle: "Paste",
-      action: #selector(paste(_:)),
-      keyEquivalent: ""
-    )
-    if features.contains(.shellIntegration) {
-      let item = NSMenuItem(
-        title: "Select Command Output",
-        action: #selector(selectClickedCommandOutput(_:)),
-        keyEquivalent: ""
-      )
-      item.target = self
+    func add(_ title: String, _ action: Selector, target: AnyObject? = nil) {
+      let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+      item.target = target
       menu.addItem(item)
     }
     if let link = hoveredLink, covers(link, c) {
-      menu.addItem(.separator())
       let item = NSMenuItem(
         title: "Open Link",
         action: #selector(openMenuLink(_:)),
@@ -446,8 +433,55 @@ extension MuxPaneView {
       item.representedObject = link.url
       item.target = self
       menu.addItem(item)
+      let copy = NSMenuItem(
+        title: "Copy Link",
+        action: #selector(copyMenuLink(_:)),
+        keyEquivalent: ""
+      )
+      copy.representedObject = link.url
+      copy.target = self
+      menu.addItem(copy)
+      menu.addItem(.separator())
     }
+    add("New Tab", #selector(workspace.newTerminalTab(_:)))
+    menu.addItem(.separator())
+    add("Split Right", #selector(workspace.splitRight(_:)))
+    add("Split Below", #selector(workspace.splitDown(_:)))
+    menu.addItem(.separator())
+    if selection != nil { add("Copy", #selector(copy(_:))) }
+    add("Paste", #selector(paste(_:)))
+    add("Select All", #selector(selectAll(_:)))
+    if features.contains(.shellIntegration) {
+      add(
+        "Select Command Output",
+        #selector(selectClickedCommandOutput(_:)),
+        target: self
+      )
+    }
+    menu.addItem(.separator())
+    add("Find…", #selector(performFindPanelAction(_:)))
+    menu.items.last?.tag = Int(NSFindPanelAction.showFindPanel.rawValue)
+    if selection != nil {
+      add("Use Selection for Find", #selector(performFindPanelAction(_:)))
+      menu.items.last?.tag = Int(NSFindPanelAction.setFindString.rawValue)
+    }
+    menu.addItem(.separator())
+    add("Previous Prompt", #selector(jumpToPreviousPrompt(_:)))
+    add("Next Prompt", #selector(jumpToNextPrompt(_:)))
+    menu.addItem(.separator())
+    add("Clear Screen", #selector(clearScreen(_:)))
+    add("Reset Terminal", #selector(resetTerminal(_:)))
+    menu.addItem(.separator())
+    add("Rename Tab…", #selector(workspace.renameActiveTab(_:)))
+    add("End Pane…", #selector(workspace.endActivePane(_:)))
     return menu
+  }
+
+  @objc
+  private func copyMenuLink(_ sender: NSMenuItem) {
+    guard let url = sender.representedObject as? String else { return }
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(url, forType: .string)
   }
 
   @objc
