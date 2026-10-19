@@ -125,6 +125,11 @@ public struct RoamingStatus: Hashable, Sendable {
   public var title: String
   public var exitStatus: Int32?
   public var lastFailure: RoamingFailure?
+  /// The transport's own reason for `lastFailure` when the roaming
+  /// endpoint could not be reached (for example "No route to host" or a
+  /// certificate mismatch). One bounded line, for diagnostics; it never
+  /// carries tokens or certificates.
+  public var lastFailureDetail: String?
   /// Consecutive reconnect attempts since the last success.
   public var reconnectAttempt: Int
   /// The QUIC endpoint the current grant names, once SSH has authorized
@@ -141,6 +146,7 @@ public struct RoamingStatus: Hashable, Sendable {
     title: String = "",
     exitStatus: Int32? = nil,
     lastFailure: RoamingFailure? = nil,
+    lastFailureDetail: String? = nil,
     reconnectAttempt: Int = 0,
     roamingEndpoint: BootstrapEndpoint? = nil
   ) {
@@ -153,6 +159,7 @@ public struct RoamingStatus: Hashable, Sendable {
     self.title = title
     self.exitStatus = exitStatus
     self.lastFailure = lastFailure
+    self.lastFailureDetail = lastFailureDetail
     self.reconnectAttempt = reconnectAttempt
     self.roamingEndpoint = roamingEndpoint
   }

@@ -30,7 +30,8 @@ public actor RoamingClient {
 
   enum AttachOutcome: Sendable {
     case active
-    case unreachable
+    /// The connect failed; carries the transport's reason.
+    case unreachable(String)
     case closed
     case timedOut
     case rejected(RSTErrorCode)
@@ -107,6 +108,7 @@ public actor RoamingClient {
   private var currentStatus = RoamingStatus()
   private var statusHandler: (@Sendable (RoamingStatus) -> Void)?
   private var lastFailure: RoamingFailure?
+  private var lastFailureDetail: String?
   private var lastScreenAt: Date?
   private var refusedInputCount = 0
 
@@ -460,7 +462,8 @@ public actor RoamingClient {
         }
         attemptFailed(.attachRejected(code))
       // SSH already granted this attachment: only the QUIC route failed.
-      case .unreachable: attemptFailed(.endpointUnreachable)
+      case let .unreachable(reason):
+        attemptFailed(.endpointUnreachable, detail: reason)
       case .closed: attemptFailed(.connectionLost)
       case .timedOut: attemptFailed(.attachTimedOut)
       case .protocolViolation: attemptFailed(.protocolViolation)
@@ -468,13 +471,13 @@ public actor RoamingClient {
     }
   }
 
-  private func attemptFailed(_ failure: RoamingFailure) {
+  private func attemptFailed(_ failure: RoamingFailure, detail: String? = nil) {
     dropConnection()
     failedAttempts += 1
     // Repeated failures may mean the helper restarted: ask SSH, which
     // distinguishes "unreachable" from "session no longer exists".
     if failedAttempts % 3 == 0 { needsFreshGrant = true }
-    noteFailure(failure)
+    noteFailure(failure, detail: detail)
     move(to: .reconnecting)
   }
 
@@ -500,7 +503,7 @@ public actor RoamingClient {
     } catch DeadlineOperationError.timedOut {
       return .timedOut
     } catch ProviderOperationError.busy { return .timedOut } catch {
-      return .unreachable
+      return .unreachable(Self.reason(error))
     }
     guard !Task.isCancelled, lifecycle.state == .attaching,
       connectionGeneration == gen
@@ -989,6 +992,7 @@ public actor RoamingClient {
         backoff.reset()
         failedAttempts = 0
         lastFailure = nil
+        lastFailureDetail = nil
         finishAttach(.active)
         maybeSendGrid()
       }
@@ -1185,9 +1189,27 @@ public actor RoamingClient {
     return true
   }
 
-  private func noteFailure(_ failure: RoamingFailure) {
+  private func noteFailure(_ failure: RoamingFailure, detail: String? = nil) {
     lastFailure = failure
+    lastFailureDetail = detail
     publish()
+  }
+
+  /// A connect error as one bounded line: what the network or TLS stack
+  /// said, so an unreachable endpoint is distinguishable from a refused
+  /// handshake or a certificate mismatch.
+  public static func reason(_ error: any Error) -> String {
+    let text: String =
+      switch error as? RSTTransportError {
+      case let .handshake(message)?: message
+      case .pinMismatch?: "the Mac's certificate does not match the grant"
+      case .resourceLimit?: "the grant's limits are invalid"
+      case let other?: String(describing: other)
+      case nil: String(describing: error)
+      }
+    let line = text.split(whereSeparator: \.isNewline).joined(separator: " ")
+      .trimmingCharacters(in: .whitespaces)
+    return String((line.isEmpty ? "unknown error" : line).prefix(200))
   }
 
   private func publish() {
@@ -1201,6 +1223,7 @@ public actor RoamingClient {
       title: store?.current?.title ?? "",
       exitStatus: exitStatus,
       lastFailure: lastFailure,
+      lastFailureDetail: lastFailureDetail,
       reconnectAttempt: backoff.attempt,
       roamingEndpoint: grant?.endpoint
     )

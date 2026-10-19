@@ -57,11 +57,14 @@ struct EndpointStageNotice: Hashable, Sendable {
   static let title = "SSH connected; roaming endpoint unavailable"
   let endpoint: String
   let timedOut: Bool
+  /// What the network or TLS stack reported, verbatim.
+  let reason: String?
 
   init?(
     state: ClientConnectionState,
     failure: RoamingFailure?,
-    endpoint: BootstrapEndpoint?
+    endpoint: BootstrapEndpoint?,
+    reason: String? = nil
   ) {
     guard let endpoint, state == .attaching || state == .reconnecting else {
       return nil
@@ -74,6 +77,7 @@ struct EndpointStageNotice: Hashable, Sendable {
     let host =
       endpoint.host.contains(":") ? "[\(endpoint.host)]" : endpoint.host
     self.endpoint = "\(host):\(endpoint.port) (UDP)"
+    self.reason = timedOut ? nil : reason.flatMap { $0.isEmpty ? nil : $0 }
   }
 
   var detail: String {
@@ -84,6 +88,7 @@ struct EndpointStageNotice: Hashable, Sendable {
       + "configuration advertises. A local-network name or address may not be "
       + "reachable over the route used for SSH, such as cellular or a VPN. "
       + "The session is kept on the Mac."
+      + (reason.map { " Reported error: \($0)." } ?? "")
   }
 }
 
@@ -323,7 +328,8 @@ final class RoamingTerminalController: TerminalSurfaceController {
     return EndpointStageNotice(
       state: model.connectionState,
       failure: model.lastFailure,
-      endpoint: model.roamingEndpoint
+      endpoint: model.roamingEndpoint,
+      reason: model.lastFailureDetail
     )
   }
 

@@ -38,6 +38,8 @@ struct RoamingEndpointStageTests {
         == BootstrapEndpoint(host: "127.0.0.1", port: 51222)
     )
     #expect(status.lastFailure != .authenticationFailed)
+    // The transport's own reason travels with the failure.
+    #expect(status.lastFailureDetail == "unreachable")
     #expect(!String(describing: status).contains("applicationToken"))
     await client.close()
   }
@@ -69,6 +71,50 @@ struct RoamingEndpointStageTests {
     )
     #expect(timeout.endpoint == "[fd00::5]:4000 (UDP)")
     #expect(timeout.detail.contains("did not answer in time"))
+  }
+
+  @Test
+  func noticeShowsTheReportedErrorVerbatim() throws {
+    let endpoint = BootstrapEndpoint(host: "mbp.local", port: 51222)
+    let notice = try #require(
+      EndpointStageNotice(
+        state: .reconnecting,
+        failure: .endpointUnreachable,
+        endpoint: endpoint,
+        reason: "POSIXErrorCode(rawValue: 65): No route to host"
+      )
+    )
+    #expect(
+      notice.detail.hasSuffix(
+        "Reported error: POSIXErrorCode(rawValue: 65): No route to host."
+      )
+    )
+    let silent = try #require(
+      EndpointStageNotice(
+        state: .reconnecting,
+        failure: .endpointUnreachable,
+        endpoint: endpoint,
+        reason: ""
+      )
+    )
+    #expect(!silent.detail.contains("Reported error"))
+  }
+
+  /// One bounded line, whatever the transport reported.
+  @Test
+  func connectReasonsAreSingleBoundedLines() {
+    #expect(RoamingClient.reason(RSTTransportError.handshake("a\nb")) == "a b")
+    #expect(
+      RoamingClient.reason(RSTTransportError.pinMismatch)
+        == "the Mac's certificate does not match the grant"
+    )
+    let long = RoamingClient.reason(
+      RSTTransportError.handshake(String(repeating: "x", count: 500))
+    )
+    #expect(long.count == 200)
+    #expect(
+      RoamingClient.reason(RSTTransportError.handshake("")) == "unknown error"
+    )
   }
 
   @Test

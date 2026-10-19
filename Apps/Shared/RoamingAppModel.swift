@@ -130,6 +130,8 @@ public final class TerminalScreenModel: Identifiable {
   public private(set) var exitStatus: Int32?
   /// Latest nonsecret failure reported by the roaming client.
   public private(set) var lastFailure: RoamingFailure?
+  /// The transport's reason for `lastFailure`, when it reported one.
+  public private(set) var lastFailureDetail: String?
   /// Consecutive reconnect attempts since the last success.
   public private(set) var reconnectAttempt = 0
   /// The roaming (QUIC) endpoint SSH authorized, for diagnostics only.
@@ -213,6 +215,9 @@ public final class TerminalScreenModel: Identifiable {
       changed = true
     }
     if status.lastFailure != lastFailure { lastFailure = status.lastFailure }
+    if status.lastFailureDetail != lastFailureDetail {
+      lastFailureDetail = status.lastFailureDetail
+    }
     if status.reconnectAttempt != reconnectAttempt {
       reconnectAttempt = status.reconnectAttempt
     }
