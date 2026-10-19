@@ -19,15 +19,11 @@ final class TerminalAccessoryBar: UIInputView, UIInputViewAudioFeedback {
     allowsSelfSizing = true
     translatesAutoresizingMaskIntoConstraints = false
 
-    #if os(visionOS)
+    // No glass container: one draws every nested element's glass itself,
+    // outside any clipping, so scrolled keys showed under and beside Hide
+    // Keyboard. Each `.glass()` button draws its own, which the scroll
+    // view clips.
     let content = self
-    #else
-    let container = UIVisualEffectView(effect: UIGlassContainerEffect())
-    container.frame = bounds
-    container.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    addSubview(container)
-    let content = container.contentView
-    #endif
 
     let stack = UIStackView()
     stack.axis = .horizontal
@@ -58,18 +54,8 @@ final class TerminalAccessoryBar: UIInputView, UIInputViewAudioFeedback {
     scroll.translatesAutoresizingMaskIntoConstraints = false
     scroll.addSubview(stack)
 
-    // The keys get their own clipped glass container. A shared container
-    // draws every element's glass itself, outside the scroll view's
-    // clipping, so keys scrolled to the edge slid under Hide Keyboard.
-    #if os(visionOS)
     let keys = UIView()
     let keysContent = keys
-    #else
-    let keysEffect = UIGlassContainerEffect()
-    keysEffect.spacing = 6
-    let keys = UIVisualEffectView(effect: keysEffect)
-    let keysContent = keys.contentView
-    #endif
     keys.clipsToBounds = true
     keys.translatesAutoresizingMaskIntoConstraints = false
     keysContent.addSubview(scroll)
@@ -91,16 +77,14 @@ final class TerminalAccessoryBar: UIInputView, UIInputViewAudioFeedback {
     content.addSubview(dismissButton)
     NSLayoutConstraint.activate([
       heightAnchor.constraint(equalToConstant: 44),
-      keys.leadingAnchor.constraint(
-        equalTo: safeAreaLayoutGuide.leadingAnchor
-      ), keys.topAnchor.constraint(equalTo: topAnchor),
+      keys.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor),
+      keys.topAnchor.constraint(equalTo: topAnchor),
       keys.bottomAnchor.constraint(equalTo: bottomAnchor),
       // A clear gap so the last key never touches Hide Keyboard.
       keys.trailingAnchor.constraint(
         equalTo: dismissButton.leadingAnchor,
         constant: -8
-      ),
-      scroll.leadingAnchor.constraint(equalTo: keysContent.leadingAnchor),
+      ), scroll.leadingAnchor.constraint(equalTo: keysContent.leadingAnchor),
       scroll.trailingAnchor.constraint(equalTo: keysContent.trailingAnchor),
       scroll.topAnchor.constraint(equalTo: keysContent.topAnchor),
       scroll.bottomAnchor.constraint(equalTo: keysContent.bottomAnchor),
@@ -171,8 +155,10 @@ final class TerminalAccessoryBar: UIInputView, UIInputViewAudioFeedback {
     var config = Self.keyConfiguration
     if let symbol = key.symbolName {
       config.image = UIImage(systemName: symbol)
-      config.preferredSymbolConfigurationForImage =
-        UIImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+      config.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(
+        pointSize: 15,
+        weight: .medium
+      )
     } else {
       config.title = key.title
     }
