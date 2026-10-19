@@ -237,6 +237,8 @@ public struct PaneSummary: Codable, Sendable, Equatable {
   /// Set once the pane's process exited and output drained.
   public var exitStatus: Int32?
   public var workingDirectory: String?
+  /// OSC 7 host when it names another machine; nil or empty when local.
+  public var workingHost: String?
 
   public init(
     id: PaneID,
@@ -245,7 +247,8 @@ public struct PaneSummary: Codable, Sendable, Equatable {
     title: String = "",
     pid: Int32? = nil,
     exitStatus: Int32? = nil,
-    workingDirectory: String? = nil
+    workingDirectory: String? = nil,
+    workingHost: String? = nil
   ) {
     self.id = id
     self.columns = columns
@@ -254,6 +257,7 @@ public struct PaneSummary: Codable, Sendable, Equatable {
     self.pid = pid
     self.exitStatus = exitStatus
     self.workingDirectory = workingDirectory
+    self.workingHost = workingHost
   }
 }
 
@@ -906,6 +910,8 @@ public enum MuxEvent: Codable, Sendable {
   /// final output may be incomplete.
   case paneExited(PaneID, status: Int32, truncated: Bool)
   case title(PaneID, String)
+  /// A pane's OSC 7 location changed; `host` is empty for this machine.
+  case location(PaneID, directory: String?, host: String?)
   case bell(PaneID)
   /// An unsubscribed pane in another tab of the attached workspace
   /// changed. Sent once until it is subscribed again.

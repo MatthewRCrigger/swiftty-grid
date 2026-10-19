@@ -47,6 +47,8 @@ public struct TerminalState: ~Copyable {
   var titleChanged = false
   var directoryBytes: [UInt8] = []
   var directoryChanged = false
+  /// Host of the last OSC 7 URL; empty for none or this machine.
+  var directoryHost = ""
   private var spareGraphemes = GraphemeTable()
 
   public var title: String { String(decoding: titleBytes, as: UTF8.self) }
@@ -227,6 +229,11 @@ public struct TerminalState: ~Copyable {
       url.isFileURL
     {
       out.append(.workingDirectory(url.path))
+      let host = url.host ?? ""
+      if host != directoryHost {
+        directoryHost = host
+        out.append(.workingHost(host))
+      }
     }
     if commandFinished { out.append(.commandFinished(exitCode: lastExitCode)) }
     titleChanged = false

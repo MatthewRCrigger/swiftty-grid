@@ -30,6 +30,19 @@ enum Grid {
 
   /// Selected · primary.
   static let accent = hex(0xf4be4f)
+  /// The accent while the app is in the background (`signal-amber-dim`).
+  static let accentDim = hex(0x98742b)
+  /// The accent now: dimmed while the app is not active, as macOS dims its
+  /// own selection.
+  @MainActor static var accentNow: NSColor {
+    (NSApp?.isActive ?? true) ? accent : accentDim
+  }
+  /// Calls `selector` on `observer` when the app is activated or deactivated.
+  @MainActor static func observeActivity(_ observer: NSObject, _ selector: Selector) {
+    for name in [NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification] {
+      NotificationCenter.default.addObserver(observer, selector: selector, name: name, object: nil)
+    }
+  }
   /// Ink on a solid accent fill.
   static let accentOn = hex(0x000000)
   /// Live · running · focus.
@@ -86,7 +99,11 @@ class GridFlatView: NSView {
   override init(frame: NSRect) {
     super.init(frame: frame)
     wantsLayer = true
+    Grid.observeActivity(self, #selector(gridActivityChanged))
   }
+
+  /// The app was activated or deactivated: subclasses redraw their accent.
+  @objc func gridActivityChanged() { needsDisplay = true }
 
   @available(*, unavailable)
   required init?(coder: NSCoder) { fatalError() }

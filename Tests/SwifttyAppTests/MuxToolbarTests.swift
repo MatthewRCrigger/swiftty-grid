@@ -450,3 +450,38 @@ struct GridStatusTests {
     #expect(text.filter { $0 == ":" }.count == 2)
   }
 }
+
+@Suite
+struct GridLocationTests {
+  @Test
+  func `a host is remote unless it names this machine`() {
+    #expect(!GridLocation(directory: "/tmp", host: nil).isRemote)
+    #expect(!GridLocation(directory: "/tmp", host: "").isRemote)
+    #expect(!GridLocation(directory: "/tmp", host: "localhost").isRemote)
+    let own = ProcessInfo.processInfo.hostName
+    #expect(!GridLocation(directory: "/tmp", host: own).isRemote)
+    #expect(GridLocation(directory: "/srv", host: "build-box.example").isRemote)
+  }
+
+  @Test
+  func `home is abbreviated only for local paths`() {
+    let home = NSHomeDirectory()
+    #expect(GridLocation(directory: home, host: nil).displayPath == "~")
+    #expect(
+      GridLocation(directory: home + "/crggr", host: nil).displayPath
+        == "~/crggr"
+    )
+    #expect(
+      GridLocation(directory: home + "/x", host: "build-box.example")
+        .displayPath == home + "/x"
+    )
+  }
+
+  @Test
+  func `a repository directory reports its branch`() {
+    let location = GridLocation(directory: FileManager.default.currentDirectoryPath, host: nil)
+    #expect(location.branch != nil)
+    #expect(GridLocation(directory: "/", host: nil).branch == nil)
+    #expect(GridLocation(directory: "/tmp", host: "build-box.example").branch == nil)
+  }
+}

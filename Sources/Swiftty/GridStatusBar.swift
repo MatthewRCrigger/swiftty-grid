@@ -8,6 +8,7 @@ struct GridStatus: Equatable {
   var rows: Int
   /// nil while the program runs.
   var exitStatus: Int32?
+  var location = GridLocation()
 
   var sizeText: String { "\(columns)x\(rows)" }
 
@@ -42,6 +43,8 @@ final class GridStatusBar: NSView {
   static let height: CGFloat = 28
   private let left = GridStatusBar.label(Grid.accent)
   private let tab = GridStatusBar.label(Grid.ink200)
+  private let place = GridStatusBar.label(Grid.ink300)
+  private let remote = GridStatusBar.label(Grid.live)
   private let size = GridStatusBar.label(Grid.ink200)
   private let clock = GridStatusBar.label(Grid.ink200)
   private let exit = GridStatusBar.label(Grid.live)
@@ -65,7 +68,7 @@ final class GridStatusBar: NSView {
     super.init(frame: frame)
     wantsLayer = true
     translatesAutoresizingMaskIntoConstraints = false
-    let row = NSStackView(views: [left, tab, leader, size, clock, exit])
+    let row = NSStackView(views: [left, tab, remote, place, leader, size, clock, exit])
     row.orientation = .horizontal
     row.spacing = 16
     row.alignment = .centerY
@@ -85,6 +88,8 @@ final class GridStatusBar: NSView {
     setAccessibilityElement(true)
     setAccessibilityRole(.group)
     setAccessibilityLabel("Status")
+    Grid.observeActivity(self, #selector(gridActivityChanged))
+    place.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
     render()
   }
 
@@ -124,6 +129,8 @@ final class GridStatusBar: NSView {
     tick()
   }
 
+  @objc private func gridActivityChanged() { left.textColor = Grid.accentNow }
+
   private func tick() {
     let text = GridStatus.clock(Date())
     if clock.stringValue != text { clock.stringValue = text }
@@ -131,7 +138,14 @@ final class GridStatusBar: NSView {
 
   private func render() {
     left.stringValue = status.theme
+    left.textColor = Grid.accentNow
     tab.stringValue = status.tab
+    remote.stringValue =
+      status.location.isRemote ? "remote " + (status.location.host ?? "") : ""
+    remote.isHidden = !status.location.isRemote
+    let branch = status.location.branch.map { "  " + $0 } ?? ""
+    place.stringValue = status.location.displayPath + branch
+    place.isHidden = place.stringValue.isEmpty
     size.stringValue = status.sizeText
     exit.stringValue = status.exitText
     exit.textColor = status.exitColor

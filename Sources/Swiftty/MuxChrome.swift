@@ -310,6 +310,11 @@ final class MuxTabButton: GridFlatView, NSTextFieldDelegate {
     )
   }
 
+  override func gridActivityChanged() {
+    super.gridActivityChanged()
+    applyColors()
+  }
+
   override func mouseEntered(with event: NSEvent) { hovering = true }
 
   override func mouseExited(with event: NSEvent) { hovering = false }
@@ -320,9 +325,9 @@ final class MuxTabButton: GridFlatView, NSTextFieldDelegate {
     guard let item else { return }
     let ink: NSColor =
       item.isActive ? Grid.accentOn : (hovering ? Grid.ink100 : Grid.ink200)
-    fillColor = item.isActive ? Grid.accent : nil
+    fillColor = item.isActive ? Grid.accentNow : nil
     strokeColor =
-      item.isActive ? Grid.accent : (hovering ? Grid.line100 : Grid.line300)
+      item.isActive ? Grid.accentNow : (hovering ? Grid.line100 : Grid.line300)
     label.textColor = ink
     icon.contentTintColor = ink
     closeButton.contentTintColor = ink
@@ -493,6 +498,8 @@ struct MuxPaneHeaderState: Equatable {
   /// 1-based place among the tab's panes, and their count (0: none).
   var index = 0
   var count = 0
+  /// The shell reports another machine: the header shows a globe.
+  var remote = false
 }
 
 /// A pane's header (icon, title, actions) above its Metal view.
@@ -521,6 +528,7 @@ final class MuxPaneContainer: NSView {
     super.init(frame: .zero)
     wantsLayer = true
     layer?.cornerCurve = .continuous
+    Grid.observeActivity(self, #selector(gridActivityChanged))
     addSubview(header)
     addSubview(paneView)
     setAccessibilityElement(true)
@@ -528,6 +536,8 @@ final class MuxPaneContainer: NSView {
   }
 
   override var wantsUpdateLayer: Bool { true }
+
+  @objc func gridActivityChanged() { needsDisplay = true }
 
   override func updateLayer() {
     guard let layer else { return }
@@ -542,7 +552,7 @@ final class MuxPaneContainer: NSView {
       switch header.state.exitStatus {
       case 0?: Grid.success
       case .some: Grid.danger
-      case nil: header.state.isActive && showsHeader ? Grid.accent : Grid.line200
+      case nil: header.state.isActive && showsHeader ? Grid.accentNow : Grid.line200
       }
     layer.borderColor = frame.cgColor
     layer.backgroundColor = Grid.surface1.cgColor
@@ -609,7 +619,8 @@ final class MuxPaneHeader: NSView {
     hasExited: false,
     exitStatus: nil,
     index: 0,
-    count: 0
+    count: 0,
+    remote: false
   ) {
     didSet {
       guard state != oldValue else { return }
@@ -621,7 +632,11 @@ final class MuxPaneHeader: NSView {
         color: label.textColor ?? Grid.ink100
       )
       icon.contentTintColor = label.textColor
-      icon.image = MuxIcons.image(MuxIcons.symbol(for: state.title), "")
+      icon.image = MuxIcons.image(
+        state.remote ? "globe" : MuxIcons.symbol(for: state.title),
+        state.remote ? "Remote" : ""
+      )
+      icon.contentTintColor = state.remote ? Grid.live : label.textColor
       dot.isHidden = !state.hasActivity
       counter.stringValue =
         state.count > 0

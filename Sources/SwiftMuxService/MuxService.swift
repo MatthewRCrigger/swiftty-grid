@@ -1187,6 +1187,16 @@ public actor MuxService {
     pump()
   }
 
+  private func sendLocation(_ id: PaneID, to client: UUID?) {
+    guard let client, let pane = panes[id] else { return }
+    send(
+      .event(
+        .location(id, directory: pane.workingDirectory, host: pane.workingHost)
+      ),
+      to: client
+    )
+  }
+
   func paneEvent(_ id: PaneID, _ event: PaneEvent) {
     guard let wsID = panes[id]?.workspace else { return }
     let client = leases[wsID]?.client
@@ -1195,7 +1205,12 @@ public actor MuxService {
       panes[id]?.title = title
       if let client { send(.event(.title(id, title)), to: client) }
     case .bell: if let client { send(.event(.bell(id)), to: client) }
-    case let .workingDirectory(dir): panes[id]?.workingDirectory = dir
+    case let .workingDirectory(dir):
+      panes[id]?.workingDirectory = dir
+      sendLocation(id, to: client)
+    case let .workingHost(host):
+      panes[id]?.workingHost = host.isEmpty ? nil : host
+      sendLocation(id, to: client)
     case let .status(epoch, changes):
       let tab = locate(pane: id).map { workspaces[$0.0].tabs[$0.1].id }
       attention.apply(

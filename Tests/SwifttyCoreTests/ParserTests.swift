@@ -889,7 +889,17 @@ struct ParserTests {
     }
     vt.feed("\(ESC)]7;file://host/tmp/a%20b\u{07}")
     do {
-      let ok = vt.state.takeEvents() == [.workingDirectory("/tmp/a b")];
+      let ok =
+        vt.state.takeEvents()
+        == [.workingDirectory("/tmp/a b"), .workingHost("host")];
+      #expect(ok)
+    }
+    vt.feed("\(ESC)]7;file:///tmp/c\u{07}")
+    do {
+      // Back on this machine: the host change is reported once, as empty.
+      let ok =
+        vt.state.takeEvents()
+        == [.workingDirectory("/tmp/c"), .workingHost("")];
       #expect(ok)
     }
     #expect(TestFixture(vt.lines[0]) == TestFixture("xy"))

@@ -12,6 +12,7 @@ enum PaneEvent: Sendable {
   case title(String)
   case bell
   case workingDirectory(String)
+  case workingHost(String)
   /// OSC 7501 changes in stream order, under the terminal epoch they
   /// happened in. Always delivered before `finished`.
   case status(TerminalEpochID, [StatusChange])
@@ -339,6 +340,7 @@ final class PaneRuntime: @unchecked Sendable {
         onEvent?(.title(DisplayText.sanitize(raw)))
       case .bell: onEvent?(.bell)
       case let .workingDirectory(d): onEvent?(.workingDirectory(d))
+      case let .workingHost(h): onEvent?(.workingHost(h))
       default: break  // program clipboard writes are disabled
       }
     }

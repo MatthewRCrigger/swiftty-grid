@@ -4,6 +4,9 @@ public enum TerminalEvent: Sendable, Equatable {
   case bell
   case clipboard(String)
   case workingDirectory(String)
+  /// OSC 7 host when it changes: empty means this machine (sent only when
+  /// it differs from the last one, so local-only streams never see it).
+  case workingHost(String)
   /// Child exit status, or -1 when it cannot be collected (for example,
   /// another child reaper in the embedding application collected it).
   case exited(Int32)

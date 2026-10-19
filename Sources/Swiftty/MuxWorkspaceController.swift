@@ -36,6 +36,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   let tabStrip = MuxTabStrip()
   /// Sanitized program titles, from snapshots and title events.
   private var titles: [PaneID: String] = [:]
+  private var locations: [PaneID: GridLocation] = [:]
   /// Panes with output the user has not seen (hidden tabs, bells).
   private(set) var activity: Set<PaneID> = []
   /// A divider drag shown locally before the service commits it.
@@ -335,6 +336,9 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     case let .title(pane, title):
       titles[pane] = DisplayText.sanitize(title)
       refreshChrome()
+    case let .location(pane, directory, host):
+      locations[pane] = GridLocation(directory: directory, host: host)
+      refreshChrome()
     case let .bell(pane):
       guard !detached else { return }
       NSSound.beep()
@@ -419,8 +423,15 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     for pane in ws.panes where titles[pane.id] == nil || !pane.title.isEmpty {
       titles[pane.id] = DisplayText.sanitize(pane.title)
     }
+    for pane in ws.panes {
+      locations[pane.id] = GridLocation(
+        directory: pane.workingDirectory,
+        host: pane.workingHost
+      )
+    }
     let known = Set(ws.panes.map(\.id))
     titles = titles.filter { known.contains($0.key) }
+    locations = locations.filter { known.contains($0.key) }
     activity.formIntersection(known)
     guard let tab = ws.activeTabSnapshot else {
       refreshChrome()
@@ -504,7 +515,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
           hasExited: ws.pane(id)?.exitStatus != nil,
           exitStatus: ws.pane(id)?.exitStatus,
           index: (order.firstIndex(of: id) ?? 0) + 1,
-          count: order.count
+          count: order.count,
+          remote: locations[id]?.isRemote ?? false
         )
       )
     }
@@ -516,7 +528,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       tab: title(of: tab.activePane),
       columns: size.columns,
       rows: size.rows,
-      exitStatus: ws.pane(tab.activePane)?.exitStatus
+      exitStatus: ws.pane(tab.activePane)?.exitStatus,
+      location: locations[tab.activePane] ?? GridLocation()
     )
     showsTabs(ws.tabs.count > 1)
   }
