@@ -31,34 +31,12 @@ public struct RoamingRootView: View {
             }
           }
           ToolbarItem(placement: .automatic) {
-            Menu {
-              NavigationLink {
-                SSHKeysView(model: model)
-              } label: {
-                Label("SSH Keys", systemImage: "key")
-              }
-              .accessibilityIdentifier("settings.keys")
-              if model.profile.cloudSync {
-                NavigationLink {
-                  SyncSettingsView(model: model)
-                } label: {
-                  Label("iCloud Sync", systemImage: "icloud")
-                }
-                .accessibilityIdentifier("settings.sync")
-              }
+            NavigationLink {
+              SettingsView(model: model)
             } label: {
               Label("Settings", systemImage: "gearshape")
             }
             .accessibilityIdentifier("settings")
-          }
-          if model.profile.companionBridge {
-            ToolbarItem(placement: .automatic) {
-              NavigationLink {
-                CompanionSettingsView(model: model)
-              } label: {
-                Label("Apple Watch", systemImage: "applewatch")
-              }
-            }
           }
         }
         .navigationDestination(item: activeSession) { session in

@@ -71,7 +71,7 @@ public struct SSHKeysView: View {
     .toolbar {
       ToolbarItem(placement: .primaryAction) {
         Menu {
-          Button("Generate Key…", systemImage: "key.badge.plus") {
+          Button("Generate Key…", systemImage: "key") {
             creating = .generate
           }
           .accessibilityIdentifier("keys.generate")
@@ -211,6 +211,11 @@ struct SSHKeyDetailView: View {
   private var confirmingWithdraw = false
   @State
   private var repairing = false
+  /// A chosen repair file that needs its passphrase.
+  @State
+  private var repairData: Data?
+  @State
+  private var repairPassphrase = ""
   @State
   private var error: String?
   @State
@@ -313,7 +318,43 @@ struct SSHKeyDetailView: View {
     }
     .keyFileImporter(isPresented: $repairing) { data in
       guard let data else { return }
-      run { try await model.identityStore.repair(id, with: data) }
+      repair(data, passphrase: nil)
+    }
+    .alert(
+      "Key Passphrase",
+      isPresented: Binding(
+        get: { repairData != nil },
+        set: {
+          if !$0 {
+            repairData = nil
+            repairPassphrase = ""
+          }
+        }
+      )
+    ) {
+      SecureField("Passphrase", text: $repairPassphrase)
+      Button("Repair") {
+        guard let data = repairData else { return }
+        let passphrase = repairPassphrase
+        repairData = nil
+        repairPassphrase = ""
+        repair(data, passphrase: passphrase)
+      }
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text("This key file is protected by a passphrase. It is not saved.")
+    }
+  }
+
+  private func repair(_ data: Data, passphrase: String?) {
+    run {
+      do throws(IdentityOperationError) {
+        try await model.identityStore.repair(
+          id,
+          with: data,
+          passphrase: passphrase
+        )
+      } catch .importFailed(.passphraseRequired) { repairData = data }
     }
   }
 
@@ -495,6 +536,9 @@ struct KeyCreationView: View {
   private var keyData: Data?
   @State
   private var inspection: OpenSSHKeyInspection?
+  /// Opens an encrypted key once, on save; never stored.
+  @State
+  private var passphrase = ""
   @State
   private var choosingFile = false
   @State
@@ -555,6 +599,7 @@ struct KeyCreationView: View {
               .disabled(
                 working != nil || name.isEmpty
                   || (mode == .importKey && inspection == nil)
+                  || (inspection?.isEncrypted == true && passphrase.isEmpty)
               )
               .accessibilityIdentifier("key.new.save")
           }
@@ -603,13 +648,19 @@ struct KeyCreationView: View {
           )
           .foregroundStyle(.orange)
         }
+        if inspection.isEncrypted {
+          SecureField("Passphrase", text: $passphrase)
+            .textContentType(.password).onSubmit(save)
+            .accessibilityIdentifier("key.import.passphrase")
+        }
       }
     } header: {
       Text("Private Key")
     } footer: {
       Text(
-        "Unencrypted OpenSSH Ed25519 keys only. The key is stored in the Keychain; "
-          + "delete the original file afterwards if you no longer need it."
+        "OpenSSH Ed25519 keys, with or without a passphrase. A passphrase only "
+          + "decrypts the key here and is not saved. The key is stored in the "
+          + "Keychain; delete the original file afterwards if you no longer need it."
       )
     }
     .listRowBackground(Color.clear)
@@ -642,6 +693,7 @@ struct KeyCreationView: View {
     error = nil
     inspection = nil
     keyData = nil
+    passphrase = ""
     Task {
       do throws(IdentityOperationError) {
         let parsed = try await model.identityStore.inspect(data)
@@ -674,10 +726,12 @@ struct KeyCreationView: View {
           guard let keyData else { return }
           identity = try await model.identityStore.importKey(
             keyData,
+            passphrase: inspection?.isEncrypted == true ? passphrase : nil,
             name: name,
             policy: policy
           )
           self.keyData = nil
+          passphrase = ""
         }
         guard !Task.isCancelled else { return }
         created = identity
@@ -690,6 +744,7 @@ struct KeyCreationView: View {
     working?.cancel()
     keyData = nil
     inspection = nil
+    passphrase = ""
     finish(identity)
   }
 }

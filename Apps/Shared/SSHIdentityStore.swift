@@ -159,16 +159,21 @@ public final class SSHIdentityStore {
     )
   }
 
-  /// Imports an unencrypted OpenSSH Ed25519 key after the user confirmed
-  /// its fingerprint (see `inspect`).
+  /// Imports an OpenSSH Ed25519 key after the user confirmed its
+  /// fingerprint (see `inspect`). `passphrase` opens an encrypted key and is
+  /// never stored (spec.ssh-identity.md §6.4).
   public func importKey(
     _ data: Data,
+    passphrase: String? = nil,
     name: String,
     policy: IdentityStoragePolicy
   ) async throws(IdentityOperationError) -> SSHIdentityMetadata {
     let key: ImportedOpenSSHKey
     do {
-      key = try await OpenSSHImportGate.shared.decode(data)
+      key = try await OpenSSHImportGate.shared.decode(
+        data,
+        passphrase: passphrase
+      )
     } catch .cancelled { throw .cancelled } catch { throw .importFailed(error) }
     return try await create(
       key.secret,
@@ -178,13 +183,14 @@ public final class SSHIdentityStore {
     )
   }
 
-  /// Parses `data` for confirmation without saving anything.
+  /// Parses `data` for confirmation without saving anything. An encrypted
+  /// key needs no passphrase here.
   public func inspect(
     _ data: Data
   ) async throws(IdentityOperationError) -> OpenSSHKeyInspection {
-    do {
-      return try await OpenSSHImportGate.shared.decode(data).inspection
-    } catch { throw .importFailed(error) }
+    do { return try await OpenSSHImportGate.shared.inspect(data) } catch {
+      throw .importFailed(error)
+    }
   }
 
   /// Identities already holding this public key: duplicate detection only,
@@ -428,15 +434,19 @@ public final class SSHIdentityStore {
   /// whose public key exactly matches. The caller confirms the match first.
   public func repair(
     _ id: UUID,
-    with data: Data
+    with data: Data,
+    passphrase: String? = nil
   ) async throws(IdentityOperationError) {
     guard let identity = snapshot.identity(id), !identity.isDeleted else {
       throw .notFound
     }
     let key: ImportedOpenSSHKey
-    do { key = try await OpenSSHImportGate.shared.decode(data) } catch {
-      throw .importFailed(error)
-    }
+    do {
+      key = try await OpenSSHImportGate.shared.decode(
+        data,
+        passphrase: passphrase
+      )
+    } catch { throw .importFailed(error) }
     guard
       SSHEd25519Key.authorizedKeysLine(for: key.secret.publicKey)
         == identity.publicKey

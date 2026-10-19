@@ -232,10 +232,11 @@ final class ConnectToMacUITests: XCTestCase {
     press(element("password.submit"))
   }
 
+  /// Connect to Mac lives in Settings.
   private func openConnectMenu(_ item: String) {
-    let menu = element("hosts.connect")
-    XCTAssertTrue(menu.waitForExistence(timeout: 20), "no Connect to Mac menu")
-    press(menu)
+    let settings = element("settings")
+    XCTAssertTrue(settings.waitForExistence(timeout: 20), "no Settings")
+    press(settings)
     let entry = element(item)
     XCTAssertTrue(entry.waitForExistence(timeout: 5), "no \(item)")
     press(entry)

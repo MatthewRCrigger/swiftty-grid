@@ -1,6 +1,7 @@
 import Crypto
 import Foundation
 import SSHClient
+import _CryptoExtras
 
 /// Why an imported private key was refused (spec.ssh-identity.md §6.2).
 /// Messages name the problem only; they never echo file contents.
@@ -10,9 +11,16 @@ public enum OpenSSHImportError: Error, Hashable, Sendable {
   case unrecognizedFormat
   /// Another private-key format, such as PEM RSA or PKCS #8.
   case unsupportedFormat(String)
-  /// A passphrase-protected OpenSSH key. V1 imports unencrypted keys only
-  /// and adds no bcrypt compatibility.
-  case encryptedKeyUnsupported
+  /// A passphrase-protected key, opened without a passphrase.
+  case passphraseRequired
+  /// The passphrase does not decrypt the key.
+  case wrongPassphrase
+  /// An encryption cipher other than the AES modes in §6.4.
+  case unsupportedCipher(String)
+  /// A key derivation other than `bcrypt`.
+  case unsupportedKDF(String)
+  /// More KDF rounds than `OpenSSHKeyImporter.maxRounds`.
+  case workFactorTooHigh(Int)
   case publicKeyOnly
   case certificate
   case malformed
@@ -31,9 +39,17 @@ public enum OpenSSHImportError: Error, Hashable, Sendable {
     case .unsupportedFormat(let name):
       "\(name) keys are not supported. Import an OpenSSH Ed25519 key, or "
         + "generate one here."
-    case .encryptedKeyUnsupported:
-      "Passphrase-protected keys are not supported. Remove the passphrase "
-        + "from a copy with ssh-keygen -p, import that copy, then delete it."
+    case .passphraseRequired: "Enter the key's passphrase."
+    case .wrongPassphrase: "The passphrase is incorrect."
+    case .unsupportedCipher(let name):
+      "Keys encrypted with \(name) are not supported. Re-encrypt a copy with "
+        + "ssh-keygen -p -Z aes256-ctr, import that copy, then delete it."
+    case .unsupportedKDF(let name):
+      "Keys protected with the \(name) key derivation are not supported."
+    case .workFactorTooHigh(let rounds):
+      "The key's passphrase uses \(rounds) rounds; at most "
+        + "\(OpenSSHKeyImporter.maxRounds) are supported. Re-encrypt a copy "
+        + "with ssh-keygen -p -a 100."
     case .publicKeyOnly:
       "This is a public key. Import the matching private key file."
     case .certificate: "SSH certificates are not supported."
@@ -55,7 +71,10 @@ public enum OpenSSHImportError: Error, Hashable, Sendable {
 public struct OpenSSHKeyInspection: Hashable, Sendable {
   public let algorithm: String
   public let fingerprint: String
+  /// Nil for an encrypted key: the comment is inside the encrypted part.
   public let comment: String?
+  /// Saving needs the passphrase.
+  public let isEncrypted: Bool
 }
 
 /// A decoded key, normalized for Keychain storage.
@@ -72,17 +91,93 @@ public struct ImportedOpenSSHKey: Sendable {
     OpenSSHKeyInspection(
       algorithm: SSHIdentityMetadata.algorithm,
       fingerprint: fingerprint,
-      comment: comment
+      comment: comment,
+      isEncrypted: false
     )
   }
 }
 
-/// Bounded import of one unencrypted `openssh-key-v1` Ed25519 key (§6.2).
-/// Every length is checked before allocation and the input must be
-/// consumed exactly. Encrypted keys are recognized and refused.
+/// The ciphers of passphrase-protected `openssh-key-v1` files that import
+/// supports (§6.4), with OpenSSH's key, IV, block and tag sizes.
+enum OpenSSHCipher: Sendable {
+  case ctr(keySize: Int)
+  case cbc(keySize: Int)
+  case gcm(keySize: Int)
+
+  init?(name: String) {
+    switch name {
+    case "aes128-ctr": self = .ctr(keySize: 16)
+    case "aes192-ctr": self = .ctr(keySize: 24)
+    case "aes256-ctr": self = .ctr(keySize: 32)
+    case "aes128-cbc": self = .cbc(keySize: 16)
+    case "aes192-cbc": self = .cbc(keySize: 24)
+    case "aes256-cbc": self = .cbc(keySize: 32)
+    case "aes128-gcm@openssh.com": self = .gcm(keySize: 16)
+    case "aes256-gcm@openssh.com": self = .gcm(keySize: 32)
+    default: return nil
+    }
+  }
+
+  var keySize: Int {
+    switch self {
+    case let .ctr(n), let .cbc(n), let .gcm(n): n
+    }
+  }
+
+  var ivSize: Int { if case .gcm = self { 12 } else { 16 } }
+
+  var blockSize: Int { 16 }
+
+  /// Bytes of authentication tag following the encrypted section.
+  var tagSize: Int { if case .gcm = self { 16 } else { 0 } }
+
+  /// Decrypts the private section; nil when GCM authentication fails.
+  func decrypt(_ section: [UInt8], tag: [UInt8], keyAndIV: [UInt8]) -> [UInt8]?
+  {
+    let key = SymmetricKey(data: keyAndIV[..<keySize])
+    let iv = keyAndIV[keySize...]
+    do {
+      switch self {
+      case .ctr:
+        return Array(
+          try AES._CTR.decrypt(
+            section,
+            using: key,
+            nonce: AES._CTR.Nonce(nonceBytes: iv)
+          )
+        )
+      case .cbc:
+        return Array(
+          try AES._CBC.decrypt(
+            section,
+            using: key,
+            iv: AES._CBC.IV(ivBytes: iv),
+            noPadding: true
+          )
+        )
+      case .gcm:
+        let box = try AES.GCM.SealedBox(
+          nonce: AES.GCM.Nonce(data: iv),
+          ciphertext: section,
+          tag: tag
+        )
+        return Array(try AES.GCM.open(box, using: key))
+      }
+    } catch { return nil }
+  }
+}
+
+/// Bounded import of one `openssh-key-v1` Ed25519 key (§6.2), unencrypted
+/// or passphrase-protected (§6.4). Every length is checked before
+/// allocation and the input must be consumed exactly.
 public enum OpenSSHKeyImporter {
   public static let maxInputBytes = 64 * 1024
   public static let maxCommentBytes = 1024
+  /// `bcrypt_pbkdf` rounds accepted: ssh-keygen's default is 16 and common
+  /// hardening advice is 100. Each round costs the same, so the bound caps
+  /// the work an imported file can demand.
+  public static let maxRounds = 1024
+  static let maxSaltBytes = 64
 
   static let magic = Array("openssh-key-v1".utf8) + [0]
   static let beginArmor = "-----BEGIN OPENSSH PRIVATE KEY-----"
@@ -90,27 +185,109 @@ public enum OpenSSHKeyImporter {
   /// The unencrypted private section is padded to this block size.
   static let blockSize = 8
 
+  /// The file's structure, validated, before any decryption.
+  struct Envelope {
+    var publicKey: Curve25519.Signing.PublicKey
+    /// Nil when unencrypted.
+    var encryption: (cipher: OpenSSHCipher, salt: [UInt8], rounds: Int)?
+    var section: [UInt8]
+    var tag: [UInt8]
+
+    mutating func reset() {
+      section.resetBytes()
+      tag.resetBytes()
+    }
+  }
+
+  /// What the file holds, for confirmation. An encrypted key needs no
+  /// passphrase here: its public key is stored in the clear.
+  public static func inspect(
+    _ input: Data
+  ) throws(OpenSSHImportError) -> OpenSSHKeyInspection {
+    var envelope = try parse(input)
+    defer { envelope.reset() }
+    guard envelope.encryption != nil else {
+      return try parsePrivateSection(
+        envelope.section,
+        publicKey: envelope.publicKey,
+        padding: blockSize,
+        encrypted: false
+      )
+      .inspection
+    }
+    return OpenSSHKeyInspection(
+      algorithm: SSHIdentityMetadata.algorithm,
+      fingerprint: SSHEd25519Key.fingerprint(of: envelope.publicKey),
+      comment: nil,
+      isEncrypted: true
+    )
+  }
+
   /// Decodes synchronously on the caller's thread. Prefer
   /// `OpenSSHImportGate`, which runs off the main actor with bounded
-  /// concurrency.
+  /// concurrency. `passphrase` is used only for an encrypted key and is
+  /// never stored; `isCancelled` is polled during key derivation.
   public static func decode(
-    _ input: Data
+    _ input: Data,
+    passphrase: String? = nil,
+    isCancelled: () -> Bool = { false }
   ) throws(OpenSSHImportError) -> ImportedOpenSSHKey {
+    var envelope = try parse(input)
+    defer { envelope.reset() }
+    guard let (cipher, salt, rounds) = envelope.encryption else {
+      return try parsePrivateSection(
+        envelope.section,
+        publicKey: envelope.publicKey,
+        padding: blockSize,
+        encrypted: false
+      )
+    }
+    guard let passphrase, !passphrase.isEmpty else { throw .passphraseRequired }
+    var secret = Array(passphrase.utf8)
+    defer { secret.resetBytes() }
+    var keyAndIV: [UInt8]
+    do {
+      keyAndIV = try BcryptPBKDF.derive(
+        passphrase: secret,
+        salt: salt,
+        rounds: rounds,
+        length: cipher.keySize + cipher.ivSize,
+        isCancelled: isCancelled
+      )
+    } catch .cancelled { throw .cancelled } catch { throw .malformed }
+    defer { keyAndIV.resetBytes() }
+    guard
+      var plain = cipher.decrypt(
+        envelope.section,
+        tag: envelope.tag,
+        keyAndIV: keyAndIV
+      )
+    else { throw .wrongPassphrase }
+    defer { plain.resetBytes() }
+    return try parsePrivateSection(
+      plain,
+      publicKey: envelope.publicKey,
+      padding: cipher.blockSize,
+      encrypted: true
+    )
+  }
+
+  static func parse(_ input: Data) throws(OpenSSHImportError) -> Envelope {
     var bytes = try unarmor(input)
     defer { bytes.resetBytes() }
     guard bytes.count > magic.count, Array(bytes[..<magic.count]) == magic
     else { throw .malformed }
     var reader = SSHWireReader(Array(bytes[magic.count...]))
     defer { reader.reset() }
-    guard let cipher = reader.readText(maxLength: 64),
+    guard let cipherName = reader.readText(maxLength: 64),
       let kdf = reader.readText(maxLength: 64),
       let kdfOptions = reader.readString(maxLength: 4096)
     else { throw .malformed }
-    // Any cipher or KDF means a passphrase-protected key.
-    guard cipher == "none", kdf == "none" else {
-      throw .encryptedKeyUnsupported
-    }
-    guard kdfOptions.isEmpty else { throw .malformed }
+    let encryption = try encryption(
+      cipher: cipherName,
+      kdf: kdf,
+      options: kdfOptions
+    )
     guard let count = reader.readUInt32() else { throw .malformed }
     guard count == 1 else {
       throw count == 0 ? .malformed : .unsupportedKeyCount(Int(count))
@@ -119,14 +296,47 @@ public enum OpenSSHKeyImporter {
       throw .malformed
     }
     let publicKey = try ed25519PublicKey(blob: blob)
-    guard var section = reader.readString(maxLength: maxInputBytes),
-      reader.isAtEnd
-    else { throw .malformed }
-    defer { section.resetBytes() }
-    guard !section.isEmpty, section.count % blockSize == 0 else {
+    guard let section = reader.readString(maxLength: maxInputBytes) else {
+      throw .malformed
+    }
+    let tagSize = encryption?.cipher.tagSize ?? 0
+    let tag = reader.readRest()
+    guard tag.count == tagSize else { throw .malformed }
+    let block = encryption?.cipher.blockSize ?? blockSize
+    guard !section.isEmpty, section.count % block == 0 else {
       throw .invalidPadding
     }
-    return try parsePrivateSection(section, publicKey: publicKey)
+    return Envelope(
+      publicKey: publicKey,
+      encryption: encryption,
+      section: section,
+      tag: tag
+    )
+  }
+
+  /// The cipher and `bcrypt` parameters, bounded before any work is done.
+  private static func encryption(
+    cipher name: String,
+    kdf: String,
+    options: [UInt8]
+  ) throws(OpenSSHImportError) -> (
+    cipher: OpenSSHCipher, salt: [UInt8], rounds: Int
+  )? {
+    if name == "none" {
+      guard kdf == "none", options.isEmpty else { throw .malformed }
+      return nil
+    }
+    guard kdf != "none" else { throw .malformed }
+    guard let cipher = OpenSSHCipher(name: name) else {
+      throw .unsupportedCipher(name)
+    }
+    guard kdf == "bcrypt" else { throw .unsupportedKDF(kdf) }
+    var reader = SSHWireReader(options)
+    guard let salt = reader.readString(maxLength: maxSaltBytes), !salt.isEmpty,
+      let rounds = reader.readUInt32(), reader.isAtEnd, rounds >= 1
+    else { throw .malformed }
+    guard rounds <= maxRounds else { throw .workFactorTooHigh(Int(rounds)) }
+    return (cipher, salt, Int(rounds))
   }
 
   // MARK: Armor
@@ -192,15 +402,21 @@ public enum OpenSSHKeyImporter {
 
   // MARK: Private section
 
+  /// `padding` is the cipher's block size. For a decrypted section,
+  /// mismatched check integers mean the passphrase was wrong.
   static func parsePrivateSection(
     _ plain: [UInt8],
-    publicKey: Curve25519.Signing.PublicKey
+    publicKey: Curve25519.Signing.PublicKey,
+    padding blockSize: Int,
+    encrypted: Bool
   ) throws(OpenSSHImportError) -> ImportedOpenSSHKey {
     var reader = SSHWireReader(plain)
     defer { reader.reset() }
-    guard let check1 = reader.readUInt32(), let check2 = reader.readUInt32(),
-      check1 == check2
+    guard let check1 = reader.readUInt32(), let check2 = reader.readUInt32()
     else { throw .malformed }
+    guard check1 == check2 else {
+      throw encrypted ? .wrongPassphrase : .malformed
+    }
     guard let type = reader.readText(maxLength: 128) else { throw .malformed }
     guard type == SSHIdentityMetadata.algorithm else {
       throw .unsupportedAlgorithm(type)
@@ -237,7 +453,7 @@ public enum OpenSSHKeyImporter {
   }
 }
 
-/// Runs imports off the main actor, one at a time (§6.2). A cancelled
+/// Runs imports off the main actor, one at a time (§6.2, §6.4). A cancelled
 /// import reports `.cancelled` and its result is discarded, so nothing is
 /// persisted from it.
 public actor OpenSSHImportGate {
@@ -246,12 +462,24 @@ public actor OpenSSHImportGate {
   public init() {}
 
   public func decode(
-    _ input: Data
+    _ input: Data,
+    passphrase: String? = nil
   ) throws(OpenSSHImportError) -> ImportedOpenSSHKey {
     guard !Task.isCancelled else { throw .cancelled }
-    let key = try OpenSSHKeyImporter.decode(input)
+    let key = try OpenSSHKeyImporter.decode(
+      input,
+      passphrase: passphrase,
+      isCancelled: { Task.isCancelled }
+    )
     guard !Task.isCancelled else { throw .cancelled }
     return key
+  }
+
+  public func inspect(
+    _ input: Data
+  ) throws(OpenSSHImportError) -> OpenSSHKeyInspection {
+    guard !Task.isCancelled else { throw .cancelled }
+    return try OpenSSHKeyImporter.inspect(input)
   }
 }
 

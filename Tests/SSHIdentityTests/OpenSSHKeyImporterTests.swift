@@ -5,8 +5,8 @@ import Testing
 
 @testable import SSHIdentity
 
-/// KEY-05: bounded unencrypted `openssh-key-v1` import
-/// (spec.ssh-identity.md §6.2).
+/// KEY-05: bounded `openssh-key-v1` import, unencrypted and
+/// passphrase-protected (spec.ssh-identity.md §6.2, §6.4).
 @Suite
 struct OpenSSHKeyImporterTests {
   static func fixture(_ name: String) throws -> Data {
@@ -22,17 +22,25 @@ struct OpenSSHKeyImporterTests {
   }
 
   static func decode(
-    _ data: Data
+    _ data: Data,
+    passphrase: String? = nil
   ) -> Result<ImportedOpenSSHKey, OpenSSHImportError> {
     Result { () throws(OpenSSHImportError) in
-      try OpenSSHKeyImporter.decode(data)
+      try OpenSSHKeyImporter.decode(data, passphrase: passphrase)
     }
   }
 
-  static func failure(_ data: Data) -> OpenSSHImportError? {
-    if case .failure(let error) = decode(data) { return error }
+  static func failure(
+    _ data: Data,
+    passphrase: String? = nil
+  ) -> OpenSSHImportError? {
+    if case .failure(let error) = decode(data, passphrase: passphrase) {
+      return error
+    }
     return nil
   }
+
+  static let passphrase = "correct horse"
 
   @Test
   func importsAnUnencryptedKey() throws {
@@ -42,24 +50,120 @@ struct OpenSSHKeyImporterTests {
     #expect(key.inspection.algorithm == "ssh-ed25519")
   }
 
-  /// Encrypted OpenSSH keys are refused explicitly: v1 adds no bcrypt
-  /// compatibility (spec.ssh-identity.md §6.2).
+  /// `plain`, re-encrypted by ssh-keygen with each supported cipher
+  /// (Fixtures/README.md).
+  @Test(arguments: ["aes128-ctr", "aes256-cbc", "aes128-gcm", "aes256-gcm"])
+  func decryptsPassphraseProtectedKeys(_ name: String) throws {
+    let data = try Self.fixture(name)
+    let key = try Self.decode(data, passphrase: Self.passphrase).get()
+    #expect(key.fingerprint == (try Self.expectedFingerprint("plain")))
+    #expect(key.comment == "plain@fixture")
+    #expect(Self.failure(data) == .passphraseRequired)
+    #expect(Self.failure(data, passphrase: "") == .passphraseRequired)
+    #expect(Self.failure(data, passphrase: "wrong") == .wrongPassphrase)
+  }
+
+  /// ssh-keygen's defaults: aes256-ctr, 16 rounds.
   @Test
-  func refusesEncryptedKeys() throws {
-    #expect(
-      Self.failure(try Self.fixture("aes256")) == .encryptedKeyUnsupported
+  func decryptsADefaultEncryptedKey() throws {
+    let data = try Self.fixture("aes256")
+    let key = try Self.decode(data, passphrase: Self.passphrase).get()
+    let inspection = try OpenSSHKeyImporter.inspect(data)
+    #expect(key.fingerprint == inspection.fingerprint)
+  }
+
+  /// The public key is in the clear, so confirmation needs no passphrase.
+  @Test
+  func inspectsEncryptedKeysWithoutAPassphrase() throws {
+    let inspection = try OpenSSHKeyImporter.inspect(
+      try Self.fixture("aes256-cbc")
     )
-    var b = Builder()
+    #expect(inspection.isEncrypted)
+    #expect(inspection.comment == nil)
+    #expect(inspection.fingerprint == (try Self.expectedFingerprint("plain")))
+    let plain = try OpenSSHKeyImporter.inspect(try Self.fixture("plain"))
+    #expect(!plain.isEncrypted)
+    #expect(plain.comment == "plain@fixture")
+  }
+
+  @Test
+  func refusesUnsupportedEncryption() throws {
+    #expect(
+      Self.failure(try Self.fixture("chacha20"), passphrase: Self.passphrase)
+        == .unsupportedCipher("chacha20-poly1305@openssh.com")
+    )
+    var b = Builder.encrypted()
+    b.kdf = "scrypt"
+    #expect(Self.failure(b.data()) == .unsupportedKDF("scrypt"))
+    // Cipher and KDF must both be set or both be none.
+    b = Builder()
+    b.kdf = "bcrypt"
+    #expect(Self.failure(b.data()) == .malformed)
+    b = Builder()
     b.cipher = "aes256-ctr"
-    b.kdf = "bcrypt"
-    b.kdfOptions = Builder.string([1, 2, 3, 4]) + Builder.uint32(16)
-    #expect(Self.failure(b.data()) == .encryptedKeyUnsupported)
-    b = Builder()
-    b.kdf = "bcrypt"
-    #expect(Self.failure(b.data()) == .encryptedKeyUnsupported)
-    b = Builder()
-    b.cipher = "chacha20-poly1305@openssh.com"
-    #expect(Self.failure(b.data()) == .encryptedKeyUnsupported)
+    #expect(Self.failure(b.data()) == .malformed)
+  }
+
+  /// KDF parameters are bounded before any key derivation runs.
+  @Test
+  func boundsKDFParameters() {
+    var b = Builder.encrypted(rounds: UInt32(OpenSSHKeyImporter.maxRounds) + 1)
+    #expect(
+      Self.failure(b.data(), passphrase: Self.passphrase)
+        == .workFactorTooHigh(OpenSSHKeyImporter.maxRounds + 1)
+    )
+    b = Builder.encrypted(rounds: 0)
+    #expect(Self.failure(b.data()) == .malformed)
+    b = Builder.encrypted(salt: [])
+    #expect(Self.failure(b.data()) == .malformed)
+    b = Builder.encrypted(
+      salt: Array(repeating: 1, count: OpenSSHKeyImporter.maxSaltBytes + 1)
+    )
+    #expect(Self.failure(b.data()) == .malformed)
+    b = Builder.encrypted()
+    b.kdfOptions += [0]
+    #expect(Self.failure(b.data()) == .malformed)
+    // An encrypted section is padded to the AES block size.
+    b = Builder.encrypted()
+    b.blockSize = 8
+    b.comment = Array("odd".utf8)
+    #expect(Self.failure(b.data()) == .invalidPadding)
+  }
+
+  @Test
+  func gcmTagIsRequiredAndAuthenticated() throws {
+    let text = String(decoding: try Self.fixture("aes256-gcm"), as: UTF8.self)
+    let lines = text.split(separator: "\n").map(String.init)
+    var bytes = try #require(
+      Data(base64Encoded: lines.dropFirst().dropLast().joined())
+    )
+    func armored(_ bytes: Data) -> Data {
+      Data(
+        "\(OpenSSHKeyImporter.beginArmor)\n\(bytes.base64EncodedString())\n"
+          .appending(OpenSSHKeyImporter.endArmor + "\n").utf8
+      )
+    }
+    bytes[bytes.count - 1] ^= 1
+    #expect(
+      Self.failure(armored(bytes), passphrase: Self.passphrase)
+        == .wrongPassphrase
+    )
+    #expect(
+      Self.failure(armored(bytes.dropLast()), passphrase: Self.passphrase)
+        == .malformed
+    )
+  }
+
+  @Test
+  func keyDerivationStopsWhenCancelled() throws {
+    let data = try Self.fixture("aes256")
+    #expect(throws: OpenSSHImportError.cancelled) {
+      try OpenSSHKeyImporter.decode(
+        data,
+        passphrase: Self.passphrase,
+        isCancelled: { true }
+      )
+    }
   }
 
   @Test
@@ -99,6 +203,20 @@ struct OpenSSHKeyImporterTests {
     var trailing: [UInt8] = []
     var privateTail: [UInt8]?
     var blockSize = 8
+
+    /// A bcrypt/aes256-ctr header around an (unencrypted) section: enough
+    /// to exercise every check that runs before decryption.
+    static func encrypted(
+      salt: [UInt8] = Array(repeating: 7, count: 16),
+      rounds: UInt32 = 2
+    ) -> Builder {
+      var b = Builder()
+      b.cipher = "aes256-ctr"
+      b.kdf = "bcrypt"
+      b.kdfOptions = string(salt) + uint32(rounds)
+      b.blockSize = 16
+      return b
+    }
 
     static func string(_ bytes: [UInt8]) -> [UInt8] {
       let n = UInt32(bytes.count)

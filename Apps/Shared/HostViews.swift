@@ -11,7 +11,7 @@ public struct HostListView: View {
   private var adding = false
   @State
   private var browsing: HostProfile?
-  /// Connect to Mac: discovery, codes, confirmation and the chooser.
+  /// The workspace chooser for a tapped host (pairing lives in Settings).
   @State
   private var connecting: ConnectSheet?
 
@@ -27,7 +27,9 @@ public struct HostListView: View {
         ContentUnavailableView(
           "No Hosts",
           systemImage: "server.rack",
-          description: Text("Add a Mac with Remote Login enabled.")
+          description: Text(
+            "Add a Mac with Remote Login enabled, or pair one in Settings."
+          )
         )
         .listRowBackground(Color.clear)
       }
@@ -84,38 +86,6 @@ public struct HostListView: View {
         }
         .accessibilityIdentifier("hosts.add").addHostShortcut()
       }
-      if model.profile.nearbyDiscovery || model.profile.codeScanning
-        || model.profile.codeImport
-      {
-        ToolbarItem(placement: .automatic) {
-          Menu {
-            if model.profile.nearbyDiscovery {
-              Button("Nearby Macs", systemImage: "dot.radiowaves.left.and.right")
-              { connecting = .nearby }
-              .accessibilityIdentifier("connect.nearby")
-            }
-            if model.profile.codeScanning {
-              Button("Scan Mac Code", systemImage: "qrcode.viewfinder") {
-                connecting = .scan
-              }
-              .accessibilityIdentifier("connect.scan")
-            }
-            if model.profile.codeImport {
-              Button("Paste Mac Code", systemImage: "doc.on.clipboard") {
-                connecting = .paste
-              }
-              .accessibilityIdentifier("connect.paste")
-            }
-            Button("Enter Address Manually", systemImage: "keyboard") {
-              adding = true
-            }
-            .accessibilityIdentifier("connect.manual")
-          } label: {
-            Label("Connect to Mac", systemImage: "laptopcomputer.and.iphone")
-          }
-          .accessibilityIdentifier("hosts.connect")
-        }
-      }
     }
     #if !os(tvOS)
     .adaptiveSheet(item: $browsing) { host in
@@ -127,43 +97,9 @@ public struct HostListView: View {
     .background {
       // A separate presentation anchor from the editor sheets.
       Color.clear.adaptiveSheet(item: $connecting) { sheet in
-        connectSheet(sheet).macSheetFrame(width: 480, height: 460)
+        ConnectSheetView(sheet: sheet, connecting: $connecting, model: model)
+          .macSheetFrame(width: 480, height: 460)
       }
-    }
-  }
-
-  @ViewBuilder
-  private func connectSheet(_ sheet: ConnectSheet) -> some View {
-    let binding = $connecting
-    let select: @MainActor @Sendable (HostCandidate) -> Void = {
-      binding.wrappedValue = .candidate($0)
-    }
-    let cancel = { connecting = nil }
-    switch sheet {
-    case .nearby:
-      NearbyMacsView(select: select, cancel: cancel)
-    case .scan:
-      #if os(iOS) && !targetEnvironment(macCatalyst)
-      ScanCodeView(
-        select: select,
-        paste: { connecting = .paste },
-        cancel: cancel
-      )
-      #else
-      PasteCodeView(select: select, cancel: cancel)
-      #endif
-    case .paste:
-      PasteCodeView(select: select, cancel: cancel)
-    case let .candidate(candidate):
-      HostEditorView(
-        model: model,
-        host: nil,
-        candidate: candidate,
-        onPaired: { connecting = .choose($0) },
-        dismiss: cancel
-      )
-    case let .choose(host):
-      WorkspaceChooserView(host: host, app: model, dismiss: cancel)
     }
   }
 }

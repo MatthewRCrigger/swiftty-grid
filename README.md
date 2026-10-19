@@ -343,7 +343,7 @@ Appendix B of the spec records the design sources.
 | `SessionCore` | IDs, limits, input ledger (client queue, host admission), lifecycle, backoff, transfer manifests |
 | `ScreenProtocol` | RST/1 messages, framing, RFC 1950 snapshots, validation, snapshot scheduler, bootstrap envelope and attention metadata, `RSTConnection` |
 | `SSHClient` | SwiftNIO SSH: host trust, password/Ed25519, exec, shell, SFTP v3 subset, resumable verified transfers |
-| `SSHIdentity` | SSH identities (spec.ssh-identity.md): UUID metadata, Keychain storage policies, read-only resolution, bounded unencrypted OpenSSH Ed25519 import; client-only |
+| `SSHIdentity` | SSH identities (spec.ssh-identity.md): UUID metadata, Keychain storage policies, read-only resolution, bounded OpenSSH Ed25519 import, including passphrase-protected keys; client-only |
 | `AppleTransport` | Network framework QUIC (ALPN `rst/1`, TLS 1.3, no 0-RTT), SPKI and exact-certificate pinning, host identity |
 | `TerminalHost` | RST/1 host over the SwiftMux service (owns no PTYs): `RoamingHost` QUIC listener and grants, in-process SMX client, screen exporter, session registry, bootstrap/attention service, control socket, roaming configuration |
 | `TerminalSurface` | Client: `RoamingClient`, frontend backends (roaming, ordinary SSH, local PTY), SSH and QUIC bridges |
@@ -442,7 +442,7 @@ set up a device:
    Panel Is Open** to advertise `_swiftty._tcp` on the local network. Closing
    the panel stops advertising. The panel never turns on Remote Login or
    changes the firewall or roaming configuration.
-2. On the iPhone or iPad, open **Connect to Mac** and choose **Nearby Macs**,
+2. On the iPhone or iPad, open **Settings › Connect to Mac** and choose **Nearby Macs**,
    **Scan Mac Code**, **Paste Mac Code** or **Enter Address Manually**. The
    app asks for Local Network access when it browses or first reaches a LAN
    address, and asks for camera access only when you scan. A code's SSH key
@@ -519,9 +519,9 @@ retained shell on the Mac logs one line per switch.
 
 [spec.ssh-identity.md](spec.ssh-identity.md) makes an SSH key a reusable
 identity. **Settings › SSH Keys** (or **New Key** in the host editor)
-generates an Ed25519 key or imports an unencrypted OpenSSH Ed25519 private key
-from a file or an explicit paste; passphrase-protected keys are refused. Hosts
-select a key by UUID, so renaming never breaks them. Add the shown public key
+generates an Ed25519 key or imports an OpenSSH Ed25519 private key from a
+file or an explicit paste; a passphrase-protected key asks for its passphrase
+once, which is not saved. Hosts select a key by UUID, so renaming never breaks them. Add the shown public key
 to `~/.ssh/authorized_keys` on the Mac yourself. Signing in only reads the
 selected key: a missing, locked, deleted or mismatched key fails closed, never
 generates a replacement and never falls back to a password.

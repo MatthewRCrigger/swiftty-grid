@@ -261,25 +261,43 @@ extension MainActorIntegrationTests {
       #expect(model.identities.isEmpty)
     }
 
+    /// Without the right passphrase nothing is saved; with it the key is
+    /// stored like any other import and the passphrase is not kept.
     @Test
-    func encryptedImportsAreRefusedWithoutSaving() async throws {
+    func encryptedImportsNeedTheirPassphrase() async throws {
       defer { try? FileManager.default.removeItem(at: directory) }
       let secrets = InMemoryIdentitySecretStore()
       let model = app(secrets: secrets)
       model.load()
-      let fixture = URL(filePath: #filePath).deletingLastPathComponent()
-        .appending(path: "../../SSHIdentityTests/Fixtures/aes256")
-      await #expect(
-        throws: IdentityOperationError.importFailed(.encryptedKeyUnsupported)
-      ) {
-        _ = try await model.identityStore.importKey(
-          try Data(contentsOf: fixture),
-          name: "Encrypted",
-          policy: .deviceOnly
-        )
+      let fixture = try Data(
+        contentsOf: URL(filePath: #filePath).deletingLastPathComponent()
+          .appending(path: "../../SSHIdentityTests/Fixtures/aes256")
+      )
+      let inspection = try await model.identityStore.inspect(fixture)
+      #expect(inspection.isEncrypted)
+      for (passphrase, error) in [
+        (nil, OpenSSHImportError.passphraseRequired),
+        ("wrong", .wrongPassphrase),
+      ] {
+        await #expect(throws: IdentityOperationError.importFailed(error)) {
+          _ = try await model.identityStore.importKey(
+            fixture,
+            passphrase: passphrase,
+            name: "Encrypted",
+            policy: .deviceOnly
+          )
+        }
       }
       #expect(model.identities.isEmpty)
       #expect(try await secrets.storedIdentities(policy: .deviceOnly).isEmpty)
+      let identity = try await model.identityStore.importKey(
+        fixture,
+        passphrase: "correct horse",
+        name: "Encrypted",
+        policy: .deviceOnly
+      )
+      #expect(identity.fingerprint == inspection.fingerprint)
+      #expect(model.identities.map(\.id) == [identity.id])
     }
 
     // MARK: MIG-01, MIG-02

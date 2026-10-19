@@ -100,7 +100,8 @@ extension RoamingAppModel {
   }
 }
 
-/// The host list's Connect to Mac presentations, one sheet at a time.
+/// Connect to Mac presentations (Settings) and the workspace chooser (host
+/// list), one sheet at a time.
 enum ConnectSheet: Identifiable, Hashable {
   case nearby
   case scan
@@ -115,6 +116,48 @@ enum ConnectSheet: Identifiable, Hashable {
     case .paste: "paste"
     case let .candidate(candidate): "candidate-\(candidate.id)"
     case let .choose(host): "choose-\(host.id)"
+    }
+  }
+}
+
+/// The content of one `ConnectSheet`. Each step replaces the sheet with
+/// the next: a found or decoded Mac is confirmed in the host editor, and a
+/// paired host goes on to the workspace chooser.
+struct ConnectSheetView: View {
+  let sheet: ConnectSheet
+  @Binding
+  var connecting: ConnectSheet?
+  let model: RoamingAppModel
+
+  var body: some View {
+    let binding = $connecting
+    let select: @MainActor @Sendable (HostCandidate) -> Void = {
+      binding.wrappedValue = .candidate($0)
+    }
+    let cancel = { connecting = nil }
+    switch sheet {
+    case .nearby: NearbyMacsView(select: select, cancel: cancel)
+    case .scan:
+      #if os(iOS) && !targetEnvironment(macCatalyst)
+      ScanCodeView(
+        select: select,
+        paste: { connecting = .paste },
+        cancel: cancel
+      )
+      #else
+      PasteCodeView(select: select, cancel: cancel)
+      #endif
+    case .paste: PasteCodeView(select: select, cancel: cancel)
+    case let .candidate(candidate):
+      HostEditorView(
+        model: model,
+        host: nil,
+        candidate: candidate,
+        onPaired: { connecting = .choose($0) },
+        dismiss: cancel
+      )
+    case let .choose(host):
+      WorkspaceChooserView(host: host, app: model, dismiss: cancel)
     }
   }
 }

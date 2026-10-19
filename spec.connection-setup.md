@@ -54,7 +54,7 @@ not advertising.
 
 ### 1.2 On the iPhone or iPad: Connect to Mac
 
-The host list's **Connect to Mac** menu offers these entries:
+**Settings › Connect to Mac** offers these entries:
 
 | Entry | What it does |
 |---|---|

@@ -185,6 +185,8 @@ let package = Package(
       name: "SSHIdentity",
       dependencies: [
         "SSHClient", .product(name: "Crypto", package: "swift-crypto"),
+        // AES-CTR/CBC for encrypted key import; already linked by X509.
+        .product(name: "_CryptoExtras", package: "swift-crypto"),
       ]
     ),
     // Network framework QUIC, TLS identity and pinning policy.
