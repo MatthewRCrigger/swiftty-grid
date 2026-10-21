@@ -247,7 +247,9 @@ final class RoamingTerminalController: TerminalSurfaceController {
 
     let client = RoamingClient(
       bootstrapper: SSHBootstrapper(endpoint: endpoint),
-      connector: QUICGrantConnector(),
+      connector: QUICGrantConnector(
+        fallbackHost: endpoint.configuration.host
+      ),
       sink: display,
       configuration: RoamingClientConfiguration(initialGrid: grid)
     )

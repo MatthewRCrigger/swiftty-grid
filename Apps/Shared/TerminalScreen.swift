@@ -23,6 +23,9 @@ extension EnvironmentValues {
 public struct TerminalScreen: View {
   @Bindable var model: TerminalScreenModel
   @Environment(\.terminalSurfaceFactory) private var factory
+  /// Pending input that outlived a normal round trip; a keystroke awaiting
+  /// its ack is not worth showing.
+  @State private var pendingVisible = false
   let onClose: () -> Void
 
   public init(model: TerminalScreenModel, onClose: @escaping () -> Void) {
@@ -44,6 +47,19 @@ public struct TerminalScreen: View {
       } else {
         TerminalSurfacePlaceholder(model: model)
       }
+    }
+    // Transient state floats over the terminal: inserting a row would
+    // resize the grid, and redraw it, on every keystroke.
+    .overlay(alignment: .top) {
+      if showsStatusOverlay { statusBar }
+    }
+    .task(id: model.pendingInputCount > 0) {
+      guard model.pendingInputCount > 0 else {
+        pendingVisible = false
+        return
+      }
+      try? await Task.sleep(for: .milliseconds(750))
+      if !Task.isCancelled { pendingVisible = true }
     }
     .navigationTitle(model.host.nickname)
     #if os(iOS) && !targetEnvironment(macCatalyst)
@@ -78,9 +94,13 @@ public struct TerminalScreen: View {
     #endif
   }()
 
+  /// The bar as a layout row, only where it stays put.
   private var showsStatusBar: Bool {
     !Self.statusInTitle || model.kind != .roaming
-      || model.pendingInputCount > 0 || !model.acceptsInput
+  }
+
+  private var showsStatusOverlay: Bool {
+    !showsStatusBar && (pendingVisible || !model.acceptsInput)
   }
 
   /// The host name with a state dot: green connected, orange on the way,
@@ -110,7 +130,7 @@ public struct TerminalScreen: View {
           .foregroundStyle(.secondary)
       }
       Spacer()
-      if model.pendingInputCount > 0 {
+      if pendingVisible, model.pendingInputCount > 0 {
         // Previously submitted input may still apply later (spec §8).
         Label("\(model.pendingInputCount) pending", systemImage: "hourglass")
           .foregroundStyle(.orange)
