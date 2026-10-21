@@ -50,10 +50,22 @@ struct LiveTerminalSurface: View {
 
 // MARK: - Roaming
 
+/// Forwards scene phase changes to the controller. Its own modifier, so
+/// reading the phase does not invalidate the surface view.
+private struct ScenePhaseForwarding: ViewModifier {
+  let controller: RoamingTerminalController
+  @Environment(\.scenePhase) private var scenePhase
+
+  func body(content: Content) -> some View {
+    content.onChange(of: scenePhase) { _, phase in
+      controller.scenePhaseChanged(phase)
+    }
+  }
+}
+
 struct RoamingSurfaceView: View {
   let controller: RoamingTerminalController
   let app: RoamingAppModel
-  @Environment(\.scenePhase) private var scenePhase
   @State private var confirmTerminate = false
   @State private var showsFiles = false
 
@@ -72,38 +84,38 @@ struct RoamingSurfaceView: View {
         }
       }
       .task { controller.startIfNeeded() }
-      .onChange(of: scenePhase) { _, phase in controller.scenePhaseChanged(phase) }
+      .modifier(ScenePhaseForwarding(controller: controller))
       .toolbar {
         ToolbarItem(placement: .primaryAction) {
           Menu {
             #if !os(tvOS)
               if controller.model.profile.sftp {
-                Button("Files…", systemImage: "folder") { showsFiles = true }
+                Button(.localized("Files…"), systemImage: "folder") { showsFiles = true }
                   .accessibilityIdentifier("session.files")
               }
             #endif
-            Button("Detach", systemImage: "eject") { app.close(.detach) }
+            Button(.localized("Detach"), systemImage: "eject") { app.close(.detach) }
               .accessibilityIdentifier("session.detach")
             if controller.model.sessionID != nil {
-              Button("Terminate Session…", systemImage: "xmark.octagon", role: .destructive) {
+              Button(.localized("Terminate Session…"), systemImage: "xmark.octagon", role: .destructive) {
                 confirmTerminate = true
               }
             }
           } label: {
-            Label("Session", systemImage: "ellipsis.circle")
+            Label(.localized("Session"), systemImage: "ellipsis.circle")
           }
           .accessibilityIdentifier("session.menu")
         }
       }
       .confirmationDialog(
-        "Terminate the session on \(controller.model.host.nickname)?",
+        Text("Terminate the session on \(controller.model.host.nickname)?", bundle: #bundle),
         isPresented: $confirmTerminate,
         titleVisibility: .visible
       ) {
-        Button("Terminate Session", role: .destructive) { app.close(.terminate) }
-        Button("Cancel", role: .cancel) {}
+        Button(.localized("Terminate Session"), role: .destructive) { app.close(.terminate) }
+        Button(.localized("Cancel"), role: .cancel) {}
       } message: {
-        Text("The shell on the Mac and every program running in it will be ended.")
+        Text("The shell on the Mac and every program running in it will be ended.", bundle: #bundle)
       }
       #if !os(tvOS)
         .adaptiveSheet(isPresented: $showsFiles) {
@@ -146,16 +158,19 @@ struct FallbackBanner: View {
         Text(notice.detail).font(.caption).foregroundStyle(.secondary)
           .selectableIfSupported()
       } else {
-        Text("The roaming connection can't be reached.")
+        Text("The roaming connection can't be reached.", bundle: #bundle)
           .font(.subheadline.bold())
       }
       Text(
-        "An ordinary SSH shell is a different shell. The roaming session stays "
-          + "on the Mac and can be resumed later."
+        """
+        An ordinary SSH shell is a different shell. The roaming session stays \
+        on the Mac and can be resumed later.
+        """,
+        bundle: #bundle
       )
       .font(.caption)
       .foregroundStyle(.secondary)
-      Button("Open Ordinary SSH Shell", systemImage: "terminal") {
+      Button(.localized("Open Ordinary SSH Shell"), systemImage: "terminal") {
         app.open(host, kind: .ordinarySSH)
       }
     }
@@ -177,7 +192,7 @@ struct SSHSurfaceView: View {
     VStack(spacing: 0) {
       // Never presented as the resumed roaming session.
       Label(
-        "Ordinary SSH shell — not the roaming session. It ends if the connection drops.",
+        .localized("Ordinary SSH shell — not the roaming session. It ends if the connection drops."),
         systemImage: "exclamationmark.triangle"
       )
       .font(.caption)
@@ -189,7 +204,7 @@ struct SSHSurfaceView: View {
         HStack {
           Label(notice, systemImage: "exclamationmark.triangle")
           Spacer()
-          Button("Dismiss", systemImage: "xmark") { controller.dismissInputNotice() }
+          Button(.localized("Dismiss"), systemImage: "xmark") { controller.dismissInputNotice() }
         }
         .font(.caption)
         .padding(8)
@@ -205,7 +220,7 @@ struct SSHSurfaceView: View {
       .toolbar {
         if controller.model.profile.sftp {
           ToolbarItem(placement: .primaryAction) {
-            Button("Files…", systemImage: "folder") { showsFiles = true }
+            Button(.localized("Files…"), systemImage: "folder") { showsFiles = true }
           }
         }
       }
@@ -223,7 +238,10 @@ struct SSHSurfaceView: View {
     case .running:
       EmptyView()
     case .failed(let problem):
-      ProblemCard(problem: problem, retryTitle: "Open New SSH Shell") { _ in
+      ProblemCard(
+        problem: problem,
+        retryTitle: .localized("Open New SSH Shell")
+      ) { _ in
         // A new, different shell; the old one is gone.
         let host = controller.model.host
         app.close()
@@ -236,7 +254,7 @@ struct SSHSurfaceView: View {
 // MARK: - Shared pieces
 
 struct ProgressCard: View {
-  let message: String
+  let message: LocalizedStringResource
 
   var body: some View {
     VStack(spacing: 12) {
@@ -251,7 +269,7 @@ struct ProgressCard: View {
 
 struct ProblemCard: View {
   let problem: SurfaceProblem
-  var retryTitle = "Try Again"
+  var retryTitle: LocalizedStringResource = .localized("Try Again")
   let perform: (SurfaceAction) -> Void
 
   var body: some View {
@@ -268,12 +286,12 @@ struct ProblemCard: View {
           Button(retryTitle) { perform(.retry) }
             .glassButtonStyle(prominent: true)
         case .startNewSession:
-          Button("Start New Session") { perform(.startNewSession) }
+          Button(.localized("Start New Session")) { perform(.startNewSession) }
             .glassButtonStyle(prominent: true)
         case .openOrdinarySSH:
           VStack(alignment: .leading, spacing: 4) {
-            Button("Open Ordinary SSH Shell") { perform(.openOrdinarySSH) }
-            Text("A different shell; it is not the roaming session.")
+            Button(.localized("Open Ordinary SSH Shell")) { perform(.openOrdinarySSH) }
+            Text("A different shell; it is not the roaming session.", bundle: #bundle)
               .font(.caption)
               .foregroundStyle(.secondary)
           }
@@ -306,7 +324,10 @@ struct ProblemCard: View {
         return view
       } catch {
         let label = UILabel()
-        label.text = "Terminal rendering is unavailable on this device."
+        label.text = String(
+          localized: "Terminal rendering is unavailable on this device.",
+          bundle: #bundle
+        )
         label.textAlignment = .center
         label.numberOfLines = 0
         return label
@@ -333,7 +354,12 @@ struct ProblemCard: View {
         DispatchQueue.main.async { view.window?.makeFirstResponder(view) }
         return view
       } catch {
-        return NSTextField(labelWithString: "Terminal rendering is unavailable on this Mac.")
+        return NSTextField(
+          labelWithString: String(
+            localized: "Terminal rendering is unavailable on this Mac.",
+            bundle: #bundle
+          )
+        )
       }
     }
 

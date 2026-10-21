@@ -13,7 +13,10 @@ struct MobileClientApp: App {
   var body: some Scene {
     WindowGroup {
       RoamingRootView(model: model)
-        .environment(\.terminalSurfaceFactory, .live(model))
+        .environment(
+          \.terminalSurfaceFactory,
+          LiveTerminalSurfaceFactory(app: model)
+        )
         .task { watchBridge.attach(to: model) }
     }
     // Links reuse an open window rather than spawning a scene per link.

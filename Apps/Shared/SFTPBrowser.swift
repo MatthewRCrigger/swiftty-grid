@@ -27,13 +27,13 @@ struct RemoteEntry: Identifiable, Hashable, Sendable {
 }
 
 /// A transfer row: its latest checkpoint and what the user can do.
-struct TransferItem: Identifiable, Hashable, Sendable {
-  enum State: Hashable, Sendable {
+struct TransferItem: Identifiable, Equatable, Sendable {
+  enum State: Equatable, Sendable {
     case running
     /// Stopped by the user or the connection; resumable.
-    case paused(String)
+    case paused(LocalizedStringResource)
     case completed
-    case failed(String)
+    case failed(LocalizedStringResource)
   }
 
   var manifest: TransferManifest
@@ -85,11 +85,11 @@ struct PendingOverwrite: Identifiable, Sendable {
 @MainActor
 @Observable
 final class SFTPBrowserModel {
-  enum Status: Hashable {
+  enum Status: Equatable {
     case closed
     case connecting
     case ready
-    case failed(String)
+    case failed(LocalizedStringResource)
   }
 
   let host: HostProfile
@@ -97,8 +97,17 @@ final class SFTPBrowserModel {
   private(set) var path = ""
   private(set) var entries: [RemoteEntry] = []
   private(set) var transfers: [TransferItem] = []
-  var message: String?
+  var message: LocalizedStringResource?
   var pendingOverwrite: PendingOverwrite?
+  /// The overwrite alert's binding: dismissing it keeps the remote file.
+  var isOverwritePending: Bool {
+    get { pendingOverwrite != nil }
+    set {
+      if !newValue, pendingOverwrite != nil {
+        Task { await resolveOverwrite(false) }
+      }
+    }
+  }
   var exportDocument: ExportedFile?
   var exportName = ""
   var exporting = false
@@ -179,7 +188,8 @@ final class SFTPBrowserModel {
           state: manifest.isComplete
             ? .completed
             : manifest.state == .failed
-              ? .failed("Needs attention") : .paused("Interrupted")
+              ? .failed(.localized("Needs attention"))
+              : .paused(.localized("Interrupted"))
         )
       }
   }
@@ -278,7 +288,7 @@ final class SFTPBrowserModel {
       guard generation == self.generation, !isClosed else { return }
       status = .failed(
         (error as? SSHAccessError)?.title
-          ?? "SFTP is not available on this host."
+          ?? .localized("SFTP is not available on this host.")
       )
     }
   }
@@ -357,9 +367,9 @@ final class SFTPBrowserModel {
       guard generation == self.generation, navigationID == self.navigationID,
         listingID == self.listingID, !isClosed, path == directory
       else { return }
-      message = "This folder could not be listed."
+      message = .localized("This folder could not be listed.")
       if !client.isActive {
-        status = .failed("The SFTP connection was closed.")
+        status = .failed(.localized("The SFTP connection was closed."))
       }
     }
   }
@@ -388,7 +398,7 @@ final class SFTPBrowserModel {
       guard generation == self.generation, navigationID == self.navigationID,
         !isClosed
       else { return }
-      message = "That folder is not available."
+      message = .localized("That folder is not available.")
     }
   }
 
@@ -429,10 +439,10 @@ final class SFTPBrowserModel {
       )
       try store.save(manifest)
       transfers.append(
-        TransferItem(manifest: manifest, state: .paused("Queued"))
+        TransferItem(manifest: manifest, state: .paused(.localized("Queued")))
       )
       run(manifest.id)
-    } catch { message = "The download could not be prepared." }
+    } catch { message = .localized("The download could not be prepared.") }
   }
 
   /// Stages `source` and uploads it into the current directory. An
@@ -522,15 +532,15 @@ final class SFTPBrowserModel {
         throw error
       }
       transfers.append(
-        TransferItem(manifest: manifest, state: .paused("Queued"))
+        TransferItem(manifest: manifest, state: .paused(.localized("Queued")))
       )
       run(manifest.id)
     } catch SFTPTransferError.notRegularFile {
       guard ownsPreparation(lifetime) else { return }
-      message = "Only regular files can be uploaded."
+      message = .localized("Only regular files can be uploaded.")
     } catch {
       guard ownsPreparation(lifetime) else { return }
-      message = "The file could not be staged for upload."
+      message = .localized("The file could not be staged for upload.")
     }
   }
 
@@ -578,7 +588,7 @@ final class SFTPBrowserModel {
     guard !isClosed, !removing.contains(id), tasks[id] == nil, let client,
       let app, let index = transfers.firstIndex(where: { $0.id == id })
     else {
-      if client == nil { message = "Not connected." }
+      if client == nil { message = .localized("Not connected.") }
       return
     }
     let manifest = transfers[index].manifest
@@ -633,27 +643,34 @@ final class SFTPBrowserModel {
     transfers[index].manifest = manifest
     let state: TransferItem.State
     switch error {
-    case nil: state = manifest.isComplete ? .completed : .paused("Incomplete")
-    case is CancellationError: state = .paused("Cancelled")
+    case nil:
+      state =
+        manifest.isComplete ? .completed : .paused(.localized("Incomplete"))
+    case is CancellationError: state = .paused(.localized("Cancelled"))
     case SFTPTransferError.destinationExists?:
-      state = .failed("The destination exists and was not replaced.")
+      state = .failed(
+        .localized("The destination exists and was not replaced.")
+      )
     case SFTPTransferError.notRegularFile?:
-      state = .failed("Only regular files can be transferred.")
+      state = .failed(.localized("Only regular files can be transferred."))
     case SFTPTransferError.fileTooLarge?:
-      state = .failed("This file is too large to download.")
+      state = .failed(.localized("This file is too large to download."))
     case SFTPTransferError.remoteSourceChanged?,
       SFTPTransferError.stagedSourceChanged?:
-      state = .failed("The source changed during the transfer.")
+      state = .failed(.localized("The source changed during the transfer."))
     case SFTPTransferError.verificationFailed?:
-      state = .failed("Verification failed.")
+      state = .failed(.localized("Verification failed."))
     case SFTPTransferError.renameOutcomeUncertain?:
       state = .failed(
-        "The upload's final rename could not be confirmed. Check the folder."
+        .localized(
+          "The upload's final rename could not be confirmed. Check the folder."
+        )
       )
     default:
       state =
         manifest.state == .failed
-        ? .failed("The transfer failed.") : .paused("Interrupted; resumable")
+        ? .failed(.localized("The transfer failed."))
+        : .paused(.localized("Interrupted; resumable"))
     }
     transfers[index].state = state
     if case .ready = status, error != nil { Task { await reconnectIfNeeded() } }
@@ -665,20 +682,44 @@ final class SFTPBrowserModel {
 
 /// Minimal SFTP browser sheet.
 public struct SFTPBrowserView: View {
+  /// Created once, on first appearance: the model reads saved transfer
+  /// manifests from disk, and `init` runs on every parent redraw.
   @State
-  private var model: SFTPBrowserModel
+  private var model: SFTPBrowserModel?
+  private let host: HostProfile
+  private let app: RoamingAppModel
+
+  public init(host: HostProfile, app: RoamingAppModel) {
+    self.host = host
+    self.app = app
+  }
+
+  public var body: some View {
+    Group {
+      if let model {
+        SFTPBrowserContent(model: model, app: app)
+      } else {
+        Color.clear.onAppear {
+          model = SFTPBrowserModel(host: host, app: app)
+        }
+      }
+    }
+    #if os(macOS)
+    .frame(minWidth: 480, minHeight: 420)
+    #endif
+  }
+}
+
+private struct SFTPBrowserContent: View {
+  @Bindable
+  var model: SFTPBrowserModel
   @State
   private var importing = false
   @Environment(\.dismiss)
   private var dismiss
-  private let app: RoamingAppModel
+  let app: RoamingAppModel
 
-  public init(host: HostProfile, app: RoamingAppModel) {
-    self.app = app
-    _model = State(initialValue: SFTPBrowserModel(host: host, app: app))
-  }
-
-  public var body: some View {
+  var body: some View {
     NavigationStack {
       List {
         if let message = model.message {
@@ -688,24 +729,25 @@ public struct SFTPBrowserView: View {
         switch model.status {
         case .closed: EmptyView()
         case .connecting:
-          ProgressView("Connecting").listRowBackground(Color.clear)
+          ProgressView(.localized("Connecting")).listRowBackground(Color.clear)
         case .failed(let reason):
           VStack(alignment: .leading) {
             Text(reason)
-            Button("Try Again") { Task { await model.connect() } }
+            Button(.localized("Try Again")) { Task { await model.connect() } }
           }
           .listRowBackground(Color.clear).glassButtonStyle()
-        case .ready: directorySection
+        case .ready: SFTPDirectorySection(model: model)
         }
-        if !model.transfers.isEmpty { transferSection }
+        if !model.transfers.isEmpty { SFTPTransferSection(model: model) }
       }
       .glassListBackground().navigationTitle(model.host.nickname)
       .toolbar {
         ToolbarItem(placement: .cancellationAction) {
-          Button("Done") { dismiss() }.accessibilityIdentifier("sftp.done")
+          Button(.localized("Done")) { dismiss() }
+            .accessibilityIdentifier("sftp.done")
         }
         ToolbarItem(placement: .primaryAction) {
-          Button("Upload", systemImage: "square.and.arrow.up") {
+          Button(.localized("Upload"), systemImage: "square.and.arrow.up") {
             importing = true
           }
           .disabled(model.status != .ready)
@@ -741,63 +783,42 @@ public struct SFTPBrowserView: View {
       ) { _ in model.exportDocument = nil }
       .alert(
         "Replace \u{201C}\(model.pendingOverwrite?.name ?? "")\u{201D}?",
-        isPresented: overwriteBinding
+        isPresented: $model.isOverwritePending
       ) {
-        Button("Replace", role: .destructive) {
+        Button(.localized("Replace"), role: .destructive) {
           Task { await model.resolveOverwrite(true) }
         }
-        Button("Cancel", role: .cancel) {
+        Button(.localized("Cancel"), role: .cancel) {
           Task { await model.resolveOverwrite(false) }
         }
       } message: {
-        Text("A file with this name already exists in this folder on the Mac.")
+        Text(
+          "A file with this name already exists in this folder on the Mac.",
+          bundle: #bundle
+        )
       }
     }
-    #if os(macOS)
-    .frame(minWidth: 480, minHeight: 420)
-    #endif
   }
+}
 
-  private var overwriteBinding: Binding<Bool> {
-    Binding(
-      get: { model.pendingOverwrite != nil },
-      set: {
-        if !$0, model.pendingOverwrite != nil {
-          Task { await model.resolveOverwrite(false) }
-        }
-      }
-    )
-  }
+private struct SFTPDirectorySection: View {
+  let model: SFTPBrowserModel
 
-  private var directorySection: some View {
+  var body: some View {
     Section {
       if model.path != "/" {
         Button {
           Task { await model.goUp() }
         } label: {
-          Label("..", systemImage: "arrow.turn.left.up")
+          Label {
+            Text(verbatim: "..")
+          } icon: {
+            Image(systemName: "arrow.turn.left.up")
+          }
         }
       }
       ForEach(model.entries) { entry in
-        if entry.isDirectory {
-          Button {
-            Task { await model.open(entry) }
-          } label: {
-            Label(entry.name, systemImage: "folder")
-          }
-        } else {
-          HStack {
-            Label(entry.name, systemImage: "doc")
-            Spacer()
-            if let size = entry.sizeDescription {
-              Text(size).foregroundStyle(.secondary).font(.caption)
-            }
-            Button("Download", systemImage: "arrow.down.circle") {
-              model.download(entry)
-            }
-            .labelStyle(.iconOnly).buttonStyle(.borderless)
-          }
-        }
+        RemoteEntryRow(entry: entry, model: model)
       }
     } header: {
       Text(model.path).font(.caption.monospaced())
@@ -805,63 +826,114 @@ public struct SFTPBrowserView: View {
     }
     .listRowBackground(Color.clear)
   }
+}
 
-  private var transferSection: some View {
+/// One remote entry. A single top-level view for either kind, so `List`
+/// can derive row identity without evaluating every row.
+private struct RemoteEntryRow: View {
+  let entry: RemoteEntry
+  let model: SFTPBrowserModel
+
+  var body: some View {
+    HStack {
+      if entry.isDirectory {
+        Button {
+          Task { await model.open(entry) }
+        } label: {
+          Label(entry.name, systemImage: "folder")
+        }
+      } else {
+        Label(entry.name, systemImage: "doc")
+        Spacer()
+        if let size = entry.sizeDescription {
+          Text(size).foregroundStyle(.secondary).font(.caption)
+        }
+        Button(.localized("Download"), systemImage: "arrow.down.circle") {
+          model.download(entry)
+        }
+        .labelStyle(.iconOnly).buttonStyle(.borderless)
+      }
+    }
+  }
+}
+
+/// Transfers in their own section, so progress updates do not redraw the
+/// directory listing.
+private struct SFTPTransferSection: View {
+  let model: SFTPBrowserModel
+
+  var body: some View {
     Section {
       if model.isPausedForTerminal {
         Label(
-          "Paused while terminal input is pending",
+          .localized("Paused while terminal input is pending"),
           systemImage: "pause.circle"
         )
         .foregroundStyle(.secondary)
       }
       ForEach(model.transfers) { item in
-        VStack(alignment: .leading, spacing: 4) {
-          Label(
-            item.name,
-            systemImage: item.manifest.direction == .upload
-              ? "arrow.up.doc" : "arrow.down.doc"
-          )
-          if let progress = item.progress, item.state != .completed {
-            ProgressView(value: progress)
-          }
-          HStack {
-            Text(stateText(item.state)).font(.caption)
-              .foregroundStyle(.secondary)
-            Spacer()
-            actions(for: item)
-          }
-          .buttonStyle(.borderless)
-        }
+        TransferRow(item: item, model: model)
       }
     } header: {
-      Text("Transfers")
+      Text("Transfers", bundle: #bundle)
     }
     .listRowBackground(Color.clear)
   }
+}
 
-  @ViewBuilder
-  private func actions(for item: TransferItem) -> some View {
-    switch item.state {
-    case .running: Button("Cancel") { model.cancel(item) }
-    case .paused:
-      Button("Resume") { Task { await model.resume(item) } }
-      Button("Remove", role: .destructive) { Task { await model.remove(item) } }
-    case .completed:
-      if item.manifest.direction == .download {
-        Button("Save…") { model.export(item) }
+private struct TransferRow: View {
+  let item: TransferItem
+  let model: SFTPBrowserModel
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 4) {
+      Label(
+        item.name,
+        systemImage: item.manifest.direction == .upload
+          ? "arrow.up.doc" : "arrow.down.doc"
+      )
+      if let progress = item.progress, item.state != .completed {
+        ProgressView(value: progress)
       }
-      Button("Remove", role: .destructive) { Task { await model.remove(item) } }
-    case .failed:
-      Button("Remove", role: .destructive) { Task { await model.remove(item) } }
+      HStack {
+        Text(stateText(item.state)).font(.caption)
+          .foregroundStyle(.secondary)
+        Spacer()
+        actions
+      }
+      .buttonStyle(.borderless)
     }
   }
 
-  private func stateText(_ state: TransferItem.State) -> String {
+  @ViewBuilder
+  private var actions: some View {
+    switch item.state {
+    case .running: Button(.localized("Cancel")) { model.cancel(item) }
+    case .paused:
+      Button(.localized("Resume")) { Task { await model.resume(item) } }
+      Button(.localized("Remove"), role: .destructive) {
+        Task { await model.remove(item) }
+      }
+    case .completed:
+      if item.manifest.direction == .download {
+        Button(.localized("Save…")) { model.export(item) }
+      }
+      Button(.localized("Remove"), role: .destructive) {
+        Task { await model.remove(item) }
+      }
+    case .failed:
+      Button(.localized("Remove"), role: .destructive) {
+        Task { await model.remove(item) }
+      }
+    }
+  }
+
+  private func stateText(_ state: TransferItem.State) -> LocalizedStringResource
+  {
     switch state {
-    case .running: "Transferring"
+    case .running: .localized("Transferring")
     case .paused(let reason): reason
-    case .completed: "Verified"
+    case .completed: .localized("Verified")
     case .failed(let reason): reason
     }
   }

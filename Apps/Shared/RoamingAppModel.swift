@@ -72,10 +72,10 @@ public enum TerminalKind: Hashable, Sendable {
   /// it ends with its connection and is never resumed (spec §9).
   case ordinarySSH
 
-  public var displayName: String {
+  public var displayName: LocalizedStringResource {
     switch self {
-    case .roaming: "Roaming session"
-    case .ordinarySSH: "Ordinary SSH shell"
+    case .roaming: .localized("Roaming session")
+    case .ordinarySSH: .localized("Ordinary SSH shell")
     }
   }
 }
@@ -327,10 +327,31 @@ public final class RoamingAppModel {
   /// current iCloud account).
   public private(set) var hosts: [HostProfile] = []
   /// The committed non-secret connection state (spec.ssh-identity.md §5).
-  public private(set) var connections = ConnectionSnapshot()
+  /// Views read the narrower stored values derived from it below, so a
+  /// trust or sync change does not invalidate every key and host screen.
+  public private(set) var connections = ConnectionSnapshot() {
+    didSet { deriveConnectionValues() }
+  }
+  /// SSH identities visible on this device, by name.
+  public private(set) var identities: [SSHIdentityMetadata] = []
+  /// Every identity, deleted ones included, by ID.
+  private var identityIndex: [UUID: SSHIdentityMetadata] = [:]
+  public private(set) var syncSettings = SyncSettings()
+  /// Entities hidden because they belong to another iCloud account.
+  public private(set) var hiddenCount = 0
+  /// Pending host conflicts, in a stable order.
+  public private(set) var hostConflicts: [HostConflictItem] = []
+  /// Pending trusted-host reviews, in a stable order.
+  public private(set) var trustReviews: [TrustReview] = []
   public private(set) var lastError: String?
   /// The single active terminal, if any.
   public private(set) var activeSession: TerminalScreenModel?
+  /// `activeSession` as a navigation destination: clearing it closes the
+  /// session.
+  public var presentedSession: TerminalScreenModel? {
+    get { activeSession }
+    set { if newValue == nil { close() } }
+  }
   /// A host-key decision awaiting the user.
   public var pendingTrust: TrustPrompt?
   /// A password awaiting the user.
@@ -492,7 +513,10 @@ public final class RoamingAppModel {
       lastError = nil
     } catch {
       savedHostsReadable = false
-      lastError = "Saved hosts could not be read."
+      lastError = String(
+        localized: "Saved hosts could not be read.",
+        bundle: #bundle
+      )
       return
     }
     // Version-1 labels move to stable identities before any new identity
@@ -525,7 +549,10 @@ public final class RoamingAppModel {
     _ mutate: (inout ConnectionSnapshot) throws(ConnectionStore.StoreError) -> Void
   ) -> Bool {
     guard savedHostsReadable else {
-      lastError = "Saved hosts could not be read."
+      lastError = String(
+        localized: "Saved hosts could not be read.",
+        bundle: #bundle
+      )
       return false
     }
     var next = connections
@@ -534,13 +561,22 @@ public final class RoamingAppModel {
       guard next != connections else { return true }
       try store.commit(next)
     } catch .tooManyHosts {
-      lastError = "You can save up to \(ConnectionStore.maxHosts) hosts."
+      lastError = String(
+        localized: "You can save up to \(ConnectionStore.maxHosts) hosts.",
+        bundle: #bundle
+      )
       return false
     } catch .tooManyIdentities {
-      lastError = "You can save up to \(ConnectionStore.maxIdentities) keys."
+      lastError = String(
+        localized: "You can save up to \(ConnectionStore.maxIdentities) keys.",
+        bundle: #bundle
+      )
       return false
     } catch {
-      lastError = "Saved hosts could not be written."
+      lastError = String(
+        localized: "Saved hosts could not be written.",
+        bundle: #bundle
+      )
       return false
     }
     apply(next)
@@ -585,24 +621,53 @@ public final class RoamingAppModel {
 
   // MARK: Identities
 
-  /// SSH identities visible on this device, by name.
-  public var identities: [SSHIdentityMetadata] {
-    connections.visibleIdentities.sorted {
+  public func identity(_ id: UUID) -> SSHIdentityMetadata? {
+    identityIndex[id]
+  }
+
+  /// Recomputes the values views read from `connections`, assigning each
+  /// only when it changed so unaffected readers stay valid.
+  private func deriveConnectionValues() {
+    let identities = connections.visibleIdentities.sorted {
       $0.name.localizedStandardCompare($1.name) == .orderedAscending
     }
+    if identities != self.identities { self.identities = identities }
+    // `ConnectionSnapshot.identity(_:)` returns the first match.
+    let index = Dictionary(
+      connections.identities.map { ($0.id, $0) },
+      uniquingKeysWith: { first, _ in first }
+    )
+    if index != identityIndex { identityIndex = index }
+    if connections.settings != syncSettings {
+      syncSettings = connections.settings
+    }
+    if connections.hiddenCount != hiddenCount {
+      hiddenCount = connections.hiddenCount
+    }
+    let conflicts = connections.hostConflicts
+      .map { HostConflictItem(id: $0.key, conflict: $0.value) }
+      .sorted { $0.id.uuidString < $1.id.uuidString }
+    if conflicts != hostConflicts { hostConflicts = conflicts }
+    let reviews = connections.trustReviews.values.sorted {
+      $0.recordName < $1.recordName
+    }
+    if reviews != trustReviews { trustReviews = reviews }
   }
 
-  public func identity(_ id: UUID) -> SSHIdentityMetadata? {
-    connections.identity(id)
-  }
-
-  /// The sign-in summary shown under a host.
+  /// The sign-in summary shown under a host. Localized plain text: it
+  /// names the key the user chose.
   public func authSummary(for host: HostProfile) -> String {
     guard case .key(let id) = host.auth else { return host.auth.summary }
     guard let identity = identity(id), !identity.isDeleted else {
-      return "SSH key (deleted or unavailable)"
+      return String(
+        localized: "SSH key (deleted or unavailable)",
+        bundle: #bundle
+      )
     }
-    return "Key \u{201C}\(identity.name)\u{201D}"
+    return String(
+      localized: "Key \u{201C}\(identity.name)\u{201D}",
+      bundle: #bundle
+    )
   }
 
   // MARK: Session

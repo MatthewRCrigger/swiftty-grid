@@ -21,18 +21,18 @@ struct SettingsView: View {
 
   var body: some View {
     Form {
-      Section("Keys & Sync") {
+      Section(.localized("Keys & Sync")) {
         NavigationLink {
           SSHKeysView(model: model)
         } label: {
-          Label("SSH Keys", systemImage: "key")
+          Label(.localized("SSH Keys"), systemImage: "key")
         }
         .accessibilityIdentifier("settings.keys")
         if model.profile.cloudSync {
           NavigationLink {
             SyncSettingsView(model: model)
           } label: {
-            Label("iCloud Sync", systemImage: "icloud")
+            Label(.localized("iCloud Sync"), systemImage: "icloud")
           }
           .accessibilityIdentifier("settings.sync")
         }
@@ -40,18 +40,18 @@ struct SettingsView: View {
       .listRowBackground(Color.clear)
       if pairs { pairing }
       if model.profile.companionBridge {
-        Section("Apple Watch") {
+        Section(.localized("Apple Watch")) {
           NavigationLink {
             CompanionSettingsView(model: model)
           } label: {
-            Label("Apple Watch", systemImage: "applewatch")
+            Label(.localized("Apple Watch"), systemImage: "applewatch")
           }
           .accessibilityIdentifier("settings.watch")
         }
         .listRowBackground(Color.clear)
       }
     }
-    .glassListBackground().navigationTitle("Settings")
+    .glassListBackground().navigationTitle(.localized("Settings"))
     .hostEditorPresentation(adding: $adding, editing: $editing, model: model)
     .background {
       // A separate presentation anchor from the editor sheets.
@@ -65,33 +65,37 @@ struct SettingsView: View {
   private var pairing: some View {
     Section {
       if model.profile.nearbyDiscovery {
-        Button("Nearby Macs", systemImage: "dot.radiowaves.left.and.right") {
-          connecting = .nearby
-        }
+        Button(
+          .localized("Nearby Macs"),
+          systemImage: "dot.radiowaves.left.and.right"
+        ) { connecting = .nearby }
         .accessibilityIdentifier("connect.nearby")
       }
       if model.profile.codeScanning {
-        Button("Scan Mac Code", systemImage: "qrcode.viewfinder") {
+        Button(.localized("Scan Mac Code"), systemImage: "qrcode.viewfinder") {
           connecting = .scan
         }
         .accessibilityIdentifier("connect.scan")
       }
       if model.profile.codeImport {
-        Button("Paste Mac Code", systemImage: "doc.on.clipboard") {
+        Button(.localized("Paste Mac Code"), systemImage: "doc.on.clipboard") {
           connecting = .paste
         }
         .accessibilityIdentifier("connect.paste")
       }
-      Button("Enter Address Manually", systemImage: "keyboard") {
+      Button(.localized("Enter Address Manually"), systemImage: "keyboard") {
         adding = true
       }
       .accessibilityIdentifier("connect.manual")
     } header: {
-      Text("Connect to Mac")
+      Text("Connect to Mac", bundle: #bundle)
     } footer: {
       Text(
-        "Find a Mac on this network, or use the code its Connect a Device "
-          + "window shows. Paired Macs appear in Hosts."
+        """
+        Find a Mac on this network, or use the code its Connect a Device \
+        window shows. Paired Macs appear in Hosts.
+        """,
+        bundle: #bundle
       )
     }
     .listRowBackground(Color.clear)

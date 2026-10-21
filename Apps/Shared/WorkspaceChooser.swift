@@ -43,6 +43,11 @@ final class WorkspaceChooserModel {
   private(set) var notice: String?
   /// A takeover awaiting the user's confirmation.
   var pendingTakeover: Row?
+  /// The takeover dialog's binding: dismissing it drops the request.
+  var isTakeoverPending: Bool {
+    get { pendingTakeover != nil }
+    set { if !newValue { pendingTakeover = nil } }
+  }
   /// Set once a selection was handed to the terminal; the view dismisses.
   private(set) var finished = false
 
@@ -106,11 +111,16 @@ final class WorkspaceChooserModel {
     let opened = try await connector.connect(to: navigationHost)
     guard let metadata = opened as? any RoamingAttentionMetadataService else {
       await opened.close()
-      throw .unsupported("This Mac cannot list its workspaces.")
+      throw .unsupported(
+        String(
+          localized: "This Mac cannot list its workspaces.",
+          bundle: #bundle
+        )
+      )
     }
     guard !closed, !Task.isCancelled else {
       await metadata.close()
-      throw .other("Cancelled.")
+      throw .other(String(localized: "Cancelled.", bundle: #bundle))
     }
     service = metadata
     return metadata
@@ -245,15 +255,33 @@ final class WorkspaceChooserModel {
     await service?.close()
   }
 
+  /// Localized plain text: it can carry what the host reported, so it is
+  /// a `String`, never read as Markdown.
   static func describe(_ error: AttentionServiceError) -> String {
     switch error {
     case .leaseHeld:
-      "Another device took control of this workspace. Review it and confirm again."
+      String(
+        localized:
+          "Another device took control of this workspace. Review it and confirm again.",
+        bundle: #bundle
+      )
     case .leaseChanged:
-      "This workspace's controller changed. Review it and confirm again."
+      String(
+        localized:
+          "This workspace's controller changed. Review it and confirm again.",
+        bundle: #bundle
+      )
     case .serviceRestarted:
-      "SwiftMux restarted on the Mac. The list was refreshed; choose again."
-    case .notFound: "That workspace no longer exists on the Mac."
+      String(
+        localized:
+          "SwiftMux restarted on the Mac. The list was refreshed; choose again.",
+        bundle: #bundle
+      )
+    case .notFound:
+      String(
+        localized: "That workspace no longer exists on the Mac.",
+        bundle: #bundle
+      )
     default: RoamingInboxModel.describe(error)
     }
   }
@@ -264,24 +292,40 @@ final class WorkspaceChooserModel {
 /// Lists a Mac's workspaces after sign-in. Presented as a sheet; it hosts
 /// the connection prompts while it is up.
 struct WorkspaceChooserView: View {
+  /// Created once, on first appearance, rather than in `init`, which
+  /// runs on every parent redraw.
   @State
-  private var chooser: WorkspaceChooserModel
+  private var chooser: WorkspaceChooserModel?
+  let host: HostProfile
   let app: RoamingAppModel
   let dismiss: () -> Void
-  @Environment(\.scenePhase)
-  private var scenePhase
 
   init(
     host: HostProfile,
     app: RoamingAppModel,
     dismiss: @escaping () -> Void
   ) {
-    _chooser = State(
-      initialValue: WorkspaceChooserModel(model: app, host: host)
-    )
+    self.host = host
     self.app = app
     self.dismiss = dismiss
   }
+
+  var body: some View {
+    if let chooser {
+      WorkspaceChooserContent(chooser: chooser, app: app, dismiss: dismiss)
+    } else {
+      Color.clear.onAppear {
+        chooser = WorkspaceChooserModel(model: app, host: host)
+      }
+    }
+  }
+}
+
+private struct WorkspaceChooserContent: View {
+  @Bindable
+  var chooser: WorkspaceChooserModel
+  let app: RoamingAppModel
+  let dismiss: () -> Void
 
   var body: some View {
     NavigationStack {
@@ -297,30 +341,35 @@ struct WorkspaceChooserView: View {
       .navigationTitle(chooser.host.nickname)
       .toolbar {
         ToolbarItem(placement: .cancellationAction) {
-          Button("Cancel", action: cancel)
+          Button(.localized("Cancel"), action: cancel)
             .accessibilityIdentifier("workspace.cancel")
         }
         ToolbarItem(placement: .automatic) {
           Button {
             chooser.load()
           } label: {
-            Label("Refresh", systemImage: "arrow.clockwise")
+            Label(.localized("Refresh"), systemImage: "arrow.clockwise")
           }
           .disabled(chooser.phase == .connecting)
         }
       }
       .confirmationDialog(
         takeoverTitle,
-        isPresented: takeoverBinding,
+        isPresented: $chooser.isTakeoverPending,
         titleVisibility: .visible
       ) {
-        Button("Take Control") { chooser.confirmTakeover() }
+        Button(.localized("Take Control")) { chooser.confirmTakeover() }
           .accessibilityIdentifier("workspace.takeover")
-        Button("Cancel", role: .cancel) { chooser.pendingTakeover = nil }
+        Button(.localized("Cancel"), role: .cancel) {
+          chooser.pendingTakeover = nil
+        }
       } message: {
         Text(
-          "Another client controls this workspace. Taking control detaches it "
-            + "there; nothing running in the workspace is ended."
+          """
+          Another client controls this workspace. Taking control detaches it \
+          there; nothing running in the workspace is ended.
+          """,
+          bundle: #bundle
         )
       }
     }
@@ -336,20 +385,22 @@ struct WorkspaceChooserView: View {
     case .connecting:
       HStack {
         ProgressView()
-        Text("Signing in to list workspaces…").foregroundStyle(.secondary)
+        Text("Signing in to list workspaces…", bundle: #bundle)
+          .foregroundStyle(.secondary)
       }
       .listRowBackground(Color.clear)
     case let .failed(message):
       Label(message, systemImage: "exclamationmark.triangle")
         .foregroundStyle(.orange).listRowBackground(Color.clear)
         .accessibilityIdentifier("workspace.error")
-      Button("Try Again") { chooser.load() }.listRowBackground(Color.clear)
+      Button(.localized("Try Again")) { chooser.load() }
+        .listRowBackground(Color.clear)
     case .loaded:
       if chooser.rows.isEmpty {
         ContentUnavailableView(
-          "No Workspaces",
+          .localized("No Workspaces"),
           systemImage: "rectangle.stack",
-          description: Text("This Mac has no workspaces yet.")
+          description: Text("This Mac has no workspaces yet.", bundle: #bundle)
         )
         .listRowBackground(Color.clear)
       }
@@ -368,24 +419,28 @@ struct WorkspaceChooserView: View {
         Button {
           chooser.createNew()
         } label: {
-          Label("New Workspace", systemImage: "plus.rectangle.on.rectangle")
+          Label(
+            .localized("New Workspace"),
+            systemImage: "plus.rectangle.on.rectangle"
+          )
         }
         .accessibilityIdentifier("workspace.new")
       } footer: {
-        Text("Starts a new shell on the Mac. Existing workspaces keep running.")
+        Text(
+          "Starts a new shell on the Mac. Existing workspaces keep running.",
+          bundle: #bundle
+        )
       }
       .listRowBackground(Color.clear)
     }
   }
 
+  /// Plain text: the workspace name comes from the Mac.
   private var takeoverTitle: String {
-    "Take control of \u{201C}\(chooser.pendingTakeover?.summary.name ?? "")\u{201D}?"
-  }
-
-  private var takeoverBinding: Binding<Bool> {
-    Binding(
-      get: { chooser.pendingTakeover != nil },
-      set: { if !$0 { chooser.pendingTakeover = nil } }
+    String(
+      localized:
+        "Take control of \u{201C}\(chooser.pendingTakeover?.summary.name ?? "")\u{201D}?",
+      bundle: #bundle
     )
   }
 
@@ -401,33 +456,40 @@ struct WorkspaceRowLabel: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 2) {
-      Text(row.summary.name.isEmpty ? "Untitled Workspace" : row.summary.name)
+      (row.summary.name.isEmpty
+        ? Text("Untitled Workspace", bundle: #bundle) : Text(row.summary.name))
         .font(.headline)
-      Text(counts).font(.caption).foregroundStyle(.secondary)
+      counts.font(.caption).foregroundStyle(.secondary)
       Label(control, systemImage: controlImage).font(.caption)
         .foregroundStyle(row.heldElsewhere ? .orange : .secondary)
     }
   }
 
-  private var counts: String {
+  private var counts: Text {
     let s = row.summary
-    var parts = [
-      "\(s.tabCount) tab\(s.tabCount == 1 ? "" : "s")",
-      "\(s.paneCount) pane\(s.paneCount == 1 ? "" : "s")",
-    ]
-    if let live = s.livePaneCount, live != s.paneCount {
-      parts.append("\(live) running")
+    let tabs = Text(
+      "\(s.tabCount) tabs",
+      bundle: #bundle,
+      comment: "Plural: a workspace's tab count."
+    )
+    let panes = Text(
+      "\(s.paneCount) panes",
+      bundle: #bundle,
+      comment: "Plural: a workspace's pane count."
+    )
+    guard let live = s.livePaneCount, live != s.paneCount else {
+      return Text("\(tabs) · \(panes)", bundle: #bundle)
     }
-    return parts.joined(separator: " · ")
+    return Text("\(tabs) · \(panes) · \(live) running", bundle: #bundle)
   }
 
-  private var control: String {
-    if row.isShownHere { return "Shown on this device" }
-    guard row.summary.isAttached else { return "Not attached" }
+  private var control: LocalizedStringResource {
+    if row.isShownHere { return .localized("Shown on this device") }
+    guard row.summary.isAttached else { return .localized("Not attached") }
     switch row.summary.leaseHolder?.transport {
-    case .local?: return "Controlled on the Mac"
-    case .remote?: return "Controlled by another device"
-    case nil: return "Controlled by another client"
+    case .local?: return .localized("Controlled on the Mac")
+    case .remote?: return .localized("Controlled by another device")
+    case nil: return .localized("Controlled by another client")
     }
   }
 
@@ -444,13 +506,14 @@ struct WorkspaceRowLabel: View {
 /// disappear.
 private struct ModalConnectionPrompts: ViewModifier {
   let model: RoamingAppModel
+  let enabled: Bool
   @State
   private var counted = false
 
   func body(content: Content) -> some View {
-    content.connectionPrompts(model)
+    content.connectionPrompts(model, enabled: enabled)
       .onAppear {
-        guard !counted else { return }
+        guard enabled, !counted else { return }
         counted = true
         model.modalDepth += 1
       }
@@ -463,7 +526,12 @@ private struct ModalConnectionPrompts: ViewModifier {
 }
 
 extension View {
-  func modalConnectionPrompts(_ model: RoamingAppModel) -> some View {
-    modifier(ModalConnectionPrompts(model: model))
+  /// `enabled` is a parameter rather than a conditional modifier, so
+  /// toggling it never replaces the view and resets its state.
+  func modalConnectionPrompts(
+    _ model: RoamingAppModel,
+    enabled: Bool = true
+  ) -> some View {
+    modifier(ModalConnectionPrompts(model: model, enabled: enabled))
   }
 }

@@ -64,7 +64,8 @@ enum PairingFailure: Error, Equatable {
   var message: String {
     switch self {
     case let .invalid(error): error.message
-    case let .ssh(error): "\(error.title). \(error.detail)"
+    case let .ssh(error):
+      String(localized: "\(error.title). \(error.detail)", bundle: #bundle)
     case let .notSaved(reason): reason
     }
   }
@@ -197,10 +198,10 @@ struct NearbyMacsView: View {
             .foregroundStyle(.orange).listRowBackground(Color.clear)
         }
       }
-      .glassListBackground().navigationTitle("Nearby Macs")
+      .glassListBackground().navigationTitle(.localized("Nearby Macs"))
       .toolbar {
         ToolbarItem(placement: .cancellationAction) {
-          Button("Cancel", action: close)
+          Button(.localized("Cancel"), action: close)
         }
       }
     }
@@ -222,7 +223,7 @@ struct NearbyMacsView: View {
     case .idle, .searching:
       HStack {
         ProgressView()
-        Text("Looking for Macs with Connect a Device open…")
+        Text("Looking for Macs with Connect a Device open…", bundle: #bundle)
           .foregroundStyle(.secondary)
       }
       .listRowBackground(Color.clear)
@@ -230,30 +231,39 @@ struct NearbyMacsView: View {
       EmptyView()
     case .noResults:
       VStack(alignment: .leading, spacing: 6) {
-        Text("No Macs found yet").font(.headline)
+        Text("No Macs found yet", bundle: #bundle).font(.headline)
         Text(
-          "On the Mac, choose Terminal Service › Connect a Device… and turn on "
-            + "Make Discoverable. Both devices must be on the same local network."
+          """
+          On the Mac, choose Terminal Service › Connect a Device… and turn on \
+          Make Discoverable. Both devices must be on the same local network.
+          """,
+          bundle: #bundle
         )
         .font(.footnote).foregroundStyle(.secondary)
       }
       .listRowBackground(Color.clear)
     case .denied:
       VStack(alignment: .leading, spacing: 8) {
-        Label("Local Network access is off", systemImage: "hand.raised")
-          .font(.headline)
+        Label(
+          .localized("Local Network access is off"),
+          systemImage: "hand.raised"
+        )
+        .font(.headline)
         Text(
-          "Allow Swiftty in Settings › Privacy & Security › Local Network, "
-            + "then try again. You can still enter an address or scan a code."
+          """
+          Allow Swiftty in Settings › Privacy & Security › Local Network, \
+          then try again. You can still enter an address or scan a code.
+          """,
+          bundle: #bundle
         )
         .font(.footnote).foregroundStyle(.secondary)
-        Button("Try Again") { browser.restart() }
+        Button(.localized("Try Again")) { browser.restart() }
       }
       .listRowBackground(Color.clear).accessibilityIdentifier("nearby.denied")
     case let .failed(message):
       VStack(alignment: .leading, spacing: 8) {
         Label(message, systemImage: "exclamationmark.triangle")
-        Button("Try Again") { browser.restart() }
+        Button(.localized("Try Again")) { browser.restart() }
       }
       .listRowBackground(Color.clear)
     }
@@ -281,7 +291,7 @@ struct PasteCodeView: View {
     NavigationStack {
       Form {
         Section {
-          TextField("Connection code", text: $text, axis: .vertical)
+          TextField(.localized("Connection code"), text: $text, axis: .vertical)
             .lineLimit(3 ... 8).plainEntry()
             .accessibilityIdentifier("paste.code")
           #if !os(tvOS)
@@ -292,8 +302,11 @@ struct PasteCodeView: View {
           #endif
         } footer: {
           Text(
-            "On the Mac, open Terminal Service › Connect a Device… and copy the "
-              + "pairing code. It contains no password."
+            """
+            On the Mac, open Terminal Service › Connect a Device… and copy the \
+            pairing code. It contains no password.
+            """,
+            bundle: #bundle
           )
         }
         .listRowBackground(Color.clear)
@@ -301,13 +314,13 @@ struct PasteCodeView: View {
           Text(error).foregroundStyle(.red).listRowBackground(Color.clear)
         }
       }
-      .glassListBackground().navigationTitle("Paste Mac Code")
+      .glassListBackground().navigationTitle(.localized("Paste Mac Code"))
       .toolbar {
         ToolbarItem(placement: .cancellationAction) {
-          Button("Cancel", action: cancel)
+          Button(.localized("Cancel"), action: cancel)
         }
         ToolbarItem(placement: .confirmationAction) {
-          Button("Continue", action: decode).disabled(text.isEmpty)
+          Button(.localized("Continue"), action: decode).disabled(text.isEmpty)
             .accessibilityIdentifier("paste.continue")
         }
       }
@@ -329,18 +342,45 @@ struct PasteCodeView: View {
 extension HostConnectionDescriptor.DecodingError {
   var message: String {
     switch self {
-    case .tooLarge: "That is too long to be a Swiftty connection code."
+    case .tooLarge:
+      String(
+        localized: "That is too long to be a Swiftty connection code.",
+        bundle: #bundle
+      )
     case .malformed, .unsupportedKind:
-      "That is not a Swiftty connection code."
+      String(
+        localized: "That is not a Swiftty connection code.",
+        bundle: #bundle
+      )
     case .unsupportedVersion:
-      "This code needs a newer version of the app."
+      String(
+        localized: "This code needs a newer version of the app.",
+        bundle: #bundle
+      )
     case .unknownField:
-      "The code contains fields this app does not accept."
-    case .invalidName: "The code's Mac name is not valid."
-    case .invalidHost: "The code's host name or address is not valid."
-    case .invalidPort: "The code's SSH port is not valid."
-    case .invalidUsername: "The code's account name is not valid."
-    case .invalidHostKeys: "The code's SSH key fingerprints are not valid."
+      String(
+        localized: "The code contains fields this app does not accept.",
+        bundle: #bundle
+      )
+    case .invalidName:
+      String(localized: "The code's Mac name is not valid.", bundle: #bundle)
+    case .invalidHost:
+      String(
+        localized: "The code's host name or address is not valid.",
+        bundle: #bundle
+      )
+    case .invalidPort:
+      String(localized: "The code's SSH port is not valid.", bundle: #bundle)
+    case .invalidUsername:
+      String(
+        localized: "The code's account name is not valid.",
+        bundle: #bundle
+      )
+    case .invalidHostKeys:
+      String(
+        localized: "The code's SSH key fingerprints are not valid.",
+        bundle: #bundle
+      )
     }
   }
 }
@@ -364,29 +404,39 @@ struct CandidateSummary: View {
           }
         }
         Toggle(
-          "This code came from the Mac I want to connect to",
+          .localized("This code came from the Mac I want to connect to"),
           isOn: $confirmedSource
         )
         .accessibilityIdentifier("candidate.confirmSource")
       } header: {
-        Text("Expected SSH host keys")
+        Text("Expected SSH host keys", bundle: #bundle)
       } footer: {
         Text(
-          "The Mac must present one of these keys before any password is sent. "
-            + "A different key blocks the connection."
+          """
+          The Mac must present one of these keys before any password is sent. \
+          A different key blocks the connection.
+          """,
+          bundle: #bundle
         )
       }
       .listRowBackground(Color.clear)
     case .nearby:
       Section {
-        Label(
-          "Found on this network as \u{201C}\(candidate.name)\u{201D}",
-          systemImage: "dot.radiowaves.left.and.right"
-        )
+        Label {
+          Text(
+            "Found on this network as \u{201C}\(candidate.name)\u{201D}",
+            bundle: #bundle
+          )
+        } icon: {
+          Image(systemName: "dot.radiowaves.left.and.right")
+        }
       } footer: {
         Text(
-          "A network name is not proof of identity. Compare the SSH key "
-            + "fingerprint with the Mac's Connect a Device panel when asked."
+          """
+          A network name is not proof of identity. Compare the SSH key \
+          fingerprint with the Mac's Connect a Device panel when asked.
+          """,
+          bundle: #bundle
         )
       }
       .listRowBackground(Color.clear)

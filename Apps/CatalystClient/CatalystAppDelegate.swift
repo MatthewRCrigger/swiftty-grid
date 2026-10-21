@@ -17,7 +17,10 @@ struct CatalystClientApp: App {
   var body: some Scene {
     WindowGroup {
       RoamingRootView(model: delegate.model)
-        .environment(\.terminalSurfaceFactory, .live(delegate.model))
+        .environment(
+          \.terminalSurfaceFactory,
+          LiveTerminalSurfaceFactory(app: delegate.model)
+        )
         .frame(minWidth: 640, minHeight: 420)
     }
     // Links reuse an open window rather than spawning one per link.

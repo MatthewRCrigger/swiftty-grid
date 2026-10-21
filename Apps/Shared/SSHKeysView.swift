@@ -31,11 +31,14 @@ public struct SSHKeysView: View {
     List {
       if model.identities.isEmpty {
         ContentUnavailableView(
-          "No SSH Keys",
+          .localized("No SSH Keys"),
           systemImage: "key",
           description: Text(
-            "Generate a key here, then add its public key to ~/.ssh/authorized_keys "
-              + "on the Mac."
+            """
+            Generate a key here, then add its public key to ~/.ssh/authorized_keys \
+            on the Mac.
+            """,
+            bundle: #bundle
           )
         )
         .listRowBackground(Color.clear)
@@ -57,32 +60,36 @@ public struct SSHKeysView: View {
             OrphanRow(model: model, orphan: orphan) { Task { await reload() } }
           }
         } header: {
-          Text("Unrecognized Keychain Keys")
+          Text("Unrecognized Keychain Keys", bundle: #bundle)
         } footer: {
           Text(
-            "Swiftty keys with no saved description, for example after an interrupted "
-              + "operation. Nothing uses them until you restore them."
+            """
+            Swiftty keys with no saved description, for example after an interrupted \
+            operation. Nothing uses them until you restore them.
+            """,
+            bundle: #bundle
           )
         }
         .listRowBackground(Color.clear)
       }
     }
-    .glassListBackground().navigationTitle("SSH Keys")
+    .glassListBackground().navigationTitle(.localized("SSH Keys"))
     .toolbar {
       ToolbarItem(placement: .primaryAction) {
         Menu {
-          Button("Generate Key…", systemImage: "key") {
+          Button(.localized("Generate Key…"), systemImage: "key") {
             creating = .generate
           }
           .accessibilityIdentifier("keys.generate")
           if model.profile.keyImport {
-            Button("Import Key…", systemImage: "square.and.arrow.down") {
-              creating = .importKey
-            }
+            Button(
+              .localized("Import Key…"),
+              systemImage: "square.and.arrow.down"
+            ) { creating = .importKey }
             .accessibilityIdentifier("keys.import")
           }
         } label: {
-          Label("Add Key", systemImage: "plus")
+          Label(.localized("Add Key"), systemImage: "plus")
         }
         .accessibilityIdentifier("keys.add")
       }
@@ -115,14 +122,14 @@ struct IdentityRow: View {
       Text(identity.fingerprint).font(.caption.monospaced())
         .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
       HStack(spacing: 6) {
-        Text("Ed25519")
-        Text("·")
+        Text(verbatim: "Ed25519")
+        Text(verbatim: "·")
         Label(
           identity.storage.displayName,
           systemImage: identity.storage == .iCloudKeychain ? "icloud" : "iphone"
         )
         if let availability, availability != .available {
-          Text("·")
+          Text(verbatim: "·")
           Text(availability.summary).foregroundStyle(.orange)
         }
       }
@@ -144,10 +151,10 @@ private struct OrphanRow: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 6) {
-      TextField("Name", text: $name)
+      TextField(.localized("Name"), text: $name)
       Text(orphan.policy.displayName).font(.caption).foregroundStyle(.secondary)
       HStack {
-        Button("Restore") {
+        Button(.localized("Restore")) {
           Task {
             do throws(IdentityOperationError) {
               try await model.identityStore.adoptOrphan(
@@ -162,16 +169,18 @@ private struct OrphanRow: View {
         // Only a device-only item can be deleted here; an iCloud item may
         // be another device's key whose details have not arrived.
         if orphan.policy == .deviceOnly {
-          Button("Delete", role: .destructive) { confirmingDelete = true }
+          Button(.localized("Delete"), role: .destructive) {
+            confirmingDelete = true
+          }
         }
       }
       .glassButtonStyle()
       .confirmationDialog(
-        "Delete this unrecognized key?",
+        .localized("Delete this unrecognized key?"),
         isPresented: $confirmingDelete,
         titleVisibility: .visible
       ) {
-        Button("Delete", role: .destructive) {
+        Button(.localized("Delete"), role: .destructive) {
           Task {
             do throws(IdentityOperationError) {
               try await model.identityStore.deleteOrphan(
@@ -184,8 +193,11 @@ private struct OrphanRow: View {
         }
       } message: {
         Text(
-          "The private key is removed from this device's Keychain and can't be "
-            + "recovered. Restore it instead if a server still trusts it."
+          """
+          The private key is removed from this device's Keychain and can't be \
+          recovered. Restore it instead if a server still trusts it.
+          """,
+          bundle: #bundle
         )
       }
       if let error { Text(error).font(.caption).foregroundStyle(.red) }
@@ -220,21 +232,32 @@ struct SSHKeyDetailView: View {
   private var error: String?
   @State
   private var working = false
+  /// Hosts that use this key, cached so typing a name does not refilter
+  /// every host on each redraw.
+  @State
+  private var referencing: [HostProfile] = []
   @Environment(\.dismiss)
   private var dismiss
 
   private var identity: SSHIdentityMetadata? { model.identity(id) }
 
-  private var referencing: [HostProfile] {
+  private func currentReferencing() -> [HostProfile] {
     model.hosts.filter { $0.auth.identityID == id }
   }
 
   var body: some View {
     dialogs(
-      form.glassListBackground().navigationTitle(identity?.name ?? "Key")
+      form.glassListBackground()
+        .navigationTitle(
+          identity.map { Text($0.name) } ?? Text("Key", bundle: #bundle)
+        )
         .disabled(working).onAppear { name = identity?.name ?? "" }
         .task(id: identity) {
           availability = await model.identityStore.availability(id)
+        }
+        .onChange(of: model.hosts, initial: true) {
+          let hosts = currentReferencing()
+          if hosts != referencing { referencing = hosts }
         }
     )
   }
@@ -245,57 +268,29 @@ struct SSHKeyDetailView: View {
         if let error {
           Text(error).foregroundStyle(.red).listRowBackground(Color.clear)
         }
-        Section("Name") {
-          TextField("Name", text: $name).onSubmit(rename)
+        Section(.localized("Name")) {
+          TextField(.localized("Name"), text: $name).onSubmit(rename)
             .accessibilityIdentifier("key.name")
         }
         .listRowBackground(Color.clear)
-        Section {
-          LabeledContent("Algorithm", value: "Ed25519")
-          LabeledContent("Storage", value: identity.storage.displayName)
-          LabeledContent("Status", value: availability?.summary ?? "Checking…")
-          VStack(alignment: .leading, spacing: 4) {
-            Text("Fingerprint").font(.caption).foregroundStyle(.secondary)
-            Text(identity.fingerprint).font(.body.monospaced())
-              .selectableIfSupported()
-          }
-        } footer: {
-          Text(storageExplanation(identity))
-        }
-        .listRowBackground(Color.clear)
-        Section {
-          Text(identity.authorizedKeysLine).font(.caption.monospaced())
-            .selectableIfSupported().accessibilityIdentifier("key.public")
-          #if !os(tvOS)
-          Button("Copy Public Key", systemImage: "doc.on.doc") {
-            Pasteboard.copy(identity.authorizedKeysLine)
-          }
-          ShareLink(item: identity.authorizedKeysLine) {
-            Label("Export Public Key", systemImage: "square.and.arrow.up")
-          }
-          #endif
-        } header: {
-          Text("Public Key")
-        } footer: {
-          Text(
-            "Add this line to ~/.ssh/authorized_keys on each Mac. Swiftty never "
-              + "installs it for you."
-          )
-        }
-        .listRowBackground(Color.clear)
-        Section("Used By") {
-          if referencing.isEmpty {
-            Text("No hosts").foregroundStyle(.secondary)
-          }
-          ForEach(referencing) { host in
-            Text("\(host.nickname) — \(host.endpointSummary)")
-          }
-        }
-        .listRowBackground(Color.clear)
-        actions(identity)
+        KeyDetailsSection(identity: identity, availability: availability)
+        PublicKeySection(identity: identity)
+        KeyUsedBySection(hosts: referencing)
+        KeyActionsSection(
+          identity: identity,
+          availability: availability,
+          profile: model.profile,
+          repairing: $repairing,
+          confirmingCopy: $confirmingCopy,
+          confirmingWithdraw: $confirmingWithdraw,
+          confirmingDelete: $confirmingDelete
+        )
       } else {
-        ContentUnavailableView("Key Deleted", systemImage: "key.slash")
-          .listRowBackground(Color.clear)
+        ContentUnavailableView(
+          .localized("Key Deleted"),
+          systemImage: "key.slash"
+        )
+        .listRowBackground(Color.clear)
       }
     }
   }
@@ -310,18 +305,18 @@ struct SSHKeyDetailView: View {
       isPresented: $confirmingDelete,
       titleVisibility: .visible
     ) {
-      Button("Delete", role: .destructive) {
+      Button(.localized("Delete"), role: .destructive) {
         run { try await model.identityStore.delete(id) }
       }
     } message: {
-      Text(deleteMessage)
+      deleteMessage
     }
     .keyFileImporter(isPresented: $repairing) { data in
       guard let data else { return }
       repair(data, passphrase: nil)
     }
     .alert(
-      "Key Passphrase",
+      .localized("Key Passphrase"),
       isPresented: Binding(
         get: { repairData != nil },
         set: {
@@ -332,17 +327,20 @@ struct SSHKeyDetailView: View {
         }
       )
     ) {
-      SecureField("Passphrase", text: $repairPassphrase)
-      Button("Repair") {
+      SecureField(.localized("Passphrase"), text: $repairPassphrase)
+      Button(.localized("Repair")) {
         guard let data = repairData else { return }
         let passphrase = repairPassphrase
         repairData = nil
         repairPassphrase = ""
         repair(data, passphrase: passphrase)
       }
-      Button("Cancel", role: .cancel) {}
+      Button(.localized("Cancel"), role: .cancel) {}
     } message: {
-      Text("This key file is protected by a passphrase. It is not saved.")
+      Text(
+        "This key file is protected by a passphrase. It is not saved.",
+        bundle: #bundle
+      )
     }
   }
 
@@ -364,16 +362,16 @@ struct SSHKeyDetailView: View {
       isPresented: $confirmingCopy,
       titleVisibility: .visible
     ) {
-      Button("Create Copy and Use It for These Hosts") {
+      Button(.localized("Create Copy and Use It for These Hosts")) {
         run {
           _ = try await model.identityStore.createICloudCopy(
             of: id,
             name: copyName,
-            reassign: referencing.map(\.id)
+            reassign: currentReferencing().map(\.id)
           )
         }
       }
-      Button("Create Copy Only") {
+      Button(.localized("Create Copy Only")) {
         run {
           _ = try await model.identityStore.createICloudCopy(
             of: id,
@@ -384,65 +382,40 @@ struct SSHKeyDetailView: View {
       }
     } message: {
       Text(
-        "The same private key is saved again as a new key that syncs with iCloud "
-          + "Keychain to your other devices. This device-only key stays until you "
-          + "delete it."
+        """
+        The same private key is saved again as a new key that syncs with iCloud \
+        Keychain to your other devices. This device-only key stays until you \
+        delete it.
+        """,
+        bundle: #bundle
       )
     }
     .confirmationDialog(
-      "Withdraw from iCloud?",
+      .localized("Withdraw from iCloud?"),
       isPresented: $confirmingWithdraw,
       titleVisibility: .visible
     ) {
-      Button("Keep on This Device Only", role: .destructive) {
+      Button(.localized("Keep on This Device Only"), role: .destructive) {
         run {
           _ = try await model.identityStore.withdrawFromICloud(
             id,
             name: identity?.name ?? "Key",
-            reassign: referencing.map(\.id)
+            reassign: currentReferencing().map(\.id)
           )
           dismiss()
         }
       }
     } message: {
       Text(
-        "A device-only copy is saved first and these hosts move to it. Then the "
-          + "iCloud key is deleted, which removes it from your other devices over "
-          + "time. This does not revoke the key on any server, and copies made "
-          + "elsewhere may remain."
+        """
+        A device-only copy is saved first and these hosts move to it. Then the \
+        iCloud key is deleted, which removes it from your other devices over \
+        time. This does not revoke the key on any server, and copies made \
+        elsewhere may remain.
+        """,
+        bundle: #bundle
       )
     }
-  }
-
-  @ViewBuilder
-  private func actions(_ identity: SSHIdentityMetadata) -> some View {
-    Section {
-      if availability != .available, availability != nil,
-        model.profile.keyImport
-      {
-        Button(
-          "Repair by Importing This Key…",
-          systemImage: "wrench.and.screwdriver"
-        ) { repairing = true }
-      }
-      if model.profile.cloudSync, availability == .available {
-        switch identity.storage {
-        case .deviceOnly:
-          Button("Create iCloud Copy…", systemImage: "icloud.and.arrow.up") {
-            confirmingCopy = true
-          }
-        case .iCloudKeychain:
-          Button("Withdraw from iCloud…", systemImage: "icloud.slash") {
-            confirmingWithdraw = true
-          }
-        }
-      }
-      Button("Delete Key…", systemImage: "trash", role: .destructive) {
-        confirmingDelete = true
-      }
-      .accessibilityIdentifier("key.delete")
-    }
-    .listRowBackground(Color.clear)
   }
 
   private var copyName: String {
@@ -451,42 +424,52 @@ struct SSHKeyDetailView: View {
     return SSHIdentityMetadata.isValidName(candidate) ? candidate : base
   }
 
-  private var deleteTitle: String {
+  private var deleteTitle: LocalizedStringResource {
     identity?.storage == .iCloudKeychain
-      ? "Delete this iCloud key?" : "Delete this device-only key?"
+      ? .localized("Delete this iCloud key?")
+      : .localized("Delete this device-only key?")
   }
 
-  private var deleteMessage: String {
-    var text: String
-    switch (identity?.storage, availability) {
-    case (.iCloudKeychain, _):
-      text =
-        "Deletion propagates to your other devices that use iCloud Keychain, "
-        + "which can take time. "
-    case (_, .unavailableOnThisDevice?):
-      // A device-only key held elsewhere: the tombstone still syncs.
-      text =
-        "This key's private half is on another device. Deleting it here also "
-        + "deletes it there once synced, and hosts there that use it will stop "
-        + "connecting. "
-    default: text = "The private key is removed from this device. "
-    }
-    text += "It is not removed from any server's authorized_keys."
-    if !referencing.isEmpty {
-      text +=
-        " \(referencing.count) host(s) keep this key selected and will not "
-        + "connect until you choose another key."
-    }
-    return text
-  }
-
-  private func storageExplanation(_ identity: SSHIdentityMetadata) -> String {
-    switch identity.storage {
-    case .deviceOnly: "Stored in this device's Keychain and never synchronized."
-    case .iCloudKeychain:
-      "Synced by iCloud Keychain, which the system manages. Saving it here does "
-        + "not confirm another device has received it."
-    }
+  private var deleteMessage: Text {
+    let removal =
+      switch (identity?.storage, availability) {
+      case (.iCloudKeychain, _):
+        Text(
+          """
+          Deletion propagates to your other devices that use iCloud Keychain, \
+          which can take time. It is not removed from any server's authorized_keys.
+          """,
+          bundle: #bundle
+        )
+      case (_, .unavailableOnThisDevice?):
+        // A device-only key held elsewhere: the tombstone still syncs.
+        Text(
+          """
+          This key's private half is on another device. Deleting it here also \
+          deletes it there once synced, and hosts there that use it will stop \
+          connecting. It is not removed from any server's authorized_keys.
+          """,
+          bundle: #bundle
+        )
+      default:
+        Text(
+          """
+          The private key is removed from this device. It is not removed from \
+          any server's authorized_keys.
+          """,
+          bundle: #bundle
+        )
+      }
+    guard !referencing.isEmpty else { return removal }
+    let hosts = Text(
+      """
+      \(referencing.count) hosts keep this key selected and will not connect \
+      until you choose another key.
+      """,
+      bundle: #bundle,
+      comment: "Plural: the number of saved hosts that still use the key."
+    )
+    return Text("\(removal) \(hosts)", bundle: #bundle)
   }
 
   private func rename() {
@@ -511,6 +494,151 @@ struct SSHKeyDetailView: View {
       }
       availability = await model.identityStore.availability(id)
     }
+  }
+}
+
+
+private struct KeyDetailsSection: View {
+  let identity: SSHIdentityMetadata
+  let availability: IdentityAvailability?
+
+  var body: some View {
+    Section {
+      LabeledContent(.localized("Algorithm"), value: "Ed25519")
+      LabeledContent {
+        Text(identity.storage.displayName)
+      } label: {
+        Text("Storage", bundle: #bundle)
+      }
+      LabeledContent {
+        Text(
+          availability?.summary
+            ?? String(localized: "Checking…", bundle: #bundle)
+        )
+      } label: {
+        Text("Status", bundle: #bundle)
+      }
+      VStack(alignment: .leading, spacing: 4) {
+        Text("Fingerprint", bundle: #bundle).font(.caption)
+          .foregroundStyle(.secondary)
+        Text(identity.fingerprint).font(.body.monospaced())
+          .selectableIfSupported()
+      }
+    } footer: {
+      Text(storageExplanation)
+    }
+    .listRowBackground(Color.clear)
+  }
+
+  private var storageExplanation: LocalizedStringResource {
+    switch identity.storage {
+    case .deviceOnly:
+      .localized("Stored in this device's Keychain and never synchronized.")
+    case .iCloudKeychain:
+      .localized(
+        """
+        Synced by iCloud Keychain, which the system manages. Saving it here does \
+        not confirm another device has received it.
+        """
+      )
+    }
+  }
+}
+
+private struct PublicKeySection: View {
+  let identity: SSHIdentityMetadata
+
+  var body: some View {
+    Section {
+      Text(identity.authorizedKeysLine).font(.caption.monospaced())
+        .selectableIfSupported().accessibilityIdentifier("key.public")
+      #if !os(tvOS)
+      Button(.localized("Copy Public Key"), systemImage: "doc.on.doc") {
+        Pasteboard.copy(identity.authorizedKeysLine)
+      }
+      ShareLink(item: identity.authorizedKeysLine) {
+        Label(
+          .localized("Export Public Key"),
+          systemImage: "square.and.arrow.up"
+        )
+      }
+      #endif
+    } header: {
+      Text("Public Key", bundle: #bundle)
+    } footer: {
+      Text(
+        """
+        Add this line to ~/.ssh/authorized_keys on each Mac. Swiftty never \
+        installs it for you.
+        """,
+        bundle: #bundle
+      )
+    }
+    .listRowBackground(Color.clear)
+  }
+}
+
+private struct KeyUsedBySection: View {
+  let hosts: [HostProfile]
+
+  var body: some View {
+    Section(.localized("Used By")) {
+      if hosts.isEmpty {
+        Text("No hosts", bundle: #bundle).foregroundStyle(.secondary)
+      }
+      ForEach(hosts) { host in
+        Text("\(host.nickname) — \(host.endpointSummary)", bundle: #bundle)
+      }
+    }
+    .listRowBackground(Color.clear)
+  }
+}
+
+private struct KeyActionsSection: View {
+  let identity: SSHIdentityMetadata
+  let availability: IdentityAvailability?
+  let profile: PlatformProfile
+  @Binding
+  var repairing: Bool
+  @Binding
+  var confirmingCopy: Bool
+  @Binding
+  var confirmingWithdraw: Bool
+  @Binding
+  var confirmingDelete: Bool
+
+  var body: some View {
+    Section {
+      if availability != .available, availability != nil,
+        profile.keyImport
+      {
+        Button(
+          .localized("Repair by Importing This Key…"),
+          systemImage: "wrench.and.screwdriver"
+        ) { repairing = true }
+      }
+      if profile.cloudSync, availability == .available {
+        switch identity.storage {
+        case .deviceOnly:
+          Button(
+            .localized("Create iCloud Copy…"),
+            systemImage: "icloud.and.arrow.up"
+          ) { confirmingCopy = true }
+        case .iCloudKeychain:
+          Button(
+            .localized("Withdraw from iCloud…"),
+            systemImage: "icloud.slash"
+          ) { confirmingWithdraw = true }
+        }
+      }
+      Button(
+        .localized("Delete Key…"),
+        systemImage: "trash",
+        role: .destructive
+      ) { confirmingDelete = true }
+      .accessibilityIdentifier("key.delete")
+    }
+    .listRowBackground(Color.clear)
   }
 }
 
@@ -561,14 +689,14 @@ struct KeyCreationView: View {
           createdSection(created)
         } else {
           if mode == .importKey { importSection }
-          Section("Name") {
-            TextField("Name", text: $name)
+          Section(.localized("Name")) {
+            TextField(.localized("Name"), text: $name)
               .accessibilityIdentifier("key.new.name")
           }
           .listRowBackground(Color.clear)
           if model.profile.cloudSync {
             Section {
-              Picker("Storage", selection: $policy) {
+              Picker(.localized("Storage"), selection: $policy) {
                 ForEach(IdentityStoragePolicy.allCases, id: \.self) {
                   Text($0.displayName).tag($0)
                 }
@@ -578,9 +706,11 @@ struct KeyCreationView: View {
               Text(
                 policy == .deviceOnly
                   ? "The private key never leaves this device."
-                  : "iCloud Keychain syncs the private key, end-to-end encrypted, to "
-                    + "your devices signed in to the same Apple Account. This choice "
-                    + "can't be changed later."
+                  : """
+                    iCloud Keychain syncs the private key, end-to-end encrypted, to \
+                    your devices signed in to the same Apple Account. This choice \
+                    can't be changed later.
+                    """
               )
             }
             .listRowBackground(Color.clear)
@@ -588,14 +718,20 @@ struct KeyCreationView: View {
         }
       }
       .glassListBackground()
-      .navigationTitle(mode == .generate ? "Generate Key" : "Import Key")
+      .navigationTitle(
+        mode == .generate
+          ? .localized("Generate Key") : .localized("Import Key")
+      )
       .toolbar {
         if created == nil {
           ToolbarItem(placement: .cancellationAction) {
-            Button("Cancel") { close(nil) }
+            Button(.localized("Cancel")) { close(nil) }
           }
           ToolbarItem(placement: .confirmationAction) {
-            Button(mode == .generate ? "Generate" : "Save", action: save)
+            Button(
+              mode == .generate ? .localized("Generate") : .localized("Save"),
+              action: save
+            )
               .disabled(
                 working != nil || name.isEmpty
                   || (mode == .importKey && inspection == nil)
@@ -605,7 +741,7 @@ struct KeyCreationView: View {
           }
         } else {
           ToolbarItem(placement: .confirmationAction) {
-            Button("Done") { close(created) }
+            Button(.localized("Done")) { close(created) }
               .accessibilityIdentifier("key.new.done")
           }
         }
@@ -623,8 +759,10 @@ struct KeyCreationView: View {
 
   private var importSection: some View {
     Section {
-      Button("Choose Key File…", systemImage: "doc") { choosingFile = true }
-        .accessibilityIdentifier("key.import.file")
+      Button(.localized("Choose Key File…"), systemImage: "doc") {
+        choosingFile = true
+      }
+      .accessibilityIdentifier("key.import.file")
       #if !os(tvOS)
       PasteButton(payloadType: String.self) { strings in
         guard let first = strings.first else { return }
@@ -632,9 +770,10 @@ struct KeyCreationView: View {
       }
       #endif
       if let inspection {
-        LabeledContent("Algorithm", value: "Ed25519")
+        LabeledContent(.localized("Algorithm"), value: "Ed25519")
         VStack(alignment: .leading, spacing: 4) {
-          Text("Fingerprint").font(.caption).foregroundStyle(.secondary)
+          Text("Fingerprint", bundle: #bundle).font(.caption)
+            .foregroundStyle(.secondary)
           Text(inspection.fingerprint).font(.body.monospaced())
             .accessibilityIdentifier("key.import.fingerprint")
         }
@@ -642,25 +781,32 @@ struct KeyCreationView: View {
           withFingerprint: inspection.fingerprint
         )
         if let first = existing.first {
-          Label(
-            "Same key as \u{201C}\(first.name)\u{201D}. Saving creates a separate entry.",
-            systemImage: "exclamationmark.triangle"
-          )
+          Label {
+            Text(
+              "Same key as \u{201C}\(first.name)\u{201D}. Saving creates a separate entry.",
+              bundle: #bundle
+            )
+          } icon: {
+            Image(systemName: "exclamationmark.triangle")
+          }
           .foregroundStyle(.orange)
         }
         if inspection.isEncrypted {
-          SecureField("Passphrase", text: $passphrase)
+          SecureField(.localized("Passphrase"), text: $passphrase)
             .textContentType(.password).onSubmit(save)
             .accessibilityIdentifier("key.import.passphrase")
         }
       }
     } header: {
-      Text("Private Key")
+      Text("Private Key", bundle: #bundle)
     } footer: {
       Text(
-        "OpenSSH Ed25519 keys, with or without a passphrase. A passphrase only "
-          + "decrypts the key here and is not saved. The key is stored in the "
-          + "Keychain; delete the original file afterwards if you no longer need it."
+        """
+        OpenSSH Ed25519 keys, with or without a passphrase. A passphrase only \
+        decrypts the key here and is not saved. The key is stored in the \
+        Keychain; delete the original file afterwards if you no longer need it.
+        """,
+        bundle: #bundle
       )
     }
     .listRowBackground(Color.clear)
@@ -671,19 +817,25 @@ struct KeyCreationView: View {
       Text(identity.authorizedKeysLine).font(.caption.monospaced())
         .selectableIfSupported().accessibilityIdentifier("key.new.public")
       #if !os(tvOS)
-      Button("Copy Public Key", systemImage: "doc.on.doc") {
+      Button(.localized("Copy Public Key"), systemImage: "doc.on.doc") {
         Pasteboard.copy(identity.authorizedKeysLine)
       }
       ShareLink(item: identity.authorizedKeysLine) {
-        Label("Export Public Key", systemImage: "square.and.arrow.up")
+        Label(
+          .localized("Export Public Key"),
+          systemImage: "square.and.arrow.up"
+        )
       }
       #endif
     } header: {
-      Text("Key Saved")
+      Text("Key Saved", bundle: #bundle)
     } footer: {
       Text(
-        "Before you can sign in, add this line to ~/.ssh/authorized_keys on the "
-          + "Mac. Creating a key does not install it anywhere."
+        """
+        Before you can sign in, add this line to ~/.ssh/authorized_keys on the \
+        Mac. Creating a key does not install it anywhere.
+        """,
+        bundle: #bundle
       )
     }
     .listRowBackground(Color.clear)
@@ -816,32 +968,41 @@ public struct SyncSettingsView: View {
           Text(error).foregroundStyle(.red).listRowBackground(Color.clear)
         }
         Section {
-          Toggle("Sync profiles and key metadata", isOn: metadataBinding(sync))
-            .accessibilityIdentifier("sync.metadata")
-          LabeledContent("Status", value: sync.status.summary)
-          Button("Refresh", systemImage: "arrow.clockwise") {
+          Toggle(
+            .localized("Sync profiles and key metadata"),
+            isOn: metadataBinding(sync)
+          )
+          .accessibilityIdentifier("sync.metadata")
+          LabeledContent(.localized("Status"), value: sync.status.summary)
+          Button(.localized("Refresh"), systemImage: "arrow.clockwise") {
             sync.refresh()
             Task { await model.identityStore.recover() }
           }
-          .disabled(!model.connections.settings.metadataSync)
+          .disabled(!model.syncSettings.metadataSync)
         } footer: {
           Text(
-            "Syncs host names, addresses, usernames, key names and public keys to "
-              + "your private iCloud database. These are not private keys, but are "
-              + "still sensitive. Private keys sync only for keys you saved to iCloud "
-              + "Keychain; turning this off does not change that, and does not delete "
-              + "anything from iCloud."
+            """
+            Syncs host names, addresses, usernames, key names and public keys to \
+            your private iCloud database. These are not private keys, but are \
+            still sensitive. Private keys sync only for keys you saved to iCloud \
+            Keychain; turning this off does not change that, and does not delete \
+            anything from iCloud.
+            """,
+            bundle: #bundle
           )
         }
         .listRowBackground(Color.clear)
         Section {
-          Toggle("Sync trusted hosts", isOn: trustBinding(sync))
-            .disabled(!model.connections.settings.metadataSync)
+          Toggle(.localized("Sync trusted hosts"), isOn: trustBinding(sync))
+            .disabled(!model.syncSettings.metadataSync)
             .accessibilityIdentifier("sync.trust")
         } footer: {
           Text(
-            "Lets your devices accept host keys you trusted on another device. A "
-              + "different key for a trusted host is never accepted automatically."
+            """
+            Lets your devices accept host keys you trusted on another device. A \
+            different key for a trusted host is never accepted automatically.
+            """,
+            bundle: #bundle
           )
         }
         .listRowBackground(Color.clear)
@@ -856,38 +1017,45 @@ public struct SyncSettingsView: View {
         .foregroundStyle(.secondary).listRowBackground(Color.clear)
       }
     }
-    .glassListBackground().navigationTitle("iCloud Sync").disabled(working)
+    .glassListBackground().navigationTitle(.localized("iCloud Sync"))
+    .disabled(working)
   }
 
   @ViewBuilder
   private func accountSection(_ sync: ConnectionSyncCoordinator) -> some View {
     if sync.status == .accountChanged {
       Section {
-        Button("Sync This Device's Data with the Current Account") {
+        Button(.localized("Sync This Device's Data with the Current Account")) {
           run { try await sync.confirmCurrentAccount() }
         }
       } footer: {
         Text(
-          "The iCloud account changed. Data synced with the previous account is "
-            + "hidden on this device and is not uploaded to the new one."
+          """
+          The iCloud account changed. Data synced with the previous account is \
+          hidden on this device and is not uploaded to the new one.
+          """,
+          bundle: #bundle
         )
       }
       .listRowBackground(Color.clear)
     }
     if sync.status == .zoneRecoveryRequired {
       Section {
-        Button("Upload This Device's Data Again") {
+        Button(.localized("Upload This Device's Data Again")) {
           run { try await sync.recoverZone() }
         }
       } footer: {
-        Text("Swiftty's synced data was removed from iCloud.")
+        Text("Swiftty's synced data was removed from iCloud.", bundle: #bundle)
       }
       .listRowBackground(Color.clear)
     }
-    if model.connections.hiddenCount > 0 {
+    if model.hiddenCount > 0 {
       Section {
         Text(
-          "\(model.connections.hiddenCount) item(s) from another iCloud account are hidden."
+          "\(model.hiddenCount) items from another iCloud account are hidden.",
+          bundle: #bundle,
+          comment:
+            "Plural: the number of synced items hidden from this account."
         )
         .foregroundStyle(.secondary)
       }
@@ -897,23 +1065,34 @@ public struct SyncSettingsView: View {
 
   @ViewBuilder
   private func reviews(_ sync: ConnectionSyncCoordinator) -> some View {
-    let conflicts = model.connections.hostConflicts.sorted {
-      $0.key.uuidString < $1.key.uuidString
-    }
+    let conflicts = model.hostConflicts
     if !conflicts.isEmpty {
-      Section("Conflicting Host Changes") {
-        ForEach(conflicts, id: \.key) { id, conflict in
+      let localHosts = Dictionary(
+        model.hosts.map { ($0.id, $0) },
+        uniquingKeysWith: { first, _ in first }
+      )
+      Section(.localized("Conflicting Host Changes")) {
+        ForEach(conflicts) { item in
+          let id = item.id
+          let conflict = item.conflict
           VStack(alignment: .leading, spacing: 6) {
-            let local = model.hosts.first { $0.id == id }
+            let local = localHosts[id]
             Text(local?.nickname ?? conflict.remote.nickname).font(.headline)
-            Text("This device: \(local?.endpointSummary ?? "—")").font(.caption)
-            Text("Other device: \(conflict.remote.endpointSummary)")
-              .font(.caption)
+            Text(
+              "This device: \(local?.endpointSummary ?? "—")",
+              bundle: #bundle
+            )
+            .font(.caption)
+            Text(
+              "Other device: \(conflict.remote.endpointSummary)",
+              bundle: #bundle
+            )
+            .font(.caption)
             HStack {
-              Button("Keep This Device's") {
+              Button(.localized("Keep This Device's")) {
                 sync.resolveConflict(host: id, keepLocal: true)
               }
-              Button("Use Other Device's") {
+              Button(.localized("Use Other Device's")) {
                 sync.resolveConflict(host: id, keepLocal: false)
               }
             }
@@ -923,35 +1102,42 @@ public struct SyncSettingsView: View {
       }
       .listRowBackground(Color.clear)
     }
-    let trust = model.connections.trustReviews.values.sorted {
-      $0.recordName < $1.recordName
-    }
+    let trust = model.trustReviews
     if !trust.isEmpty {
-      Section("Trusted Host Reviews") {
+      Section(.localized("Trusted Host Reviews")) {
         ForEach(trust) { review in
           VStack(alignment: .leading, spacing: 6) {
-            Text("\(review.host):\(review.port)").font(.headline)
+            Text(verbatim: "\(review.host):\(review.port)").font(.headline)
             switch review.kind {
             case .conflictingKey(_, let fingerprint):
-              Text("Another device trusts a different key:").font(.caption)
+              Text("Another device trusts a different key:", bundle: #bundle)
+                .font(.caption)
               Text(fingerprint).font(.caption.monospaced())
-              Text("This device: \(review.localFingerprint ?? "—")")
-                .font(.caption.monospaced())
+              Text(
+                "This device: \(review.localFingerprint ?? "—")",
+                bundle: #bundle
+              )
+              .font(.caption.monospaced())
               HStack {
-                Button("Keep This Device's Key") {
+                Button(.localized("Keep This Device's Key")) {
                   Task { await sync.resolve(review) }
                 }
-                Button("Trust Other Key (Verified)") {
+                Button(.localized("Trust Other Key (Verified)")) {
                   Task { await sync.resolve(review, trustRemote: true) }
                 }
               }
               .glassButtonStyle()
             case .removedElsewhere:
-              Text("Another device stopped trusting this host's key.")
-                .font(.caption)
+              Text(
+                "Another device stopped trusting this host's key.",
+                bundle: #bundle
+              )
+              .font(.caption)
               HStack {
-                Button("Keep Trusting") { Task { await sync.resolve(review) } }
-                Button("Remove Trust", role: .destructive) {
+                Button(.localized("Keep Trusting")) {
+                  Task { await sync.resolve(review) }
+                }
+                Button(.localized("Remove Trust"), role: .destructive) {
                   Task { await sync.resolve(review, remove: true) }
                 }
               }
@@ -968,7 +1154,7 @@ public struct SyncSettingsView: View {
     _ sync: ConnectionSyncCoordinator
   ) -> Binding<Bool> {
     Binding(
-      get: { model.connections.settings.metadataSync },
+      get: { model.syncSettings.metadataSync },
       set: { enabled in run { try await sync.setMetadataSync(enabled) } }
     )
   }
@@ -976,7 +1162,7 @@ public struct SyncSettingsView: View {
   private func trustBinding(_ sync: ConnectionSyncCoordinator) -> Binding<Bool>
   {
     Binding(
-      get: { model.connections.settings.trustSync },
+      get: { model.syncSettings.trustSync },
       set: { enabled in
         Task {
           let keys =

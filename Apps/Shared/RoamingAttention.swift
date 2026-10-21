@@ -49,7 +49,10 @@ struct RoamingAttentionConnector: AttentionServiceConnector {
 
   /// The SSH stage and its nonsecret explanation.
   static func describe(_ error: SSHAccessError) -> AttentionServiceError {
-    let message = "\(error.title). \(error.detail)"
+    let message = String(
+      localized: "\(error.title). \(error.detail)",
+      bundle: #bundle
+    )
     return error == .unreachable ? .offline(message) : .other(message)
   }
 
@@ -248,10 +251,20 @@ final class RoamingInboxModel {
   nonisolated private static let maxEntriesPerHost = 10_000
   nonisolated private static let maxPagesPerSection = 100
   nonisolated struct Entry: Identifiable, Hashable, Sendable {
-    var host: NavigationHost
-    var item: AttentionItem
+    let host: NavigationHost
+    let item: AttentionItem
+    /// Sanitized once here rather than on every inbox redraw.
+    let title: String?
+    let appName: String?
     var id: String {
       "\(host.id)/\(item.source.serviceEpoch)/\(item.occurrence)"
+    }
+
+    init(host: NavigationHost, item: AttentionItem) {
+      self.host = host
+      self.item = item
+      title = AttentionInboxText.plain(item.status.title ?? item.status.message)
+      appName = AttentionInboxText.plain(item.status.app)
     }
   }
 
@@ -261,7 +274,16 @@ final class RoamingInboxModel {
     case failed(String)
   }
 
-  private(set) var entries: [Entry] = []
+  private(set) var entries: [Entry] = [] {
+    didSet {
+      needsYouEntries = entries.filter { $0.item.category != .result }
+      resultEntries = entries.filter { $0.item.category == .result }
+    }
+  }
+  /// `entries` split by section, cached so the inbox does not filter up
+  /// to 10,000 entries per host on every redraw.
+  private(set) var needsYouEntries: [Entry] = []
+  private(set) var resultEntries: [Entry] = []
   private(set) var hostStates: [UUID: HostState] = [:]
   private(set) var refreshedAt: Date?
   @ObservationIgnored

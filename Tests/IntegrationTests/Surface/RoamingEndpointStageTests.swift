@@ -55,7 +55,8 @@ struct RoamingEndpointStageTests {
       )
     )
     #expect(
-      EndpointStageNotice.title == "SSH connected; roaming endpoint unavailable"
+      String(localized: EndpointStageNotice.title)
+        == "SSH connected; roaming endpoint unavailable"
     )
     #expect(notice.endpoint == "macbook.local:51222 (UDP)")
     #expect(notice.detail.contains("macbook.local:51222"))

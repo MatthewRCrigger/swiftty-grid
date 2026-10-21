@@ -62,7 +62,9 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" \
 for exe in swiftty swiftmux-agent swmux-launcher swmux; do
   cp "$bin/$exe" "$app/Contents/MacOS/$exe"
 done
-cp -R "$bin/swiftty_SwifttyCore.bundle" "$app/Contents/Resources/"
+for bundle in SwifttyCore Swiftty MuxNavigation; do
+  cp -R "$bin/swiftty_$bundle.bundle" "$app/Contents/Resources/"
+done
 
 # The app icon, from the asset catalog's macOS images.
 icons=Resources/Assets.xcassets/AppIcon.appiconset

@@ -327,9 +327,9 @@ extension MainActorIntegrationTests {
       let controller = RoamingTerminalController(model: session, app: app)
       controller.start()
       let deadline = ContinuousClock.now + .seconds(5)
-      while controller.phase == .preparing("Signing in"),
-        ContinuousClock.now < deadline
-      { try await Task.sleep(for: .milliseconds(5)) }
+      while case .preparing = controller.phase, ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(5))
+      }
       #expect(
         controller.phase == .failed(RoamingTerminalController.noWorkspaceChosen)
       )

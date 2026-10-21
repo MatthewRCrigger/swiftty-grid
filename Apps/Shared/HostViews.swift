@@ -25,64 +25,35 @@ public struct HostListView: View {
       }
       if model.hosts.isEmpty {
         ContentUnavailableView(
-          "No Hosts",
+          .localized("No Hosts"),
           systemImage: "server.rack",
           description: Text(
-            "Add a Mac with Remote Login enabled, or pair one in Settings."
+            "Add a Mac with Remote Login enabled, or pair one in Settings.",
+            bundle: #bundle
           )
         )
         .listRowBackground(Color.clear)
       }
       ForEach(model.hosts) { host in
-        Button {
-          // Mac → Workspace: sign in, then pick or create a workspace.
-          connecting = .choose(host)
-        } label: {
-          VStack(alignment: .leading, spacing: 2) {
-            Text(host.nickname).font(.headline)
-            Text(host.endpointSummary).font(.subheadline.monospaced())
-              .foregroundStyle(.secondary)
-            Text(model.authSummary(for: host)).font(.caption)
-              .foregroundStyle(.secondary)
-            if model.resumableHosts.contains(host.id) {
-              // Resuming still needs fresh SSH sign-in.
-              Label(
-                "Detached session — open to resume",
-                systemImage: "arrow.uturn.forward"
-              )
-              .font(.caption).foregroundStyle(.tint)
-            }
-          }
-        }
-        .contextMenu {
-          if let last = model.resumableSessionID(for: host) {
-            // Names the remembered workspace; never creates one.
-            Button(
-              "Resume Last Workspace (\(last.hex.prefix(8)))",
-              systemImage: "arrow.uturn.forward"
-            ) { model.resumeLastWorkspace(host) }
-          }
-          if model.profile.sshShell {
-            Button("Open Ordinary SSH Shell") {
-              model.open(host, kind: .ordinarySSH)
-            }
-          }
-          #if !os(tvOS)
-          if model.profile.sftp { Button("Browse Files…") { browsing = host } }
-          #endif
-          Button("Edit") { editing = host }
-          Button("Delete", role: .destructive) { model.delete(host) }
-        }
+        HostRow(
+          host: host,
+          authSummary: model.authSummary(for: host),
+          isResumable: model.resumableHosts.contains(host.id),
+          model: model,
+          connecting: $connecting,
+          editing: $editing,
+          browsing: $browsing
+        )
       }
       .listRowBackground(Color.clear)
     }
-    .glassListBackground().navigationTitle("Hosts")
+    .glassListBackground().navigationTitle(.localized("Hosts"))
     .toolbar {
       ToolbarItem(placement: .primaryAction) {
         Button {
           adding = true
         } label: {
-          Label("Add Host", systemImage: "plus")
+          Label(.localized("Add Host"), systemImage: "plus")
         }
         .accessibilityIdentifier("hosts.add").addHostShortcut()
       }
@@ -100,6 +71,74 @@ public struct HostListView: View {
         ConnectSheetView(sheet: sheet, connecting: $connecting, model: model)
           .macSheetFrame(width: 480, height: 460)
       }
+    }
+  }
+}
+
+/// One saved host. Its own view with only the values it shows, so a
+/// row redraws only when its host, sign-in summary or resume state
+/// changes.
+private struct HostRow: View {
+  let host: HostProfile
+  let authSummary: String
+  let isResumable: Bool
+  let model: RoamingAppModel
+  @Binding
+  var connecting: ConnectSheet?
+  @Binding
+  var editing: HostProfile?
+  @Binding
+  var browsing: HostProfile?
+
+  var body: some View {
+    Button {
+      // Mac → Workspace: sign in, then pick or create a workspace.
+      connecting = .choose(host)
+    } label: {
+      VStack(alignment: .leading, spacing: 2) {
+        Text(host.nickname).font(.headline)
+        Text(host.endpointSummary).font(.subheadline.monospaced())
+          .foregroundStyle(.secondary)
+        Text(authSummary).font(.caption)
+          .foregroundStyle(.secondary)
+        if isResumable {
+          // Resuming still needs fresh SSH sign-in.
+          Label(
+            .localized("Detached session — open to resume"),
+            systemImage: "arrow.uturn.forward"
+          )
+          .font(.caption).foregroundStyle(.tint)
+        }
+      }
+    }
+    .contextMenu {
+      if let last = model.resumableSessionID(for: host) {
+        // Names the remembered workspace; never creates one.
+        Button {
+          model.resumeLastWorkspace(host)
+        } label: {
+          Label {
+            Text(
+              "Resume Last Workspace (\(last.hex.prefix(8)))",
+              bundle: #bundle
+            )
+          } icon: {
+            Image(systemName: "arrow.uturn.forward")
+          }
+        }
+      }
+      if model.profile.sshShell {
+        Button(.localized("Open Ordinary SSH Shell")) {
+          model.open(host, kind: .ordinarySSH)
+        }
+      }
+      #if !os(tvOS)
+      if model.profile.sftp {
+        Button(.localized("Browse Files…")) { browsing = host }
+      }
+      #endif
+      Button(.localized("Edit")) { editing = host }
+      Button(.localized("Delete"), role: .destructive) { model.delete(host) }
     }
   }
 }
@@ -197,14 +236,16 @@ public struct HostEditorView: View {
   @State
   private var auth: AuthSelection
   @State
-  private var creatingKey: KeyCreationMode?
-  @State
   private var error: String?
   @State
   private var confirmedSource = false
   /// Explicit choice to update this saved host instead of adding one.
   @State
   private var replacing: UUID?
+  /// `currentMatches()`, cached so typing does not refilter the hosts on
+  /// every redraw.
+  @State
+  private var matchingHosts: [HostProfile] = []
   @State
   private var pairing: Task<Void, Never>?
   /// The presenting binding alone does not always close the sheet on Mac
@@ -236,20 +277,24 @@ public struct HostEditorView: View {
   }
 
   public var body: some View {
-    if candidate != nil {
-      form.modalConnectionPrompts(model)
-    } else {
-      form
-    }
+    form.modalConnectionPrompts(model, enabled: candidate != nil)
+      .onChange(of: host, initial: true) { refreshMatches() }
+      .onChange(of: port) { refreshMatches() }
+      .onChange(of: model.hosts) { refreshMatches() }
   }
 
   /// Saved hosts at the same address, offered only as an explicit update.
-  private var matchingHosts: [HostProfile] {
+  private func currentMatches() -> [HostProfile] {
     let address = host.trimmingCharacters(in: .whitespaces).lowercased()
     let number = Int(port.trimmingCharacters(in: .whitespaces))
     return model.hosts.filter {
       $0.host.lowercased() == address && $0.port == number
     }
+  }
+
+  private func refreshMatches() {
+    let matches = currentMatches()
+    if matches != matchingHosts { matchingHosts = matches }
   }
 
   private var form: some View {
@@ -259,7 +304,7 @@ public struct HostEditorView: View {
         if pairing != nil {
           HStack {
             ProgressView()
-            Text("Verifying the Mac's SSH key and signing in…")
+            Text("Verifying the Mac's SSH key and signing in…", bundle: #bundle)
           }
           .listRowBackground(Color.clear)
         }
@@ -273,35 +318,21 @@ public struct HostEditorView: View {
             confirmedSource: $confirmedSource
           )
         }
-        Section("Host") {
-          TextField("Nickname", text: $nickname)
+        Section(.localized("Host")) {
+          TextField(.localized("Nickname"), text: $nickname)
             .accessibilityIdentifier("host.nickname")
-          TextField("Host name or address", text: $host).plainEntry()
-            .accessibilityIdentifier("host.address")
-          TextField("Port", text: $port).plainEntry()
+          TextField(.localized("Host name or address"), text: $host)
+            .plainEntry().accessibilityIdentifier("host.address")
+          TextField(.localized("Port"), text: $port).plainEntry()
             .accessibilityIdentifier("host.port")
-          TextField("Username", text: $username).plainEntry()
+          TextField(.localized("Username"), text: $username).plainEntry()
             .accessibilityIdentifier("host.username")
         }
         .listRowBackground(Color.clear)
-        authenticationSection
+        HostAuthenticationSection(model: model, auth: $auth)
           .listRowBackground(Color.clear)
         if candidate != nil, !matchingHosts.isEmpty {
-          Section {
-            Picker("Save as", selection: $replacing) {
-              Text("New host").tag(UUID?.none)
-              ForEach(matchingHosts) { saved in
-                Text("Update \u{201C}\(saved.nickname)\u{201D}")
-                  .tag(UUID?.some(saved.id))
-              }
-            }
-          } footer: {
-            Text(
-              "Updating keeps that host's place in the list. Its trusted key is "
-                + "never replaced: a different key still blocks the connection."
-            )
-          }
-          .listRowBackground(Color.clear)
+          SaveAsSection(matches: matchingHosts, replacing: $replacing)
         }
       }
       .glassListBackground()
@@ -311,18 +342,19 @@ public struct HostEditorView: View {
       )
       .toolbar {
         ToolbarItem(placement: .cancellationAction) {
-          Button("Cancel", action: close)
+          Button(.localized("Cancel"), action: close)
         }
         ToolbarItem(placement: .confirmationAction) {
           if candidate != nil {
-            Button("Connect", action: connect)
+            Button(.localized("Connect"), action: connect)
               .disabled(
                 pairing != nil
                   || (candidate?.source == .code && !confirmedSource)
               )
               .accessibilityIdentifier("host.connect")
           } else {
-            Button("Save", action: save).accessibilityIdentifier("host.save")
+            Button(.localized("Save"), action: save)
+              .accessibilityIdentifier("host.save")
           }
         }
       }
@@ -348,67 +380,11 @@ public struct HostEditorView: View {
     )
   }
 
-  /// Password or one saved SSH identity, by UUID. An identity that is
-  /// missing on this device stays selected and explained; it never turns
-  /// into Password.
-  private var authenticationSection: some View {
-    Section {
-      Picker("Sign in with", selection: $auth) {
-        Text("Password").tag(AuthSelection.password)
-        ForEach(model.identities) { identity in
-          Text("Key \u{201C}\(identity.name)\u{201D}").tag(AuthSelection.key(identity.id))
-        }
-        if case .key(let id) = auth, !model.identities.contains(where: { $0.id == id }) {
-          Text("Deleted or unavailable key").tag(auth)
-        }
-        if case .preserved(let reference) = auth {
-          Text(reference.summary).tag(auth)
-        }
-      }
-      .accessibilityIdentifier("host.auth")
-      Menu("New Key", systemImage: "key.badge.plus") {
-        Button("Generate Key…") { creatingKey = .generate }
-          .accessibilityIdentifier("host.key.generate")
-        if model.profile.keyImport {
-          Button("Import Key…") { creatingKey = .importKey }
-        }
-      }
-      .accessibilityIdentifier("host.key.new")
-    } header: {
-      Text("Authentication")
-    } footer: {
-      switch auth {
-      case .password:
-        Text("You will be asked for the password when connecting.")
-      case .key(let id):
-        if let identity = model.identity(id), !identity.isDeleted {
-          Text(identity.fingerprint).font(.caption.monospaced())
-        } else {
-          Text("This key was deleted or is not on this device. Choose another key.")
-        }
-      case .preserved(.legacyKey):
-        Text(
-          "This key was not found when Swiftty updated its key storage. Choose or "
-            + "import a key."
-        )
-      case .preserved:
-        Text("Saved by a newer version of Swiftty.")
-      }
-    }
-    .adaptiveSheet(item: $creatingKey) { mode in
-      KeyCreationView(model: model, mode: mode) { created in
-        if let created { auth = .key(created.id) }
-        creatingKey = nil
-      }
-      .macSheetFrame(width: 480, height: 460)
-    }
-  }
-
   /// Verify, trust, sign in, save; then the workspace chooser.
   private func connect() {
     guard let candidate, pairing == nil else { return }
     let profile = draft(
-      id: matchingHosts.first { $0.id == replacing }?.id ?? UUID()
+      id: currentMatches().first { $0.id == replacing }?.id ?? UUID()
     )
     do { try profile.validate() } catch {
       self.error = error.message
@@ -450,14 +426,125 @@ public struct HostEditorView: View {
   }
 }
 
+/// Password or one saved SSH identity, by UUID. An identity that is
+/// missing on this device stays selected and explained; it never turns
+/// into Password. Its own view, so typing in the host fields does not
+/// redraw the identity picker.
+private struct HostAuthenticationSection: View {
+  let model: RoamingAppModel
+  @Binding
+  var auth: AuthSelection
+  @State
+  private var creatingKey: KeyCreationMode?
+
+  var body: some View {
+    Section {
+      Picker(.localized("Sign in with"), selection: $auth) {
+        Text("Password", bundle: #bundle).tag(AuthSelection.password)
+        ForEach(model.identities) { identity in
+          Text("Key \u{201C}\(identity.name)\u{201D}", bundle: #bundle)
+            .tag(AuthSelection.key(identity.id))
+        }
+        if case .key(let id) = auth,
+          !model.identities.contains(where: { $0.id == id })
+        {
+          Text("Deleted or unavailable key", bundle: #bundle).tag(auth)
+        }
+        if case .preserved(let reference) = auth {
+          Text(reference.summary).tag(auth)
+        }
+      }
+      .accessibilityIdentifier("host.auth")
+      Menu(.localized("New Key"), systemImage: "key.badge.plus") {
+        Button(.localized("Generate Key…")) { creatingKey = .generate }
+          .accessibilityIdentifier("host.key.generate")
+        if model.profile.keyImport {
+          Button(.localized("Import Key…")) { creatingKey = .importKey }
+        }
+      }
+      .accessibilityIdentifier("host.key.new")
+    } header: {
+      Text("Authentication", bundle: #bundle)
+    } footer: {
+      switch auth {
+      case .password:
+        Text(
+          "You will be asked for the password when connecting.",
+          bundle: #bundle
+        )
+      case .key(let id):
+        if let identity = model.identity(id), !identity.isDeleted {
+          Text(identity.fingerprint).font(.caption.monospaced())
+        } else {
+          Text(
+            "This key was deleted or is not on this device. Choose another key.",
+            bundle: #bundle
+          )
+        }
+      case .preserved(.legacyKey):
+        Text(
+          """
+          This key was not found when Swiftty updated its key storage. Choose or \
+          import a key.
+          """,
+          bundle: #bundle
+        )
+      case .preserved:
+        Text("Saved by a newer version of Swiftty.", bundle: #bundle)
+      }
+    }
+    .adaptiveSheet(item: $creatingKey) { mode in
+      KeyCreationView(model: model, mode: mode) { created in
+        if let created { auth = .key(created.id) }
+        creatingKey = nil
+      }
+      .macSheetFrame(width: 480, height: 460)
+    }
+  }
+}
+
+/// Saved hosts at the candidate's address, offered as explicit updates.
+private struct SaveAsSection: View {
+  let matches: [HostProfile]
+  @Binding
+  var replacing: UUID?
+
+  var body: some View {
+    Section {
+      Picker(.localized("Save as"), selection: $replacing) {
+        Text("New host", bundle: #bundle).tag(UUID?.none)
+        ForEach(matches) { saved in
+          Text("Update \u{201C}\(saved.nickname)\u{201D}", bundle: #bundle)
+            .tag(UUID?.some(saved.id))
+        }
+      }
+    } footer: {
+      Text(
+        """
+        Updating keeps that host's place in the list. Its trusted key is \
+        never replaced: a different key still blocks the connection.
+        """,
+        bundle: #bundle
+      )
+    }
+    .listRowBackground(Color.clear)
+  }
+}
+
 extension HostProfile.ValidationError {
+  /// Localized; a `String` because it shares the error line with
+  /// messages that carry what the Mac or Keychain reported.
   var message: String {
     switch self {
-    case .emptyNickname: "Enter a nickname."
-    case .invalidHost: "Enter a valid host name or address."
-    case .invalidPort: "Port must be between 1 and 65535."
-    case .invalidUsername: "Enter a valid username."
-    case .invalidKeyLabel: "Enter a valid key label."
+    case .emptyNickname: String(localized: "Enter a nickname.", bundle: #bundle)
+    case .invalidHost:
+      String(localized: "Enter a valid host name or address.", bundle: #bundle)
+    case .invalidPort:
+      String(localized: "Port must be between 1 and 65535.", bundle: #bundle)
+    case .invalidUsername:
+      String(localized: "Enter a valid username.", bundle: #bundle)
+    case .invalidKeyLabel:
+      String(localized: "Enter a valid key label.", bundle: #bundle)
     }
   }
 }
@@ -517,30 +604,45 @@ public struct TrustPromptView: View {
     VStack(alignment: .leading, spacing: 16) {
       switch prompt.kind {
       case .unknownKey:
-        Label("Unknown host key", systemImage: "questionmark.diamond")
-          .font(.title2)
+        Label(
+          .localized("Unknown host key"),
+          systemImage: "questionmark.diamond"
+        )
+        .font(.title2)
         if prompt.matchesPairingCode {
           Label(
-            "Matches the connection code you confirmed",
+            .localized("Matches the connection code you confirmed"),
             systemImage: "checkmark.seal"
           )
           .foregroundStyle(.green).accessibilityIdentifier("trust.paired")
           Text(
-            "Trusting stores this key for \(prompt.host.endpointSummary); "
-              + "a different key will be blocked later."
+            """
+            Trusting stores this key for \(prompt.host.endpointSummary); \
+            a different key will be blocked later.
+            """,
+            bundle: #bundle
           )
         } else {
           Text(
-            "The authenticity of \(prompt.host.endpointSummary) can't be established. "
-              + "Verify the fingerprint on the Mac before trusting it."
+            """
+            The authenticity of \(prompt.host.endpointSummary) can't be established. \
+            Verify the fingerprint on the Mac before trusting it.
+            """,
+            bundle: #bundle
           )
         }
       case .changedKey:
-        Label("Host key changed", systemImage: "exclamationmark.octagon")
-          .font(.title2).foregroundStyle(.red)
+        Label(
+          .localized("Host key changed"),
+          systemImage: "exclamationmark.octagon"
+        )
+        .font(.title2).foregroundStyle(.red)
         Text(
-          "The key for \(prompt.host.endpointSummary) differs from the trusted key. "
-            + "The connection is blocked."
+          """
+          The key for \(prompt.host.endpointSummary) differs from the trusted key. \
+          The connection is blocked.
+          """,
+          bundle: #bundle
         )
       }
       VStack(alignment: .leading, spacing: 4) {
@@ -550,12 +652,14 @@ public struct TrustPromptView: View {
       }
       HStack {
         Button(
-          prompt.kind == .changedKey ? "Close" : "Don't Trust",
+          prompt.kind == .changedKey
+            ? .localized("Close") : .localized("Don't Trust"),
           role: .cancel
         ) { decide(.reject) }
         .accessibilityIdentifier("trust.reject")
         if prompt.kind == .unknownKey {
-          Button("Trust") { decide(.trust) }.glassButtonStyle(prominent: true)
+          Button(.localized("Trust")) { decide(.trust) }
+            .glassButtonStyle(prominent: true)
             .accessibilityIdentifier("trust.accept")
         }
       }
@@ -583,27 +687,32 @@ public struct PasswordPromptView: View {
     NavigationStack {
       Form {
         Section {
-          SecureField("Password", text: $password).textContentType(.password)
-            .onSubmit(submit).accessibilityIdentifier("password.field")
+          SecureField(.localized("Password"), text: $password)
+            .textContentType(.password).onSubmit(submit)
+            .accessibilityIdentifier("password.field")
         } header: {
           Text(prompt.host.endpointSummary)
         } footer: {
           if prompt.isRetry {
-            Text("The password was not accepted. Try again.")
+            Text("The password was not accepted. Try again.", bundle: #bundle)
               .foregroundStyle(.red)
           } else {
-            Text("Kept in memory until the app quits; never saved.")
+            Text(
+              "Kept in memory until the app quits; never saved.",
+              bundle: #bundle
+            )
           }
         }
         .listRowBackground(Color.clear)
       }
-      .glassListBackground().navigationTitle("Sign In")
+      .glassListBackground().navigationTitle(.localized("Sign In"))
       .toolbar {
         ToolbarItem(placement: .cancellationAction) {
-          Button("Cancel") { answer(nil) }
+          Button(.localized("Cancel")) { answer(nil) }
         }
         ToolbarItem(placement: .confirmationAction) {
-          Button("Sign In", action: submit).disabled(password.isEmpty)
+          Button(.localized("Sign In"), action: submit)
+            .disabled(password.isEmpty)
             .accessibilityIdentifier("password.submit")
         }
       }

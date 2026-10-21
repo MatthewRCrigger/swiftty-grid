@@ -35,12 +35,9 @@ extension View {
   /// `terminal.screen` whose value is the visible terminal text. UIKit's
   /// terminal only builds screen text for VoiceOver, which UI tests don't
   /// run.
-  @ViewBuilder
   func uiTestingScreenProbe(_ model: TerminalScreenModel) -> some View {
-    if UITesting.isEnabled {
-      overlay(alignment: .topLeading) { ScreenTextProbe(model: model) }
-    } else {
-      self
+    overlay(alignment: .topLeading) {
+      if UITesting.isEnabled { ScreenTextProbe(model: model) }
     }
   }
 }
@@ -55,9 +52,8 @@ private struct ScreenTextProbe: View {
         .frame(width: 2, height: 2)
         .allowsHitTesting(false)
         .accessibilityElement()
-        .accessibilityLabel("Terminal screen")
-        .accessibilityValue(text)
-        .accessibilityIdentifier("terminal.screen")
+        .accessibilityLabel(Text("Terminal screen", bundle: #bundle))
+        .accessibilityValue(text).accessibilityIdentifier("terminal.screen")
     }
   }
 }

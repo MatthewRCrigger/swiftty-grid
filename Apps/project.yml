@@ -22,6 +22,10 @@ options:
   # entitlements from SWIFTTY_LINK_DOMAINS (no associated domains when
   # unset). Runs from this directory.
   preGenCommand: ../Scripts/configure-links.sh
+  # Builds the local package's code with arm64e too, so pointer
+  # authentication (ENABLE_ENHANCED_SECURITY below) covers RoamingApp and
+  # the rest of the linked package code, not just the thin app targets.
+  postGenCommand: ../Scripts/configure-arm64e-packages.sh Swiftty.xcodeproj
   bundleIdPrefix: dev.chr33s.swiftty
   createIntermediateGroups: true
   deploymentTarget:
@@ -49,6 +53,20 @@ settings:
     CURRENT_PROJECT_VERSION: "1"
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     DEAD_CODE_STRIPPING: YES
+    # Enhanced Security (xcode-security-settings.md): pointer authentication
+    # (arm64e), security compiler warnings, typed allocators and libc++
+    # hardening for every target. The runtime protections are the
+    # com.apple.security.hardened-process entitlements in
+    # Apps/<Target>/<Target>.entitlements (iOS, Catalyst, visionOS only).
+    ENABLE_ENHANCED_SECURITY: YES
+    # Extract the app targets' localizable literals into their String
+    # Catalogs (Apps/WatchCompanion/Localizable.xcstrings) on build.
+    SWIFT_EMIT_LOC_STRINGS: YES
+    # With iOSPackagesShouldBuildARM64e (postGenCommand) Xcode builds the
+    # package products for arm64 only on the simulator, so an app slice
+    # for x86_64 cannot import them. macOS 27 runs only on Apple silicon,
+    # so the Intel simulator slice is never used.
+    "EXCLUDED_ARCHS[sdk=*simulator*]": x86_64
     # Automatic signing for Xcode Cloud archives (Apps/ci_scripts). XcodeGen
     # substitutes SWIFTTY_TEAM_ID at generation time; when it is unset the
     # literal reference expands to an empty team and local unsigned builds
@@ -90,7 +108,12 @@ targets:
   MobileClient:
     type: application
     platform: iOS
-    sources: [MobileClient, ../Resources/Assets.xcassets]
+    sources:
+      # Entitlements are merged into Config/Generated/ by the
+      # preGenCommand, not bundled as a resource.
+      - path: MobileClient
+        excludes: ["*.entitlements"]
+      - ../Resources/Assets.xcassets
     scheme: {}
     dependencies:
       - package: Swiftty
@@ -171,12 +194,23 @@ targets:
         # libraries, and every link step warns "Search path ... not found".
         # Pin the Swift toolchain; this target compiles no Metal shaders.
         TOOLCHAINS: com.apple.dt.toolchain.XcodeDefault
+        # Pointer authentication off for this target only: Xcode builds
+        # package products as arm64e only for the iOS-family SDKs it covers
+        # with iOSPackagesShouldBuildARM64e, not for Mac Catalyst, so an arm64e
+        # build cannot import RoamingApp ("Unable to resolve module
+        # dependency"). The rest of Enhanced Security still applies. Lift
+        # this when Xcode builds packages as arm64e here
+        # (xcode-security-settings.md).
+        ENABLE_POINTER_AUTHENTICATION: NO
+        ENABLE_HARDWARE_CHECKED_POINTER_ARITHMETIC_SLICE: NO
 
   # Windowed visionOS full remote client.
   VisionClient:
     type: application
     platform: visionOS
-    sources: [VisionClient]
+    sources:
+      - path: VisionClient
+        excludes: ["*.entitlements"]
     scheme: {}
     dependencies:
       - package: Swiftty
@@ -205,6 +239,15 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty
         TARGETED_DEVICE_FAMILY: "3"
         ASSETCATALOG_COMPILER_APPICON_NAME: App Icon & Top Shelf Image
+        # Pointer authentication off for this target only: Xcode builds
+        # package products as arm64e only for the iOS-family SDKs it covers
+        # with iOSPackagesShouldBuildARM64e, not for tvOS, so an arm64e
+        # build cannot import RoamingApp ("Unable to resolve module
+        # dependency"). The rest of Enhanced Security still applies. Lift
+        # this when Xcode builds packages as arm64e here
+        # (xcode-security-settings.md).
+        ENABLE_POINTER_AUTHENTICATION: NO
+        ENABLE_HARDWARE_CHECKED_POINTER_ARITHMETIC_SLICE: NO
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
 
   # Read-only watch companion. Links ONLY CompanionModel and the

@@ -31,6 +31,12 @@ public struct HostConflict: Hashable, Sendable, Codable {
   public var remoteRevision: LogicalRevision
 }
 
+/// A host conflict with the host it belongs to.
+public struct HostConflictItem: Hashable, Sendable, Identifiable {
+  public var id: UUID
+  public var conflict: HostConflict
+}
+
 /// Trust metadata for one known host, for opt-in trust sync (§8.1).
 public struct KnownHostRecord: Hashable, Sendable, Codable {
   public enum Provenance: Hashable, Sendable, Codable {

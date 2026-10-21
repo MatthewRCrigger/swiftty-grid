@@ -96,14 +96,18 @@ struct ConnectionDraft: Equatable {
 }
 
 extension ConnectionDraft.Problem {
-  var message: String {
+  var message: LocalizedStringResource {
     switch self {
-    case .invalidHost: "Enter a host name or address other devices can resolve."
+    case .invalidHost:
+      .localized("Enter a host name or address other devices can resolve.")
     case .unusableAddress:
-      "That address only refers to this Mac itself; enter one other devices can reach."
-    case .invalidPort: "Enter the SSH port, 1–65535."
-    case .portUnconfirmed: "Confirm that SSH listens on this nondefault port."
-    case .invalidUsername: "Enter the account short name."
+      .localized(
+        "That address only refers to this Mac itself; enter one other devices can reach."
+      )
+    case .invalidPort: .localized("Enter the SSH port, 1–65535.")
+    case .portUnconfirmed:
+      .localized("Confirm that SSH listens on this nondefault port.")
+    case .invalidUsername: .localized("Enter the account short name.")
     }
   }
 }
@@ -129,6 +133,11 @@ final class ConnectDeviceModel {
   private(set) var helperCheck: LocalConnectionInfo.Check = .checking
   var showsCode = false
   private(set) var discoverable = false
+  /// The discoverable toggle's binding.
+  var isDiscoverable: Bool {
+    get { discoverable }
+    set { setDiscoverable(newValue) }
+  }
   private(set) var advertisement: HostAdvertiser.State = .stopped
 
   @ObservationIgnored
@@ -256,147 +265,132 @@ final class ConnectDevicePanelController: NSWindowController, NSWindowDelegate {
   func windowWillClose(_ notification: Notification) { model.close() }
 }
 
+/// The panel, one view per section: typing in the connection details
+/// redraws only the sections that read the draft.
 struct ConnectDeviceView: View {
   @Bindable
   var model: ConnectDeviceModel
 
   var body: some View {
     Form {
-      Section {
-        TextField("SSH host name or address", text: $model.draft.host)
-          .accessibilityIdentifier("connect.host")
-        TextField("SSH port", text: $model.draft.port)
-          .accessibilityIdentifier("connect.port")
-        if model.draft.needsPortConfirmation {
-          Toggle(
-            "SSH listens on port \(model.draft.port) on this Mac",
-            isOn: $model.draft.portConfirmed
-          )
-          .accessibilityIdentifier("connect.confirmPort")
-        }
-        TextField("Account name", text: $model.draft.username)
-        if let problem = model.draft.problem {
-          Text(problem.message).foregroundStyle(.red).font(.footnote)
-        } else if model.draft.isLocalOnly {
-          Text(
-            "\(model.draft.trimmedHost) works only on this local network (or a "
-              + "VPN you configured to carry it), not over cellular. For other "
-              + "networks, enter an address or DNS name reachable from there."
-          )
-          .font(.footnote).foregroundStyle(.secondary)
-        }
-      } header: {
-        Text("Connection details")
-      } footer: {
-        Text(
-          "Configured values; shown to devices as entered. Nothing on this Mac changes."
-        )
-      }
-
-      Section("Roaming endpoint (configured)") {
-        switch model.roaming {
-        case let .configured(endpoint):
-          LabeledContent(
-            "Advertised",
-            value: "\(endpoint.advertisedHost):\(endpoint.port) UDP"
-          )
-          Text(
-            "Devices receive this address after SSH sign-in. It must be reachable "
-              + "from them over UDP; a local name may not work on other networks."
-          )
-          .font(.footnote).foregroundStyle(.secondary)
-        case .absent:
-          Text(
-            "Roaming is not configured. Ordinary SSH still works. To set it up, "
-              + "run Scripts/install.sh --roaming --host <address> and restart Swiftty."
-          )
-          .font(.footnote)
-        case .unreadable:
-          Text("The roaming configuration file could not be read.")
-            .font(.footnote).foregroundStyle(.orange)
-        }
-      }
-
-      Section {
-        check("SSH", model.sshCheck)
-        check("Roaming helper", model.helperCheck)
-        if case .unavailable = model.sshCheck {
-          Text(
-            "Turn on System Settings › General › Sharing › Remote Login for this "
-              + "account. Swiftty does not change it for you."
-          )
-          .font(.footnote).foregroundStyle(.secondary)
-        }
-        Button("Check Again") { model.refresh() }
-      } header: {
-        Text("Status (checked on this Mac)")
-      }
-
-      Section {
-        if model.hostKeys.isEmpty {
-          Text(
-            "This Mac's SSH host public keys could not be read, so no pairing code "
-              + "is offered. Enter the details above on the device instead and "
-              + "compare the fingerprint when it asks."
-          )
-          .font(.footnote)
-        } else {
-          ForEach(model.hostKeys, id: \.sha256) { key in
-            VStack(alignment: .leading) {
-              Text(key.algorithm).font(.caption).foregroundStyle(.secondary)
-              Text(key.sha256).font(.caption.monospaced())
-                .textSelection(.enabled)
-            }
-          }
-        }
-        Toggle("Show Pairing Code", isOn: $model.showsCode)
-          .disabled(model.descriptor == nil)
-          .accessibilityIdentifier("connect.showCode")
-        if model.showsCode, let descriptor = model.descriptor,
-          let text = try? descriptor.encodedString()
-        {
-          PairingCodeView(text: text)
-        }
-      } header: {
-        Text("SSH host keys")
-      }
-
-      Section {
-        Toggle(
-          "Make Discoverable While This Panel Is Open",
-          isOn: Binding(
-            get: { model.discoverable },
-            set: { model.setDiscoverable($0) }
-          )
-        )
-        .disabled(model.draft.problem != nil)
-        .accessibilityIdentifier("connect.discoverable")
-        Text(advertisementText).font(.footnote).foregroundStyle(.secondary)
-      } footer: {
-        Text(
-          "Advertises only that a Swiftty Mac is here and its SSH port, on the "
-            + "local network. Closing this panel stops it; workspaces keep running."
-        )
-      }
+      ConnectionDetailsSection(model: model)
+      RoamingEndpointSection(roaming: model.roaming)
+      ConnectStatusSection(model: model)
+      HostKeysSection(model: model)
+      DiscoverySection(model: model)
     }
     .formStyle(.grouped).frame(minWidth: 480, minHeight: 560)
   }
+}
 
-  private var advertisementText: String {
-    switch model.advertisement {
-    case .stopped: "Not discoverable."
-    case .registering: "Registering…"
-    case let .advertising(name, port):
-      "Discoverable as \u{201C}\(name)\u{201D} (SSH port \(port))."
-    case .denied:
-      "Local Network access for Swiftty is off. Allow it in System Settings › "
-        + "Privacy & Security › Local Network, then turn this on again."
-    case let .failed(code): "Could not advertise (DNS-SD error \(code))."
+private struct ConnectionDetailsSection: View {
+  @Bindable
+  var model: ConnectDeviceModel
+
+  var body: some View {
+    Section {
+      TextField(.localized("SSH host name or address"), text: $model.draft.host)
+        .accessibilityIdentifier("connect.host")
+      TextField(.localized("SSH port"), text: $model.draft.port)
+        .accessibilityIdentifier("connect.port")
+      if model.draft.needsPortConfirmation {
+        Toggle(isOn: $model.draft.portConfirmed) {
+          Text(
+            "SSH listens on port \(model.draft.port) on this Mac",
+            bundle: #bundle
+          )
+        }
+        .accessibilityIdentifier("connect.confirmPort")
+      }
+      TextField(.localized("Account name"), text: $model.draft.username)
+      if let problem = model.draft.problem {
+        Text(problem.message).foregroundStyle(.red).font(.footnote)
+      } else if model.draft.isLocalOnly {
+        Text(
+          """
+          \(model.draft.trimmedHost) works only on this local network (or a \
+          VPN you configured to carry it), not over cellular. For other \
+          networks, enter an address or DNS name reachable from there.
+          """,
+          bundle: #bundle
+        )
+        .font(.footnote).foregroundStyle(.secondary)
+      }
+    } header: {
+      Text("Connection details", bundle: #bundle)
+    } footer: {
+      Text(
+        "Configured values; shown to devices as entered. Nothing on this Mac changes.",
+        bundle: #bundle
+      )
+    }
+  }
+}
+
+private struct RoamingEndpointSection: View {
+  let roaming: LocalConnectionInfo.RoamingConfiguration
+
+  var body: some View {
+    Section(.localized("Roaming endpoint (configured)")) {
+      switch roaming {
+      case let .configured(endpoint):
+        LabeledContent(
+          .localized("Advertised"),
+          value: "\(endpoint.advertisedHost):\(endpoint.port) UDP"
+        )
+        Text(
+          """
+          Devices receive this address after SSH sign-in. It must be reachable \
+          from them over UDP; a local name may not work on other networks.
+          """,
+          bundle: #bundle
+        )
+        .font(.footnote).foregroundStyle(.secondary)
+      case .absent:
+        Text(
+          """
+          Roaming is not configured. Ordinary SSH still works. To set it up, \
+          run Scripts/install.sh --roaming --host <address> and restart Swiftty.
+          """,
+          bundle: #bundle
+        )
+        .font(.footnote)
+      case .unreadable:
+        Text(
+          "The roaming configuration file could not be read.",
+          bundle: #bundle
+        )
+        .font(.footnote).foregroundStyle(.orange)
+      }
+    }
+  }
+}
+
+private struct ConnectStatusSection: View {
+  let model: ConnectDeviceModel
+
+  var body: some View {
+    Section {
+      check(.localized("SSH"), model.sshCheck)
+      check(.localized("Roaming helper"), model.helperCheck)
+      if case .unavailable = model.sshCheck {
+        Text(
+          """
+          Turn on System Settings › General › Sharing › Remote Login for this \
+          account. Swiftty does not change it for you.
+          """,
+          bundle: #bundle
+        )
+        .font(.footnote).foregroundStyle(.secondary)
+      }
+      Button(.localized("Check Again")) { model.refresh() }
+    } header: {
+      Text("Status (checked on this Mac)", bundle: #bundle)
     }
   }
 
   private func check(
-    _ title: String,
+    _ title: LocalizedStringResource,
     _ check: LocalConnectionInfo.Check
   ) -> some View {
     LabeledContent(title) {
@@ -411,28 +405,133 @@ struct ConnectDeviceView: View {
   }
 }
 
+private struct HostKeysSection: View {
+  @Bindable
+  var model: ConnectDeviceModel
+
+  var body: some View {
+    Section {
+      if model.hostKeys.isEmpty {
+        Text(
+          """
+          This Mac's SSH host public keys could not be read, so no pairing code \
+          is offered. Enter the details above on the device instead and \
+          compare the fingerprint when it asks.
+          """,
+          bundle: #bundle
+        )
+        .font(.footnote)
+      } else {
+        ForEach(model.hostKeys, id: \.sha256) { key in
+          VStack(alignment: .leading) {
+            Text(key.algorithm).font(.caption).foregroundStyle(.secondary)
+            Text(key.sha256).font(.caption.monospaced()).textSelection(.enabled)
+          }
+        }
+      }
+      Toggle(.localized("Show Pairing Code"), isOn: $model.showsCode)
+        .disabled(model.descriptor == nil)
+        .accessibilityIdentifier("connect.showCode")
+      if model.showsCode, let descriptor = model.descriptor,
+        let text = try? descriptor.encodedString()
+      {
+        PairingCodeView(text: text)
+      }
+    } header: {
+      Text("SSH host keys", bundle: #bundle)
+    }
+  }
+}
+
+private struct DiscoverySection: View {
+  @Bindable
+  var model: ConnectDeviceModel
+
+  var body: some View {
+    Section {
+      Toggle(
+        .localized("Make Discoverable While This Panel Is Open"),
+        isOn: $model.isDiscoverable
+      )
+      .disabled(model.draft.problem != nil)
+      .accessibilityIdentifier("connect.discoverable")
+      Text(advertisementText).font(.footnote).foregroundStyle(.secondary)
+    } footer: {
+      Text(
+        """
+        Advertises only that a Swiftty Mac is here and its SSH port, on the \
+        local network. Closing this panel stops it; workspaces keep running.
+        """,
+        bundle: #bundle
+      )
+    }
+  }
+
+  /// Localized plain text: it names this Mac as the system reports it.
+  private var advertisementText: String {
+    switch model.advertisement {
+    case .stopped: String(localized: "Not discoverable.", bundle: #bundle)
+    case .registering: String(localized: "Registering…", bundle: #bundle)
+    case let .advertising(name, port):
+      String(
+        localized:
+          "Discoverable as \u{201C}\(name)\u{201D} (SSH port \(port)).",
+        bundle: #bundle
+      )
+    case .denied:
+      String(
+        localized: """
+          Local Network access for Swiftty is off. Allow it in System Settings › \
+          Privacy & Security › Local Network, then turn this on again.
+          """,
+        bundle: #bundle
+      )
+    case let .failed(code):
+      String(
+        localized: "Could not advertise (DNS-SD error \(code)).",
+        bundle: #bundle
+      )
+    }
+  }
+}
+
 /// The pairing code as a QR image, plus an explicit copy for pasting.
 struct PairingCodeView: View {
   let text: String
 
   var body: some View {
     VStack(spacing: 8) {
-      if let image = Self.qrImage(text) {
+      if let image = Self.cachedQRImage(text) {
         Image(nsImage: image).interpolation(.none).resizable()
-          .frame(width: 220, height: 220).accessibilityLabel("Pairing code")
+          .frame(width: 220, height: 220)
+          .accessibilityLabel(Text("Pairing code", bundle: #bundle))
       }
-      Button("Copy Code") {
+      Button(.localized("Copy Code")) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
       }
       Text(
-        "Scan with the iPhone or iPad app (Connect to Mac › Scan Mac Code). The "
-          + "code has no password or token; the device still signs in over SSH."
+        """
+        Scan with the iPhone or iPad app (Connect to Mac › Scan Mac Code). The \
+        code has no password or token; the device still signs in over SSH.
+        """,
+        bundle: #bundle
       )
       .font(.footnote).foregroundStyle(.secondary)
       .multilineTextAlignment(.center)
     }
     .frame(maxWidth: .infinity)
+  }
+
+  /// The last code's image. Rendering synchronously keeps the first frame
+  /// complete; the cache keeps redraws from running the CIFilter again.
+  private static var lastImage: (text: String, image: NSImage?)?
+
+  private static func cachedQRImage(_ text: String) -> NSImage? {
+    if let lastImage, lastImage.text == text { return lastImage.image }
+    let image = qrImage(text)
+    lastImage = (text, image)
+    return image
   }
 
   static func qrImage(_ text: String) -> NSImage? {

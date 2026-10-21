@@ -13,10 +13,12 @@ public enum IdentityStoragePolicy: String, Hashable, Sendable, Codable,
   /// Synchronizable through iCloud Keychain; `WhenUnlocked`.
   case iCloudKeychain
 
-  public var displayName: String {
+  public var displayName: LocalizedStringResource {
     switch self {
-    case .deviceOnly: "This device only"
-    case .iCloudKeychain: "iCloud Keychain"
+    case .deviceOnly:
+      LocalizedStringResource("This device only", bundle: #bundle)
+    case .iCloudKeychain:
+      LocalizedStringResource("iCloud Keychain", bundle: #bundle)
     }
   }
 }

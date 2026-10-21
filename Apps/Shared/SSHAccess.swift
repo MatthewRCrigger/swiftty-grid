@@ -52,66 +52,135 @@ enum SSHAccessError: Error, Equatable, Sendable {
   /// No SSH connection (network, DNS, timeout, refused).
   case unreachable
 
-  var title: String {
+  var title: LocalizedStringResource {
     switch self {
-    case .cancelled: "Sign-in cancelled"
-    case .keyUnavailable: "Key unavailable"
-    case .keyNeedsRepair: "Choose a key"
-    case .unsupportedAuthMethod: "Sign-in method not supported"
-    case .hostKeyChanged: "Host key changed"
-    case .hostKeyRejected: "Host key not trusted"
-    case .hostKeyMismatch: "Host key doesn't match the code"
-    case .trustStoreUnavailable: "Trusted keys unavailable"
-    case .authenticationFailed: "Authentication failed"
-    case .unreachable: "Mac unreachable over SSH"
+    case .cancelled: .localized("Sign-in cancelled")
+    case .keyUnavailable: .localized("Key unavailable")
+    case .keyNeedsRepair: .localized("Choose a key")
+    case .unsupportedAuthMethod: .localized("Sign-in method not supported")
+    case .hostKeyChanged: .localized("Host key changed")
+    case .hostKeyRejected: .localized("Host key not trusted")
+    case .hostKeyMismatch: .localized("Host key doesn't match the code")
+    case .trustStoreUnavailable: .localized("Trusted keys unavailable")
+    case .authenticationFailed: .localized("Authentication failed")
+    case .unreachable: .localized("Mac unreachable over SSH")
     }
   }
 
+  /// Localized plain text, so the key line it can carry is never read as
+  /// Markdown.
   var detail: String {
     switch self {
-    case .cancelled: "No credentials were sent."
+    case .cancelled:
+      String(localized: "No credentials were sent.", bundle: #bundle)
     case .keyUnavailable(let reason):
       switch reason {
       case .unknownIdentity, .deleted:
-        "The SSH key selected for this host was deleted or is not on this "
-          + "device. Edit the host to choose another key. No credentials were sent."
+        String(
+          localized: """
+            The SSH key selected for this host was deleted or is not on this \
+            device. Edit the host to choose another key. No credentials were sent.
+            """,
+          bundle: #bundle
+        )
       case .unavailableOnThisDevice:
-        "The selected key is stored only on another device. Choose a key "
-          + "saved on this device. No credentials were sent."
+        String(
+          localized: """
+            The selected key is stored only on another device. Choose a key \
+            saved on this device. No credentials were sent.
+            """,
+          bundle: #bundle
+        )
       case .awaitingKeyMaterial:
-        "The selected key is not available on this device. iCloud Keychain may "
-          + "be off, delayed or unable to deliver it. No credentials were sent."
+        String(
+          localized: """
+            The selected key is not available on this device. iCloud Keychain may \
+            be off, delayed or unable to deliver it. No credentials were sent.
+            """,
+          bundle: #bundle
+        )
       case .protectedDataUnavailable:
-        "Unlock this device to use the selected key. No credentials were sent."
+        String(
+          localized:
+            "Unlock this device to use the selected key. No credentials were sent.",
+          bundle: #bundle
+        )
       case .integrityConflict:
-        "The stored key does not match the selected key's fingerprint, so it "
-          + "was not used. No credentials were sent."
+        String(
+          localized: """
+            The stored key does not match the selected key's fingerprint, so it \
+            was not used. No credentials were sent.
+            """,
+          bundle: #bundle
+        )
       case .unsupported:
-        "The Keychain could not be read. No credentials were sent."
-      case .cancelled: "No credentials were sent."
+        String(
+          localized:
+            "The Keychain could not be read. No credentials were sent.",
+          bundle: #bundle
+        )
+      case .cancelled:
+        String(localized: "No credentials were sent.", bundle: #bundle)
       }
     case .keyNeedsRepair:
-      "This host used a key that was not found during the update. Edit the host "
-        + "to choose or import a key. No credentials were sent."
+      String(
+        localized: """
+          This host used a key that was not found during the update. Edit the host \
+          to choose or import a key. No credentials were sent.
+          """,
+        bundle: #bundle
+      )
     case .unsupportedAuthMethod:
-      "This host was saved by a newer version of Swiftty. Update the app or "
-        + "edit the host. No credentials were sent."
+      String(
+        localized: """
+          This host was saved by a newer version of Swiftty. Update the app or \
+          edit the host. No credentials were sent.
+          """,
+        bundle: #bundle
+      )
     case .hostKeyChanged:
-      "The key presented differs from the trusted key, so the connection was blocked. "
-        + "Verify the Mac's key before removing the old one."
+      String(
+        localized: """
+          The key presented differs from the trusted key, so the connection was blocked. \
+          Verify the Mac's key before removing the old one.
+          """,
+        bundle: #bundle
+      )
     case .hostKeyRejected:
-      "The connection was closed before any credentials were sent."
+      String(
+        localized:
+          "The connection was closed before any credentials were sent.",
+        bundle: #bundle
+      )
     case .hostKeyMismatch:
-      "The Mac's SSH key is not one listed in the connection code, so the "
-        + "connection was blocked before any credentials were sent. Show the "
-        + "code again on the intended Mac."
+      String(
+        localized: """
+          The Mac's SSH key is not one listed in the connection code, so the \
+          connection was blocked before any credentials were sent. Show the \
+          code again on the intended Mac.
+          """,
+        bundle: #bundle
+      )
     case .trustStoreUnavailable:
-      "The list of trusted host keys could not be read or written."
+      String(
+        localized:
+          "The list of trusted host keys could not be read or written.",
+        bundle: #bundle
+      )
     case .authenticationFailed(let line?):
-      "Add this public key to ~/.ssh/authorized_keys on the Mac:\n\(line)"
-    case .authenticationFailed(nil): "The server rejected the credentials."
+      String(
+        localized:
+          "Add this public key to ~/.ssh/authorized_keys on the Mac:\n\(line)",
+        bundle: #bundle
+      )
+    case .authenticationFailed(nil):
+      String(localized: "The server rejected the credentials.", bundle: #bundle)
     case .unreachable:
-      "Check that the Mac is reachable and Remote Login is enabled."
+      String(
+        localized:
+          "Check that the Mac is reachable and Remote Login is enabled.",
+        bundle: #bundle
+      )
     }
   }
 }

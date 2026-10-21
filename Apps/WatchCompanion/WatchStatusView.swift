@@ -36,10 +36,10 @@ struct WatchStatusView: View {
 
   private func header(_ p: WatchCompanionStore.Presentation) -> some View {
     VStack(alignment: .leading, spacing: 2) {
-      Text(p.nickname ?? "Session")
+      (p.nickname.map { Text($0) } ?? Text("Session"))
         .font(.headline)
         .lineLimit(1)
-      Text(p.state?.summary ?? "No status from iPhone")
+      (p.state.map { Text($0.summary) } ?? Text("No status from iPhone"))
         .font(.subheadline)
         .foregroundStyle(p.freshness == .fresh ? .primary : .secondary)
     }
@@ -91,9 +91,9 @@ struct WatchStatusView: View {
       Text("Preview \(preview.capturedAt, format: .relative(presentation: .named))")
         .font(.caption2)
         .foregroundStyle(.secondary)
-      ForEach(Array(preview.lines.enumerated()), id: \.offset) { _, line in
+      ForEach(preview.lines.enumerated(), id: \.offset) { _, line in
         Text(verbatim: line)
-          .font(.system(size: 10, design: .monospaced))
+          .font(.caption2.monospaced())
           .lineLimit(1)
       }
     }
@@ -106,7 +106,7 @@ struct FreshnessBadge: View {
   let freshness: CompanionFreshness
 
   var body: some View {
-    let (text, color): (String, Color) =
+    let (text, color): (LocalizedStringResource, Color) =
       switch freshness {
       case .fresh: ("Recent", .green)
       case .stale: ("Stale", .orange)

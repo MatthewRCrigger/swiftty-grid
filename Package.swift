@@ -5,6 +5,8 @@ let core: [SwiftSetting] = [.enableExperimentalFeature("Lifetimes")]
 
 let package = Package(
   name: "swiftty",
+  // Source language of the String Catalogs in the UI targets.
+  defaultLocalization: "en",
   // Deployment minimums for every included Apple product profile
   // (spec.roaming.md §2.1). Declarations are not proof of compatibility:
   // the watch companion links CompanionModel and MuxNavigation, and
@@ -73,7 +75,8 @@ let package = Package(
       dependencies: [
         "SwifttyCore", "SwifttyMac", "SwiftMuxClient", "SwiftMuxBridge",
         "MuxNavigation", "MuxNavigationSMX", "HostConnection",
-      ]
+      ],
+      resources: [.process("Localizable.xcstrings")]
     ),
     // SwiftMux (spec.multiplexer.md): shared messages, engine bridge,
     // service, PTY launcher, client connection and frontends.
@@ -109,7 +112,8 @@ let package = Package(
     // Foundation only, so the watch companion can link it.
     .target(
       name: "MuxNavigation",
-      dependencies: ["SwiftMuxProtocol", "CompanionModel"]
+      dependencies: ["SwiftMuxProtocol", "CompanionModel"],
+      resources: [.process("Localizable.xcstrings")]
     ),
     // The navigator's local SwiftMux (XPC) service adapter; macOS only.
     .target(
@@ -187,7 +191,8 @@ let package = Package(
         "SSHClient", .product(name: "Crypto", package: "swift-crypto"),
         // AES-CTR/CBC for encrypted key import; already linked by X509.
         .product(name: "_CryptoExtras", package: "swift-crypto"),
-      ]
+      ],
+      resources: [.process("Localizable.xcstrings")]
     ),
     // Network framework QUIC, TLS identity and pinning policy.
     .target(
@@ -237,6 +242,7 @@ let package = Package(
         .product(name: "Crypto", package: "swift-crypto"),
       ],
       path: "Apps/Shared",
+      resources: [.process("Localizable.xcstrings")],
       swiftSettings: core
     ),
     // The fixed no-PTY SSH bootstrap helper; relays to the service.

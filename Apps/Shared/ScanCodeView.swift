@@ -27,18 +27,21 @@ struct ScanCodeView: View {
         case .authorized:
           CameraPreview(session: scanner.session)
             .clipShape(RoundedRectangle(cornerRadius: 16))
-            .accessibilityLabel("Camera viewfinder")
+            .accessibilityLabel(Text("Camera viewfinder", bundle: #bundle))
           if let notice = scanner.notice {
             Label(notice, systemImage: "exclamationmark.triangle")
               .foregroundStyle(.orange).font(.footnote)
           }
-          Text("Point the camera at the code in the Mac's Connect a Device panel.")
-            .font(.footnote).foregroundStyle(.secondary)
+          Text(
+            "Point the camera at the code in the Mac's Connect a Device panel.",
+            bundle: #bundle
+          )
+          .font(.footnote).foregroundStyle(.secondary)
         case .notDetermined:
-          ProgressView("Asking for camera access…")
+          ProgressView(.localized("Asking for camera access…"))
         default:
           ContentUnavailableView(
-            "Camera Unavailable",
+            .localized("Camera Unavailable"),
             systemImage: "camera.badge.ellipsis",
             description: Text(
               access == .restricted
@@ -48,14 +51,17 @@ struct ScanCodeView: View {
           )
           .accessibilityIdentifier("scan.unavailable")
         }
-        Button("Paste Code Instead", systemImage: "doc.on.clipboard", action: paste)
-          .accessibilityIdentifier("scan.paste")
+        Button(
+          .localized("Paste Code Instead"),
+          systemImage: "doc.on.clipboard",
+          action: paste
+        )
+        .accessibilityIdentifier("scan.paste")
       }
-      .padding()
-      .navigationTitle("Scan Mac Code")
+      .padding().navigationTitle(.localized("Scan Mac Code"))
       .toolbar {
         ToolbarItem(placement: .cancellationAction) {
-          Button("Cancel", action: close)
+          Button(.localized("Cancel"), action: close)
         }
       }
     }
@@ -94,8 +100,10 @@ struct ScanCodeView: View {
 @MainActor
 @Observable
 final class QRScanner: NSObject, AVCaptureMetadataOutputObjectsDelegate {
+  /// Created on first use, not when the sheet's view is built: the
+  /// view's `@State` initial value is evaluated on every parent redraw.
   @ObservationIgnored
-  nonisolated(unsafe) let session = AVCaptureSession()
+  private(set) lazy var session = AVCaptureSession()
   private(set) var notice: String?
   @ObservationIgnored
   private var found: ((HostConnectionDescriptor) -> Void)?
@@ -114,7 +122,10 @@ final class QRScanner: NSObject, AVCaptureMetadataOutputObjectsDelegate {
         let input = try? AVCaptureDeviceInput(device: device),
         session.canAddInput(input)
       else {
-        notice = "The camera could not be started."
+        notice = String(
+          localized: "The camera could not be started.",
+          bundle: #bundle
+        )
         return
       }
       session.beginConfiguration()

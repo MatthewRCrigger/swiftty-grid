@@ -94,7 +94,8 @@ extension MainActorIntegrationTests {
         controller.session.send(.text("early"))
         #expect(
           try await eventually {
-            controller.inputNotice?.contains("not ready") == true
+            controller.inputNotice.map { String(localized: $0) }?
+              .contains("not ready") == true
           }
         )
         controller.dismissInputNotice()
@@ -106,7 +107,8 @@ extension MainActorIntegrationTests {
         )
         #expect(
           try await eventually {
-            controller.inputNotice?.contains("limits") == true
+            controller.inputNotice.map { String(localized: $0) }?
+              .contains("limits") == true
           }
         )
         #expect(controller.phase == .running)
@@ -249,7 +251,8 @@ extension MainActorIntegrationTests {
         )
         if case let .failed(problem) = controller.phase {
           #expect(
-            problem.title == (status ? "Shell exited" : "SSH connection lost")
+            String(localized: problem.title)
+              == (status ? "Shell exited" : "SSH connection lost")
           )
         } else {
           Issue.record("A finished shell must retain its failure explanation")

@@ -164,9 +164,10 @@ class LinkConfigurationTests(unittest.TestCase):
         products.mkdir()
         for name in ["swiftty", "swiftmux-agent", "swmux-launcher", "swmux"]:
             (products / name).write_text("owned fixture executable\n")
-        resources = products / "swiftty_SwifttyCore.bundle"
-        resources.mkdir()
-        (resources / "fixture").write_text("owned resource\n")
+        for target in ["SwifttyCore", "Swiftty", "MuxNavigation"]:
+            resources = products / f"swiftty_{target}.bundle"
+            resources.mkdir()
+            (resources / "fixture").write_text("owned resource\n")
         for name in ["swift", "codesign"]:
             executable = tools / name
             executable.write_text(TOOL.replace("/PYTHON", sys.executable))

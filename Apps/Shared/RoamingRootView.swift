@@ -34,12 +34,12 @@ public struct RoamingRootView: View {
             NavigationLink {
               SettingsView(model: model)
             } label: {
-              Label("Settings", systemImage: "gearshape")
+              Label(.localized("Settings"), systemImage: "gearshape")
             }
             .accessibilityIdentifier("settings")
           }
         }
-        .navigationDestination(item: activeSession) { session in
+        .navigationDestination(item: $model.presentedSession) { session in
           TerminalScreen(model: session) { model.close() }
         }
     }
@@ -57,7 +57,7 @@ public struct RoamingRootView: View {
         inbox?.refresh(interactive: false)
       }
     }
-    .onChange(of: model.hosts) { _, _ in inbox?.refresh(interactive: false) }
+    .modifier(InboxHostRefresh(model: model, inbox: inbox))
     .onChange(of: scenePhase, initial: true) { _, phase in
       // Foreground recovery fetches the inbox again (no push delivery);
       // never prompting for a password in the background.
@@ -75,13 +75,6 @@ public struct RoamingRootView: View {
     }
   }
 
-  private var activeSession: Binding<TerminalScreenModel?> {
-    Binding(
-      get: { model.activeSession },
-      set: { if $0 == nil { model.close() } }
-    )
-  }
-
   /// Hide terminal content from app-switcher snapshots on platforms that
   /// take them. A Mac window losing focus is not a
   /// suspension, so it stays visible there (spec §9).
@@ -90,6 +83,19 @@ public struct RoamingRootView: View {
     case .catalyst: false
     case .mobile, .vision, .tv:
       scenePhase != .active && model.activeSession != nil
+    }
+  }
+}
+
+/// Refetches the inbox when the saved hosts change. Its own modifier, so
+/// reading `hosts` for the side effect does not invalidate the root view.
+private struct InboxHostRefresh: ViewModifier {
+  let model: RoamingAppModel
+  let inbox: RoamingInboxModel?
+
+  func body(content: Content) -> some View {
+    content.onChange(of: model.hosts) { _, _ in
+      inbox?.refresh(interactive: false)
     }
   }
 }
@@ -167,7 +173,8 @@ extension View {
           Image(systemName: "lock.rectangle").font(.largeTitle)
             .foregroundStyle(.secondary)
         }
-        .ignoresSafeArea().accessibilityLabel("Content hidden")
+        .ignoresSafeArea()
+        .accessibilityLabel(Text("Content hidden", bundle: #bundle))
       }
     }
   }
@@ -185,31 +192,37 @@ public struct CompanionSettingsView: View {
     Form {
       Section {
         Toggle(
-          "Share session status",
+          .localized("Share session status"),
           isOn: $model.companionSettings.sharingEnabled
         )
       } footer: {
         Text(
-          "Shows the selected session's nickname, connection state and the time "
-            + "this iPhone last observed it. Turning this off clears the watch."
+          """
+          Shows the selected session's nickname, connection state and the time \
+          this iPhone last observed it. Turning this off clears the watch.
+          """,
+          bundle: #bundle
         )
       }
       .listRowBackground(Color.clear)
       Section {
         Toggle(
-          "Allow text preview",
+          .localized("Allow text preview"),
           isOn: $model.companionSettings.previewEnabled
         )
         .disabled(!model.companionSettings.sharingEnabled)
       } footer: {
         Text(
-          "When the watch asks and this app is open, sends a short preview of the "
-            + "visible terminal text. It is never stored on the watch or shown in "
-            + "complications or notifications."
+          """
+          When the watch asks and this app is open, sends a short preview of the \
+          visible terminal text. It is never stored on the watch or shown in \
+          complications or notifications.
+          """,
+          bundle: #bundle
         )
       }
       .listRowBackground(Color.clear)
     }
-    .glassListBackground().navigationTitle("Apple Watch")
+    .glassListBackground().navigationTitle(.localized("Apple Watch"))
   }
 }
