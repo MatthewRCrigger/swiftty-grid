@@ -13,6 +13,8 @@ enum PaneEvent: Sendable {
   case bell
   case workingDirectory(String)
   case workingHost(String)
+  /// The foreground program changed; nil when the shell holds the terminal.
+  case foreground(String?)
   /// OSC 7501 changes in stream order, under the terminal epoch they
   /// happened in. Always delivered before `finished`.
   case status(TerminalEpochID, [StatusChange])
@@ -65,6 +67,9 @@ final class PaneRuntime: @unchecked Sendable {
   private var master: Int32 = -1
   private var slave: Int32 = -1
   private(set) var pid: pid_t = 0
+  private var foreground: String?
+  private var lastForegroundCheck: UInt64 = 0
+  private var foregroundCheckPending = false
   private var readSource: DispatchSourceRead?
   private var readSourceActive = false
   private var processingRead = false
@@ -346,6 +351,32 @@ final class PaneRuntime: @unchecked Sendable {
     }
     _ = state.takeDamage()
     noteChange()
+    checkForeground()
+  }
+
+  /// Reports the foreground program when it changes. Output drives the
+  /// check, so it is rate limited with a trailing run: the prompt that
+  /// follows a command always gets seen.
+  private func checkForeground() {
+    guard master >= 0, pid > 0, exitStatus == nil else { return }
+    let now = DispatchTime.now().uptimeNanoseconds
+    if now &- lastForegroundCheck < 200_000_000 {
+      if !foregroundCheckPending {
+        foregroundCheckPending = true
+        queue.asyncAfter(deadline: .now() + .milliseconds(220)) { [weak self] in
+          guard let self else { return }
+          foregroundCheckPending = false
+          checkForeground()
+        }
+      }
+      return
+    }
+    lastForegroundCheck = now
+    let current = ForegroundCommand.name(master: master, shell: pid)
+    if current != foreground {
+      foreground = current
+      onEvent?(.foreground(current))
+    }
   }
 
   /// Converts the status journal into owned changes, splitting it at

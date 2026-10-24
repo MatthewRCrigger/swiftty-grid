@@ -239,6 +239,8 @@ public struct PaneSummary: Codable, Sendable, Equatable {
   public var workingDirectory: String?
   /// OSC 7 host when it names another machine; nil or empty when local.
   public var workingHost: String?
+  /// The program holding the terminal's foreground, nil at the shell.
+  public var foreground: String?
 
   public init(
     id: PaneID,
@@ -248,7 +250,8 @@ public struct PaneSummary: Codable, Sendable, Equatable {
     pid: Int32? = nil,
     exitStatus: Int32? = nil,
     workingDirectory: String? = nil,
-    workingHost: String? = nil
+    workingHost: String? = nil,
+    foreground: String? = nil
   ) {
     self.id = id
     self.columns = columns
@@ -258,6 +261,7 @@ public struct PaneSummary: Codable, Sendable, Equatable {
     self.exitStatus = exitStatus
     self.workingDirectory = workingDirectory
     self.workingHost = workingHost
+    self.foreground = foreground
   }
 }
 
@@ -913,6 +917,8 @@ public enum MuxEvent: Codable, Sendable {
   /// A pane's OSC 7 location changed; `host` is empty for this machine.
   case location(PaneID, directory: String?, host: String?)
   case bell(PaneID)
+  /// The program in a pane's foreground changed; nil when the shell has it.
+  case foreground(PaneID, String?)
   /// An unsubscribed pane in another tab of the attached workspace
   /// changed. Sent once until it is subscribed again.
   case activity(PaneID)

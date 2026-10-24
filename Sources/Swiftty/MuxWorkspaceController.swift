@@ -37,6 +37,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// Sanitized program titles, from snapshots and title events.
   private var titles: [PaneID: String] = [:]
   private var locations: [PaneID: GridLocation] = [:]
+  /// The program holding each pane's terminal; nil entries are at the shell.
+  private var foregrounds: [PaneID: String] = [:]
   /// Panes with output the user has not seen (hidden tabs, bells).
   private(set) var activity: Set<PaneID> = []
   /// A divider drag shown locally before the service commits it.
@@ -336,6 +338,9 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     case let .title(pane, title):
       titles[pane] = DisplayText.sanitize(title)
       refreshChrome()
+    case let .foreground(pane, command):
+      foregrounds[pane] = command
+      refreshChrome()
     case let .location(pane, directory, host):
       locations[pane] = GridLocation(directory: directory, host: host)
       refreshChrome()
@@ -429,7 +434,9 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
         host: pane.workingHost
       )
     }
+    for pane in ws.panes { foregrounds[pane.id] = pane.foreground }
     let known = Set(ws.panes.map(\.id))
+    foregrounds = foregrounds.filter { known.contains($0.key) }
     titles = titles.filter { known.contains($0.key) }
     locations = locations.filter { known.contains($0.key) }
     activity.formIntersection(known)
@@ -516,7 +523,16 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
           exitStatus: ws.pane(id)?.exitStatus,
           index: (order.firstIndex(of: id) ?? 0) + 1,
           count: order.count,
-          remote: locations[id]?.isRemote ?? false
+          remote: locations[id]?.isRemote ?? false,
+          tint: foregrounds[id].flatMap { config.commandThemes[$0] }
+            .map {
+              NSColor(
+                srgbRed: CGFloat($0 >> 16 & 0xFF) / 255,
+                green: CGFloat($0 >> 8 & 0xFF) / 255,
+                blue: CGFloat($0 & 0xFF) / 255,
+                alpha: 1
+              )
+            }
         )
       )
     }

@@ -500,6 +500,8 @@ struct MuxPaneHeaderState: Equatable {
   var count = 0
   /// The shell reports another machine: the header shows a globe.
   var remote = false
+  /// Accent override while a themed command runs (`command-theme`).
+  var tint: NSColor? = nil
 }
 
 /// A pane's header (icon, title, actions) above its Metal view.
@@ -552,7 +554,12 @@ final class MuxPaneContainer: NSView {
       switch header.state.exitStatus {
       case 0?: Grid.success
       case .some: Grid.danger
-      case nil: header.state.isActive && showsHeader ? Grid.accentNow : Grid.line200
+      case nil:
+        if let tint = header.state.tint {
+          header.state.isActive ? tint : tint.blended(withFraction: 0.55, of: Grid.line200) ?? tint
+        } else {
+          header.state.isActive && showsHeader ? Grid.accentNow : Grid.line200
+        }
       }
     layer.borderColor = frame.cgColor
     layer.backgroundColor = Grid.surface1.cgColor

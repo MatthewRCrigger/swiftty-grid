@@ -69,6 +69,7 @@ struct PaneRecord {
   var title = ""
   var workingDirectory: String?
   var workingHost: String?
+  var foreground: String?
   var exitStatus: Int32?
   /// Removed from the layout; kept only until its process is reaped.
   var detachedFromLayout = false
@@ -82,7 +83,8 @@ struct PaneRecord {
       pid: runtime.pid > 0 ? runtime.pid : nil,
       exitStatus: exitStatus,
       workingDirectory: workingDirectory,
-      workingHost: workingHost
+      workingHost: workingHost,
+      foreground: foreground
     )
   }
 }

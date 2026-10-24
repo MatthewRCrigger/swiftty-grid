@@ -1211,6 +1211,9 @@ public actor MuxService {
     case let .workingHost(host):
       panes[id]?.workingHost = host.isEmpty ? nil : host
       sendLocation(id, to: client)
+    case let .foreground(command):
+      panes[id]?.foreground = command
+      if let client { send(.event(.foreground(id, command)), to: client) }
     case let .status(epoch, changes):
       let tab = locate(pane: id).map { workspaces[$0.0].tabs[$0.1].id }
       attention.apply(

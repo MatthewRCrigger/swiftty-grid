@@ -926,9 +926,15 @@ struct ConfigurationTests {
       scrollback-limit = 2000000
       window-padding-x = 2,6
       copy-on-select = clipboard
+      command-theme = claude, claude-code = #D97757
+      command-theme = shopify=#95BF47
       """
     )
     #expect(config.diagnostics.isEmpty)
+    #expect(
+      config.commandThemes
+        == ["claude": 0xD97757, "claude-code": 0xD97757, "shopify": 0x95BF47]
+    )
     #expect(config.fontFamily == "JetBrains Mono" && config.fontSize == 15)
     #expect(config.fontFeatures == ["calt", "-liga", "ss01"])
     #expect(config.fontVariations == ["wght": 600])

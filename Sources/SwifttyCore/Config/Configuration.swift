@@ -230,6 +230,9 @@ public struct Configuration: Sendable, Equatable {
 
   public var keybindings = Keybindings.defaults
 
+  /// Pane accent by foreground command name (`command-theme = claude=#D97757`).
+  public var commandThemes: [String: UInt32] = [:]
+
   /// Problems found while loading, as `file:line: message`.
   public var diagnostics: [String] = []
 
@@ -477,6 +480,22 @@ public struct Configuration: Sendable, Equatable {
       return setFont(key, value)
     }
     switch key {
+    case "command-theme":
+      if value.isEmpty {
+        commandThemes = [:]
+        return nil
+      }
+      guard let eq = value.firstIndex(of: "="),
+        let rgb = Self.parseColor(
+          value[value.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+        )
+      else { return "invalid command-theme \(value)" }
+      let names = value[..<eq].split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+      guard !names.isEmpty else { return "invalid command-theme \(value)" }
+      for name in names { commandThemes[name] = rgb }
+      return nil
     case "theme":
       if value.isEmpty {
         theme = nil
