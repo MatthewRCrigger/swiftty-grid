@@ -40,19 +40,20 @@ let package = Package(
     .executable(name: "swifttyd", targets: ["Swifttyd"]),
   ],
   dependencies: [
-    .package(url: "https://github.com/apple/swift-nio.git", from: "2.86.0"),
-    .package(url: "https://github.com/apple/swift-nio-ssh.git", from: "0.11.0"),
+    .package(url: "https://github.com/apple/swift-nio.git", from: "2.104.0"),
+    .package(url: "https://github.com/apple/swift-nio-ssh.git", from: "0.15.0"),
     .package(
       url: "https://github.com/apple/swift-nio-transport-services.git",
-      from: "1.25.0"
+      from: "1.28.0"
     ),
     .package(
       url: "https://github.com/apple/swift-crypto.git",
-      "3.0.0" ..< "5.0.0"
+      // NIOSSH 0.15.0 currently requires Crypto < 5.0.0.
+      "4.5.2" ..< "6.0.0"
     ),
     .package(
       url: "https://github.com/apple/swift-certificates.git",
-      from: "1.10.0"
+      from: "1.21.0"
     ),
   ],
   targets: [
@@ -190,7 +191,7 @@ let package = Package(
       dependencies: [
         "SSHClient", .product(name: "Crypto", package: "swift-crypto"),
         // AES-CTR/CBC for encrypted key import; already linked by X509.
-        .product(name: "_CryptoExtras", package: "swift-crypto"),
+        .product(name: "CryptoExtras", package: "swift-crypto"),
       ],
       resources: [.process("Localizable.xcstrings")]
     ),

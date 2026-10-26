@@ -1,10 +1,10 @@
 [tools]
-swift = "6.4.0"
-swiftformat = "0.63.1"
+swift = "6.4.1"
+swiftformat = "0.64.1" # latest release with a standalone macOS CLI asset
 swiftlint = "0.65.1"
-tmux = "3.7b" # integration tests
-zig = "0.16.0" # builds upstream ghostty-bench for comparison
-"cargo:hyperfine" = "1.20.0" # native arm64 build; release binary is x86_64-only
+tmux = "3.7c" # integration tests; latest available tmux-builds release
+zig = "0.17.0" # builds upstream ghostty-bench for comparison
+"github:sharkdp/hyperfine" = "2.0.0" # upstream now publishes native arm64 binaries
 
 [env]
 # swift.org toolchains need the macOS SDK from Xcode / CLT to link.

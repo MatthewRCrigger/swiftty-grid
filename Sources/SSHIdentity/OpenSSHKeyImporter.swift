@@ -1,7 +1,7 @@
 import Crypto
+import CryptoExtras
 import Foundation
 import SSHClient
-import _CryptoExtras
 
 /// Why an imported private key was refused (spec.ssh-identity.md §6.2).
 /// Messages name the problem only; they never echo file contents.
