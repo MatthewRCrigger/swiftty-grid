@@ -488,6 +488,18 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     titles[pane].flatMap(\.nonEmpty) ?? "shell"
   }
 
+  /// The `command-theme` color for the program running in `pane`.
+  private func tint(of pane: PaneID) -> NSColor? {
+    guard let rgb = foregrounds[pane].flatMap({ config.commandThemes[$0] })
+    else { return nil }
+    return NSColor(
+      srgbRed: CGFloat(rgb >> 16 & 0xFF) / 255,
+      green: CGFloat(rgb >> 8 & 0xFF) / 255,
+      blue: CGFloat(rgb & 0xFF) / 255,
+      alpha: 1
+    )
+  }
+
   /// Tab strip, pane headers and window title from the current snapshot.
   private func refreshChrome() {
     guard !detached, let ws = workspace else { return }
@@ -504,7 +516,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
           isActive: tab.id == ws.activeTab,
           hasActivity: tab.id != ws.activeTab
             && tab.layout.panes.contains(where: activity.contains),
-          name: automatic ? nil : tab.name
+          name: automatic ? nil : tab.name,
+          tint: tint(of: tab.activePane)
         )
       }
     )
@@ -524,15 +537,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
           index: (order.firstIndex(of: id) ?? 0) + 1,
           count: order.count,
           remote: locations[id]?.isRemote ?? false,
-          tint: foregrounds[id].flatMap { config.commandThemes[$0] }
-            .map {
-              NSColor(
-                srgbRed: CGFloat($0 >> 16 & 0xFF) / 255,
-                green: CGFloat($0 >> 8 & 0xFF) / 255,
-                blue: CGFloat($0 & 0xFF) / 255,
-                alpha: 1
-              )
-            }
+          tint: tint(of: id)
         )
       )
     }

@@ -20,20 +20,26 @@ enum ForegroundCommand {
       return nil
     }
     let name = String(cString: buffer)
-    guard interpreters.contains(name), let script = script(of: group) else {
-      return name
+    let args = arguments(of: group)
+    if interpreters.contains(name) {
+      let script = args.dropFirst().first(where: { !$0.hasPrefix("-") })
+      return script.map { ($0 as NSString).lastPathComponent } ?? name
     }
-    return script
+    // `proc_name` is the resolved binary (a versioned file behind a
+    // symlink, say), not the name the user typed.
+    let typed = args.first.map { ($0 as NSString).lastPathComponent }
+      .map { $0.hasPrefix("-") ? String($0.dropFirst()) : $0 }
+    return typed.flatMap { $0.isEmpty ? nil : $0 } ?? name
   }
 
-  /// Basename of the first non-option argument after `argv[0]`.
-  private static func script(of pid: pid_t) -> String? {
+  /// The process's argv, empty when unreadable.
+  private static func arguments(of pid: pid_t) -> [String] {
     var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
     var size = 0
-    guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return nil }
+    guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return [] }
     var data = [UInt8](repeating: 0, count: size)
     guard sysctl(&mib, 3, &data, &size, nil, 0) == 0, size > 4 else {
-      return nil
+      return []
     }
     var argc: Int32 = 0
     withUnsafeMutableBytes(of: &argc) { $0.copyBytes(from: data[0 ..< 4]) }
@@ -47,8 +53,6 @@ enum ForegroundCommand {
       args.append(String(decoding: data[i ..< end], as: UTF8.self))
       i = end + 1
     }
-    guard let arg = args.dropFirst().first(where: { !$0.hasPrefix("-") })
-    else { return nil }
-    return (arg as NSString).lastPathComponent
+    return args
   }
 }

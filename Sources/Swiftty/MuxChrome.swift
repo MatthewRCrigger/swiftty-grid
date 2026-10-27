@@ -12,6 +12,8 @@ struct MuxTabItem: Equatable {
   /// The tab's stored name, which a rename edits; nil for an unnamed tab
   /// (the service's number), which shows its program instead.
   var name: String?
+  /// Accent override while a themed command runs in the tab's active pane.
+  var tint: NSColor? = nil
 }
 
 enum MuxIcons {
@@ -325,9 +327,14 @@ final class MuxTabButton: GridFlatView, NSTextFieldDelegate {
     guard let item else { return }
     let ink: NSColor =
       item.isActive ? Grid.accentOn : (hovering ? Grid.ink100 : Grid.ink200)
-    fillColor = item.isActive ? Grid.accentNow : nil
-    strokeColor =
-      item.isActive ? Grid.accentNow : (hovering ? Grid.line100 : Grid.line300)
+    if let tint = item.tint {
+      fillColor = item.isActive ? tint : tint.withAlphaComponent(hovering ? 0.35 : 0.22)
+      strokeColor = tint
+    } else {
+      fillColor = item.isActive ? Grid.accentNow : nil
+      strokeColor =
+        item.isActive ? Grid.accentNow : (hovering ? Grid.line100 : Grid.line300)
+    }
     label.textColor = ink
     icon.contentTintColor = ink
     closeButton.contentTintColor = ink
