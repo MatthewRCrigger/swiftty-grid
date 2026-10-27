@@ -75,19 +75,23 @@ public enum ControlMessage: Hashable, Sendable {
     /// An admitted operation whose bytes are not all written yet.
     public var partialInputSequence: UInt64?
     public var resizeRevision: UInt64
+    /// Additions the host accepts; omitted (empty) from older hosts.
+    public var features: RSTFeatures
 
     public init(
       attachmentEpoch: UInt64,
       writerID: WriterID,
       lastFullyAppliedInputSequence: UInt64,
       partialInputSequence: UInt64? = nil,
-      resizeRevision: UInt64
+      resizeRevision: UInt64,
+      features: RSTFeatures = []
     ) {
       self.attachmentEpoch = attachmentEpoch
       self.writerID = writerID
       self.lastFullyAppliedInputSequence = lastFullyAppliedInputSequence
       self.partialInputSequence = partialInputSequence
       self.resizeRevision = resizeRevision
+      self.features = features
     }
   }
 
@@ -162,7 +166,7 @@ extension ControlMessage: Codable {
     case type, sessionID, serverInstanceID, writerID, applicationToken,
       attachmentEpoch, lastFullyAppliedInputSequence, partialInputSequence,
       resizeRevision, sequence, operation, screenRevision, nonce, status,
-      finalScreenRevision, code, message
+      finalScreenRevision, code, message, features
   }
 
   public init(from decoder: any Decoder) throws {
@@ -200,7 +204,10 @@ extension ControlMessage: Codable {
             forKey: .partialInputSequence
           )?
           .value,
-          resizeRevision: try u64(.resizeRevision)
+          resizeRevision: try u64(.resizeRevision),
+          features: RSTFeatures(
+            names: try c.decodeIfPresent([String].self, forKey: .features) ?? []
+          )
         )
       )
     case "Input":
@@ -280,6 +287,7 @@ extension ControlMessage: Codable {
       try u64(a.lastFullyAppliedInputSequence, .lastFullyAppliedInputSequence)
       if let p = a.partialInputSequence { try u64(p, .partialInputSequence) }
       try u64(a.resizeRevision, .resizeRevision)
+      if !a.features.isEmpty { try c.encode(a.features.names, forKey: .features) }
     case let .input(i):
       try u64(i.attachmentEpoch, .attachmentEpoch)
       try u64(i.sequence, .sequence)
@@ -305,5 +313,31 @@ extension ControlMessage: Codable {
       if let s = error.sequence { try u64(s, .sequence) }
       try c.encodeIfPresent(error.message, forKey: .message)
     }
+  }
+}
+
+/// Additive RST/1 behaviour a host advertises in `Attached`. Older peers
+/// ignore the field; names this build does not know are ignored.
+public struct RSTFeatures: OptionSet, Hashable, Sendable {
+  public var rawValue: UInt32
+  public init(rawValue: UInt32) { self.rawValue = rawValue }
+
+  /// `kp:<key>` key names. Clients send the main-keyboard key without it.
+  public static let keypadKeys = RSTFeatures(rawValue: 1 << 0)
+
+  public static let supported: RSTFeatures = [.keypadKeys]
+
+  private static let wireNames: [(String, RSTFeatures)] = [
+    ("keypadKeys", .keypadKeys)
+  ]
+
+  init(names: [String]) {
+    self = Self.wireNames.reduce(into: []) { result, entry in
+      if names.contains(entry.0) { result.insert(entry.1) }
+    }
+  }
+
+  var names: [String] {
+    Self.wireNames.compactMap { contains($0.1) ? $0.0 : nil }
   }
 }

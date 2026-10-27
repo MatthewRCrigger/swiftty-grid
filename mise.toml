@@ -19,8 +19,11 @@ description = "Build everything (release)"
 run = "swift build -c release"
 
 [tasks.test]
-description = "Run unit + integration tests"
-run = "Scripts/test.sh"
+description = "Run unit + integration tests (native test bundle host)"
+# Plain `swift test` drains the main queue on a bare CFRunLoopRun; AppKit's
+# event thread stops it when window-server events arrive, ending the AppKit
+# bundles early. The native host runs NSApplication instead.
+run = "Scripts/test-native.sh"
 
 [tasks.test-native]
 description = "Run the full suite with the native test bundle host"
@@ -81,7 +84,7 @@ run = "Scripts/format-swift.sh check"
 
 [tasks.test-internal]
 description = "Run tests with storage and terminal invariant checks"
-run = "Scripts/test.sh -Xswiftc -DSWIFTTY_INTERNAL_CHECKS"
+run = "Scripts/test-native.sh -Xswiftc -DSWIFTTY_INTERNAL_CHECKS"
 
 [tasks.bench-storage]
 description = "Measure storage operation scaling"

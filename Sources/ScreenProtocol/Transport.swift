@@ -10,7 +10,8 @@ public struct RSTConnectionHandler: Sendable {
   /// Raw control-stream bytes in order (feed a `ControlRecordReader`).
   public var onControl: @Sendable ([UInt8]) async -> Void
   /// One complete snapshot stream payload (client side), already bounded
-  /// by the snapshot limits. Incomplete or canceled streams never arrive.
+  /// by the snapshot limits. Incomplete streams never arrive. A superseded
+  /// stream can still finish, so clients must reject stale screen revisions.
   public var onSnapshot: @Sendable ([UInt8]) async -> Void
   /// The connection ended; nil for an orderly close.
   public var onClosed: @Sendable ((any Error)?) -> Void
@@ -51,7 +52,8 @@ public protocol RSTConnection: AnyObject, Sendable {
   /// Server: sends one snapshot payload on a new stream followed by FIN.
   /// Throws `RSTTransportError.canceled` if canceled first.
   func sendSnapshot(_ payload: [UInt8], stream id: UInt64) async throws
-  /// Server: cancels a superseded snapshot stream (resets it).
+  /// Server: abandons a superseded snapshot. Bytes already accepted by the
+  /// transport may still arrive as a complete payload at the client.
   func cancelSnapshot(stream id: UInt64)
   /// Closes the connection and all streams. Idempotent.
   func close()

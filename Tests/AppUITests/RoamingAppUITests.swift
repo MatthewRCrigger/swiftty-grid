@@ -9,6 +9,7 @@ import XCTest
 /// The app is launched with `-ui-testing`: fresh on-disk state for each
 /// launch and an invisible `terminal.screen` element carrying the visible
 /// terminal text (see Apps/Shared/UITesting.swift).
+@MainActor
 final class RoamingAppUITests: XCTestCase {
   struct Server {
     let host: String
@@ -21,7 +22,7 @@ final class RoamingAppUITests: XCTestCase {
   private var server: Server!
   private var app: XCUIApplication!
 
-  override func setUpWithError() throws {
+  override func setUp() async throws {
     continueAfterFailure = false
     let env = ProcessInfo.processInfo.environment
     guard let host = env["RST_UI_HOST"], let port = env["RST_UI_PORT"],
@@ -42,9 +43,9 @@ final class RoamingAppUITests: XCTestCase {
     app.launch()
   }
 
-  override func tearDown() {
+  override func tearDown() async throws {
     app?.terminate()
-    super.tearDown()
+    try await super.tearDown()
   }
 
   // MARK: Tests
@@ -147,6 +148,73 @@ final class RoamingAppUITests: XCTestCase {
     XCTAssertFalse(element("trust.fingerprint").exists)
   }
 
+  /// A trust sheet belongs to the SFTP browser while it is open. Rejecting
+  /// that prompt must leave the browser usable, and closing the browser must
+  /// restore the root's ability to present the next connection's prompts.
+  func testNestedSFTPPromptsReturnOwnershipToRoot() throws {
+    addHost(nickname: "Prompt Box")
+    for _ in 0 ..< 2 {
+      openHostMenuItem("Browse Files…", nickname: "Prompt Box")
+      let fingerprint = element("trust.fingerprint")
+      XCTAssertTrue(fingerprint.waitForExistence(timeout: 30))
+      XCTAssertEqual(text(of: fingerprint), server.fingerprint)
+      press(element("trust.reject"))
+      XCTAssertTrue(fingerprint.waitForNonExistence(timeout: 10))
+      XCTAssertTrue(element("sftp.retry").waitForExistence(timeout: 15))
+      XCTAssertTrue(anyText("Host key not trusted").exists)
+      closeFailedBrowser(nickname: "Prompt Box")
+    }
+
+    // Ordinary SSH presents prompts from the root, without a chooser sheet
+    // that could mask leaked browser ownership by presenting them itself.
+    openHostMenuItem("Open Ordinary SSH Shell", nickname: "Prompt Box")
+    let fingerprint = element("trust.fingerprint")
+    XCTAssertTrue(
+      fingerprint.waitForExistence(timeout: 30),
+      "root trust prompt missing"
+    )
+    XCTAssertEqual(text(of: fingerprint), server.fingerprint)
+    press(element("trust.accept"))
+    signIn()
+    waitForConnected()
+    typeLine("echo root-$((6*7))")
+    waitForScreen(containing: "root-42")
+    press(element("terminal.close"))
+    XCTAssertTrue(element("hosts.add").waitForExistence(timeout: 10))
+  }
+
+  /// Password cancellation follows a different sheet anchor from trust.
+  /// After each nested cancellation the browser must still close, and the
+  /// root must be able to ask again for the uncached password.
+  func testNestedSFTPPasswordCancellationReturnsOwnershipToRoot() throws {
+    addHost(nickname: "Password Box")
+    for attempt in 0 ..< 2 {
+      openHostMenuItem("Browse Files…", nickname: "Password Box")
+      if attempt == 0 {
+        let fingerprint = element("trust.fingerprint")
+        XCTAssertTrue(fingerprint.waitForExistence(timeout: 30))
+        XCTAssertEqual(text(of: fingerprint), server.fingerprint)
+        press(element("trust.accept"))
+      }
+      let field = element("password.field")
+      XCTAssertTrue(field.waitForExistence(timeout: 30))
+      XCTAssertFalse(element("trust.fingerprint").exists)
+      press(app.buttons["Cancel"].firstMatch)
+      XCTAssertTrue(field.waitForNonExistence(timeout: 10))
+      XCTAssertTrue(element("sftp.retry").waitForExistence(timeout: 15))
+      XCTAssertTrue(anyText("Sign-in cancelled").exists)
+      closeFailedBrowser(nickname: "Password Box")
+    }
+
+    openHostMenuItem("Open Ordinary SSH Shell", nickname: "Password Box")
+    signIn()
+    waitForConnected()
+    typeLine("echo password-$((6*7))")
+    waitForScreen(containing: "password-42")
+    press(element("terminal.close"))
+    XCTAssertTrue(element("hosts.add").waitForExistence(timeout: 10))
+  }
+
   // MARK: Steps
 
   private func addHost(nickname: String) {
@@ -169,6 +237,30 @@ final class RoamingAppUITests: XCTestCase {
     XCTAssertTrue(row.waitForExistence(timeout: 10))
     press(row)
     allowLocalNetworkIfAsked()
+  }
+
+  private func openHostMenuItem(_ title: String, nickname: String) {
+    let row = hostRow(nickname)
+    XCTAssertTrue(row.waitForExistence(timeout: 10))
+    #if os(macOS) || targetEnvironment(macCatalyst)
+    row.rightClick()
+    #else
+    row.press(forDuration: 1)
+    #endif
+    let item =
+      app.menuItems[title].exists ? app.menuItems[title] : app.buttons[title]
+    XCTAssertTrue(item.waitForExistence(timeout: 10), "no \(title) menu item")
+    press(item)
+    allowLocalNetworkIfAsked()
+  }
+
+  private func closeFailedBrowser(nickname: String) {
+    let done = element("sftp.done")
+    XCTAssertTrue(done.waitForExistence(timeout: 10))
+    press(done)
+    XCTAssertTrue(done.waitForNonExistence(timeout: 10))
+    XCTAssertTrue(element("sftp.retry").waitForNonExistence(timeout: 10))
+    XCTAssertTrue(hostRow(nickname).waitForExistence(timeout: 10))
   }
 
   /// A physical device asks once for Local Network access when the app

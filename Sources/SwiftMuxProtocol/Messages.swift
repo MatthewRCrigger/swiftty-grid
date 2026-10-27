@@ -78,6 +78,9 @@ public struct ClientCapabilities: OptionSet, Codable, Sendable, Equatable {
   public static let observers = ClientCapabilities(rawValue: 1 << 1)
   /// The client scrolls a viewport without resizing the PTY.
   public static let viewerViewport = ClientCapabilities(rawValue: 1 << 2)
+  /// The client answers `clipboardRead` and `clipboardWrite` events.
+  /// Only frontends with a pasteboard ask for it (not in `supported`).
+  public static let clipboardRequests = ClientCapabilities(rawValue: 1 << 3)
 
   public static let supported: ClientCapabilities = [
     .attachReadiness, .observers, .viewerViewport,
@@ -159,9 +162,17 @@ public struct ServiceFeatures: OptionSet, Codable, Sendable, Equatable {
   public static let terminalControl = ServiceFeatures(rawValue: 1 << 2)
   /// `link`, `commandOutput` and `MuxInput.moveCursor`.
   public static let shellIntegration = ServiceFeatures(rawValue: 1 << 3)
+  /// `MuxKey.keypad`. Clients send the main-keyboard key without it.
+  public static let keypadKeys = ServiceFeatures(rawValue: 1 << 4)
+  /// Kitty clipboard events (to clients with `clipboardRequests`), their
+  /// result commands, and `MuxInput.clipboardPaste`.
+  public static let kittyClipboard = ServiceFeatures(rawValue: 1 << 5)
+  /// `PaneFrame.dropTarget` and `MuxInput.drag`.
+  public static let dropTargets = ServiceFeatures(rawValue: 1 << 6)
 
   public static let supported: ServiceFeatures = [
     .mouseReporting, .historyJumps, .terminalControl, .shellIntegration,
+    .keypadKeys, .kittyClipboard, .dropTargets,
   ]
 }
 
@@ -665,6 +676,14 @@ public enum MuxCommand: Codable, Sendable, Equatable {
   /// `commandOutput`.
   case commandOutput(pane: PaneID, at: HistoryAddress?)
 
+  // Kitty clipboard (lease required; `kittyClipboard`).
+  case clipboardReadResult(pane: PaneID, token: UInt64, MuxClipboardReadResult)
+  case clipboardWriteResult(
+    pane: PaneID,
+    token: UInt64,
+    MuxClipboardWriteResult
+  )
+
   /// Admitted at the update barrier: status, leaving, ending sessions
   /// and toggling quiescence. Everything that changes the workspace
   /// graph or starts work is refused.
@@ -675,7 +694,7 @@ public enum MuxCommand: Codable, Sendable, Equatable {
       .setSubscriptions, .setViewport, .scroll, .searchStep, .endSearch,
       .clearScreen, .resetTerminal, .link, .commandOutput, .setTheme,
       .observeWorkspaces, .subscribeInbox, .inbox, .locateAttention, .markSeen,
-      .snooze, .markReviewed:
+      .snooze, .markReviewed, .clipboardReadResult, .clipboardWriteResult:
       true
     default: false
     }
@@ -800,6 +819,16 @@ public enum MuxKey: Codable, Sendable, Hashable {
   case up, down, left, right
   case home, end, pageUp, pageDown, insert, delete
   case function(Int)
+  /// Requires `ServiceFeatures.keypadKeys`.
+  case keypad(MuxKeypadKey)
+}
+
+/// Numeric keypad keys.
+public enum MuxKeypadKey: String, Codable, CaseIterable, Sendable, Hashable {
+  case zero, one, two, three, four, five, six, seven, eight, nine
+  case decimal, divide, multiply, subtract, add, enter, equal, separator
+  case left, right, up, down, pageUp, pageDown, home, end, insert, delete
+  case begin
 }
 
 public struct MuxMouse: Codable, Sendable, Hashable {
@@ -841,6 +870,12 @@ public enum MuxInput: Codable, Sendable, Hashable {
   /// sent only while the shell edits a command line there (OSC 133;
   /// `shellIntegration`). Nothing is written otherwise.
   case moveCursor(HistoryAddress, column: Int)
+  /// The user pasted from the clipboard while the program asked for kitty
+  /// paste events (`SupportedViewModes.kittyPasteEvents`): the service
+  /// reports these available types instead of typing (`kittyClipboard`).
+  case clipboardPaste(types: [String])
+  /// A native drag over the pane (`dropTargets`).
+  case drag(MuxDrag)
   /// One bounded paste (at most `maxPasteChunkBytes`), admitted or
   /// refused whole and bracketed per the pane's modes. Larger pastes use
   /// the `pasteBegin`/`pasteChunk`/`pasteEnd` records.
@@ -922,6 +957,9 @@ public enum MuxEvent: Codable, Sendable {
   case workspaces([WorkspaceSummary])
   /// Subscribers only (`subscribeInbox`), after reduction.
   case inbox(InboxUpdate)
+  /// The controller only, with `ClientCapabilities.clipboardRequests`.
+  case clipboardRead(MuxClipboardRead)
+  case clipboardWrite(MuxClipboardWrite)
 }
 
 public enum PasteState: String, Codable, Sendable {

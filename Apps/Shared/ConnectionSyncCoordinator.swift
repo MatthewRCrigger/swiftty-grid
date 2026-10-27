@@ -48,6 +48,19 @@ public final class ConnectionSyncCoordinator {
   /// The account last verified by `accountID()`, if any.
   public private(set) var currentAccount: String?
 
+  /// Revocation takes effect even when the durable settings write fails.
+  /// Keep retrying that write before any later refresh or explicit opt-in.
+  private var pendingMetadataDisable = false
+  private var pendingTrustDisable = false
+
+  public var metadataSyncEnabled: Bool {
+    !pendingMetadataDisable && snapshot.settings.metadataSync
+  }
+
+  public var trustSyncEnabled: Bool {
+    !pendingTrustDisable && snapshot.settings.trustSync
+  }
+
   @ObservationIgnored
   private weak var app: RoamingAppModel?
   @ObservationIgnored
@@ -97,7 +110,7 @@ public final class ConnectionSyncCoordinator {
 
   /// A debounced sync after a local edit, while the app is active.
   func localChange() {
-    guard snapshot.settings.metadataSync, isActive else { return }
+    guard metadataSyncEnabled, isActive else { return }
     status = .pending
     debounce?.cancel()
     debounce = Task { [weak self, debounceDelay] in
@@ -107,15 +120,11 @@ public final class ConnectionSyncCoordinator {
     }
   }
 
-  /// Launch, foreground or explicit Refresh: fetch and send. Refresh also
-  /// asks the identity store to look again for keys; it cannot force
-  /// iCloud Keychain delivery.
+  /// Launch, foreground or explicit Refresh: verify the selected account,
+  /// then fetch and send only while metadata sync is enabled. Account
+  /// isolation remains active when uploads are disabled.
   @discardableResult
   public func refresh() -> Task<Void, Never>? {
-    guard snapshot.settings.metadataSync else {
-      status = .off
-      return nil
-    }
     if let running {
       rerun = true
       return running
@@ -146,11 +155,16 @@ public final class ConnectionSyncCoordinator {
   /// The system reported an iCloud account change: stop, invalidate
   /// in-flight work and re-verify before anything else commits.
   public func accountDidChange() {
+    app?.identityStore?.accountDidChange()
     generation += 1
     running?.cancel()
     running = nil
     debounce?.cancel()
     currentAccount = nil
+    commit(generation: generation) {
+      $0.selectKeychainAccount(nil)
+      $0.selectAccount(nil)
+    }
     refresh()
   }
 
@@ -161,26 +175,55 @@ public final class ConnectionSyncCoordinator {
   /// never deletes cloud records or synchronizable Keychain items.
   public func setMetadataSync(_ enabled: Bool) async throws(CloudSyncError) {
     guard enabled else {
+      pendingMetadataDisable = true
       generation += 1
       running?.cancel()
       running = nil
-      commit(generation: generation) { $0.settings.metadataSync = false }
+      debounce?.cancel()
       status = .off
+      guard persistSyncRevocations() else { throw .settingsNotSaved }
       return
     }
+    guard persistSyncRevocations() else { throw .settingsNotSaved }
+    let generation = generation
     let account = try await database.accountID()
+    guard generation == self.generation, !Task.isCancelled else { return }
     currentAccount = account
-    commit(generation: generation) { snapshot in
-      snapshot.settings.metadataSync = true
-      Self.bind(&snapshot, to: account)
-    }
+    guard
+      commit(
+        generation: generation,
+        { snapshot in
+          snapshot.settings.metadataSync = true
+          Self.bind(&snapshot, to: account)
+        }
+      )
+    else { throw .settingsNotSaved }
     refresh()
+  }
+
+  @discardableResult
+  private func persistSyncRevocations() -> Bool {
+    guard pendingMetadataDisable || pendingTrustDisable else { return true }
+    guard
+      commit(
+        generation: generation,
+        {
+          if pendingMetadataDisable { $0.settings.metadataSync = false }
+          if pendingTrustDisable { $0.settings.trustSync = false }
+        }
+      )
+    else { return false }
+    pendingMetadataDisable = false
+    pendingTrustDisable = false
+    return true
   }
 
   /// Confirms publishing this device's local-only data to the current,
   /// newly selected account (§8.4).
   public func confirmCurrentAccount() async throws(CloudSyncError) {
+    let generation = generation
     let account = try await database.accountID()
+    guard generation == self.generation, !Task.isCancelled else { return }
     currentAccount = account
     commit(generation: generation) { Self.bind(&$0, to: account) }
     refresh()
@@ -190,7 +233,16 @@ public final class ConnectionSyncCoordinator {
   /// entity that the account has not acknowledged at its current revision.
   static func bind(_ snapshot: inout ConnectionSnapshot, to account: String) {
     snapshot.accounts[account, default: AccountPartition()].consented = true
-    snapshot.boundAccount = account
+    snapshot.selectKeychainAccount(account)
+    snapshot.selectAccount(account)
+    for index in snapshot.intents.indices {
+      let intent = snapshot.intents[index]
+      if intent.account == nil, !intent.hasUnverifiedAccount,
+        intent.keychainAccount == nil || intent.keychainAccount == account
+      {
+        snapshot.intents[index].account = account
+      }
+    }
     let synced = snapshot.accounts[account]?.synced ?? [:]
     func queue(_ name: String, _ revision: LogicalRevision?) {
       guard let revision, snapshot.isVisible(name), synced[name] != revision
@@ -222,11 +274,20 @@ public final class ConnectionSyncCoordinator {
 
   /// Trusted-host sync, separately opt-in. Enabling it records this
   /// device's current trusted keys for upload.
-  public func setTrustSync(_ enabled: Bool, trustedKeys: [HostIdentity: String])
-  {
-    commit(generation: generation) { snapshot in
+  @discardableResult
+  public func setTrustSync(
+    _ enabled: Bool,
+    trustedKeys: [HostIdentity: String]
+  ) -> Bool {
+    guard enabled else {
+      pendingTrustDisable = true
+      let saved = persistSyncRevocations()
+      refresh()
+      return saved
+    }
+    guard persistSyncRevocations() else { return false }
+    let saved = commit(generation: generation) { snapshot in
       snapshot.settings.trustSync = enabled
-      guard enabled else { return }
       for (identity, key) in trustedKeys {
         snapshot.recordLocalTrust(
           host: identity.host,
@@ -240,13 +301,16 @@ public final class ConnectionSyncCoordinator {
         Self.bind(&snapshot, to: account)
       }
     }
-    refresh()
+    if saved { refresh() }
+    return saved
   }
 
   /// Explicit recovery after zone loss: re-creates the zone for the
   /// verified current account and re-uploads that account's data.
   public func recoverZone() async throws(CloudSyncError) {
+    let generation = generation
     let account = try await database.accountID()
+    guard generation == self.generation, !Task.isCancelled else { return }
     guard account == snapshot.boundAccount else {
       status = .accountChanged
       return
@@ -268,39 +332,43 @@ public final class ConnectionSyncCoordinator {
   // MARK: Run
 
   private func run(generation: Int) async {
-    guard snapshot.settings.metadataSync else {
-      status = .off
-      return
-    }
+    persistSyncRevocations()
     let account: String
     do { account = try await database.accountID() } catch {
       guard generation == self.generation else { return }
       if error == .accountRequired {
         // Signed out: quarantine the previous account's data (§8.4). It
         // returns when the user signs in to that account again.
-        if snapshot.boundAccount != nil {
-          commit(generation: generation) { $0.boundAccount = nil }
+        commit(generation: generation) {
+          $0.selectKeychainAccount(nil)
+          $0.selectAccount(nil)
         }
         currentAccount = nil
-        status = .accountRequired
+        status = metadataSyncEnabled ? .accountRequired : .off
       } else {
-        status = .offline
+        status = metadataSyncEnabled ? .offline : .off
       }
       return
     }
     guard generation == self.generation, !Task.isCancelled else { return }
     currentAccount = account
+    guard commit(generation: generation, { $0.selectKeychainAccount(account) })
+    else { return }
     if snapshot.boundAccount != account {
       if snapshot.accounts[account]?.consented == true {
         // Back to an account the user already synced with.
-        commit(generation: generation) { $0.boundAccount = account }
+        commit(generation: generation) { $0.selectAccount(account) }
       } else {
         // Quarantine the previous account's data; publish nothing until the
         // user confirms this account.
-        commit(generation: generation) { $0.boundAccount = nil }
-        status = .accountChanged
+        commit(generation: generation) { $0.selectAccount(nil) }
+        status = metadataSyncEnabled ? .accountChanged : .off
         return
       }
+    }
+    guard metadataSyncEnabled else {
+      status = .off
+      return
     }
     var partition: AccountPartition {
       snapshot.accounts[account] ?? AccountPartition()
@@ -324,8 +392,11 @@ public final class ConnectionSyncCoordinator {
         else { return }
       }
       try await fetch(account: account, generation: generation)
+      guard generation == self.generation, !Task.isCancelled,
+        metadataSyncEnabled
+      else { return }
       try await send(account: account, generation: generation)
-      guard generation == self.generation else { return }
+      guard generation == self.generation, !Task.isCancelled else { return }
       commit(generation: generation) { snapshot in
         snapshot.accounts[account]?.attempts = 0
         snapshot.accounts[account]?.retryAt = nil
@@ -426,17 +497,30 @@ public final class ConnectionSyncCoordinator {
     for _ in 0 ..< 3 {
       let entries =
         (snapshot.accounts[account]?.outbox.values).map(Array.init) ?? []
-      let ready = entries.sorted { $0.recordName < $1.recordName }
-        .compactMap { entry in
-          Self.record(for: entry, account: account, in: snapshot)
-            .map { (entry, $0) }
-        }
-      guard !ready.isEmpty else { return }
+      let pending = entries.sorted { $0.recordName < $1.recordName }
+      guard !pending.isEmpty else { return }
       var conflicted = false
-      for start in stride(from: 0, to: ready.count, by: Self.batchSize) {
-        let batch = Array(
-          ready[start ..< min(start + Self.batchSize, ready.count)]
-        )
+      for start in stride(from: 0, to: pending.count, by: Self.batchSize) {
+        // Consent, revisions and conflict state can change during a previous
+        // save. Build only this batch from the current publishable outbox.
+        let batch = pending[
+          start ..< min(start + Self.batchSize, pending.count)
+        ]
+        .compactMap { entry -> (OutboxEntry, CloudRecord)? in
+          guard !entry.recordName.hasPrefix("knownhost-") || trustSyncEnabled,
+            let current = snapshot.accounts[account]?.outbox[entry.recordName],
+            let record = Self.record(
+              for: current,
+              account: account,
+              in: snapshot
+            )
+          else { return nil }
+          return (current, record)
+        }
+        guard !batch.isEmpty else { continue }
+        guard generation == self.generation, !Task.isCancelled,
+          metadataSyncEnabled
+        else { return }
         let results = try await database.save(batch.map(\.1))
         guard generation == self.generation, !Task.isCancelled else { return }
         var firstError: CloudSyncError?
@@ -507,6 +591,7 @@ public final class ConnectionSyncCoordinator {
     in snapshot: ConnectionSnapshot
   ) -> CloudRecord? {
     let name = entry.recordName
+    guard snapshot.scopes[name] == account else { return nil }
     let tag = snapshot.accounts[account]?.systemFields[name]
     if name.hasPrefix("host-") {
       guard let id = UUID(uuidString: String(name.dropFirst(5))),
@@ -584,6 +669,7 @@ public final class ConnectionSyncCoordinator {
     case ConnectionRecords.knownHost:
       switch ConnectionRecords.decodeKnownHost(record) {
       case .value(let remote):
+        snapshot.activateRecord(record.name, for: account)
         snapshot.observe(remote.revision)
         snapshot.scopes[record.name] = account
         snapshot.trustInbox[record.name] = remote
@@ -634,6 +720,7 @@ public final class ConnectionSyncCoordinator {
     into snapshot: inout ConnectionSnapshot
   ) {
     let id = remote.profile.id
+    snapshot.activateRecord(name, for: account)
     snapshot.observe(remote.revision)
     snapshot.scopes[name] = account
     snapshot.accounts[account]?.synced[name] = remote.revision
@@ -732,6 +819,22 @@ public final class ConnectionSyncCoordinator {
     account: String,
     into snapshot: inout ConnectionSnapshot
   ) {
+    if snapshot.unverifiedKeychainIdentities?.contains(remote.id) == true {
+      // Keep this account's delivery without assigning ownership to the
+      // older unscoped local identity. Review will reconcile matching data.
+      if snapshot.accounts[account]?.cachedRecords == nil {
+        snapshot.accounts[account, default: AccountPartition()].cachedRecords =
+          [:]
+      }
+      snapshot.accounts[account]?.cachedRecords?[name] = .identity(
+        metadata: remote,
+        conflict: nil
+      )
+      snapshot.accounts[account]?.synced[name] = remote.revision
+      snapshot.observe(remote.revision)
+      return
+    }
+    snapshot.activateRecord(name, for: account)
     snapshot.observe(remote.revision)
     snapshot.scopes[name] = account
     snapshot.accounts[account]?.synced[name] = remote.revision
@@ -800,7 +903,6 @@ public final class ConnectionSyncCoordinator {
   /// markers that block nothing silently (§8.3).
   private func applyTrustInbox(generation: Int) async {
     guard let app, !snapshot.trustInbox.isEmpty else { return }
-    let trustSync = snapshot.settings.trustSync
     let store = app.ssh.trustFile
     // Applied to the trust file one by one, committed to the snapshot once.
     var settled:
@@ -827,14 +929,18 @@ public final class ConnectionSyncCoordinator {
       }
     }
     for (name, remote) in snapshot.trustInbox {
-      guard trustSync else { break }
+      guard generation == self.generation, !Task.isCancelled, trustSyncEnabled
+      else { return }
+      // Received trust remains quarantined with its originating account.
+      guard snapshot.isVisible(name) else { continue }
       guard let endpoint = HostIdentity(host: remote.host, port: remote.port)
       else {
         settled.append((name, remote, false, nil))
         continue
       }
       let local = try? await store.trustedKey(for: endpoint)
-      guard generation == self.generation else { return }
+      guard generation == self.generation, !Task.isCancelled, trustSyncEnabled
+      else { return }
       var review: TrustReview?
       var adopt = false
       if remote.deletedAt != nil {
@@ -870,7 +976,8 @@ public final class ConnectionSyncCoordinator {
           remote.publicKey,
           for: endpoint
         )
-        guard generation == self.generation else { return }
+        guard generation == self.generation, !Task.isCancelled, trustSyncEnabled
+        else { return }
         adopt = stored == remote.publicKey
         if let stored, stored != remote.publicKey {
           review = TrustReview(
@@ -901,7 +1008,9 @@ public final class ConnectionSyncCoordinator {
     trustRemote: Bool = false,
     remove: Bool = false
   ) async {
-    guard let app,
+    let generation = generation
+    guard let app, !Task.isCancelled, snapshot.isVisible(review.recordName),
+      snapshot.trustReviews[review.recordName] == review,
       let endpoint = HostIdentity(host: review.host, port: review.port)
     else { return }
     let store = app.ssh.trustFile
@@ -938,6 +1047,7 @@ public final class ConnectionSyncCoordinator {
   /// Resolves a connection-tuple conflict by keeping this device's version
   /// (re-sent with a newer revision) or adopting the other device's.
   public func resolveConflict(host id: UUID, keepLocal: Bool) {
+    guard snapshot.isVisible(ConnectionSnapshot.hostRecord(id)) else { return }
     commit(generation: generation) { snapshot in
       guard let conflict = snapshot.hostConflicts[id] else { return }
       snapshot.hostConflicts[id] = nil

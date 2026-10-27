@@ -10,22 +10,27 @@ import SwifttyCore
 /// A protocol rather than a closure: SwiftUI cannot compare closures, so a
 /// closure-valued environment entry invalidates its readers on every write.
 public protocol TerminalSurfaceFactory: Sendable {
-  @MainActor func makeSurface(for model: TerminalScreenModel) -> AnyView
+  @MainActor
+  func makeSurface(for model: TerminalScreenModel) -> AnyView
 }
 
 extension EnvironmentValues {
-  @Entry public var terminalSurfaceFactory: (any TerminalSurfaceFactory)?
+  @Entry
+  public var terminalSurfaceFactory: (any TerminalSurfaceFactory)?
 }
 
 /// The terminal screen for one session: connection state, pending input
 /// and capability chrome around the surface from `TerminalSurfaceFactory`
 /// (a Swiftty renderer fed by a roaming, ordinary-SSH or local backend).
 public struct TerminalScreen: View {
-  @Bindable var model: TerminalScreenModel
-  @Environment(\.terminalSurfaceFactory) private var factory
+  @Bindable
+  var model: TerminalScreenModel
+  @Environment(\.terminalSurfaceFactory)
+  private var factory
   /// Pending input that outlived a normal round trip; a keystroke awaiting
   /// its ack is not worth showing.
-  @State private var pendingVisible = false
+  @State
+  private var pendingVisible = false
   let onClose: () -> Void
 
   public init(model: TerminalScreenModel, onClose: @escaping () -> Void) {
@@ -57,6 +62,18 @@ public struct TerminalScreen: View {
     }
     .modifier(PendingInputDelay(model: model, visible: $pendingVisible))
     .navigationTitle(model.host.nickname)
+    .alert(
+      Text("Unable to open shell", bundle: #bundle),
+      isPresented: Binding(
+        get: { model.actionError != nil },
+        set: { if !$0 { model.actionError = nil } }
+      )
+    ) {
+      Button(.localized("OK"), role: .cancel) { model.actionError = nil }
+    } message: {
+      Text(model.actionError ?? "")
+        .accessibilityIdentifier("terminal.actionError")
+    }
     #if os(iOS) && !targetEnvironment(macCatalyst)
     // iPhone and iPad: the host name sits in the top row beside Back, and
     // Close joins the session actions, so the terminal starts higher.
@@ -104,7 +121,8 @@ private let terminalStatusInTitle: Bool = {
 /// only this, not the whole screen.
 private struct PendingInputDelay: ViewModifier {
   let model: TerminalScreenModel
-  @Binding var visible: Bool
+  @Binding
+  var visible: Bool
 
   func body(content: Content) -> some View {
     content.task(id: model.pendingInputCount > 0) {
@@ -125,10 +143,8 @@ private struct TerminalTitle: View {
 
   var body: some View {
     HStack(spacing: 6) {
-      Circle()
-        .fill(model.connectionState.indicatorColor)
-        .frame(width: 8, height: 8)
-        .accessibilityElement()
+      Circle().fill(model.connectionState.indicatorColor)
+        .frame(width: 8, height: 8).accessibilityElement()
         .accessibilityLabel(Text(model.stateText))
         .accessibilityIdentifier("terminal.status")
       Text(model.host.nickname).font(.headline).lineLimit(1)
@@ -149,8 +165,7 @@ private struct TerminalStatusBar: View {
           )
       }
       if model.kind != .roaming {
-        Text(model.kind.displayName)
-          .foregroundStyle(.secondary)
+        Text(model.kind.displayName).foregroundStyle(.secondary)
       }
       Spacer()
       if pendingVisible, model.pendingInputCount > 0 {
@@ -169,11 +184,8 @@ private struct TerminalStatusBar: View {
         .foregroundStyle(.secondary)
       }
     }
-    .font(.footnote)
-    .padding(.horizontal)
-    .padding(.vertical, 8)
-    .glassPanel(cornerRadius: 0)
-    .accessibilityElement(children: .combine)
+    .font(.footnote).padding(.horizontal).padding(.vertical, 8)
+    .glassPanel(cornerRadius: 0).accessibilityElement(children: .combine)
     .accessibilityIdentifier(
       terminalStatusInTitle ? "terminal.details" : "terminal.status"
     )
@@ -201,17 +213,14 @@ struct TerminalSurfacePlaceholder: View {
 
   var body: some View {
     VStack(spacing: 12) {
-      Image(systemName: "apple.terminal")
-        .font(.largeTitle)
+      Image(systemName: "apple.terminal").font(.largeTitle)
         .foregroundStyle(.secondary)
       Text("Terminal unavailable", bundle: #bundle).font(.headline)
       Text(model.host.endpointSummary).font(.subheadline.monospaced())
         .foregroundStyle(.secondary)
       capabilityList
     }
-    .padding()
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .glassSurface()
+    .padding().frame(maxWidth: .infinity, maxHeight: .infinity).glassSurface()
     .accessibilityElement(children: .contain)
     .accessibilityLabel(Text("Terminal unavailable", bundle: #bundle))
   }
@@ -268,7 +277,8 @@ extension ClientConnectionState {
   var symbol: String {
     switch self {
     case .active: "bolt.horizontal.circle"
-    case .suspect, .reconnecting, .attaching, .sshBootstrap: "arrow.triangle.2.circlepath"
+    case .suspect, .reconnecting, .attaching, .sshBootstrap:
+      "arrow.triangle.2.circlepath"
     case .sessionLost, .sessionExited: "exclamationmark.triangle"
     default: "circle.dashed"
     }

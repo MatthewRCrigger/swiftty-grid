@@ -1,7 +1,7 @@
 #!/bin/sh
 # Tells Xcode to build Swift packages with the arm64e slice, so the app
 # targets' pointer authentication (ENABLE_ENHANCED_SECURITY, see
-# xcode-security-settings.md) also covers the package code they link: all
+# spec.roaming.md §2.5) also covers the package code they link: all
 # shared app logic lives in the local Swiftty package. Xcode reads this from
 # the project's embedded workspace settings, which XcodeGen does not write,
 # so Apps/project.yml runs this as its postGenCommand after every generation.

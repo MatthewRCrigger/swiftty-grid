@@ -471,7 +471,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       case .backspace: "\u{8}"
       case .delete: function(NSDeleteFunctionKey)
       case let .function(n): function(NSF1FunctionKey + n - 1)
-      case .insert: nil
+      case .insert, .keypad: nil
       }
     return key.map { ($0, mods) }
   }

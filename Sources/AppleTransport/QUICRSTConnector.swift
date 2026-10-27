@@ -65,6 +65,7 @@ public struct QUICRSTConnector: Sendable {
     limits: NegotiatedLimits = NegotiatedLimits(),
     beforeControlForTesting: (@Sendable (QUICRSTConnection) async -> Void)? =
       nil,
+    initialMaxDataForTesting: Int? = nil,
     beforeReturnForTesting: (@Sendable (QUICRSTConnection) async -> Void)?
   ) async throws -> QUICRSTConnection {
     guard !Task.isCancelled else { throw RSTTransportError.canceled }
@@ -94,6 +95,15 @@ public struct QUICRSTConnector: Sendable {
       verdict: verdict,
       queue: queue
     )
+    if let initialMaxDataForTesting {
+      // Network requires all stream data limits to be explicit when overriding
+      // connection credit. The shipped options remain untouched by this probe.
+      quic.initialMaxData = initialMaxDataForTesting
+      quic.initialMaxStreamDataBidirectionalLocal =
+        QUICOptions.snapshotStreamWindow
+      quic.initialMaxStreamDataBidirectionalRemote =
+        QUICOptions.snapshotStreamWindow
+    }
     let endpoint = NWEndpoint.hostPort(
       host: NWEndpoint.Host(host),
       port: nwPort

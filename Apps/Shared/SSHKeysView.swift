@@ -16,6 +16,8 @@ public struct SSHKeysView: View {
   @State
   private var creating: KeyCreationMode?
   @State
+  private var deletionReview: LegacyKeyDeletionReview?
+  @State
   private var availability: [UUID: IdentityAvailability] = [:]
   @State
   private var orphans: [Orphan] = []
@@ -54,6 +56,42 @@ public struct SSHKeysView: View {
         }
       }
       .listRowBackground(Color.clear)
+      if !model.keyAccountReviews.isEmpty {
+        Section {
+          ForEach(model.keyAccountReviews) { identity in
+            IdentityAccountReviewRow(model: model, identity: identity)
+          }
+        } header: {
+          Text("Keys Needing Account Review", bundle: #bundle)
+        } footer: {
+          Text(
+            """
+            These older keys have no saved iCloud account. Restore a matching key \
+            in the current account to use it again. Metadata sync remains a \
+            separate choice.
+            """,
+            bundle: #bundle
+          )
+        }
+        .listRowBackground(Color.clear)
+      }
+      if !model.keyDeletionReviews.isEmpty {
+        Section {
+          ForEach(model.keyDeletionReviews) { intent in
+            LegacyKeyDeletionRow(model: model, intent: intent) {
+              deletionReview = $0
+            }
+          }
+        } header: {
+          Text("Key Removals Needing Review", bundle: #bundle)
+        } footer: {
+          Text(
+            "An interrupted removal has no saved account information. Review the matching key before authorizing removal from the current account.",
+            bundle: #bundle
+          )
+        }
+        .listRowBackground(Color.clear)
+      }
       if !orphans.isEmpty {
         Section {
           ForEach(orphans) { orphan in
@@ -97,6 +135,10 @@ public struct SSHKeysView: View {
     .adaptiveSheet(item: $creating) { mode in
       KeyCreationView(model: model, mode: mode) { _ in creating = nil }
         .macSheetFrame(width: 480, height: 460)
+    }
+    .adaptiveSheet(item: $deletionReview) { review in
+      LegacyKeyDeletionView(model: model, review: review)
+        .macSheetFrame(width: 540, height: 420)
     }
     .task(id: model.identities) { await reload() }
   }
@@ -211,6 +253,12 @@ struct SSHKeyDetailView: View {
   @Bindable
   var model: RoamingAppModel
   let id: UUID
+  private struct Selection: Equatable {
+    var identity: SSHIdentityMetadata?
+    let accountGeneration: Int
+  }
+  @State
+  private var selection: Selection
   @State
   private var name = ""
   @State
@@ -239,7 +287,28 @@ struct SSHKeyDetailView: View {
   @Environment(\.dismiss)
   private var dismiss
 
-  private var identity: SSHIdentityMetadata? { model.identity(id) }
+  init(model: RoamingAppModel, id: UUID) {
+    self.model = model
+    self.id = id
+    let identity = model.identities.first { $0.id == id }
+    _selection = State(
+      initialValue: Selection(
+        identity: identity,
+        accountGeneration: model.accountGeneration
+      )
+    )
+    _name = State(initialValue: identity?.name ?? "")
+  }
+
+  private var selectionIsCurrent: Bool {
+    selection.identity != nil
+      && selection.accountGeneration == model.accountGeneration
+      && model.identities.first { $0.id == id } == selection.identity
+  }
+
+  private var identity: SSHIdentityMetadata? {
+    selectionIsCurrent ? selection.identity : nil
+  }
 
   private func currentReferencing() -> [HostProfile] {
     model.hosts.filter { $0.auth.identityID == id }
@@ -251,9 +320,25 @@ struct SSHKeyDetailView: View {
         .navigationTitle(
           identity.map { Text($0.name) } ?? Text("Key", bundle: #bundle)
         )
-        .disabled(working).onAppear { name = identity?.name ?? "" }
+        .disabled(working)
         .task(id: identity) {
-          availability = await model.identityStore.availability(id)
+          guard selectionIsCurrent else { return }
+          let value = await model.identityStore.availability(id)
+          guard selectionIsCurrent, !Task.isCancelled else { return }
+          availability = value
+        }
+        .onChange(of: selectionIsCurrent) {
+          guard !selectionIsCurrent else { return }
+          selection.identity = nil
+          confirmingDelete = false
+          confirmingCopy = false
+          confirmingWithdraw = false
+          repairing = false
+          repairData = nil
+          repairPassphrase = ""
+          name = ""
+          availability = nil
+          error = nil
         }
         .onChange(of: model.hosts, initial: true) {
           let hosts = currentReferencing()
@@ -287,9 +372,14 @@ struct SSHKeyDetailView: View {
         )
       } else {
         ContentUnavailableView(
-          .localized("Key Deleted"),
-          systemImage: "key.slash"
+          .localized("Key Changed"),
+          systemImage: "key.slash",
+          description: Text(
+            "Return to SSH Keys and open the key again to review its current details.",
+            bundle: #bundle
+          )
         )
+        .accessibilityIdentifier("key.detailUnavailable")
         .listRowBackground(Color.clear)
       }
     }
@@ -308,6 +398,7 @@ struct SSHKeyDetailView: View {
       Button(.localized("Delete"), role: .destructive) {
         run { try await model.identityStore.delete(id) }
       }
+      .accessibilityIdentifier("key.confirmDelete")
     } message: {
       deleteMessage
     }
@@ -352,7 +443,9 @@ struct SSHKeyDetailView: View {
           with: data,
           passphrase: passphrase
         )
-      } catch .importFailed(.passphraseRequired) { repairData = data }
+      } catch .importFailed(.passphraseRequired) {
+        if selectionIsCurrent { repairData = data }
+      }
     }
   }
 
@@ -476,6 +569,7 @@ struct SSHKeyDetailView: View {
     guard let identity, name != identity.name else { return }
     do throws(IdentityOperationError) {
       try model.identityStore.rename(id, to: name)
+      selection.identity = model.identity(id)
     } catch {
       self.error = error.message
       name = identity.name
@@ -483,20 +577,25 @@ struct SSHKeyDetailView: View {
   }
 
   private func run(_ work: @escaping @MainActor () async throws -> Void) {
+    guard selectionIsCurrent else { return }
     working = true
     error = nil
     Task {
       defer { working = false }
+      // The task may start after an account switch or metadata delivery.
+      guard selectionIsCurrent else { return }
       do { try await work() } catch {
+        guard selectionIsCurrent else { return }
         self.error =
           (error as? IdentityOperationError)?.message
           ?? "The key could not be changed."
       }
-      availability = await model.identityStore.availability(id)
+      guard selectionIsCurrent else { return }
+      let value = await model.identityStore.availability(id)
+      if selectionIsCurrent { availability = value }
     }
   }
 }
-
 
 private struct KeyDetailsSection: View {
   let identity: SSHIdentityMetadata
@@ -609,9 +708,7 @@ private struct KeyActionsSection: View {
 
   var body: some View {
     Section {
-      if availability != .available, availability != nil,
-        profile.keyImport
-      {
+      if availability != .available, availability != nil, profile.keyImport {
         Button(
           .localized("Repair by Importing This Key…"),
           systemImage: "wrench.and.screwdriver"
@@ -707,10 +804,10 @@ struct KeyCreationView: View {
                 policy == .deviceOnly
                   ? "The private key never leaves this device."
                   : """
-                    iCloud Keychain syncs the private key, end-to-end encrypted, to \
-                    your devices signed in to the same Apple Account. This choice \
-                    can't be changed later.
-                    """
+                  iCloud Keychain syncs the private key, end-to-end encrypted, to \
+                  your devices signed in to the same Apple Account. This choice \
+                  can't be changed later.
+                  """
               )
             }
             .listRowBackground(Color.clear)
@@ -732,12 +829,12 @@ struct KeyCreationView: View {
               mode == .generate ? .localized("Generate") : .localized("Save"),
               action: save
             )
-              .disabled(
-                working != nil || name.isEmpty
-                  || (mode == .importKey && inspection == nil)
-                  || (inspection?.isEncrypted == true && passphrase.isEmpty)
-              )
-              .accessibilityIdentifier("key.new.save")
+            .disabled(
+              working != nil || name.isEmpty
+                || (mode == .importKey && inspection == nil)
+                || (inspection?.isEncrypted == true && passphrase.isEmpty)
+            )
+            .accessibilityIdentifier("key.new.save")
           }
         } else {
           ToolbarItem(placement: .confirmationAction) {
@@ -930,10 +1027,10 @@ enum KeyFile {
   static func read(_ url: URL) -> Data? {
     let scoped = url.startAccessingSecurityScopedResource()
     defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-    guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
-      size <= OpenSSHKeyImporter.maxInputBytes
-    else { return nil }
-    return try? Data(contentsOf: url)
+    return try? BoundedFile.readIfPresent(
+      url,
+      limit: OpenSSHKeyImporter.maxInputBytes
+    )
   }
 }
 
@@ -975,10 +1072,9 @@ public struct SyncSettingsView: View {
           .accessibilityIdentifier("sync.metadata")
           LabeledContent(.localized("Status"), value: sync.status.summary)
           Button(.localized("Refresh"), systemImage: "arrow.clockwise") {
-            sync.refresh()
-            Task { await model.identityStore.recover() }
+            Task { await model.refreshConnections() }
           }
-          .disabled(!model.syncSettings.metadataSync)
+          .disabled(!sync.metadataSyncEnabled)
         } footer: {
           Text(
             """
@@ -994,7 +1090,7 @@ public struct SyncSettingsView: View {
         .listRowBackground(Color.clear)
         Section {
           Toggle(.localized("Sync trusted hosts"), isOn: trustBinding(sync))
-            .disabled(!model.syncSettings.metadataSync)
+            .disabled(!sync.metadataSyncEnabled)
             .accessibilityIdentifier("sync.trust")
         } footer: {
           Text(
@@ -1154,7 +1250,7 @@ public struct SyncSettingsView: View {
     _ sync: ConnectionSyncCoordinator
   ) -> Binding<Bool> {
     Binding(
-      get: { model.syncSettings.metadataSync },
+      get: { sync.metadataSyncEnabled },
       set: { enabled in run { try await sync.setMetadataSync(enabled) } }
     )
   }
@@ -1162,12 +1258,14 @@ public struct SyncSettingsView: View {
   private func trustBinding(_ sync: ConnectionSyncCoordinator) -> Binding<Bool>
   {
     Binding(
-      get: { model.syncSettings.trustSync },
+      get: { sync.trustSyncEnabled },
       set: { enabled in
-        Task {
+        run {
           let keys =
             enabled ? ((try? await model.ssh.trustFile.entries()) ?? [:]) : [:]
-          sync.setTrustSync(enabled, trustedKeys: keys)
+          guard sync.setTrustSync(enabled, trustedKeys: keys) else {
+            throw CloudSyncError.settingsNotSaved
+          }
         }
       }
     )

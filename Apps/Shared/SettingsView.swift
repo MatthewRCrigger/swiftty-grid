@@ -12,7 +12,7 @@ struct SettingsView: View {
   @State
   private var adding = false
   @State
-  private var editing: HostProfile?
+  private var editing: HostMutationContext?
 
   private var pairs: Bool {
     model.profile.nearbyDiscovery || model.profile.codeScanning

@@ -7,12 +7,15 @@ import json
 import math
 import os
 from pathlib import Path
-import selectors
 import signal
 import stat
 import subprocess
 import sys
 import time
+
+# -I excludes the script directory; add only our trusted sibling modules.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from real_ssh_commands import CommandError, capture_command
 
 
 class ReadinessError(Exception):
@@ -101,53 +104,10 @@ def wait_listener(pid, path, token, timeout=10):
 
 
 def capture_probe(command, timeout, limit=65536):
-    """Return capped stdout only on success; kill/reap failed or timed-out probes."""
-    if not math.isfinite(timeout) or timeout <= 0:
-        raise ReadinessError("probe timeout must be finite and positive")
-    if type(limit) is not int or limit < 0:
-        raise ReadinessError("probe output limit must be nonnegative")
-    deadline = time.monotonic() + timeout
-    process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
-        output = bytearray()
-        os.set_blocking(process.stdout.fileno(), False)
-        with selectors.DefaultSelector() as selector:
-            selector.register(process.stdout, selectors.EVENT_READ)
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return None
-                if not selector.select(min(0.1, remaining)):
-                    continue
-                try:
-                    data = os.read(process.stdout.fileno(), min(4096, limit + 1 - len(output)))
-                except BlockingIOError:
-                    continue
-                if not data:
-                    break
-                output.extend(data)
-                if len(output) > limit:
-                    raise ReadinessError("container probe output exceeds limit")
-        try:
-            status = process.wait(timeout=max(0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            return None
-        if status != 0 or time.monotonic() >= deadline:
-            return None
-        return bytes(output)
-    finally:
-        previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
-        try:
-            if process.poll() is None:
-                process.kill()
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired as error:
-                    raise ReadinessError("container probe did not exit after SIGKILL") from error
-        finally:
-            process.stdout.close()
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        return capture_command(command, timeout, limit)
+    except CommandError as error:
+        raise ReadinessError(str(error)) from error
 
 
 def container_address(inspection):

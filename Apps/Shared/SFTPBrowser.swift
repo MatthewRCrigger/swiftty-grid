@@ -1,4 +1,5 @@
 #if !os(tvOS)
+import Darwin
 import Foundation
 import Observation
 import SSHClient
@@ -97,6 +98,7 @@ final class SFTPBrowserModel {
   private(set) var path = ""
   private(set) var entries: [RemoteEntry] = []
   private(set) var transfers: [TransferItem] = []
+  private(set) var recoverableTransfers: [SavedTransfer] = []
   var message: LocalizedStringResource?
   var pendingOverwrite: PendingOverwrite?
   /// The overwrite alert's binding: dismissing it keeps the remote file.
@@ -114,6 +116,8 @@ final class SFTPBrowserModel {
 
   @ObservationIgnored
   private weak var app: RoamingAppModel?
+  @ObservationIgnored
+  private var selection: HostConnectionSelection
   @ObservationIgnored
   private var connection: SSHConnection?
   @ObservationIgnored
@@ -140,7 +144,7 @@ final class SFTPBrowserModel {
   private var isClosed = false
   private(set) var presentationID: UUID?
   @ObservationIgnored
-  private let connectSSH: @MainActor () async throws -> SSHConnection
+  private let connectSSH: (@MainActor () async throws -> SSHConnection)?
   @ObservationIgnored
   private let prepareUpload:
     @Sendable (URL, String, URL, Bool) async throws -> TransferManifest
@@ -148,10 +152,13 @@ final class SFTPBrowserModel {
   private let root: URL
   @ObservationIgnored
   private let store: TransferManifestStore
+  @ObservationIgnored
+  private let owner: HostDataOwner
 
   init(
     host: HostProfile,
     app: RoamingAppModel,
+    selection: HostConnectionSelection? = nil,
     transferDirectory: URL? = nil,
     connectSSH: (@MainActor () async throws -> SSHConnection)? = nil,
     prepareUpload:
@@ -168,30 +175,82 @@ final class SFTPBrowserModel {
     self.host = host
     self.app = app
     self.prepareUpload = prepareUpload
-    self.connectSSH =
-      connectSSH ?? { [weak app] in
-        guard let app else { throw CancellationError() }
-        return try await app.ssh.connect(host)
-      }
+    let selection = selection ?? app.connectionSelection(for: host)
+    self.selection = selection
+    owner = HostDataOwner(selection)
+    self.connectSSH = connectSSH
     root =
       transferDirectory
       ?? RoamingStorage.directory
       .appending(path: "Transfers", directoryHint: .isDirectory)
       .appending(path: host.id.uuidString, directoryHint: .isDirectory)
     store = TransferManifestStore(
-      directory: root.appending(path: "manifests", directoryHint: .isDirectory)
+      directory: root.appending(path: "manifests", directoryHint: .isDirectory),
+      owner: owner
     )
-    transfers = store.loadAll()
-      .map { manifest in
-        TransferItem(
-          manifest: manifest,
-          state: manifest.isComplete
-            ? .completed
-            : manifest.state == .failed
-              ? .failed(.localized("Needs attention"))
-              : .paused(.localized("Interrupted"))
+    transfers = store.loadAll().map(Self.item)
+    recoverableTransfers = store.recoverable()
+  }
+
+  private static func item(_ manifest: TransferManifest) -> TransferItem {
+    TransferItem(
+      manifest: manifest,
+      state: manifest.isComplete
+        ? .completed
+        : manifest.state == .failed
+          ? .failed(.localized("Needs attention"))
+          : .paused(.localized("Interrupted"))
+    )
+  }
+
+  /// Explicitly assign a reviewed old transfer, without starting network work.
+  func recover(_ reviewed: SavedTransfer) async {
+    guard !isClosed, recoverableTransfers.contains(reviewed) else { return }
+    guard !store.isInUse(reviewed.id) else {
+      message = .localized(
+        "This transfer is still in use. Pause it before recovering it."
+      )
+      return
+    }
+    let lifetime = preparationGeneration
+    message = nil
+    await preparing { [self] in
+      var prepared: TransferManifest?
+      do {
+        guard let app else { throw SSHAccessError.cancelled }
+        let current = try await app.ssh.prepare(selection)
+        guard ownsPreparation(lifetime), HostDataOwner(current) == owner else {
+          throw SSHAccessError.cancelled
+        }
+        selection = current
+        let manifest = try await TransferRecovery.prepare(
+          reviewed.manifest,
+          staging: staging,
+          partial: partial,
+          prepareUpload: prepareUpload
+        )
+        prepared = manifest
+        guard ownsPreparation(lifetime),
+          app.hostMutationIsCurrent(selection.context)
+        else { throw SSHAccessError.cancelled }
+        try store.recover(reviewed, as: manifest)
+        prepared = nil  // The durable owned checkpoint now owns the new stage.
+        recoverableTransfers = store.recoverable()
+        transfers.append(Self.item(manifest))
+        if manifest.localPath != reviewed.manifest.localPath {
+          await SFTPTransfers.discard(reviewed.manifest, client: nil)
+        }
+      } catch {
+        if let prepared, prepared.localPath != reviewed.manifest.localPath {
+          await SFTPTransfers.discard(prepared, client: nil)
+        }
+        guard ownsPreparation(lifetime) else { return }
+        recoverableTransfers = store.recoverable()
+        message = .localized(
+          "The transfer could not be recovered. Reopen Files and review the host and transfer again."
         )
       }
+    }
   }
 
   private var staging: URL {
@@ -263,7 +322,20 @@ final class SFTPBrowserModel {
       return
     }
     do {
-      let connection = try await connectSSH()
+      guard let app else { throw SSHAccessError.cancelled }
+      let prepared = try await app.ssh.prepare(selection)
+      guard generation == self.generation, !isClosed, !Task.isCancelled else {
+        return
+      }
+      // Retain migration before sign-in suspends, and never let an obsolete
+      // connection attempt overwrite a newer presentation's selection.
+      selection = prepared
+      let connection: SSHConnection
+      if let connectSSH {
+        connection = try await connectSSH()
+      } else {
+        connection = try await app.ssh.connectPrepared(prepared)
+      }
       guard generation == self.generation, !isClosed, !Task.isCancelled else {
         await connection.close()
         return
@@ -547,6 +619,7 @@ final class SFTPBrowserModel {
   func cancel(_ item: TransferItem) { tasks[item.id]?.cancel() }
 
   func resume(_ item: TransferItem) async {
+    guard transfers.contains(where: { $0.id == item.id }) else { return }
     await connect()
     run(item.id)
   }
@@ -560,23 +633,33 @@ final class SFTPBrowserModel {
       task.cancel()
       await task.value
     }
-    guard let index = transfers.firstIndex(where: { $0.id == item.id }) else {
+    guard transfers.contains(where: { $0.id == item.id }) else { return }
+    guard let manifest = store.beginUse(item.id) else {
+      message = .localized(
+        "This transfer is in use or belongs to another host. Reopen Files before trying again."
+      )
       return
     }
-    let manifest = transfers[index].manifest
+    defer { store.endUse(item.id) }
     await SFTPTransfers.discard(manifest, client: client)
     if manifest.direction == .download,
-      let destination = manifest.localDestinationPath
+      let destination = manifest.localDestinationPath,
+      !destination.utf8.contains(0)
     {
+      // A recovered checkpoint or a later filesystem change can leave siblings
+      // here. Never recursively delete them or a directory replacing the file.
+      _ = Darwin.unlink(destination)
       let folder = URL(fileURLWithPath: destination).deletingLastPathComponent()
-      try? FileManager.default.removeItem(at: folder)
+      _ = Darwin.rmdir(folder.path)
     }
     store.remove(item.id)
     transfers.removeAll { $0.id == item.id }
   }
 
   func export(_ item: TransferItem) {
-    guard item.manifest.direction == .download, item.state == .completed,
+    guard let item = transfers.first(where: { $0.id == item.id }),
+      store.owns(item.id), item.manifest.direction == .download,
+      item.state == .completed,
       let destination = item.manifest.localDestinationPath
     else { return }
     exportDocument = ExportedFile(url: URL(fileURLWithPath: destination))
@@ -591,8 +674,17 @@ final class SFTPBrowserModel {
       if client == nil { message = .localized("Not connected.") }
       return
     }
-    let manifest = transfers[index].manifest
-    guard !manifest.isComplete else { return }
+    guard let manifest = store.beginUse(id) else {
+      message = .localized(
+        "This transfer is in use or belongs to another host. Reopen Files before trying again."
+      )
+      return
+    }
+    transfers[index] = Self.item(manifest)
+    guard !manifest.isComplete else {
+      store.endUse(id)
+      return
+    }
     transfers[index].state = .running
     let gate = app.transferPolicy.gate
     let store = store
@@ -601,6 +693,7 @@ final class SFTPBrowserModel {
       await self?.update(manifest)
     }
     tasks[id] = Task {
+      defer { store.endUse(id) }
       var manifest = manifest
       var failure: (any Error)?
       do {
@@ -686,11 +779,15 @@ public struct SFTPBrowserView: View {
   /// manifests from disk, and `init` runs on every parent redraw.
   @State
   private var model: SFTPBrowserModel?
-  private let host: HostProfile
+  private let selection: HostConnectionSelection
   private let app: RoamingAppModel
 
   public init(host: HostProfile, app: RoamingAppModel) {
-    self.host = host
+    self.init(selection: app.connectionSelection(for: host), app: app)
+  }
+
+  init(selection: HostConnectionSelection, app: RoamingAppModel) {
+    self.selection = selection
     self.app = app
   }
 
@@ -700,7 +797,11 @@ public struct SFTPBrowserView: View {
         SFTPBrowserContent(model: model, app: app)
       } else {
         Color.clear.onAppear {
-          model = SFTPBrowserModel(host: host, app: app)
+          model = SFTPBrowserModel(
+            host: selection.host,
+            app: app,
+            selection: selection
+          )
         }
       }
     }
@@ -710,11 +811,13 @@ public struct SFTPBrowserView: View {
   }
 }
 
-private struct SFTPBrowserContent: View {
+struct SFTPBrowserContent: View {
   @Bindable
   var model: SFTPBrowserModel
   @State
   private var importing = false
+  @State
+  private var reviewingTransfers = false
   @Environment(\.dismiss)
   private var dismiss
   let app: RoamingAppModel
@@ -734,11 +837,24 @@ private struct SFTPBrowserContent: View {
           VStack(alignment: .leading) {
             Text(reason)
             Button(.localized("Try Again")) { Task { await model.connect() } }
+              .accessibilityIdentifier("sftp.retry")
           }
           .listRowBackground(Color.clear).glassButtonStyle()
         case .ready: SFTPDirectorySection(model: model)
         }
         if !model.transfers.isEmpty { SFTPTransferSection(model: model) }
+        if !model.recoverableTransfers.isEmpty {
+          Section {
+            Text(
+              "Older saved transfers need review before they can be used with this host.",
+              bundle: #bundle
+            )
+            Button(.localized("Review older transfers")) {
+              reviewingTransfers = true
+            }
+            .accessibilityIdentifier("sftp.reviewTransfers")
+          }
+        }
       }
       .glassListBackground().navigationTitle(model.host.nickname)
       .toolbar {
@@ -764,6 +880,10 @@ private struct SFTPBrowserContent: View {
           .frame(width: 0, height: 0).allowsHitTesting(false)
           .accessibilityHidden(true)
         #endif
+      }
+      .adaptiveSheet(isPresented: $reviewingTransfers) {
+        SFTPTransferRecoveryView(model: model)
+          .macSheetFrame(width: 560, height: 480)
       }
       .connectionPrompts(app)
       .fileImporter(
@@ -871,9 +991,7 @@ private struct SFTPTransferSection: View {
         )
         .foregroundStyle(.secondary)
       }
-      ForEach(model.transfers) { item in
-        TransferRow(item: item, model: model)
-      }
+      ForEach(model.transfers) { item in TransferRow(item: item, model: model) }
     } header: {
       Text("Transfers", bundle: #bundle)
     }
@@ -896,8 +1014,7 @@ private struct TransferRow: View {
         ProgressView(value: progress)
       }
       HStack {
-        Text(stateText(item.state)).font(.caption)
-          .foregroundStyle(.secondary)
+        Text(stateText(item.state)).font(.caption).foregroundStyle(.secondary)
         Spacer()
         actions
       }

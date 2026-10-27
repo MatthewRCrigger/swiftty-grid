@@ -26,7 +26,7 @@ struct EventMailboxTests {
 
   @Test
   func callbackCapturesReleaseAfterClosureAndCannotRestart() async throws {
-    let mailbox = EventMailbox(snapshotLimit: 2)
+    let mailbox = EventMailbox()
     let entered = Mutex(false)
     let release = Mutex(false)
     let closed = Mutex(false)
@@ -85,7 +85,7 @@ struct EventMailboxTests {
     let weakMailbox = Mutex(WeakMailbox())
     let closed = Mutex(false)
     func installAndClose() {
-      let mailbox = EventMailbox(snapshotLimit: 2)
+      let mailbox = EventMailbox()
       weakMailbox.withLock { $0.value = mailbox }
       #expect(
         mailbox.start(

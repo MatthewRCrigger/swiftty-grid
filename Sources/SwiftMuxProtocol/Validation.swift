@@ -99,6 +99,13 @@ public enum FrameValidator {
     guard frame.title.utf8.count <= 4096 else {
       throw MuxError(.invalidRequest, "title length")
     }
+    if let target = frame.dropTarget {
+      guard target.types.count <= FrameDropTarget.maxTypes,
+        target.types.allSatisfy({
+          !$0.isEmpty && $0.utf8.count <= FrameDropTarget.maxTypeBytes
+        })
+      else { throw MuxError(.invalidRequest, "drop target types") }
+    }
   }
 
   private static func validColor(_ raw: UInt32) -> Bool {

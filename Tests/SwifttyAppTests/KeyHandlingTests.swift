@@ -32,6 +32,22 @@ struct KeyHandlingTests {
   }
 
   @Test
+  func `keypad keys reach the terminal and mux panes per feature`() throws {
+    let one = try key(83, "1", [.numericPad])
+    #expect(TerminalView.terminalKey(for: one)?.key == .keypad(.one))
+    let enter = try key(76, "\r", [.numericPad])
+    #expect(TerminalView.terminalKey(for: enter)?.key == .keypad(.enter))
+    // Services with keypad names get them; older ones see typed text.
+    #expect(MuxPaneView.semanticKey(for: one, keypadKeys: true)?.0 == .keypad(.one))
+    #expect(MuxPaneView.semanticKey(for: one, keypadKeys: false) == nil)
+    #expect(MuxPaneView.semanticKey(for: enter, keypadKeys: false)?.0 == .enter)
+    let caps = try key(0, "A", unmodified: "a", [.capsLock, .control])
+    #expect(
+      TerminalView.terminalKey(for: caps)?.modifiers.contains(.capsLock) == true
+    )
+  }
+
+  @Test
   func `special and control keys are encoded by the terminal`() throws {
     #expect(
       try TerminalView.terminalKey(for: key(126, "\u{F700}")) == KeyEvent(.up)

@@ -5,6 +5,7 @@ import ScreenProtocol
 import SessionCore
 import SwiftMuxProtocol
 import SwiftMuxService
+import SwifttyEngine
 import Synchronization
 
 /// One roaming session: an RST/1 view of a SwiftMux workspace (spec.inbox.md
@@ -93,7 +94,30 @@ public final class RoamingSession: @unchecked Sendable {
   private var leaseAdmission: LeaseAdmission?
   private var authorizationToken: ApplicationToken?
   private var ledger: HostInputLedger
-  private var attachment: HostAttachment?
+  private var attachment: HostAttachment? {
+    didSet {
+      guard oldValue !== attachment else { return }
+      pendingSnapshotEncodes.removeAll()
+      for send in snapshotSends.values { send.task.cancel() }
+    }
+  }
+  private struct SnapshotEncoding: Sendable {
+    let snapshot: ScreenSnapshot
+    let stream: UInt64
+    let attachment: HostAttachment
+  }
+  private struct SnapshotSend {
+    let stream: UInt64
+    let attachment: HostAttachment
+    let task: Task<Void, Never>
+  }
+  /// One encoder plus its sends share two active work slots. A task retains
+  /// its slot until its send returns, even after cancellation or fencing.
+  private var encodingSnapshot = false
+  private var snapshotSends: [UUID: SnapshotSend] = [:]
+  /// At most the current attachment's two scheduler-owned captures wait here.
+  /// Replacement removes stale captures before another worker can start them.
+  private var pendingSnapshotEncodes: [SnapshotEncoding] = []
   private var mux: MuxLocalSession?
   /// The SMX attachment of `mux`'s lease.
   private var muxAttachment: AttachmentID?
@@ -504,6 +528,7 @@ public final class RoamingSession: @unchecked Sendable {
     a.epoch = epoch
     a.writerID = writer
     a.scheduler.reset()
+    a.highestSubmittedScreenRevision = 0
     a.exitNoticeSent = false
     touch(state: exitStatus == nil ? .attached : .exited, attached: true)
     statusBox.withLock { $0.isAttached = true }
@@ -514,7 +539,8 @@ public final class RoamingSession: @unchecked Sendable {
           writerID: writer,
           lastFullyAppliedInputSequence: ledger.lastApplied,
           partialInputSequence: nil,
-          resizeRevision: resizeRevision
+          resizeRevision: resizeRevision,
+          features: .supported
         )
       )
     )
@@ -714,6 +740,11 @@ public final class RoamingSession: @unchecked Sendable {
     switch message {
     case let .input(input): admit(input, from: a)
     case let .screenAck(_, revision):
+      guard revision <= a.highestSubmittedScreenRevision else {
+        a.fail(.malformed)
+        detachOnQueue(a)
+        return
+      }
       for stream in a.scheduler.acknowledged(revision: revision) {
         a.connection.cancelSnapshot(stream: stream)
       }
@@ -800,7 +831,11 @@ public final class RoamingSession: @unchecked Sendable {
     case let .paste(text):
       mux.input(.input(.paste(text)), attachment: smx, pane: pane, done)
     case let .key(key):
-      let (name, modifiers) = Self.muxKey(key)
+      let keypad = mux.welcome?.features.contains(.keypadKeys) ?? false
+      guard let (name, modifiers) = Self.muxKey(key, keypadKeys: keypad) else {
+        done(nil)  // Keypad Begin has no main-keyboard key to fall back to.
+        return
+      }
       mux.input(
         .input(.key(name, modifiers)),
         attachment: smx,
@@ -929,12 +964,16 @@ public final class RoamingSession: @unchecked Sendable {
     a.send(.inputAck(epoch: a.epoch, sequence: sequence))
   }
 
-  static func muxKey(_ key: SemanticKey) -> (MuxKey, MuxKeyModifiers) {
+  /// Without `keypadKeys`, keypad keys become the keys they type.
+  static func muxKey(
+    _ key: SemanticKey,
+    keypadKeys: Bool = true
+  ) -> (MuxKey, MuxKeyModifiers)? {
     var modifiers: MuxKeyModifiers = []
     if key.modifiers.contains(.shift) { modifiers.insert(.shift) }
     if key.modifiers.contains(.alt) { modifiers.insert(.alt) }
     if key.modifiers.contains(.control) { modifiers.insert(.control) }
-    let name: MuxKey =
+    let name: MuxKey? =
       switch key.name {
       case let .character(scalar): .character(scalar.value)
       case .enter: .enter
@@ -952,8 +991,30 @@ public final class RoamingSession: @unchecked Sendable {
       case .insert: .insert
       case .delete: .delete
       case let .function(n): .function(n)
+      case let .keypad(k):
+        keypadKeys
+          ? MuxKeypadKey(rawValue: k.rawValue).map(MuxKey.keypad)
+          : KeypadKey(rawValue: k.rawValue)?.mainKey.flatMap(Self.muxKey)
       }
-    return (name, modifiers)
+    return name.map { ($0, modifiers) }
+  }
+
+  private static func muxKey(_ key: Key) -> MuxKey? {
+    switch key {
+    case let .character(scalar): .character(scalar.value)
+    case .enter: .enter
+    case .up: .up
+    case .down: .down
+    case .left: .left
+    case .right: .right
+    case .home: .home
+    case .end: .end
+    case .pageUp: .pageUp
+    case .pageDown: .pageDown
+    case .insert: .insert
+    case .delete: .delete
+    default: nil
+    }
   }
 
   // MARK: Snapshots (owner queue)
@@ -970,6 +1031,7 @@ public final class RoamingSession: @unchecked Sendable {
 
   private func pumpSnapshots(_ a: HostAttachment) {
     guard a === attachment, a.isCurrent, let pane = activePane else { return }
+    pruneSnapshotWork()
     let now = ContinuousClock.now
     switch a.scheduler.next(now: now) {
     case .idle: return
@@ -989,6 +1051,7 @@ public final class RoamingSession: @unchecked Sendable {
       a.nextStreamID += 1
       let stream = a.nextStreamID
       a.scheduler.started(stream: stream, revision: stamp.screenRevision)
+      pruneSnapshotWork()
       let exit = exitStatus
       // Exported in the pane's order, so every byte parsed before this
       // point (including final output after exit) is included.
@@ -1011,7 +1074,7 @@ public final class RoamingSession: @unchecked Sendable {
     exit: Int32?,
     to a: HostAttachment
   ) {
-    guard a === attachment, a.isCurrent else { return }
+    guard wantsSnapshot(stream: stream, from: a) else { return }
     guard let snapshot else {
       a.scheduler.failed(stream: stream)
       return
@@ -1029,44 +1092,101 @@ public final class RoamingSession: @unchecked Sendable {
     transmit(snapshot, stream: stream, to: a)
   }
 
-  /// Encodes off the owner queue, then sends on a new snapshot stream.
+  /// Retains only captures still owned by the bounded scheduler, rather than
+  /// queueing one encoding closure for every superseded screen revision.
   private func transmit(
     _ snapshot: ScreenSnapshot,
     stream: UInt64,
     to a: HostAttachment
   ) {
+    pruneSnapshotWork()
+    pendingSnapshotEncodes.append(
+      SnapshotEncoding(snapshot: snapshot, stream: stream, attachment: a)
+    )
+    startNextSnapshotEncoding()
+  }
+
+  private func wantsSnapshot(stream: UInt64, from a: HostAttachment) -> Bool {
+    a === attachment && a.isCurrent
+      && a.scheduler.streams.contains(where: { $0.id == stream })
+  }
+
+  private func pruneSnapshotWork() {
+    pendingSnapshotEncodes.removeAll {
+      !wantsSnapshot(stream: $0.stream, from: $0.attachment)
+    }
+    for send in snapshotSends.values
+    where !wantsSnapshot(stream: send.stream, from: send.attachment) {
+      send.task.cancel()
+    }
+  }
+
+  private func startNextSnapshotEncoding() {
+    pruneSnapshotWork()
+    guard !encodingSnapshot, snapshotSends.count < 2,
+      !pendingSnapshotEncodes.isEmpty
+    else { return }
+    let job = pendingSnapshotEncodes.removeFirst()
+    encodingSnapshot = true
     let encode = snapshotEncoder
     encodeQueue.async { [weak self] in
-      let payload: [UInt8]
-      do { payload = try encode(snapshot) } catch {
-        self?.snapshotFailed(stream: stream, to: a, retry: true)
-        return
-      }
-      Task {
+      let result = Result { try encode(job.snapshot) }
+      self?.queue
+        .async { [weak self] in self?.snapshotEncoded(result, job: job) }
+    }
+  }
+
+  private func snapshotEncoded(
+    _ result: Result<[UInt8], any Error>,
+    job: SnapshotEncoding
+  ) {
+    encodingSnapshot = false
+    defer { startNextSnapshotEncoding() }
+    let a = job.attachment
+    let stream = job.stream
+    guard wantsSnapshot(stream: stream, from: a) else { return }
+    switch result {
+    case .failure: snapshotFailed(stream: stream, to: a, retry: true)
+    case let .success(payload):
+      // A peer can acknowledge before the send's completion reaches this
+      // queue. Publish the bound before starting transport work, but never
+      // include captures still waiting for encoding or an available slot.
+      a.highestSubmittedScreenRevision = max(
+        a.highestSubmittedScreenRevision,
+        job.snapshot.screenRevision
+      )
+      let id = UUID()
+      let task = Task { [weak self] in
+        let retry: Bool?
         do {
+          guard !Task.isCancelled else { throw RSTTransportError.canceled }
           try await a.connection.sendSnapshot(payload, stream: stream)
-        } catch {
-          self?
-            .snapshotFailed(
-              stream: stream,
-              to: a,
-              retry: (error as? RSTTransportError) != .closed
-            )
-        }
+          retry = nil
+        } catch { retry = (error as? RSTTransportError) != .closed }
+        self?.queue
+          .async { [weak self] in
+            guard let self else { return }
+            self.snapshotSends.removeValue(forKey: id)
+            if let retry {
+              self.snapshotFailed(stream: stream, to: a, retry: retry)
+            }
+            self.startNextSnapshotEncoding()
+          }
       }
+      snapshotSends[id] = SnapshotSend(
+        stream: stream,
+        attachment: a,
+        task: task
+      )
     }
   }
 
   /// Encoding and transport failures settle on the attachment's owner queue.
   private func snapshotFailed(stream: UInt64, to a: HostAttachment, retry: Bool)
   {
-    queue.async { [weak self] in
-      guard let self, a === attachment, a.isCurrent,
-        a.scheduler.streams.contains(where: { $0.id == stream })
-      else { return }
-      a.scheduler.failed(stream: stream)
-      if retry { pumpSnapshots(a) }
-    }
+    guard wantsSnapshot(stream: stream, from: a) else { return }
+    a.scheduler.failed(stream: stream)
+    if retry { pumpSnapshots(a) }
   }
 }
 

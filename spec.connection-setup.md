@@ -89,11 +89,33 @@ in `HostEditorView` in confirmation mode, which shows the following:
    stored key is the server's actual key, never the code's fingerprint. A
    changed key still blocks. A code never replaces a trusted key.
 3. The user signs in as usual.
-4. The confirmed `HostProfile` is saved. Its storage format is unchanged:
-   `hosts.json` version 1 has no field for pins.
+4. The confirmed `HostProfile` is saved in the connection snapshot described by
+   [spec.ssh-identity.md](spec.ssh-identity.md). Pairing adds no stored password
+   or pin field. The account generation and target record revision reviewed
+   before pairing must still match after SSH closes; otherwise saving fails
+   and the workspace chooser does not open.
 5. The workspace chooser opens.
 
 Cancelling at any point discards the candidate.
+
+Host editors, retained row edit/delete actions, and **Save as** choices keep the
+account generation, scope, record revision, and conflict state they reviewed.
+An account switch, including switching away and back, or a changed target
+invalidates that action.
+Preserve the draft and ask the user to reopen or reselect the host rather than
+overwriting a replacement record with the same UUID. New drafts reserve their
+UUID too. Unrelated host changes do not invalidate an edit. Hidden, displaced,
+or tombstoned records cannot be changed through an old save/delete callback;
+a refused save must not report success or close the editor.
+
+Host-row connection callbacks validate their selection before starting an action.
+The workspace chooser retains that selection through delayed presentation,
+authentication and metadata replies. A stale
+chooser cannot create, resume or confirm takeover on a replacement record,
+even when its UUID and profile fields are identical. It closes its metadata
+connection and asks the user to reopen the host; an existing terminal remains
+untouched. Successful legacy-key migration can update the chooser to the
+verified label mapping for the otherwise unchanged host in the same account.
 
 ### 1.3 Mac → Workspace
 
@@ -103,6 +125,13 @@ host-key verification and then authentication, and lists workspaces with
 existing `RoamingAttentionService`. For each workspace, the chooser shows the
 name, tab and pane counts, running panes, and control state: not attached,
 shown on this device, controlled on the Mac, or controlled by another device.
+
+“Shown on this device” requires the active roaming screen's captured owner to
+match the selected host UUID, account scope, normalized endpoint and remote
+username. Reusing host/workspace UUIDs under another owner must not suppress
+takeover confirmation. The fresh lease check uses that same ownership rule;
+confirmed takeover still names the displayed lease generation. Display-name or
+credential changes alone do not turn the existing connection into another owner.
 
 | Action | Result |
 |---|---|
@@ -125,6 +154,18 @@ nothing until the user chooses **Start New Session**. **Resume Last
 Workspace** (in the host's context menu) names the remembered identity and
 never falls back to creating a workspace. Attention-link reveals and
 reconnects keep their existing semantics.
+
+A retained **Resume Last Workspace** menu action resumes the exact ID in its
+displayed label after validating its captured host context. A later saved-choice
+update or removal cannot substitute another workspace. Deleting a saved host
+closes only a terminal with that host's captured owner; a retained connection
+for a different account or endpoint remains open even when its UUID is reused.
+
+An explicit intent belongs to the terminal screen that was opened for it, not
+to a future screen with the same host UUID. Closing that screen discards an
+unconsumed intent. Persisted resume choices are scoped by account and endpoint
+as specified in [the roaming lifecycle](spec.roaming.md#9-apple-client-lifecycle-and-network-recovery).
+Older UUID-only choices require selecting the workspace again from the chooser.
 
 ## 2. Pairing code (`HostConnection` target)
 

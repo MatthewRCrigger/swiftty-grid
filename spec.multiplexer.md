@@ -110,6 +110,14 @@ Use one internal, versioned message contract, now `SMX/2`, carried as bounded va
 
 The handshake identifies protocol version, build, server instance, frontend kind, accepted terminal profile and limits. Allow only explicitly compatible versions. Authenticate the connection using OS-provided peer identity, including the expected user and shipped executable identity; do not trust a claimed PID or bundle ID inside a message. The product is local and unprivileged; it is not a security boundary against the account owner.
 
+Determine the agent's signing policy before listening. Confirmed unsigned or
+valid ad-hoc development code uses the mandatory same-user check. Other valid
+signed code requires a nonempty team identifier and a parseable same-team peer
+requirement. Unexpected lookup or validity errors and incomplete signing
+metadata abort startup with exit status 78; they never select development
+fallback. Validate the identity before reading signing metadata, since the
+Security API can otherwise return partial data for corrupt signatures.
+
 Commands have request IDs and explicit targets. Mutations produce typed results/errors, such as `alreadyAttached`, `staleGeometry`, `paneExited`, `historyUnavailable`, `resourceLimit` and `incompatibleVersion`. Command acknowledgement means the specified operation committed. Input acknowledgement means admission to the ordered writer, not execution by the shell. Never automatically replay uncertain input or mutating commands after connection loss.
 
 ### Full pane frames first
@@ -298,7 +306,7 @@ Preserve AppKit's text-input path. Native menu shortcuts handle application acti
 
 The existing Swiftty input code consults keyboard flags that are not part of `RenderSnapshot`. The conservative first profile avoids enhanced keyboard negotiation; adding it later requires explicit metadata and tests for associated text, repeats, releases and mode changes. Cancel composition on pane rebind/detach so an unfinished composition cannot be committed into another shell. [S14], [S17]
 
-For the first native release, pointer actions focus panes, select/copy text and browse history. AppKit paste is an explicit operation, so no outer bracketed-paste decoder is needed; the shared service-side paste envelope and bounds still apply. Ctrl-C remains terminal input; native Copy is a separate app command. Program-originated clipboard writes are disabled; user-initiated copy writes to `NSPasteboard`.
+For the first native release, pointer actions focus panes, select/copy text and browse history. AppKit paste is an explicit operation, so no outer bracketed-paste decoder is needed; the shared service-side paste envelope and bounds still apply. Ctrl-C remains terminal input; native Copy is a separate app command. OSC 52 clipboard writes stay disabled; user-initiated copy writes to `NSPasteboard`. The kitty clipboard protocol (OSC 5522) is offered instead, because its reads and writes can be answered by the user: with `ServiceFeatures.kittyClipboard`, the service defers each read and committed write to the controller as a `clipboardRead` or `clipboardWrite` event, sent only to a client whose hello lists `ClientCapabilities.clipboardRequests` (otherwise the service refuses at once). The controller answers with `clipboardReadResult` or `clipboardWriteResult`. Native windows serve reads the user handed over (a paste event's follow-up, a type listing, a remembered password) without asking and prompt for everything else; replies that would not fit the pane's reply reserve answer EIO. A paste while the program enabled kitty paste events (frame mode `kittyPasteEvents`) is sent as `MuxInput.clipboardPaste(types:)`, and the service reports it with a one-time password instead of typing.
 
 Use the shared frozen-frame selection/copy and asynchronous history/search policy from section 4. Visible accessibility text, selected text and IME cursor positioning come from the retained interaction presentation. Do not block a main-actor accessibility callback on IPC. Existing Swiftty mouse/search/accessibility paths require this redirection because several consult live `TerminalSession` state. [S15], [S18]
 
@@ -308,6 +316,9 @@ Resolved hyperlinks, shell prompt navigation and application mouse reporting are
 - `historyJumps`: `ScrollRequest.oldest` and `.prompt(n)` (OSC 133 prompts; `notFound` when there is none).
 - `terminalControl`: `clearScreen` and `resetTerminal` (RIS of the emulator; the process keeps running).
 - `shellIntegration`: `link` (OSC 8 or, on request, a detected URL at a history address), `commandOutput` (scrolls the output into view and returns its rows and full text) and `MuxInput.moveCursor` (click-to-move arrows, written only while the shell edits a command line there; at most `MuxInput.maxCursorMoves`).
+- `keypadKeys`: `MuxKey.keypad`, the numeric keypad keys, encoded by the service with the pane's keypad modes. Without it, frontends send keys that type through the input method and the main-keyboard key for the rest.
+- `kittyClipboard`: the clipboard events and result commands above, `MuxInput.clipboardPaste` and the `kittyPasteEvents` frame mode.
+- `dropTargets`: `PaneFrame.dropTarget` (the types a program registered with kitty drag-and-drop, OSC 72, and its answer for the current drag) and `MuxInput.drag` (move, drop with the dropped data, and leave). Native panes take drops only while their program is registered; dropped items that would not fit one control record or one reply are left out.
 
 Per-attachment viewports are specified in §4.
 
@@ -373,6 +384,18 @@ App Quit must not unregister the LaunchAgent or call local terminal teardown for
 Stage updates separately while workspaces exist; staging alone does not change normal admission or replace the installed bundle. When installation begins, quiesce new workspace creation and pane launches. Reach an ordered empty-state barrier after workspaces, retained exit screens, interactive attachments, pending launches and teardowns are gone. An explicit “End workspaces and update” action uses normal bounded termination to reach that same barrier. At the barrier, reject new attachments/mutations while allowing status responses. Await successful unregistration completion, replace the bundle, register the new service and verify its instance/version. Cancellation before unregistration returns normal admission. The connection that began quiescing owns that update barrier: other connections cannot acquire or release it, and losing its owner restores admission unless terminal service shutdown has begun. Apple documents re-registration requirements when the agent executable/plist changes; use completion ordering rather than arbitrary sleep-based sequencing. [S19]
 
 Do not replace a bundle beneath a live old service that will later spawn its launcher from that bundle. Incompatible clients must preserve the old service and explain how to reopen a compatible version or deliberately end sessions. No live PTY handoff, engine hot migration or command replay is included. Support one installed Swiftty bundle/service identity per user initially.
+
+### Native packaging security
+
+The native `Swiftty.app`, its SwiftMux helpers and `swifttyd` are built with
+`swift build`; app packaging/signing is handled by `Scripts/package-swiftmux.sh`.
+The Xcode app targets' `ENABLE_ENHANCED_SECURITY` setting and arm64e package
+configuration do not apply to these SwiftPM products. Enhanced Security
+hardened-process entitlements at `codesign` time remain deferred pending separate
+Developer ID validation. Existing hardened-runtime signing does not establish
+that additional entitlement coverage. See
+[the Xcode configuration](spec.roaming.md#25-xcode-security-build-settings) for
+the separate mobile, Catalyst, visionOS, tvOS and watchOS decisions.
 
 ## 9. Modules and delivery gates
 

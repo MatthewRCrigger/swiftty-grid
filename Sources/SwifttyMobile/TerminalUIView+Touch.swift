@@ -108,6 +108,7 @@ extension TerminalUIView {
   ) {
     guard tracking else { return }
     let c = cell(at: point)
+    let pixel = geometry.pixel(at: point)
     session.send(
       .mouse(
         MouseEvent(
@@ -115,7 +116,9 @@ extension TerminalUIView {
           button,
           column: c.column,
           row: c.row,
-          modifiers: modifiers
+          modifiers: modifiers,
+          pixelX: pixel.x,
+          pixelY: pixel.y
         )
       )
     )
@@ -142,18 +145,20 @@ extension TerminalUIView {
     }
     let c = geometry.cell(at: point)
     let detect = configuration.linkURL
-    let (link, moves) = session.withState { state in
+    let (link, click) = session.withState { state in
       let p = state.viewportPoint(row: c.row, column: c.column)
       return (
-        state.link(at: p, detectURLs: detect), state.promptCursorMoves(to: p)
+        state.link(at: p, detectURLs: detect), state.promptClickAction(at: p)
       )
     }
     if effectiveCapabilities.openURLs, let link,
       let url = LinkPolicy.openableURL(link.url)
     {
       UIApplication.shared.open(url)
-    } else if configuration.cursorClickToMove, let moves, moves != 0 {
-      send(ClickToMove.keys(moves).map { .key($0) })
+    } else if configuration.cursorClickToMove, let click,
+      click != .moves(0)
+    {
+      send(ClickToMove.inputs(click))
     }
   }
 

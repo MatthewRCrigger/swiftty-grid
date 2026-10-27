@@ -87,6 +87,12 @@ case $app in
         INFOPLIST_FILE: $apps/Config/AttentionLinks.plist
         TARGETED_DEVICE_FAMILY: \"1,2\"
         SUPPORTS_MACCATALYST: NO
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: >-
+          UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft
+          UIInterfaceOrientationLandscapeRight
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: >-
+          UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown
+          UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
         INFOPLIST_KEY_UILaunchScreen_Generation: YES" ;;
   CatalystClient)
     sources="[{ path: \"$apps/CatalystClient\", excludes: [\"*.entitlements\"] }]"
@@ -151,16 +157,15 @@ YML
 
 # Optional Nearby Macs fixture: RST_UI_ADVERTISE=<instance name> registers
 # _swiftty._tcp for the relayed SSH port with the system DNS-SD service,
-# as the Mac's Connect a Device panel does, for the run's duration.
-advertise_pid=""
+# as the Mac's Connect a Device panel does, for the run's duration. The
+# fixture's process owner retires it on normal exit and interruption alike.
 if [ -n "${RST_UI_ADVERTISE:-}" ]; then
-  dns-sd -R "$RST_UI_ADVERTISE" _swiftty._tcp local "$RST_REAL_SSH_PORT" \
-    txtvers=1 product=swiftty >"$workspace/advertise.log" 2>&1 &
-  advertise_pid=$!
+  python3 -I "$repository_root/Scripts/real-ssh-process.py" start "$workspace" advertiser \
+    dns-sd -R "$RST_UI_ADVERTISE" _swiftty._tcp local "$RST_REAL_SSH_PORT" \
+    txtvers=1 product=swiftty >/dev/null
 fi
 
 echo "Testing $app on $destination (result bundle: $workspace/result.xcresult)"
-status=0
 TEST_RUNNER_RST_UI_SCAN=${RST_UI_SCAN:-} \
 TEST_RUNNER_RST_UI_NEARBY=${RST_UI_ADVERTISE:-} \
 TEST_RUNNER_RST_UI_LOCAL_NETWORK=${RST_UI_LOCAL_NETWORK:-allow} \
@@ -169,11 +174,18 @@ TEST_RUNNER_RST_UI_PORT=$RST_REAL_SSH_PORT \
 TEST_RUNNER_RST_UI_USER=$RST_REAL_SSH_USER \
 TEST_RUNNER_RST_UI_PASSWORD=$RST_REAL_SSH_PASSWORD \
 TEST_RUNNER_RST_UI_FINGERPRINT=$RST_REAL_SSH_FINGERPRINT \
+  python3 -I "$repository_root/Scripts/real-ssh-process.py" start "$workspace" xcodebuild \
   xcodebuild -project "$project/RoamingUITests.xcodeproj" -scheme RoamingUITests \
   -destination "$destination" -derivedDataPath "$workspace/build" \
   -resultBundlePath "$workspace/result.xcresult" -collect-test-diagnostics never \
-  "$@" test >"$workspace/xcodebuild.log" 2>&1 || status=$?
-[ -z "$advertise_pid" ] || kill "$advertise_pid" 2>/dev/null || true
+  "$@" test >/dev/null
+# A foreground build defers shell traps until it exits. Bounded status queries
+# let INT/TERM enter cleanup while the owned build is still running.
+status=running
+while [ "$status" = running ]; do
+  status=$(python3 -I "$repository_root/Scripts/real-ssh-process.py" status "$workspace" xcodebuild)
+  [ "$status" != running ] || sleep 0.1
+done
 grep -E "Test Case|error:|XCTAssert|failed|TEST (SUCCEEDED|FAILED)|Signing Identity" \
   "$workspace/xcodebuild.log" | grep -Ev "^ *[0-9]+ \|" | uniq | tail -60
 [ $status -eq 0 ] || echo "xcodebuild failed ($status); log: $workspace/xcodebuild.log" >&2

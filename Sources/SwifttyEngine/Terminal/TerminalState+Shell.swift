@@ -5,6 +5,33 @@ public enum SemanticState: Sendable, Equatable {
   case none, prompt, input, output
 }
 
+/// How the shell handles clicks in its prompt, from the `cl` and kitty
+/// `click_events` options of OSC 133 ; A.
+public enum PromptClick: Sendable, Equatable {
+  /// Cursor-key sequences the shell accepts for click-to-move (`cl`).
+  public enum CursorKeys: Sendable, Equatable {
+    case line  // line
+    case multiple  // m
+    case conservativeVertical  // v
+    case smartVertical  // w
+  }
+
+  /// No option seen: clicks move the cursor within the command line.
+  case none
+  case cursorKeys(CursorKeys)
+  /// `click_events=1` reports viewport rows, `=2` rows relative to the
+  /// prompt; the shell moves its own cursor.
+  case events(relative: Bool)
+}
+
+/// What a click in the prompt sends the shell.
+public enum PromptClickAction: Sendable, Equatable {
+  /// Left (negative) or right arrow presses.
+  case moves(Int)
+  /// A synthetic SGR left-button press for `click_events`.
+  case report([UInt8])
+}
+
 /// Light or dark appearance, reported to applications (DEC mode 2031).
 public enum ColorScheme: Sendable, Equatable { case dark, light }
 
@@ -58,6 +85,15 @@ extension TerminalState {
           promptRedraw = .lastRow
         }
       }
+      // `click_events` takes precedence over `cl`; `click_events=0` falls
+      // back to it. A prompt without either keeps the previous setting.
+      if let events = option("click_events"), events.count == 1,
+        events[0] == 0x31 || events[0] == 0x32
+      {
+        promptClick = .events(relative: events[0] == 0x32)
+      } else if let cl = option("cl").flatMap(Self.promptCursorKeys) {
+        promptClick = .cursorKeys(cl)
+      }
       if grid.mark(cursor.y) != .prompt {
         grid.setMark(cursor.y, continuation ? .promptContinuation : .prompt)
       }
@@ -81,6 +117,19 @@ extension TerminalState {
       lastExitCode = Self.semanticExitCode(rest)
       commandFinished = true
     default: break
+    }
+  }
+
+  private static func promptCursorKeys(
+    _ value: UnsafeBufferPointer<UInt8>
+  ) -> PromptClick.CursorKeys? {
+    if value.elementsEqual("line".utf8) { return .line }
+    guard value.count == 1 else { return nil }
+    return switch value[0] {
+    case 0x6D: .multiple  // m
+    case 0x76: .conservativeVertical  // v
+    case 0x77: .smartVertical  // w
+    default: nil
     }
   }
 
@@ -300,6 +349,29 @@ extension TerminalState {
       TerminalPoint(row: start, column: 0),
       TerminalPoint(row: end, column: columns - 1)
     )
+  }
+
+  /// What a click at `p` sends the shell, or nil when it sends nothing.
+  /// Every `cl` value moves along the command line like Ghostty does;
+  /// `click_events` reports clicks at or below the current prompt and
+  /// leaves validation to the shell, as kitty does.
+  public func promptClickAction(at p: TerminalPoint) -> PromptClickAction? {
+    guard case let .events(relative) = promptClick else {
+      return promptCursorMoves(to: p).map(PromptClickAction.moves)
+    }
+    guard p.column >= 0, !isAlternateScreen,
+      semanticState == .prompt || semanticState == .input
+    else { return nil }
+    var promptRow = screenAbsoluteRow(cursor.y)
+    while promptRow > firstAbsoluteRow, mark(absoluteRow: promptRow) != .prompt
+    { promptRow -= 1 }
+    guard mark(absoluteRow: promptRow) == .prompt, p.row >= promptRow else {
+      return nil
+    }
+    let row = relative ? p.row - promptRow : viewportRow(absoluteRow: p.row)
+    guard row >= 0, row < rows else { return nil }
+    let column = min(p.column, columns - 1)
+    return .report(Array("\u{1B}[<0;\(column + 1);\(row + 1)M".utf8))
   }
 
   /// Left (negative) or right arrow presses that move the shell's cursor
@@ -573,6 +645,7 @@ extension TerminalState {
   mutating func resetShellState() {
     semanticState = .none
     promptRedraw = .none
+    promptClick = .none
     inputOffset = nil
     hasSemanticPrompts = false
     lastExitCode = nil

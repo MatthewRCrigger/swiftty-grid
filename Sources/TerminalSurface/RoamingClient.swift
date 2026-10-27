@@ -63,6 +63,8 @@ public actor RoamingClient {
   private var connectionGeneration: UInt64 = 0
   private var reader = ControlRecordReader()
   private var epoch: UInt64?
+  /// What the attached host accepts beyond plain RST/1.
+  private var hostFeatures: RSTFeatures = []
   private var earlySnapshot: DecodedScreen?
   private var outbox: [[UInt8]] = []
   private var pumpGeneration: UInt64?
@@ -250,20 +252,35 @@ public actor RoamingClient {
     // The record must fit RST/1's control record limit once encoded
     // (escaped control characters grow a paste): an operation that could
     // never be sent would stall every later sequence behind it.
-    guard limits.permits(input.operation),
-      Self.fitsControlRecord(
-        input.operation,
-        limit: limits.maxControlRecordBytes
-      )
+    guard
+      let operation = Self.operation(input.operation, for: hostFeatures),
+      limits.permits(operation),
+      Self.fitsControlRecord(operation, limit: limits.maxControlRecordBytes)
     else { return .refused(.invalid) }
     let entry: ClientInputQueue.Entry
-    do { entry = try queue.enqueue(input.operation) } catch .full {
+    do { entry = try queue.enqueue(operation) } catch .full {
       return .refused(.backpressure)
     } catch { return .refused(.invalid) }
     self.queue = queue
     sendInput(entry, epoch: epoch)
     publish()
     return .accepted(sequence: entry.sequence)
+  }
+
+  /// `operation` as a host with `features` accepts it: keypad keys become
+  /// the keys they type without `keypadKeys`. Nil when nothing matches.
+  static func operation(
+    _ operation: InputOperation,
+    for features: RSTFeatures
+  ) -> InputOperation? {
+    guard !features.contains(.keypadKeys), case var .key(key) = operation,
+      case let .keypad(keypad) = key.name
+    else { return operation }
+    guard let main = KeypadKey(rawValue: keypad.rawValue)?.mainKey,
+      let name = SemanticKeyName(main)
+    else { return nil }
+    key.name = name
+    return .key(key)
   }
 
   /// Whether `operation` encodes within the control record limit at the
@@ -867,6 +884,7 @@ public actor RoamingClient {
       return
     }
     epoch = attached.attachmentEpoch
+    hostFeatures = attached.features
     heard()
     store.fence(epoch: attached.attachmentEpoch)
     self.store = store
@@ -1022,7 +1040,9 @@ public actor RoamingClient {
         .init(
           attachmentEpoch: epoch,
           sequence: entry.sequence,
-          operation: entry.operation
+          // A retry may reach an older host than the one that queued it.
+          operation: Self.operation(entry.operation, for: hostFeatures)
+            ?? entry.operation
         )
       )
     )

@@ -1,6 +1,7 @@
 import Foundation
 import MuxNavigation
 import ScreenProtocol
+import SSHIdentity
 import SessionCore
 import SwiftMuxProtocol
 import Synchronization
@@ -16,6 +17,8 @@ private final class ScriptedWorkspaces: RoamingAttentionMetadataService {
     var replies: [HostMetadata]
     var requests: [AttentionRequest] = []
     var closed = 0
+    var pauseNext = false
+    var pending: CheckedContinuation<Void, Never>?
   }
 
   private let state: Mutex<State>
@@ -25,10 +28,30 @@ private final class ScriptedWorkspaces: RoamingAttentionMetadataService {
   var requests: [AttentionRequest] { state.withLock { $0.requests } }
   var closed: Int { state.withLock { $0.closed } }
 
+  func suspendNextReply() { state.withLock { $0.pauseNext = true } }
+  var isWaiting: Bool { state.withLock { $0.pending != nil } }
+  func releaseReply() {
+    let pending = state.withLock { state in
+      let pending = state.pending
+      state.pending = nil
+      return pending
+    }
+    pending?.resume()
+  }
+
   func metadata(
     _ request: AttentionRequest
   ) async throws(AttentionServiceError) -> HostMetadata {
-    try state.withLock { state throws(AttentionServiceError) in
+    await withCheckedContinuation { continuation in
+      let suspended = state.withLock { state in
+        guard state.pauseNext else { return false }
+        state.pauseNext = false
+        state.pending = continuation
+        return true
+      }
+      if !suspended { continuation.resume() }
+    }
+    return try state.withLock { state throws(AttentionServiceError) in
       state.requests.append(request)
       guard !state.replies.isEmpty else { throw .offline("gone") }
       return state.replies.count > 1
@@ -57,9 +80,13 @@ private final class ScriptedWorkspaces: RoamingAttentionMetadataService {
 
 private struct ScriptedConnector: AttentionServiceConnector {
   let service: ScriptedWorkspaces
+  var beforeConnect: (@Sendable () async -> Void)?
   func connect(
     to host: NavigationHost
-  ) async throws(AttentionServiceError) -> any AttentionService { service }
+  ) async throws(AttentionServiceError) -> any AttentionService {
+    await beforeConnect?()
+    return service
+  }
 }
 
 extension MainActorIntegrationTests {
@@ -124,6 +151,306 @@ extension MainActorIntegrationTests {
       return true
     }
 
+    @Test(arguments: [
+      "unchanged", "rename", "key", "case", "roundTrip", "account", "binding",
+      "endpoint", "port", "username",
+    ])
+    func shownWorkspaceBelongsToTheActiveTerminalsOwner(
+      change: String
+    ) async throws {
+      let (app, original, directory) = try model()
+      defer { try? FileManager.default.removeItem(at: directory) }
+      if change != "binding" {
+        #expect(
+          app.commitConnections {
+            $0.settings.metadataSync = true
+            ConnectionSyncCoordinator.bind(&$0, to: "a")
+          }
+        )
+      }
+      let held = summary("Held", attached: true, lease: 7)
+      app.openWorkspace(original, intent: .resume(SessionID(held.id), nil))
+      let active = try #require(app.activeSession)
+      #expect(
+        active.selection?.context.scope == (change == "binding" ? nil : "a")
+      )
+      active.observe(
+        RoamingStatus(state: .active, sessionID: SessionID(held.id))
+      )
+      var host = original
+      switch change {
+      case "binding":
+        #expect(
+          app.commitConnections {
+            $0.settings.metadataSync = true
+            ConnectionSyncCoordinator.bind(&$0, to: "a")
+          }
+        )
+      case "account", "roundTrip":
+        #expect(
+          app.commitConnections {
+            ConnectionSyncCoordinator.bind(&$0, to: "b")
+            if change == "account" {
+              $0.activateRecord(
+                ConnectionSnapshot.hostRecord(host.id),
+                for: "b"
+              )
+              $0.upsertHost(host)
+            }
+          }
+        )
+        if change == "roundTrip" {
+          #expect(
+            app.commitConnections {
+              ConnectionSyncCoordinator.bind(&$0, to: "a")
+            }
+          )
+        }
+      case "endpoint": host.host = "other.local"
+      case "port": host.port += 1
+      case "username": host.username = "other"
+      case "rename": host.nickname = "Renamed"
+      case "case": host.host = host.host.uppercased()
+      case "key": host.auth = .key(identityID: UUID())
+      default: break
+      }
+      if change != "account" { #expect(try app.save(host)) }
+      let service = ScriptedWorkspaces([
+        HostMetadata(serviceEpoch: epoch, workspaces: [held])
+      ])
+      let chooser = WorkspaceChooserModel(
+        model: app,
+        host: host,
+        connector: ScriptedConnector(service: service)
+      )
+      defer {
+        chooser.close();
+        app.close()
+      }
+      chooser.load()
+      try #require(try await loaded(chooser))
+      let row = try #require(chooser.rows.first)
+      let sameOwner = ["unchanged", "rename", "key", "case", "roundTrip"]
+        .contains(change)
+      #expect(row.isShownHere == sameOwner)
+      #expect(row.heldElsewhere == !sameOwner)
+      chooser.choose(row)
+      if !sameOwner {
+        #expect(chooser.pendingTakeover == row)
+        #expect(app.activeSession === active)
+        #expect(!chooser.finished)
+        // Exercise the independent lease re-read after the confirmation.
+        chooser.confirmTakeover()
+      }
+      try #require(try await settle { chooser.finished })
+      if !sameOwner {
+        #expect(
+          app.activeSession?.takeWorkspaceIntent()
+            == .resume(SessionID(held.id), ResumeTarget(expectedLease: 7))
+        )
+      }
+    }
+
+    @Test(
+      arguments: ["create", "resume", "takeover"],
+      [
+        "account", "roundTrip", "revision", "deleted", "notification",
+        "unrelated", "unchanged",
+      ]
+    )
+    func chooserActionsRequireTheirReviewedHost(
+      action: String,
+      change: String
+    ) async throws {
+      let (app, host, directory) = try model()
+      defer { try? FileManager.default.removeItem(at: directory) }
+      #expect(
+        app.commitConnections { ConnectionSyncCoordinator.bind(&$0, to: "a") }
+      )
+      let row = summary("Work", attached: action == "takeover", lease: 7)
+      let service = ScriptedWorkspaces([
+        HostMetadata(serviceEpoch: epoch, workspaces: [row])
+      ])
+      let chooser = WorkspaceChooserModel(
+        model: app,
+        host: host,
+        connector: ScriptedConnector(service: service)
+      )
+      defer {
+        chooser.close();
+        app.close()
+      }
+      chooser.load()
+      try #require(try await loaded(chooser))
+      let selected = try #require(chooser.rows.first)
+      if action == "takeover" { chooser.choose(selected) }
+      switch change {
+      case "account", "roundTrip":
+        #expect(
+          app.commitConnections {
+            ConnectionSyncCoordinator.bind(&$0, to: "b")
+            if change == "account" {
+              $0.activateRecord(
+                ConnectionSnapshot.hostRecord(host.id),
+                for: "b"
+              )
+              $0.upsertHost(host)
+            }
+          }
+        )
+        if change == "roundTrip" {
+          #expect(
+            app.commitConnections {
+              ConnectionSyncCoordinator.bind(&$0, to: "a")
+            }
+          )
+        }
+      case "revision":
+        var changed = host
+        changed.nickname = "Renamed"
+        #expect(try app.save(changed))
+        #expect(try app.save(host))
+      case "deleted": app.delete(host)
+      case "notification": app.identityStore.accountDidChange()
+      case "unrelated":
+        #expect(
+          try app.save(
+            HostProfile(nickname: "Other", host: "other.local", username: "me")
+          )
+        )
+      default: break
+      }
+      let previousHost = HostProfile(
+        nickname: "Active",
+        host: "active.local",
+        username: "me"
+      )
+      app.open(previousHost)
+      let previousSession = app.activeSession
+      switch action {
+      case "create": chooser.createNew()
+      case "resume": chooser.choose(selected)
+      default: chooser.confirmTakeover()
+      }
+      try #require(
+        try await settle {
+          if case .failed = chooser.phase { return true }
+          return chooser.finished || chooser.notice != nil
+        }
+      )
+      if change == "unchanged" || change == "unrelated" {
+        #expect(chooser.finished)
+        #expect(app.activeSession?.host == host)
+        #expect(app.activeSession?.takeWorkspaceIntent() != nil)
+      } else {
+        #expect(!chooser.finished)
+        #expect(app.activeSession === previousSession)
+        #expect(app.activeSession?.takeWorkspaceIntent() == nil)
+      }
+      #expect(chooser.pendingTakeover == nil)
+    }
+
+    @Test(arguments: [false, true])
+    func chooserRechecksSelectionAfterAnOutstandingReply(
+      resume: Bool
+    ) async throws {
+      let (app, host, directory) = try model()
+      defer { try? FileManager.default.removeItem(at: directory) }
+      #expect(
+        app.commitConnections { ConnectionSyncCoordinator.bind(&$0, to: "a") }
+      )
+      let row = summary("Work")
+      let service = ScriptedWorkspaces([
+        HostMetadata(serviceEpoch: epoch, workspaces: [row])
+      ])
+      let chooser = WorkspaceChooserModel(
+        model: app,
+        host: host,
+        connector: ScriptedConnector(service: service)
+      )
+      defer {
+        service.releaseReply();
+        chooser.close();
+        app.close()
+      }
+      if resume {
+        chooser.load()
+        try #require(try await loaded(chooser))
+        service.suspendNextReply()
+        chooser.choose(try #require(chooser.rows.first))
+      } else {
+        service.suspendNextReply()
+        chooser.load()
+      }
+      try #require(try await settle { service.isWaiting })
+      #expect(
+        app.commitConnections {
+          ConnectionSyncCoordinator.bind(&$0, to: "b")
+          $0.activateRecord(ConnectionSnapshot.hostRecord(host.id), for: "b")
+          $0.upsertHost(host)
+        }
+      )
+      service.releaseReply()
+      try #require(
+        try await settle {
+          if case .failed = chooser.phase { return true }
+          return chooser.finished || chooser.phase == .loaded && !resume
+        }
+      )
+      #expect(chooser.phase == .failed(RoamingAppModel.hostChangedMessage))
+      #expect(chooser.rows.isEmpty)
+      #expect(!chooser.finished)
+      #expect(app.activeSession == nil)
+      #expect(app.activeSession?.takeWorkspaceIntent() == nil)
+      try #require(try await settle { service.closed == 1 })
+    }
+
+    @Test
+    func successfulLegacyMigrationKeepsTheSelectedChooserUsable() async throws {
+      let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+      defer { try? FileManager.default.removeItem(at: directory) }
+      let app = RoamingAppModel(
+        store: ConnectionStore(
+          fileURL: directory.appendingPathComponent("hosts.json")
+        ),
+        secrets: InMemoryIdentitySecretStore(),
+        legacyKeys: InMemoryLegacyKeySource(keys: [
+          "phone": IdentitySecret(.init()).privateKey
+        ])
+      )
+      let host = HostProfile(
+        nickname: "Mac",
+        host: "mac.local",
+        username: "me",
+        auth: .legacyKey(label: "phone")
+      )
+      #expect(try app.save(host))
+      let service = ScriptedWorkspaces([
+        HostMetadata(serviceEpoch: epoch, workspaces: [summary("a")])
+      ])
+      let chooser = WorkspaceChooserModel(
+        model: app,
+        host: host,
+        connector: ScriptedConnector(
+          service: service,
+          beforeConnect: { await app.identityStore.recover() }
+        )
+      )
+      defer {
+        chooser.close();
+        app.close()
+      }
+      chooser.load()
+      try #require(try await settle { chooser.phase != .connecting })
+      #expect(chooser.phase == .loaded)
+      #expect(chooser.host.auth.identityID == app.hosts.first?.auth.identityID)
+      #expect(chooser.host.auth.identityID != nil)
+      chooser.createNew()
+      #expect(chooser.finished)
+      #expect(app.activeSession?.host == app.hosts.first)
+    }
+
     @Test
     func browsingAnEmptyMacAndCancellingCreatesNothing() async throws {
       let (app, host, directory) = try model()
@@ -145,7 +472,7 @@ extension MainActorIntegrationTests {
       #expect(service.requests == [.workspaces])
       #expect(app.activeSession == nil)
       #expect(app.resumableSessionID(for: host) == nil)
-      #expect(app.takeIntent(for: host) == nil)
+      #expect(app.activeSession?.takeWorkspaceIntent() == nil)
     }
 
     @Test
@@ -167,7 +494,10 @@ extension MainActorIntegrationTests {
       chooser.choose(try #require(chooser.rows.first))
       #expect(try await settle { chooser.finished })
       #expect(app.activeSession?.host == host)
-      #expect(app.takeIntent(for: host) == .resume(SessionID(free.id), nil))
+      #expect(
+        app.activeSession?.takeWorkspaceIntent()
+          == .resume(SessionID(free.id), nil)
+      )
       #expect(app.resumableSessionID(for: host) == SessionID(free.id))
       app.close()
     }
@@ -188,8 +518,8 @@ extension MainActorIntegrationTests {
       #expect(try await loaded(chooser))
       chooser.createNew()
       #expect(chooser.finished)
-      #expect(app.takeIntent(for: host) == .create)
-      #expect(app.takeIntent(for: host) == nil)
+      #expect(app.activeSession?.takeWorkspaceIntent() == .create)
+      #expect(app.activeSession?.takeWorkspaceIntent() == nil)
       app.close()
     }
 
@@ -217,7 +547,7 @@ extension MainActorIntegrationTests {
       chooser.confirmTakeover()
       #expect(try await settle { chooser.finished })
       #expect(
-        app.takeIntent(for: host)
+        app.activeSession?.takeWorkspaceIntent()
           == .resume(SessionID(held.id), ResumeTarget(expectedLease: 7))
       )
       app.close()
@@ -254,7 +584,7 @@ extension MainActorIntegrationTests {
       #expect(try await settle { service.requests.count >= 3 })
       #expect(!chooser.finished)
       #expect(app.activeSession == nil)
-      #expect(app.takeIntent(for: host) == nil)
+      #expect(app.activeSession?.takeWorkspaceIntent() == nil)
       // The list now shows what is current, for a fresh decision.
       #expect(try await settle { chooser.serviceEpoch == after.serviceEpoch })
       held.leaseGeneration = after.workspaces![0].leaseGeneration
@@ -283,7 +613,7 @@ extension MainActorIntegrationTests {
       chooser.choose(try #require(chooser.rows.first))
       #expect(try await settle { chooser.notice != nil })
       #expect(!chooser.finished)
-      #expect(app.takeIntent(for: host) == nil)
+      #expect(app.activeSession?.takeWorkspaceIntent() == nil)
       chooser.close()
     }
   }
@@ -310,11 +640,11 @@ extension MainActorIntegrationTests {
       let host = HostProfile(nickname: "Mac", host: "mac.local", username: "me")
       #expect(!app.resumeLastWorkspace(host))
       #expect(app.activeSession == nil)
-      #expect(app.takeIntent(for: host) == nil)
+      #expect(app.activeSession?.takeWorkspaceIntent() == nil)
       let id = SessionID(WorkspaceID())
-      app.rememberSession(id, for: host)
+      app.rememberSession(id, for: app.connectionSelection(for: host))
       #expect(app.resumeLastWorkspace(host))
-      #expect(app.takeIntent(for: host) == .resume(id, nil))
+      #expect(app.activeSession?.takeWorkspaceIntent() == .resume(id, nil))
       app.close()
     }
 

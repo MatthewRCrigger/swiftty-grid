@@ -6,6 +6,7 @@ import XCTest
 /// permission prompts. Run through Scripts/test-app-ui.sh; the Nearby
 /// case needs `RST_UI_ADVERTISE=<name>`, the denial case
 /// `RST_UI_LOCAL_NETWORK=deny` on a fresh install.
+@MainActor
 final class ConnectToMacUITests: XCTestCase {
   private var env: [String: String] = [:]
   private var app: XCUIApplication!
@@ -13,7 +14,7 @@ final class ConnectToMacUITests: XCTestCase {
     XCUIApplication(bundleIdentifier: "com.apple.springboard")
   }
 
-  override func setUpWithError() throws {
+  override func setUp() async throws {
     continueAfterFailure = false
     #if !os(iOS) || targetEnvironment(macCatalyst)
     throw XCTSkip("Connect to Mac discovery and scanning are iPhone/iPad only")
@@ -27,9 +28,9 @@ final class ConnectToMacUITests: XCTestCase {
     #endif
   }
 
-  override func tearDown() {
+  override func tearDown() async throws {
     app?.terminate()
-    super.tearDown()
+    try await super.tearDown()
   }
 
   private var allowsLocalNetwork: Bool { env["RST_UI_LOCAL_NETWORK"] != "deny" }
@@ -53,6 +54,7 @@ final class ConnectToMacUITests: XCTestCase {
     // Mac → Workspace: listed, nothing created.
     XCTAssertTrue(element("workspace.new").waitForExistence(timeout: 30))
     press(element("workspace.cancel"))
+    returnToHosts()
     XCTAssertTrue(hostRow("Code Mac").waitForExistence(timeout: 10))
   }
 
@@ -72,6 +74,7 @@ final class ConnectToMacUITests: XCTestCase {
     XCTAssertFalse(element("password.field").exists)
     XCTAssertFalse(element("trust.fingerprint").exists)
     press(element("Cancel", byLabel: true))
+    returnToHosts()
     XCTAssertFalse(hostRow("Code Mac").waitForExistence(timeout: 3))
   }
 
@@ -121,7 +124,7 @@ final class ConnectToMacUITests: XCTestCase {
     XCTAssertTrue(element("nearby.denied").waitForExistence(timeout: 30))
     XCTAssertTrue(anyText("Local Network access is off").exists)
     press(element("Cancel", byLabel: true))
-    XCTAssertTrue(element("hosts.add").waitForExistence(timeout: 10))
+    returnToHosts()
   }
 
   // MARK: Camera
@@ -264,6 +267,15 @@ final class ConnectToMacUITests: XCTestCase {
   }
 
   // MARK: Helpers
+
+  /// Connect to Mac is presented from Settings. Closing its sheet leaves
+  /// Settings visible, so host-list assertions must navigate back first.
+  private func returnToHosts() {
+    let back = app.navigationBars["Settings"].buttons["Hosts"]
+    XCTAssertTrue(back.waitForExistence(timeout: 10))
+    press(back)
+    XCTAssertTrue(element("hosts.add").waitForExistence(timeout: 10))
+  }
 
   private func element(_ id: String, byLabel: Bool = false) -> XCUIElement {
     let predicate =

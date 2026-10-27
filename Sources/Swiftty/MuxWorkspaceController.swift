@@ -348,6 +348,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     case let .inbox(update):
       if inbox.apply(update) { Task { await reloadInbox() } }
       refreshInbox()
+    case let .clipboardRead(request): handleClipboardRead(request)
+    case let .clipboardWrite(request): handleClipboardWrite(request)
     case .paste, .frameUnavailable, .frame, .workspaces, .ready: break
     }
   }

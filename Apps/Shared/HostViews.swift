@@ -6,11 +6,11 @@ public struct HostListView: View {
   @Bindable
   var model: RoamingAppModel
   @State
-  private var editing: HostProfile?
+  private var editing: HostMutationContext?
   @State
   private var adding = false
   @State
-  private var browsing: HostProfile?
+  private var browsing: HostConnectionSelection?
   /// The workspace chooser for a tapped host (pairing lives in Settings).
   @State
   private var connecting: ConnectSheet?
@@ -37,6 +37,7 @@ public struct HostListView: View {
       ForEach(model.hosts) { host in
         HostRow(
           host: host,
+          context: model.hostMutationContext(for: host),
           authSummary: model.authSummary(for: host),
           isResumable: model.resumableHosts.contains(host.id),
           model: model,
@@ -59,8 +60,8 @@ public struct HostListView: View {
       }
     }
     #if !os(tvOS)
-    .adaptiveSheet(item: $browsing) { host in
-      SFTPBrowserView(host: host, app: model)
+    .adaptiveSheet(item: $browsing) { selection in
+      SFTPBrowserView(selection: selection, app: model)
       .macSheetFrame(width: 560, height: 480)
     }
     #endif
@@ -80,27 +81,28 @@ public struct HostListView: View {
 /// changes.
 private struct HostRow: View {
   let host: HostProfile
+  let context: HostMutationContext
   let authSummary: String
   let isResumable: Bool
   let model: RoamingAppModel
   @Binding
   var connecting: ConnectSheet?
   @Binding
-  var editing: HostProfile?
+  var editing: HostMutationContext?
   @Binding
-  var browsing: HostProfile?
+  var browsing: HostConnectionSelection?
 
   var body: some View {
     Button {
       // Mac → Workspace: sign in, then pick or create a workspace.
-      connecting = .choose(host)
+      guard model.validateHostMutation(context) else { return }
+      connecting = .choose(context)
     } label: {
       VStack(alignment: .leading, spacing: 2) {
         Text(host.nickname).font(.headline)
         Text(host.endpointSummary).font(.subheadline.monospaced())
           .foregroundStyle(.secondary)
-        Text(authSummary).font(.caption)
-          .foregroundStyle(.secondary)
+        Text(authSummary).font(.caption).foregroundStyle(.secondary)
         if isResumable {
           // Resuming still needs fresh SSH sign-in.
           Label(
@@ -111,11 +113,13 @@ private struct HostRow: View {
         }
       }
     }
+    .accessibilityIdentifier("host.open.\(host.id)")
     .contextMenu {
       if let last = model.resumableSessionID(for: host) {
         // Names the remembered workspace; never creates one.
         Button {
-          model.resumeLastWorkspace(host)
+          guard model.validateHostMutation(context) else { return }
+          model.openWorkspace(host, intent: .resume(last, nil))
         } label: {
           Label {
             Text(
@@ -129,16 +133,25 @@ private struct HostRow: View {
       }
       if model.profile.sshShell {
         Button(.localized("Open Ordinary SSH Shell")) {
+          guard model.validateHostMutation(context) else { return }
           model.open(host, kind: .ordinarySSH)
         }
       }
       #if !os(tvOS)
       if model.profile.sftp {
-        Button(.localized("Browse Files…")) { browsing = host }
+        Button(.localized("Browse Files…")) {
+          guard model.validateHostMutation(context) else { return }
+          browsing = model.connectionSelection(for: host)
+        }
       }
       #endif
-      Button(.localized("Edit")) { editing = host }
-      Button(.localized("Delete"), role: .destructive) { model.delete(host) }
+      Button(.localized("Edit")) {
+        guard model.validateHostMutation(context) else { return }
+        editing = context
+      }
+      Button(.localized("Delete"), role: .destructive) {
+        model.delete(host, expecting: context)
+      }
     }
   }
 }
@@ -175,16 +188,18 @@ extension View {
   /// Add/Edit Host forms.
   func hostEditorPresentation(
     adding: Binding<Bool>,
-    editing: Binding<HostProfile?>,
+    editing: Binding<HostMutationContext?>,
     model: RoamingAppModel
   ) -> some View {
     self.adaptiveSheet(isPresented: adding) {
       HostEditorView(model: model, host: nil) { adding.wrappedValue = false }
         .macSheetFrame()
     }
-    .adaptiveSheet(item: editing) { host in
-      HostEditorView(model: model, host: host) { editing.wrappedValue = nil }
-        .macSheetFrame()
+    .adaptiveSheet(item: editing) { context in
+      HostEditorView(model: model, context: context) {
+        editing.wrappedValue = nil
+      }
+      .macSheetFrame()
     }
   }
 }
@@ -218,7 +233,8 @@ enum AuthSelection: Hashable {
 /// prompted at connect time and keys are referenced by identity UUID.
 public struct HostEditorView: View {
   let model: RoamingAppModel
-  let original: HostProfile?
+  @State
+  private var context: HostMutationContext
   /// A discovered or scanned Mac awaiting confirmation; `nil` for
   /// ordinary add/edit.
   let candidate: HostCandidate?
@@ -241,7 +257,7 @@ public struct HostEditorView: View {
   private var confirmedSource = false
   /// Explicit choice to update this saved host instead of adding one.
   @State
-  private var replacing: UUID?
+  private var replacement: HostMutationContext?
   /// `currentMatches()`, cached so typing does not refilter the hosts on
   /// every redraw.
   @State
@@ -260,8 +276,25 @@ public struct HostEditorView: View {
     onPaired: ((HostProfile) -> Void)? = nil,
     dismiss: @escaping () -> Void
   ) {
+    self.init(
+      model: model,
+      context: model.hostMutationContext(for: host),
+      candidate: candidate,
+      onPaired: onPaired,
+      dismiss: dismiss
+    )
+  }
+
+  init(
+    model: RoamingAppModel,
+    context: HostMutationContext,
+    candidate: HostCandidate? = nil,
+    onPaired: ((HostProfile) -> Void)? = nil,
+    dismiss: @escaping () -> Void
+  ) {
     self.model = model
-    self.original = host
+    _context = State(initialValue: context)
+    let host = context.original
     self.candidate = candidate
     self.onPaired = onPaired
     self.dismiss = dismiss
@@ -270,9 +303,7 @@ public struct HostEditorView: View {
     )
     _host = State(initialValue: host?.host ?? candidate?.host ?? "")
     _port = State(initialValue: String(host?.port ?? candidate?.port ?? 22))
-    _username = State(
-      initialValue: host?.username ?? candidate?.username ?? ""
-    )
+    _username = State(initialValue: host?.username ?? candidate?.username ?? "")
     _auth = State(initialValue: AuthSelection(host?.auth))
   }
 
@@ -282,6 +313,8 @@ public struct HostEditorView: View {
       .onChange(of: port) { refreshMatches() }
       .onChange(of: model.hosts) { refreshMatches() }
   }
+
+  private var editorIsCurrent: Bool { model.hostMutationIsCurrent(context) }
 
   /// Saved hosts at the same address, offered only as an explicit update.
   private func currentMatches() -> [HostProfile] {
@@ -308,7 +341,11 @@ public struct HostEditorView: View {
           }
           .listRowBackground(Color.clear)
         }
-        if let error {
+        if !editorIsCurrent {
+          Text(RoamingAppModel.hostChangedMessage).foregroundStyle(.red)
+            .listRowBackground(Color.clear)
+            .accessibilityIdentifier("host.error")
+        } else if let error {
           Text(error).foregroundStyle(.red).listRowBackground(Color.clear)
             .accessibilityIdentifier("host.error")
         }
@@ -328,17 +365,22 @@ public struct HostEditorView: View {
           TextField(.localized("Username"), text: $username).plainEntry()
             .accessibilityIdentifier("host.username")
         }
-        .listRowBackground(Color.clear)
+        .disabled(!editorIsCurrent).listRowBackground(Color.clear)
         HostAuthenticationSection(model: model, auth: $auth)
-          .listRowBackground(Color.clear)
+          .disabled(!editorIsCurrent).listRowBackground(Color.clear)
         if candidate != nil, !matchingHosts.isEmpty {
-          SaveAsSection(matches: matchingHosts, replacing: $replacing)
+          SaveAsSection(
+            matches: matchingHosts.map { model.hostMutationContext(for: $0) },
+            replacement: $replacement
+          )
+          .disabled(!editorIsCurrent)
         }
       }
       .glassListBackground()
       .navigationTitle(
         candidate != nil
-          ? "Connect to Mac" : original == nil ? "Add Host" : "Edit Host"
+          ? "Connect to Mac"
+          : context.original == nil ? "Add Host" : "Edit Host"
       )
       .toolbar {
         ToolbarItem(placement: .cancellationAction) {
@@ -348,12 +390,12 @@ public struct HostEditorView: View {
           if candidate != nil {
             Button(.localized("Connect"), action: connect)
               .disabled(
-                pairing != nil
+                !editorIsCurrent || pairing != nil
                   || (candidate?.source == .code && !confirmedSource)
               )
               .accessibilityIdentifier("host.connect")
           } else {
-            Button(.localized("Save"), action: save)
+            Button(.localized("Save"), action: save).disabled(!editorIsCurrent)
               .accessibilityIdentifier("host.save")
           }
         }
@@ -382,10 +424,17 @@ public struct HostEditorView: View {
 
   /// Verify, trust, sign in, save; then the workspace chooser.
   private func connect() {
-    guard let candidate, pairing == nil else { return }
-    let profile = draft(
-      id: currentMatches().first { $0.id == replacing }?.id ?? UUID()
-    )
+    guard let candidate, pairing == nil, model.validateHostMutation(context)
+    else { return }
+    let target = replacement ?? context
+    guard model.validateHostMutation(target),
+      replacement == nil
+        || currentMatches().contains(where: { $0.id == target.id })
+    else {
+      error = RoamingAppModel.hostChangedMessage
+      return
+    }
+    let profile = draft(id: target.id)
     do { try profile.validate() } catch {
       self.error = error.message
       return
@@ -396,7 +445,8 @@ public struct HostEditorView: View {
       do throws(PairingFailure) {
         let saved = try await model.pair(
           profile,
-          expectedHostKeys: candidate.expectedHostKeys
+          expectedHostKeys: candidate.expectedHostKeys,
+          context: target
         )
         guard !Task.isCancelled else { return }
         onPaired?(saved)
@@ -408,16 +458,9 @@ public struct HostEditorView: View {
   }
 
   private func save() {
-    let profile = HostProfile(
-      id: original?.id ?? UUID(),
-      nickname: nickname.trimmingCharacters(in: .whitespaces),
-      host: host.trimmingCharacters(in: .whitespaces),
-      port: Int(port.trimmingCharacters(in: .whitespaces)) ?? 0,
-      username: username.trimmingCharacters(in: .whitespaces),
-      auth: auth.reference
-    )
+    let profile = draft(id: context.id)
     do {
-      guard try model.save(profile) else {
+      guard try model.save(profile, expecting: context) else {
         error = model.lastError
         return
       }
@@ -505,19 +548,26 @@ private struct HostAuthenticationSection: View {
 
 /// Saved hosts at the candidate's address, offered as explicit updates.
 private struct SaveAsSection: View {
-  let matches: [HostProfile]
+  let matches: [HostMutationContext]
   @Binding
-  var replacing: UUID?
+  var replacement: HostMutationContext?
 
   var body: some View {
     Section {
-      Picker(.localized("Save as"), selection: $replacing) {
-        Text("New host", bundle: #bundle).tag(UUID?.none)
-        ForEach(matches) { saved in
-          Text("Update \u{201C}\(saved.nickname)\u{201D}", bundle: #bundle)
-            .tag(UUID?.some(saved.id))
+      Picker(.localized("Save as"), selection: $replacement) {
+        Text("New host", bundle: #bundle).tag(HostMutationContext?.none)
+        if let replacement, !matches.contains(replacement) {
+          Text("Selected host changed. Choose again.", bundle: #bundle)
+            .tag(HostMutationContext?.some(replacement)).disabled(true)
+        }
+        ForEach(matches) { context in
+          if let saved = context.original {
+            Text("Update \u{201C}\(saved.nickname)\u{201D}", bundle: #bundle)
+              .tag(HostMutationContext?.some(context))
+          }
         }
       }
+      .accessibilityIdentifier("host.replacement")
     } footer: {
       Text(
         """

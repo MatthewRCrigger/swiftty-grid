@@ -244,7 +244,8 @@ public final class TerminalClient {
     case let .paste(_, state):
       if state != .completed { show("paste \(state.rawValue)") }
     case let .frameUnavailable(_, error): show("frame unavailable: \(error)")
-    case .workspaces, .inbox: break
+    // This frontend never asks for clipboard requests.
+    case .workspaces, .inbox, .clipboardRead, .clipboardWrite: break
     }
   }
 
@@ -450,7 +451,7 @@ public final class TerminalClient {
       // A program sets its title (the service sanitizes it).
       if let pane = activeTab?.activePane,
         let full = workspace.pane(pane)?.title,
-        case let title = DisplayText.head(full, width: size.columns / 3),
+        case let title = TerminalText.head(full, width: size.columns / 3),
         !title.isEmpty
       {
         line.right = "\"\(title)\" "
@@ -762,7 +763,7 @@ public final class TerminalClient {
     command(.setSplitRatio(tab: tab.id, path: split.path, ratio: ratio))
   }
 
-  /// Names joined for a prompt label within `limit` characters, the rest
+  /// Names joined for a prompt label within `limit` display cells, the rest
   /// counted (", +N"). Names (plain, as the service requires) appear as
   /// typed; only a first name too long for the budget is shortened.
   static func listing(_ names: [String], limit: Int = 40) -> String {
@@ -770,15 +771,18 @@ public final class TerminalClient {
     func more(_ count: Int) -> String { count > 0 ? ", +\(count)" : "" }
     // Each name shown leaves room to count the names after it.
     let room = limit - more(names.count - 1).count
-    guard first.count <= room else {
-      return DisplayText.head(first, width: max(1, room))
+    guard TerminalText.width(first) <= room else {
+      return TerminalText.head(first, width: max(1, room))
         + more(names.count - 1)
     }
     var shown = first
     var count = 1
     for name in names.dropFirst() {
       let rest = more(names.count - count - 1)
-      guard shown.count + 2 + name.count + rest.count <= limit else { break }
+      guard
+        TerminalText.width(shown) + 2 + TerminalText.width(name) + rest.count
+          <= limit
+      else { break }
       shown += ", " + name
       count += 1
     }

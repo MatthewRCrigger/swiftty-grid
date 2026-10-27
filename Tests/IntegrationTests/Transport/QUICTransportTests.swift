@@ -761,6 +761,61 @@ struct QUICTransportTests {
     #expect(!inbox.closed)
   }
 
+  /// Sequential cancellations must not exhaust the client's initial
+  /// unidirectional stream credit.
+  @Test
+  func `repeated cancellation during stream creation preserves stream credit`()
+    async throws
+  {
+    let (listener, accepted) = try await startListener()
+    defer { listener.stop() }
+    let client = try await connector()
+      .connectQUIC(
+        host: "127.0.0.1",
+        port: listener.port,
+        pin: loopbackIdentity.pin,
+      )
+    defer { client.close() }
+    let inbox = Inbox()
+    client.start(inbox.handler)
+    try await client.sendControl(
+      ControlRecord.encode(.ping(epoch: 1, nonce: 1)),
+    )
+    try await transportEventually { accepted.count == 1 }
+    let (server, serverInbox) = try #require(accepted.all.first)
+    let cancellations = UInt64(QUICOptions.concurrentSnapshotStreams) * 3
+    for stream in 1...cancellations {
+      await #expect(throws: RSTTransportError.canceled) {
+        try await server.sendSnapshot(
+          snapshotPayload(bodyLength: 100, fill: UInt8(stream)),
+          stream: stream,
+          beforeRegistration: { server.cancelSnapshot(stream: stream) },
+        )
+      }
+    }
+    #expect(server.admittedSnapshotSendsForTesting == 0)
+    var delivered: [[UInt8]] = []
+    for offset in 1...UInt64(QUICOptions.concurrentSnapshotStreams) * 2 {
+      let replacement = snapshotPayload(
+        bodyLength: 100,
+        fill: 0x80 + UInt8(offset)
+      )
+      try await server.sendSnapshot(replacement, stream: cancellations + offset)
+      delivered.append(replacement)
+      try await transportEventually { inbox.snapshots == delivered }
+    }
+    try await client.sendControl(
+      ControlRecord.encode(.ping(epoch: 1, nonce: 2)),
+    )
+    try await transportEventually { serverInbox.messages.count == 2 }
+    try await server.sendControl(
+      ControlRecord.encode(.ping(epoch: 1, nonce: 3)),
+    )
+    try await transportEventually { inbox.messages.count == 1 }
+    #expect(!inbox.closed)
+    #expect(!serverInbox.closed)
+  }
+
   @Test
   func `replacing a pending snapshot settles both senders`() async throws {
     let (listener, accepted) = try await startListener()
@@ -852,7 +907,7 @@ struct QUICTransportTests {
         ControlRecord.encode(.ping(epoch: 1, nonce: nonce)),
       )
     }
-    try await eventually { accepted.all.first?.1.messages.count == 3 }
+    try #require(await eventually { accepted.all.first?.1.messages.count == 3 })
     let (server, serverInbox) = try #require(accepted.all.first)
     #expect(
       serverInbox.messages
@@ -865,15 +920,15 @@ struct QUICTransportTests {
       batch += try ControlRecord.encode(.pong(epoch: 1, nonce: nonce))
     }
     try await server.sendControl(batch)
-    try await eventually { clientInbox.messages.count == 3 }
+    try #require(await eventually { clientInbox.messages.count == 3 })
     #expect(
       clientInbox.messages
         == (1 ... 3).map { ControlMessage.pong(epoch: 1, nonce: $0) },
     )
 
     client.close()
-    try await eventually { serverInbox.closed && clientInbox.closed }
-    try await eventually { listener.activeConnectionCount == 0 }
+    try #require(await eventually { serverInbox.closed && clientInbox.closed })
+    try #require(await eventually { listener.activeConnectionCount == 0 })
   }
 
   @Test
@@ -911,7 +966,7 @@ struct QUICTransportTests {
       total += record.count
       try await client.sendControl(record)
     }
-    try await eventually { tracker.bytes == total }
+    try #require(await eventually { tracker.bytes == total })
     #expect(tracker.maxConcurrent == 1)
   }
 
@@ -969,7 +1024,7 @@ struct QUICTransportTests {
         ControlRecord.encode(.ping(epoch: 1, nonce: 1)),
       )
       stage = "accepted server"
-      try await eventually { accepted.count == 1 }
+      try #require(await eventually { accepted.count == 1 })
       let (server, _) = try #require(accepted.all.first)
       client.enableSnapshotReadDiagnosticsForTesting()
       server.enableSnapshotReadDiagnosticsForTesting()
@@ -1026,7 +1081,7 @@ struct QUICTransportTests {
       }
 
       stage = "snapshot delivery"
-      try await eventually { inbox.snapshots.contains(last) }
+      try #require(await eventually { inbox.snapshots.contains(last) })
       try await Task.sleep(for: .milliseconds(200))
       let received = inbox.snapshots
       #expect(received.contains(small))
@@ -1074,7 +1129,7 @@ struct QUICTransportTests {
     try await client.sendControl(
       ControlRecord.encode(.ping(epoch: 1, nonce: 1)),
     )
-    try await eventually { accepted.count == 1 }
+    try #require(await eventually { accepted.count == 1 })
     let (server, _) = try #require(accepted.all.first)
 
     client.enableSnapshotReadDiagnosticsForTesting()
@@ -1097,7 +1152,7 @@ struct QUICTransportTests {
     )
     let good = snapshotPayload(bodyLength: 50000, fill: 0x22)
     try await server.sendSnapshot(good, stream: 1)
-    try await eventually { !inbox.snapshots.isEmpty }
+    try #require(await eventually { !inbox.snapshots.isEmpty })
     try await Task.sleep(for: .milliseconds(200))
     #expect(inbox.snapshots == [good])
     try await transportEventually { client.snapshotReadBytesForTesting.isEmpty }
@@ -1121,7 +1176,7 @@ struct QUICTransportTests {
     try await client.sendControl(
       ControlRecord.encode(.ping(epoch: 1, nonce: 1)),
     )
-    try await eventually { accepted.count == 1 }
+    try #require(await eventually { accepted.count == 1 })
     let (server, _) = try #require(accepted.all.first)
 
     // A snapshot abandoned before its write ends as an empty stream.
@@ -1131,7 +1186,7 @@ struct QUICTransportTests {
     }
     let good = snapshotPayload(bodyLength: 32, fill: 0x44)
     try await server.sendSnapshot(good, stream: 1)
-    try await eventually { !inbox.snapshots.isEmpty }
+    try #require(await eventually { !inbox.snapshots.isEmpty })
     #expect(inbox.snapshots == [good])
     #expect(!client.isClosed)
     #expect(!server.isClosed)
@@ -1155,7 +1210,7 @@ struct QUICTransportTests {
     try await client.sendControl(
       ControlRecord.encode(.ping(epoch: 1, nonce: 1)),
     )
-    try await eventually { accepted.count == 1 }
+    try #require(await eventually { accepted.count == 1 })
     let (server, _) = try #require(accepted.all.first)
     server.enableSnapshotReadDiagnosticsForTesting()
 
@@ -1197,7 +1252,7 @@ struct QUICTransportTests {
     try await client.sendControl(
       ControlRecord.encode(.ping(epoch: 1, nonce: 1)),
     )
-    try await eventually { accepted.count == 1 }
+    try #require(await eventually { accepted.count == 1 })
     let (server, _) = try #require(accepted.all.first)
 
     // Header claims more than the 4 MiB bound.
@@ -1223,7 +1278,7 @@ struct QUICTransportTests {
 
     let good = snapshotPayload(bodyLength: 32, fill: 0x33)
     try await server.sendSnapshot(good, stream: 1)
-    try await eventually { !inbox.snapshots.isEmpty }
+    try #require(await eventually { !inbox.snapshots.isEmpty })
     try await Task.sleep(for: .milliseconds(200))
     #expect(inbox.snapshots == [good])
     #expect(!inbox.closed)
@@ -1307,9 +1362,11 @@ struct QUICTransportTests {
     let pin = loopbackIdentity.pin
     let first = try await connector()
       .connectQUIC(host: "127.0.0.1", port: listener.port, pin: pin)
+    defer { first.close() }
     let second = try await connector()
       .connectQUIC(host: "127.0.0.1", port: listener.port, pin: pin)
-    try await eventually { accepted.count == 2 }
+    defer { second.close() }
+    try #require(await eventually { accepted.count == 2 })
 
     // The third group is refused; depending on when Network hands the
     // group to the listener the client either fails to connect or sees
@@ -1318,20 +1375,20 @@ struct QUICTransportTests {
     do {
       let third = try await connector(timeout: .seconds(2))
         .connectQUIC(host: "127.0.0.1", port: listener.port, pin: pin)
+      defer { third.close() }
       third.start(inbox.handler)
-      try await eventually { inbox.closed }
+      try #require(await eventually { inbox.closed })
     } catch {}
     #expect(listener.rejectedConnectionCount >= 1)
     #expect(listener.activeConnectionCount == 2)
     #expect(accepted.count == 2)
 
     first.close()
-    try await eventually { listener.activeConnectionCount == 1 }
+    try #require(await eventually { listener.activeConnectionCount == 1 })
     let fourth = try await connector()
       .connectQUIC(host: "127.0.0.1", port: listener.port, pin: pin)
-    try await eventually { accepted.count == 3 }
-    fourth.close()
-    second.close()
+    defer { fourth.close() }
+    try #require(await eventually { accepted.count == 3 })
   }
 
   @Test
@@ -1354,28 +1411,31 @@ struct QUICTransportTests {
           port: listener.port,
           pin: loopbackIdentity.pin,
         )
+      defer { second.close() }
       let inbox = Inbox()
       second.start(inbox.handler)
-      try await eventually { inbox.closed }
+      try #require(await eventually { inbox.closed })
     } catch {}
     #expect(listener.rejectedConnectionCount >= 1)
-    try await eventually { accepted.count == 1 }
+    try #require(await eventually { accepted.count == 1 })
   }
 
   @Test
   func `closing the listener closes its connections`() async throws {
     let (listener, accepted) = try await startListener()
+    defer { listener.stop() }
     let client = try await connector()
       .connectQUIC(
         host: "127.0.0.1",
         port: listener.port,
         pin: loopbackIdentity.pin,
       )
+    defer { client.close() }
     let inbox = Inbox()
     client.start(inbox.handler)
-    try await eventually { accepted.count == 1 }
+    try #require(await eventually { accepted.count == 1 })
     listener.stop()
-    try await eventually { inbox.closed }
+    try #require(await eventually { inbox.closed })
     await #expect(throws: (any Error).self) {
       try await client.sendControl(
         ControlRecord.encode(.ping(epoch: 1, nonce: 1)),

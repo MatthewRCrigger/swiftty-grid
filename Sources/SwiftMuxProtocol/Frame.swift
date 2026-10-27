@@ -206,6 +206,9 @@ public struct SupportedViewModes: OptionSet, Codable, Sendable, Hashable {
   public static let mouseAnyMotion = SupportedViewModes(rawValue: 1 << 8)
   /// The wheel sends arrow keys on the alternate screen (1007).
   public static let alternateScroll = SupportedViewModes(rawValue: 1 << 9)
+  /// Pastes are reported as kitty paste events (5522), from a service
+  /// offering `ServiceFeatures.kittyClipboard`.
+  public static let kittyPasteEvents = SupportedViewModes(rawValue: 1 << 10)
 }
 
 public struct HistoryWindow: Codable, Sendable, Equatable {
@@ -297,6 +300,8 @@ public struct PaneFrame: Codable, Sendable, Equatable {
   public var history: HistoryWindow
   public var search: FrameSearch?
   public var title: String
+  /// The program's drop registration (`dropTargets`); nil when none.
+  public var dropTarget: FrameDropTarget?
 
   public init(
     identity: FrameIdentity,
@@ -309,7 +314,8 @@ public struct PaneFrame: Codable, Sendable, Equatable {
     modes: SupportedViewModes,
     history: HistoryWindow,
     search: FrameSearch?,
-    title: String
+    title: String,
+    dropTarget: FrameDropTarget? = nil
   ) {
     self.identity = identity
     self.grid = grid
@@ -322,6 +328,7 @@ public struct PaneFrame: Codable, Sendable, Equatable {
     self.history = history
     self.search = search
     self.title = title
+    self.dropTarget = dropTarget
   }
 
   /// Text of row `y`, trailing blanks trimmed.

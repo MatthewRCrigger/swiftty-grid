@@ -86,6 +86,9 @@ from pathlib import Path
 root = Path(os.environ['INSTALL_FIXTURE_ROOT'])
 with (root/'calls.jsonl').open('a') as stream:
     stream.write(json.dumps(['swiftty', sys.argv[1:]])+'\n')
+if sys.argv[1:2] == ['--running-app']:
+    print(os.environ.get('INSTALL_FIXTURE_INSTANCE_STATE', 'running'))
+    sys.exit(int(os.environ.get('INSTALL_FIXTURE_APP_QUERY_STATUS', '0')))
 print('enabled')
 '''
 
@@ -164,7 +167,34 @@ class InstallTests(unittest.TestCase):
         self.assertEqual((self.app / "old").read_text(), "old")
         self.assertFalse((self.app / "new").exists())
         self.assertFalse((self.app / "partial").exists())
-        self.assertFalse(any(name in {"swiftty", "open"} for name, _ in self.calls()))
+        self.assertFalse(any(name == "open" or name == "swiftty" and args[:1] != ["--running-app"]
+                             for name, args in self.calls()))
+
+    def test_unrelated_same_named_process_does_not_suppress_opening_selected_app(self):
+        # pgrep deliberately reports a process named swiftty. Only the exact
+        # destination's application state determines whether to open this copy.
+        result = self.install(INSTALL_FIXTURE_INSTANCE_STATE="stopped")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(["open", ["-n", str(self.app)]], self.calls())
+        self.assertNotIn("running the previous build", result.stdout)
+
+    def test_running_destination_is_left_running_and_query_precedes_publication(self):
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        query = calls.index(["swiftty", ["--running-app", str(self.app)]])
+        copy = next(i for i, (name, _) in enumerate(calls) if name == "ditto")
+        self.assertLess(query, copy)
+        self.assertFalse(any(name == "open" for name, _ in calls))
+        self.assertIn("running the previous build", result.stdout)
+
+    def test_failed_or_invalid_instance_query_preserves_previous_app(self):
+        for state, status in [("stopped", "1"), ("unexpected", "0")]:
+            with self.subTest(state=state, status=status):
+                result = self.install(INSTALL_FIXTURE_INSTANCE_STATE=state,
+                                      INSTALL_FIXTURE_APP_QUERY_STATUS=status)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assert_prior_app()
 
     def test_copy_failure_preserves_previous_app_and_skips_registration(self):
         result = self.install(INSTALL_FIXTURE_FAILURE="copy")
@@ -190,7 +220,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(list(self.destination.iterdir()), [self.app])
         calls = self.calls()
         verify = next(i for i, (name, args) in enumerate(calls) if name == "codesign" and "--verify" in args)
-        register = next(i for i, (name, _) in enumerate(calls) if name == "swiftty")
+        register = next(i for i, (name, args) in enumerate(calls)
+                        if name == "swiftty" and args == ["--swiftmux-agent", "register"])
         self.assertLess(verify, register)
         self.assertTrue(any(name == "swiftty" and args == ["--swiftmux-agent", "register"]
                             for name, args in calls))
@@ -203,7 +234,8 @@ class InstallTests(unittest.TestCase):
         self.assertIn("File exists", result.stderr)
         self.assertEqual((self.app / "competing").read_text(), "competing installation")
         self.assertFalse((self.app / "new").exists())
-        self.assertFalse(any(name == "swiftty" for name, _ in self.calls()))
+        self.assertFalse(any(name == "swiftty" and args[:1] == ["--swiftmux-agent"]
+                             for name, args in self.calls()))
         shutil.rmtree(self.app)
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)

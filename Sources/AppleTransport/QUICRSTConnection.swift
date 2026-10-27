@@ -26,13 +26,16 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
   /// in an extra queue. Network's send call is nonblocking; its completion
   /// only uses the connection state lock, never this admission lock.
   private final class SnapshotWriteAdmission: Sendable {
-    private enum Phase: Sendable { case waiting, started, cancelled }
+    private enum Phase: Sendable {
+      case waiting, started
+      case cancelled(submitted: Bool)
+    }
 
     private let phase = Mutex(Phase.waiting)
 
     func perform(_ write: () -> Void) {
       phase.withLock { phase in
-        guard phase == .waiting else { return }
+        guard case .waiting = phase else { return }
         phase = .started
         write()
       }
@@ -43,12 +46,12 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
       phase.withLock { phase in
         switch phase {
         case .waiting:
-          phase = .cancelled
+          phase = .cancelled(submitted: false)
           return false
         case .started:
-          phase = .cancelled
+          phase = .cancelled(submitted: true)
           return true
-        case .cancelled: return false
+        case let .cancelled(submitted): return submitted
         }
       }
     }
@@ -88,7 +91,8 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
     var termination: String?
     var nativeTermination: String?
     var outbound: [UInt64: OutboundSnapshot] = [:]
-    var admittedSnapshotSends = 0
+    /// Includes cancelled callers while their native writes are outstanding.
+    var admittedSnapshotSends: Set<UUID> = []
     var outboundOrder: [UInt64] = []
     /// Superseded streams whose native send is still outstanding.
     var parkedFinishes:
@@ -103,6 +107,7 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
     var snapshotReads: [ObjectIdentifier: SnapshotReadProgress] = [:]
     var streamLifecycle: [String] = []
     var beforeInboundStartForTesting: (@Sendable () -> Void)?
+    var beforeSnapshotReadForTesting: SnapshotReadGate?
     /// Server snapshot streams released so far (client side).
     var releasedSnapshotStreams = 0
     var onViabilityChange: (@Sendable (Bool) -> Void)?
@@ -142,7 +147,16 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
   static let maxPendingSnapshotSends = 8
 
   var admittedSnapshotSendsForTesting: Int {
-    state.withLock { $0.admittedSnapshotSends }
+    state.withLock { $0.admittedSnapshotSends.count }
+  }
+
+  var snapshotDeliveryCountsForTesting: (queued: Int, released: Int) {
+    queue.sync {
+      (
+        mailbox.queuedSnapshotsForTesting,
+        state.withLock { $0.releasedSnapshotStreams }
+      )
+    }
   }
   static let maxPreCanceledSnapshots = 64
 
@@ -169,9 +183,7 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
     self.group = group
     self.queue = queue
     self.limits = limits.effective
-    self.mailbox = EventMailbox(
-      snapshotLimit: RSTLimits.maxInFlightSnapshots + 1
-    )
+    self.mailbox = EventMailbox()
   }
 
   deinit {
@@ -563,7 +575,8 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
     }
   }
 
-  /// At most eight unfinished sends (including stream creation) are admitted.
+  /// At most eight unfinished sends (including stream creation and native
+  /// writes whose callers have cancelled) are admitted.
   /// Additional sends fail with `resourceLimit`; completed stream history has
   /// a separate bound for later cancellation.
   public func sendSnapshot(_ payload: [UInt8], stream id: UInt64) async throws {
@@ -576,6 +589,7 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
     stream id: UInt64,
     beforeRegistration: (@Sendable () -> Void)?,
     beforeStreamCreation: (@Sendable () async -> Void)? = nil,
+    afterRegistration: (@Sendable () -> Void)? = nil,
     beforeWrite: (@Sendable () -> Void)? = nil,
     write: ControlWrite? = nil
   ) async throws {
@@ -584,17 +598,25 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
       throw RSTTransportError.snapshotTooLarge
     }
     guard !Task.isCancelled else { throw RSTTransportError.canceled }
+    let admissionID = UUID()
     let canceled = try state.withLock { s -> Bool in
       if s.closed { throw RSTTransportError.closed }
       if s.takePreCancellation(id) { return true }
-      guard s.admittedSnapshotSends < Self.maxPendingSnapshotSends else {
+      guard s.admittedSnapshotSends.count < Self.maxPendingSnapshotSends else {
         throw RSTTransportError.resourceLimit
       }
-      s.admittedSnapshotSends += 1
+      s.admittedSnapshotSends.insert(admissionID)
       return false
     }
     if canceled { throw RSTTransportError.canceled }
-    defer { state.withLock { $0.admittedSnapshotSends -= 1 } }
+    // Once submitted, the native completion owns this reservation, even if
+    // cancellation or replacement resumes the caller before that completion.
+    var submitted = false
+    defer {
+      if !submitted {
+        state.withLock { _ = $0.admittedSnapshotSends.remove(admissionID) }
+      }
+    }
     await beforeStreamCreation?()
     guard !Task.isCancelled else { throw RSTTransportError.canceled }
     guard !state.withLock({ $0.closed }) else { throw RSTTransportError.closed }
@@ -635,6 +657,13 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
           OutboundSnapshot(stream: stream, writeIncludesFIN: write == nil),
           forKey: id
         )
+        // Publish pending retirement in the same transition that supersedes
+        // the old stream. Its send callback may run as soon as this lock opens.
+        if let previous, !previous.sent {
+          s.parkedFinishes[ObjectIdentifier(previous.stream)] = (
+            previous.stream, previous.writeIncludesFIN
+          )
+        }
         s.outboundOrder.removeAll { $0 == id }
         s.outboundOrder.append(id)
         s.openedSnapshotStreams += 1
@@ -644,8 +673,9 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
       stream.cancel()
       throw error
     }
+    afterRegistration?()
     if let previous {
-      parkOrFinish(previous)
+      finishSupersededSnapshot(previous)
       previous.continuation?.resume(throwing: RSTTransportError.canceled)
     }
     stream.start(queue: queue)
@@ -667,11 +697,16 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
         beforeWrite?()
         let completed: @Sendable (NWError?) -> Void = {
           [weak self, weak stream] error in
+          guard let self else { return }
+          self.state.withLock {
+            _ = $0.admittedSnapshotSends.remove(admissionID)
+          }
           guard let stream else { return }
-          self?.sendCompleted(id: id, stream: stream, error: error)
+          self.sendCompleted(id: id, stream: stream, error: error)
         }
         let bytes = Data(payload)
         admission.perform {
+          submitted = true
           traceStream(
             stream,
             event: "outbound write,snapshot=\(id),bytes=\(payload.count)"
@@ -695,6 +730,10 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
 
   var pendingSnapshotSendsForTesting: Int {
     state.withLock { $0.outbound.values.count { $0.continuation != nil } }
+  }
+
+  var parkedSnapshotFinishesForTesting: Int {
+    state.withLock { $0.parkedFinishes.count }
   }
 
   func snapshotStreamForTesting(_ id: UInt64) -> NWConnection? {
@@ -741,7 +780,7 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
       + "termination=\(snapshot.termination ?? "none"),"
       + "nativeTermination=\(snapshot.nativeTermination ?? "none"),"
       + "lifecycle=\(snapshot.streamLifecycle),"
-      + "admitted=\(snapshot.admittedSnapshotSends),outbound=\(outbound),"
+      + "admitted=\(snapshot.admittedSnapshotSends.count),outbound=\(outbound),"
       + "retiring=\(snapshot.retiring.count),"
       + "inbound=\(inbound),released=\(snapshot.releasedSnapshotStreams),"
       + "localMaxStreams=\(String(describing: metadata?.localMaxStreamsUnidirectional)),"
@@ -974,20 +1013,20 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
 
   /// The previous snapshot id was replaced. Finish it when no native send
   /// is outstanding; otherwise wait for that send's completion.
-  private func parkOrFinish(_ previous: OutboundSnapshot) {
+  private func finishSupersededSnapshot(_ previous: OutboundSnapshot) {
     let submitted = previous.writeAdmission.cancel()
-    if previous.sent || !submitted {
-      // An unsubmitted write never queued its FIN.
+    if previous.sent {
       finishSnapshotStream(
         previous.stream,
-        finQueued: previous.sent && previous.writeIncludesFIN
+        finQueued: previous.writeIncludesFIN
       )
-      return
-    }
-    state.withLock { s in
-      s.parkedFinishes[ObjectIdentifier(previous.stream)] = (
-        previous.stream, previous.writeIncludesFIN
-      )
+    } else if !submitted {
+      // No callback will arrive for an unsubmitted write. Claim the parked
+      // stream unless termination already retired it; its FIN is still owed.
+      let parked = state.withLock {
+        $0.parkedFinishes.removeValue(forKey: ObjectIdentifier(previous.stream))
+      }
+      if let parked { finishSnapshotStream(parked.stream, finQueued: false) }
     }
   }
 
@@ -1026,7 +1065,42 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
 
   // MARK: Inbound snapshots (client)
 
+  typealias SnapshotReadGate =
+    @Sendable (Int, @escaping @Sendable () -> Void) -> Bool
+
+  /// Defers one stream's read without blocking the connection's callback queue.
+  func setBeforeSnapshotReadForTesting(_ gate: SnapshotReadGate?) {
+    let previous = state.withLock { s in
+      let previous = s.beforeSnapshotReadForTesting
+      s.beforeSnapshotReadForTesting = gate
+      return previous
+    }
+    if gate != nil { traceSnapshotReads.store(true, ordering: .relaxed) }
+    withExtendedLifetime(previous) {}
+  }
+
   private func readSnapshot(
+    from stream: NWConnection,
+    into accumulator: SnapshotStreamAccumulator
+  ) {
+    if traceSnapshotReads.load(ordering: .relaxed),
+      let gate = state.withLock({ $0.beforeSnapshotReadForTesting }),
+      gate(
+        accumulator.bytes.count,
+        { [weak self] in
+          self?.queue
+            .async { [weak self] in
+              self?.receiveSnapshot(from: stream, into: accumulator)
+            }
+        }
+      )
+    {
+      return
+    }
+    receiveSnapshot(from: stream, into: accumulator)
+  }
+
+  private func receiveSnapshot(
     from stream: NWConnection,
     into accumulator: SnapshotStreamAccumulator
   ) {
@@ -1189,6 +1263,7 @@ public final class QUICRSTConnection: RSTConnection, RSTPathEvents {
       s.inbound = [:]
       s.snapshotReads = [:]
       s.beforeInboundStartForTesting = nil
+      s.beforeSnapshotReadForTesting = nil
       s.onViabilityChange = nil
       s.onBetterPath = nil
       s.onTerminated = nil

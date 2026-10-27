@@ -272,6 +272,135 @@ struct RawTTYTests {
 
 @Suite
 struct DiffRendererTests {
+  @Test(arguments: ["界A", "👨‍👩‍👧A", "e\u{301}界", "\u{301}A"])
+  func chromeWidthsSurviveBottomRowReplay(text: String) {
+    var screen = ScreenBuffer(columns: 8, rows: 2)
+    screen.write("pane", x: 0, y: 0, style: .plain)
+    screen.write(text, x: 0, y: 1, style: .plain)
+    let outer = TerminalSession(columns: 8, rows: 2)
+    var renderer = DiffRenderer()
+    outer.feed(renderer.update(to: screen))
+    renderer.commit(screen)
+    #expect(
+      outer.withState { $0.screenLines } == (0 ..< 2).map(screen.text(row:))
+    )
+    // Replacing a wide lead repairs its continuation on the outer display.
+    screen.write("x", x: 0, y: 1, style: .plain)
+    outer.feed(renderer.update(to: screen))
+    #expect(
+      outer.withState { $0.screenLines } == (0 ..< 2).map(screen.text(row:))
+    )
+  }
+
+  @Test
+  func chromeClipsAndPositionsInDisplayCells() {
+    #expect(TerminalText.head("界界A", width: 4) == "界…")
+    #expect(TerminalText.tail("A界界", width: 4) == "…界")
+    var clipped = ScreenBuffer(columns: 8, rows: 2)
+    clipped.write("A界", x: 0, y: 0, style: .plain, limit: 2)
+    #expect(clipped.text(row: 0) == "A")
+    clipped.write("界", x: 7, y: 1, style: .plain)
+    #expect(clipped.text(row: 1).isEmpty)
+    let workspace = WorkspaceSnapshot(
+      id: WorkspaceID(),
+      name: "w",
+      tabs: [],
+      activeTab: TabID(),
+      panes: [],
+      layoutRevision: 1
+    )
+    var status = StatusLine()
+    status.left = "界"
+    status.items = [.init(text: "🙂", active: true)]
+    status.right = "界A"
+    func render() -> ScreenBuffer {
+      Compositor(columns: 12, rows: 2)
+        .compose(
+          workspace: workspace,
+          frames: [:],
+          status: status,
+          showCursor: false
+        )
+    }
+    let screen = render()
+    #expect(screen[0, 1].width == 2)
+    #expect(screen[1, 1].width == 0)
+    #expect(screen[2, 1].text == "🙂")
+    #expect(screen[9, 1].text == "界")
+    #expect(screen[11, 1].text == "A")
+    status.prompt = "界🙂A"
+    status.promptCursor = true
+    #expect(render().cursor?.x == 5)
+    status.prompt = "界界界界界界A"
+    status.right = ""
+    let prompt = render()
+    #expect(prompt.text(row: 1) == "…界界界界A")
+    #expect(prompt.cursor?.x == 10)
+  }
+
+  @Test
+  func panePaletteAndUnderlineChangesReachTheOuterTerminal() throws {
+    let pane = TerminalSession(columns: 8, rows: 2)
+    pane.feed(Array("\u{1B}[31;44;4:3;58;5;2mA\u{1B}[0mB".utf8))
+    func compose() throws -> ScreenBuffer {
+      let frame = try FrameExporter.frame(
+        from: pane.withState { $0.captureOwnedScreen() },
+        identity: BridgeTests.identity()
+      )
+      var screen = ScreenBuffer(columns: 8, rows: 2)
+      Compositor(columns: 8, rows: 2)
+        .draw(
+          frame,
+          in: LayoutRect(x: 0, y: 0, width: 8, height: 2),
+          overlay: nil,
+          into: &screen
+        )
+      return screen
+    }
+    var renderer = DiffRenderer()
+    let outer = TerminalSession(columns: 8, rows: 2)
+    let before = try compose()
+    outer.feed(renderer.update(to: before))
+    renderer.commit(before)
+    // Only OSC palette/default changes: the pane's cells are unchanged.
+    pane.feed(
+      Array(
+        ("\u{1B}]4;1;#00ff00;4;#010203;2;#0a141e\u{7}"
+          + "\u{1B}]10;#aabbcc\u{7}\u{1B}]11;#112233\u{7}")
+          .utf8
+      )
+    )
+    let after = try compose()
+    #expect(after[0, 0].style.foreground == .rgb(0x00FF00))
+    #expect(after[0, 0].style.background == .rgb(0x010203))
+    #expect(after[0, 0].style.underlineColor == .rgb(0x0A141E))
+    #expect(after[1, 0].style.foreground == .rgb(0xAABBCC))
+    #expect(after[1, 0].style.background == .rgb(0x112233))
+    outer.feed(renderer.update(to: after))
+    renderer.commit(after)
+    let captured = outer.withState { $0.captureOwnedScreen() }
+    #expect(captured.cells[0].attributes.foreground == .rgb(0, 255, 0))
+    #expect(captured.cells[0].attributes.background == .rgb(1, 2, 3))
+    let underline = Int(captured.cells[0].attributes.underlineColor)
+    #expect(underline > 0)
+    if underline > 0 {
+      #expect(captured.underlineColors[underline - 1] == .rgb(10, 20, 30))
+    }
+    pane.feed(Array("\u{1B}[H\u{1B}[31;44;4:3;58;2;30;20;10mA".utf8))
+    let recolored = try compose()
+    let diff = String(decoding: renderer.update(to: recolored), as: UTF8.self)
+    #expect(diff.contains("58;2;30;20;10"))
+    #expect(diff.contains("A"))
+    #expect(!diff.contains("B"))
+    renderer.commit(recolored)
+    pane.feed(Array("\u{1B}[H\u{1B}[59mA".utf8))
+    let reset = try compose()
+    #expect(reset[0, 0].style.underlineColor == .default)
+    #expect(
+      String(decoding: renderer.update(to: reset), as: UTF8.self).contains("A")
+    )
+  }
+
   @Test(arguments: [
     LayoutRect(x: 10, y: 0, width: 2, height: 2),
     LayoutRect(x: 0, y: 10, width: 2, height: 2),

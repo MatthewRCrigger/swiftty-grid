@@ -80,20 +80,29 @@ extension RoamingAppModel {
   func pair(
     _ profile: HostProfile,
     expectedHostKeys: Set<String>?,
-    access: SSHAccess? = nil
+    access: SSHAccess? = nil,
+    context: HostMutationContext? = nil
   ) async throws(PairingFailure) -> HostProfile {
     do { try profile.validate() } catch { throw .invalid(error) }
-    do {
-      let connection = try await (access ?? ssh).connect(
-        profile,
-        interactive: true,
-        expectedHostKeys: expectedHostKeys
+    let context =
+      context
+      ?? hostMutationContext(
+        for: hosts.first { $0.id == profile.id },
+        id: profile.id
       )
+    guard context.id == profile.id, validateHostMutation(context) else {
+      throw .notSaved(Self.hostChangedMessage)
+    }
+    do {
+      let connection = try await (access ?? ssh)
+        .connect(profile, interactive: true, expectedHostKeys: expectedHostKeys)
       await connection.close()
     } catch { throw .ssh(error) }
     guard !Task.isCancelled else { throw .ssh(.cancelled) }
     let saved: Bool
-    do { saved = try save(profile) } catch { throw .invalid(error) }
+    do { saved = try save(profile, expecting: context) } catch {
+      throw .invalid(error)
+    }
     guard saved else {
       throw .notSaved(lastError ?? "The host could not be saved.")
     }
@@ -108,7 +117,7 @@ enum ConnectSheet: Identifiable, Hashable {
   case scan
   case paste
   case candidate(HostCandidate)
-  case choose(HostProfile)
+  case choose(HostMutationContext)
 
   var id: String {
     switch self {
@@ -154,11 +163,18 @@ struct ConnectSheetView: View {
         model: model,
         host: nil,
         candidate: candidate,
-        onPaired: { connecting = .choose($0) },
+        onPaired: { connecting = .choose(model.hostMutationContext(for: $0)) },
         dismiss: cancel
       )
-    case let .choose(host):
-      WorkspaceChooserView(host: host, app: model, dismiss: cancel)
+    case let .choose(context):
+      if let host = context.original {
+        WorkspaceChooserView(
+          host: host,
+          context: context,
+          app: model,
+          dismiss: cancel
+        )
+      }
     }
   }
 }
@@ -205,8 +221,7 @@ struct NearbyMacsView: View {
         }
       }
     }
-    .onAppear { browser.start() }
-    .onDisappear { browser.stop() }
+    .onAppear { browser.start() }.onDisappear { browser.stop() }
     .onChange(of: scenePhase) { _, phase in
       // `.inactive` covers the system permission alert: keep browsing.
       switch phase {
@@ -227,8 +242,7 @@ struct NearbyMacsView: View {
           .foregroundStyle(.secondary)
       }
       .listRowBackground(Color.clear)
-    case .results:
-      EmptyView()
+    case .results: EmptyView()
     case .noResults:
       VStack(alignment: .leading, spacing: 6) {
         Text("No Macs found yet", bundle: #bundle).font(.headline)
@@ -334,7 +348,9 @@ struct PasteCodeView: View {
       .replacingOccurrences(of: "\u{201C}", with: "\"")
       .replacingOccurrences(of: "\u{201D}", with: "\"")
     do {
-      select(HostCandidate(descriptor: try HostConnectionDescriptor.decode(trimmed)))
+      select(
+        HostCandidate(descriptor: try HostConnectionDescriptor.decode(trimmed))
+      )
     } catch { self.error = error.message }
   }
 }

@@ -53,7 +53,7 @@ settings:
     CURRENT_PROJECT_VERSION: "1"
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     DEAD_CODE_STRIPPING: YES
-    # Enhanced Security (xcode-security-settings.md): pointer authentication
+    # Enhanced Security (spec.roaming.md §2.5): pointer authentication
     # (arm64e), security compiler warnings, typed allocators and libc++
     # hardening for every target. The runtime protections are the
     # com.apple.security.hardened-process entitlements in
@@ -200,7 +200,7 @@ targets:
         # build cannot import RoamingApp ("Unable to resolve module
         # dependency"). The rest of Enhanced Security still applies. Lift
         # this when Xcode builds packages as arm64e here
-        # (xcode-security-settings.md).
+        # (spec.roaming.md §2.5).
         ENABLE_POINTER_AUTHENTICATION: NO
         ENABLE_HARDWARE_CHECKED_POINTER_ARITHMETIC_SLICE: NO
 
@@ -245,7 +245,7 @@ targets:
         # build cannot import RoamingApp ("Unable to resolve module
         # dependency"). The rest of Enhanced Security still applies. Lift
         # this when Xcode builds packages as arm64e here
-        # (xcode-security-settings.md).
+        # (spec.roaming.md §2.5).
         ENABLE_POINTER_AUTHENTICATION: NO
         ENABLE_HARDWARE_CHECKED_POINTER_ARITHMETIC_SLICE: NO
         INFOPLIST_KEY_UILaunchScreen_Generation: YES

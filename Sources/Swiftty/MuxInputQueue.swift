@@ -61,8 +61,16 @@ final class MuxInputQueue {
         bytes: text.utf8.count,
         limit: limits.maxPasteChunkBytes,
       )
-    case .key, .focus, .mouse, .moveCursor:
+    case .key, .focus, .mouse, .moveCursor, .clipboardPaste, .drag(.move),
+      .drag(.leave):
       admit(.input(input, pane), bytes: 32, limit: InputBudget.byteLimit, )
+    case let .drag(.drop(_, items)):
+      // The record carries the dropped data (base64 in JSON).
+      admit(
+        .input(input, pane),
+        bytes: items.reduce(0) { $0 + $1.data.count } * 4 / 3,
+        limit: limits.maxControlRecordBytes - 4096,
+      )
     }
   }
 

@@ -18,6 +18,9 @@ public struct SessionConfiguration: Sendable {
   /// Consume OSC 7501 program status and answer its support query
   /// (`TerminalState.programStatusEnabled`).
   public var programStatusEnabled = false
+  /// Answer DECRQCRA rectangle checksums
+  /// (`TerminalState.rectangleChecksumsEnabled`).
+  public var rectangleChecksumsEnabled = false
 
   public init(
     command: [String]? = nil,

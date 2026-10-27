@@ -53,6 +53,10 @@ extension TerminalView {
 
   private func pasteClipboard() -> Bool {
     guard capabilities.allows(.pasteFromClipboard) else { return false }
+    if sendKittyPasteEvent() {
+      clearSelection()
+      return true
+    }
     guard let text = pasteboard.string(forType: .string) else { return false }
     clearSelection()
     session.send(.paste(text))
@@ -162,6 +166,7 @@ extension TerminalView {
   /// Applies a capability change: closes search, returns to the live
   /// screen and re-derives the routing modes.
   func capabilitiesChanged() {
+    installKittyClipboard()
     if !capabilities.textInput {
       releaseHeldKeys()
       discardComposition()

@@ -209,7 +209,7 @@ extension MainActorIntegrationTests {
       let secrets = InMemoryIdentitySecretStore()
       let model = app(secrets: secrets)
       model.load()
-      model.identityStore.verifyICloudAccount = { true }
+      model.identityStore.currentICloudAccount = { "test-account" }
       let local = try await model.identityStore.generate(
         name: "Laptop",
         policy: .deviceOnly
@@ -251,7 +251,7 @@ extension MainActorIntegrationTests {
       defer { try? FileManager.default.removeItem(at: directory) }
       let model = app()
       model.load()
-      model.identityStore.verifyICloudAccount = { false }
+      model.identityStore.currentICloudAccount = { nil }
       await #expect(throws: IdentityOperationError.accountRequired) {
         _ = try await model.identityStore.generate(
           name: "Cloud",
@@ -259,6 +259,20 @@ extension MainActorIntegrationTests {
         )
       }
       #expect(model.identities.isEmpty)
+      model.identityStore.currentICloudAccount = nil
+      await #expect(
+        throws: IdentityOperationError.accountVerificationUnavailable
+      ) {
+        _ = try await model.identityStore.generate(
+          name: "Unverified",
+          policy: .iCloudKeychain
+        )
+      }
+      _ = try await model.identityStore.generate(
+        name: "Local",
+        policy: .deviceOnly
+      )
+      #expect(model.identities.map(\.name) == ["Local"])
     }
 
     /// Without the right passphrase nothing is saved; with it the key is

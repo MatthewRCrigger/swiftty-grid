@@ -116,6 +116,80 @@ For each advertised platform, cover the 27.0 baseline and the selected shipping 
 
 Platforms may be implemented in stages, but all rows above remain in product scope. Do not claim the complete platform family is released until every included profile passes its applicable gates. Linux/Windows porting and older-OS CI are not part of these gates.
 
+**macOS integration evidence, 2026-10-27:** `Scripts/test-real-ssh.sh` passed all
+four real-OpenSSH tests with both the default Network.framework transport and
+`RST_REAL_SSH_POSIX=1`, using Swift 6.4.1, the macOS 27.0 SDK and macOS 27.0.1
+(26A434). The debug tests cover host-key decisions, an ordinary SSH shell,
+SSH bootstrap followed by QUIC attachment, and SFTP upload/download. The SFTP
+test now cancels at a partial checkpoint and proves continuation on a new client
+without restarting, retaining its 1,000,003-byte payload and default request
+window. Both event streams passed the completion audit and fixture cleanup
+succeeded. This is Mac integration evidence; Release, other platform profiles,
+physical-device behavior and the full acceptance matrix remain separate gates.
+
+### 2.5 Xcode security build settings
+
+The XcodeGen targets `MobileClient`, `CatalystClient`, `VisionClient`, `TVClient`
+and `WatchCompanion` use `Apps/project.yml` as the source of build settings; the
+generated `.xcodeproj` is gitignored. Base entitlements live in
+`Apps/<Target>/<Target>.entitlements` and are merged by
+`Scripts/configure-links.sh` into `Apps/Config/Generated/`. The following records
+the Xcode 27 configuration and compatibility findings from 2026-10-21; revalidate
+toolchain limitations when upgrading Xcode.
+
+**Enabled configuration:**
+
+- Set `ENABLE_ENHANCED_SECURITY` in project-level `settings.base`, inherited by
+  all five targets. It enables pointer authentication (arm64 + arm64e), security
+  compiler warnings, `GCC_WARN_SHADOW`, typed allocator support and libc++ hardening,
+  subject to the target overrides below.
+- `Scripts/configure-arm64e-packages.sh`, invoked by XcodeGen's `postGenCommand`,
+  sets `iOSPackagesShouldBuildARM64e` in the generated workspace's
+  `WorkspaceSettings.xcsettings`. Shared app logic lives in Swift packages, so
+  app-wrapper slices alone do not provide pointer-authentication coverage. The
+  inspected Xcode 27 frameworks recognize this key, with no `macOS…` or
+  `visionOS…` variants; device packages build as arm64e for iOS, visionOS and
+  watchOS, while Catalyst and tvOS packages remain arm64.
+- Set project-level `EXCLUDED_ARCHS[sdk=*simulator*]` to `x86_64`. With the package
+  flag enabled, simulator packages build for arm64 only; an x86_64 app slice fails
+  to resolve those modules. The configured macOS 27 host baseline is Apple silicon.
+- MobileClient, CatalystClient and VisionClient enable
+  `com.apple.security.hardened-process`, its `enhanced-security-version-string`
+  set to `2`, `hardened-heap`, `dyld-ro`, and `platform-restrictions-string` set to
+  `2`. They also enable `checked-allocations` and `checked-allocations.soft-mode`
+  under that entitlement prefix. Soft mode produces simulated crash reports
+  without terminating; disable it only after reports are clean on A19 / M5 or
+  later hardware.
+- XcodeGen's default presets already provide `GCC_WARN_ABOUT_RETURN_TYPE=YES_ERROR`,
+  `GCC_WARN_UNINITIALIZED_AUTOS=YES_AGGRESSIVE`,
+  `GCC_WARN_64_TO_32_BIT_CONVERSION` and `CLANG_WARN_EMPTY_BODY`. They are not
+  duplicated in `project.yml`. The app targets compile only Swift, so these
+  C/Objective-C warnings and analyzer settings have little effect there.
+
+**Compatibility overrides:** CatalystClient and TVClient set
+`ENABLE_POINTER_AUTHENTICATION=NO` and
+`ENABLE_HARDWARE_CHECKED_POINTER_ARITHMETIC_SLICE=NO`. Generic device builds on
+2026-10-21 could not import `RoamingApp` into an arm64e app slice because Xcode 27
+did not produce matching package slices. Other Enhanced Security settings remain
+enabled, including Catalyst's hardened-process entitlements. Remove these
+overrides only after matching package builds are supported and validated.
+
+**Deferred decisions:**
+
+- MobileClient's `ENABLE_HARDWARE_CHECKED_POINTER_ARITHMETIC_SLICE` and
+  `com.apple.security.hardened-process.checked-allocations.enforce-checked-pointer-arithmetic-overflow`
+  remain disabled. The recorded hardware requirement is A20 Pro or later, with
+  no soft mode. Most app code is Swift, where integer overflow already traps;
+  the C surface is mainly swift-nio shims and system zlib. Revisit after one or
+  two releases of clean memory-tagging soft-mode reports, first in TestFlight.
+- TVClient and WatchCompanion inherit the project build setting but have no
+  Enhanced Security entitlements: the capability's recorded platform scope is
+  iOS, macOS, visionOS and DriverKit. Revisit if platform support changes.
+- Native SwiftPM app/helper signing is a separate boundary; see
+  [native packaging security](spec.multiplexer.md#native-packaging-security).
+  Package C warnings and annotation-based bounds safety are specified in
+  [the core build policy](spec.md#swiftpm-c-security-settings).
+
 ## 3. Components and dependency boundary
 
 ```text
@@ -281,6 +355,12 @@ Use one bidirectional stream for control and input. Send each screen snapshot on
 
 A snapshot stream is reliable while useful, but may be canceled when superseded. Loss within that stream can delay its completion; independent streams do not remove shared congestion or all latency. This is intentionally simpler than a generic state-delta protocol.
 
+Snapshot bytes and control records in the same direction also share connection-level
+flow-control credit. A peer withholding reads can exhaust that credit and delay
+newer snapshots and control records. Delayed-reader tests must verify bounded work
+and prompt recovery after reads resume; independent ordering does not guarantee
+progress beyond the advertised connection limit. [S10, §4]
+
 ### 7.2 Record format
 
 Control records are `UInt32BE(length)` followed by a UTF-8 JSON object. The length excludes its own four bytes. Every object has a `type` field. Binary data uses base64; 64-bit counters use decimal strings. Reject unknown message types in version 1 and ignore unknown optional object fields.
@@ -309,7 +389,7 @@ Compression is independent per snapshot, without a cross-snapshot dictionary. Bo
 | `SessionExited` | Report shell exit status and final screen revision |
 | `Error` | Bounded typed failure; never a stack trace or secret-bearing diagnostic |
 
-`Attached` includes `attachmentEpoch`, `writerID`, `lastFullyAppliedInputSequence`, any admitted partial-operation identifier, and current resize revision. Every subsequent control record is scoped to that epoch.
+`Attached` includes `attachmentEpoch`, `writerID`, `lastFullyAppliedInputSequence`, any admitted partial-operation identifier, and current resize revision. Every subsequent control record is scoped to that epoch. It may also carry `features`, a list of additive behaviours the host accepts; peers ignore names they do not know, and an absent list means none. `keypadKeys` admits numeric keypad key names (`kp:one`, `kp:enter`, `kp:pageUp`, …, matching the client's keypad keys). Without it, clients send the main-keyboard key a keypad key types and drop Keypad Begin, which has none.
 
 ### 7.3 Bounded snapshot scheduling
 
@@ -320,6 +400,34 @@ Retain at most **two in-flight snapshot streams and one latest unsent snapshot r
 - Acknowledgment of revision R retires all streams older than R. Promote a surviving newer stream to protected status, or create one from current state.
 
 The client displays only the newest complete revision. Partial snapshots are never visible. If transport credit is exhausted, replace the unsent reference rather than adding a queue entry.
+
+The host rejects a `ScreenAck` beyond the highest revision submitted for sending
+on that attachment, before advancing acknowledgment state or retiring streams.
+Captured screens still waiting for encoding are outside this bound. A valid
+acknowledgment may precede completion of its transport send; zero, duplicate and
+older acknowledgments remain harmless. An impossible acknowledgment closes the
+attachment with `malformed` while retaining the session for reattachment.
+
+Incoming snapshots retain their native stream credit until their delivery callback
+finishes. This bounds queued and active snapshot deliveries together to four.
+Keep every admitted complete payload until decoding: arrival order across streams
+does not establish revision order, so evicting the earliest arrival could discard
+the newest screen while a control callback is still running.
+
+The host runs one snapshot encoder at a time, sharing two active work slots with
+transport sends. A canceled send retains its slot until the transport call returns,
+including across attachment replacement. Waiting captures are limited to the
+current attachment's scheduler-owned streams; superseded captures are discarded
+before encoding, and stale encoding results cannot start a send. This bounds work
+even when encoding or transport completion is delayed.
+
+The QUIC transport also caps unfinished native snapshot sends, including stream
+creation, at eight per connection. Cancelling a caller does not return this
+admission slot while its native write remains pending; the native completion
+returns it. A send abandoned before submission releases its slot immediately.
+Replacing a snapshot records the old stream's pending retirement atomically, so
+a completion racing replacement cannot leave the stream waiting for a callback
+that already ran.
 
 Capture at most 30 times/second, only while attached and dirty. Lower cadence under backpressure. All send paths must respect QUIC flow control, and control/input processing must not wait for compression or rendering.
 
@@ -382,6 +490,22 @@ For the Mac Catalyst client, loss of window focus alone MUST NOT be treated as p
 
 On foreground return or recovery from sleep, reconnect as needed and obtain a complete current screen before enabling input. On cold launch, reauthenticate with SSH and resume by session ID. Distinguish “temporarily unreachable” from an authenticated “session no longer exists.” A client attaches only to a workspace the user chose or explicitly created; a remembered session ID is a convenience for resuming, never permission to create a replacement ([spec.connection-setup.md](spec.connection-setup.md) §1.3).
 
+Remembered workspace choices belong to the saved host UUID, its account scope
+(or local-only scope), normalized hostname, port and remote username. Host/key
+renames and credential rotation preserve that choice. A different account or
+endpoint has a separate choice, including across cold launches; returning to
+the original owner restores its choice. A retained terminal's status and close
+callbacks update only its captured owner. The visible resume indicators track
+the currently selected hosts. These identifiers remain nonsecret and never
+replace fresh SSH authorization.
+
+Legacy UUID-only choices lack verifiable ownership and are not automatically
+adopted. Keep them separate; users can select the existing workspace again from
+the authenticated workspace chooser. Likewise, binding a formerly local host to
+an account does not silently adopt its earlier choice. Pending create, resume
+and reveal intents belong to the individual terminal screen and are discarded
+when that screen closes, even if its lazy backend never started.
+
 If UDP is blocked, offer ordinary SSH. This opens a **different** shell; the retained roaming shell remains available until expiry. Same-session RST tunneling through an SSH channel is a later extension, not a hidden v1 promise.
 
 ## 10. SFTP: independent, resumable file operations
@@ -399,6 +523,32 @@ Limit the UI to regular files, directory navigation, upload, download, cancel, a
 Keep directory rows associated with their displayed path: clear old rows when listing starts and reject superseded list results, including repeated refreshes of the same path. Upload preparation belongs to its presentation; cancellation or dismissal must prevent late manifests, overwrite prompts and uploads from appearing in a reopened browser. Join owned preparation and discard any late staged file or staging result whose checkpoint cannot be saved.
 
 Transfer checkpoints are nonsecret JSON capped at 64 KiB per file. Validate regular-file type and size on the opened descriptor before reading, enforce the read cap if the file grows, and reject invalid progress or oversized encoding before replacing a checkpoint.
+
+The complete checkpoint envelope records the saved host UUID, owning account
+scope, configured SSH endpoint and remote username. A fresh browser loads only
+matching transfers; a changed account, endpoint or username cannot resume,
+remove or export the old target's files. Key rotation and display-name changes
+do not change the remote file owner. Returning to the original account/endpoint
+restores its saved transfers. Existing authenticated transfers keep their captured
+owner while running, including across account changes.
+Resuming or removing a transfer acquires its latest durable checkpoint together
+with exclusive use. Another browser's cached progress cannot replace a newer
+checkpoint or repeat a completed transfer, and removal uses the current temporary
+paths after a restart.
+
+Older checkpoints without ownership remain on disk and require explicit review
+and confirmation before assignment to a host/account. The same review is offered
+when a previously local host becomes cloud-bound. Incomplete recovered transfers
+restart with fresh staging/temporary paths and no inherited overwrite approval;
+old remote temporary files are left untouched. Completed downloads remain locally
+exportable after confirmation. Assignment itself never starts a connection or
+transfer. Cancelled, superseded or changed-account reviews cannot publish a late
+staged copy, and a running transfer cannot be claimed by another browser. The
+owner and reviewed checkpoint are rechecked before durable replacement; malformed
+or newer owned envelopes cannot downgrade to legacy records.
+Removing a download unlinks only its named local file and removes an empty
+containing directory; it never recursively removes sibling files or a directory
+which has replaced the downloaded file.
 
 For upload, first stage an immutable local source in app-controlled storage. Create a uniquely named remote temporary file beside the destination. Use positioned writes, never append mode. Track the highest contiguous acknowledged offset, not the highest offset submitted.
 

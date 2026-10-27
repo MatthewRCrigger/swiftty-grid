@@ -228,6 +228,9 @@ public struct Configuration: Sendable, Equatable {
   public var cursorStyleBlink: Bool?
   public var cursorOpacity = 1.0
   public var cursorClickToMove = true
+  /// DECRQCRA replies (`rectangle-checksum-report`). Off by default: a
+  /// program could checksum one cell at a time and read the screen back.
+  public var rectangleChecksumReport = false
   public var copyOnSelect = false
   public var mouseHideWhileTyping = false
   public var linkURL = true
@@ -542,6 +545,11 @@ public struct Configuration: Sendable, Equatable {
     case "cursor-click-to-move":
       guard let b = bool(defaults.cursorClickToMove) else { return invalid() };
       cursorClickToMove = b
+    case "rectangle-checksum-report":
+      guard let b = bool(defaults.rectangleChecksumReport) else {
+        return invalid()
+      }
+      rectangleChecksumReport = b
     case "copy-on-select":
       switch value {
       case "": copyOnSelect = defaults.copyOnSelect
@@ -817,6 +825,7 @@ public struct Configuration: Sendable, Equatable {
     if let command { s.command = Self.commandArguments(command) }
     s.scrollbackLimitBytes = scrollbackLimit
     s.palette = palette(for: scheme)
+    s.rectangleChecksumsEnabled = rectangleChecksumReport
     return s
   }
 

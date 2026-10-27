@@ -18,13 +18,10 @@ import TerminalSurface
 public struct LiveTerminalSurfaceFactory: TerminalSurfaceFactory {
   private weak let app: RoamingAppModel?
 
-  public init(app: RoamingAppModel) {
-    self.app = app
-  }
+  public init(app: RoamingAppModel) { self.app = app }
 
-  @MainActor public func makeSurface(
-    for model: TerminalScreenModel
-  ) -> AnyView {
+  @MainActor
+  public func makeSurface(for model: TerminalScreenModel) -> AnyView {
     guard let app else { return AnyView(EmptyView()) }
     return AnyView(LiveTerminalSurface(model: model, app: app))
   }
@@ -159,6 +156,8 @@ final class RoamingTerminalController: TerminalSurfaceController {
   @ObservationIgnored
   private weak var app: RoamingAppModel?
   @ObservationIgnored
+  private(set) var selection: HostConnectionSelection
+  @ObservationIgnored
   private let slot: ClientSlot
   @ObservationIgnored
   private let pump: OrderedInputPump
@@ -193,6 +192,8 @@ final class RoamingTerminalController: TerminalSurfaceController {
   init(model: TerminalScreenModel, app: RoamingAppModel) {
     self.model = model
     self.app = app
+    selection = model.selection ?? app.connectionSelection(for: model.host)
+    model.selection = selection
     let display = TerminalSession(
       presentationColumns: 80,
       rows: 24,
@@ -238,13 +239,24 @@ final class RoamingTerminalController: TerminalSurfaceController {
 
   private func run(_ choice: StartChoice) async {
     guard let app else { return }
-    let host = model.host
+    do {
+      selection = try await app.ssh.prepare(selection)
+      model.selection = selection
+    } catch {
+      guard !closed else { return }
+      phase = .failed(Self.problem(for: error))
+      return
+    }
+    guard !closed, !Task.isCancelled else { return }
+    let host = selection.host
     if choice == .newSession {
-      app.forgetSession(for: host)
+      app.forgetSession(for: selection)
+      _ = model.takeWorkspaceIntent()
       intent = .create
-    } else if let chosen = app.takeIntent(for: host) {
+    } else if let chosen = model.takeWorkspaceIntent() {
       intent = chosen
-    } else if intent == nil, let remembered = app.resumableSessionID(for: host)
+    } else if intent == nil,
+      let remembered = app.resumableSessionID(for: selection)
     {
       intent = .resume(remembered, nil)
     }
@@ -264,10 +276,10 @@ final class RoamingTerminalController: TerminalSurfaceController {
     do {
       // Interactive trust and credential check; the client's own SSH
       // bootstraps then run without prompts.
-      let probe = try await app.ssh.connect(host)
+      let probe = try await app.ssh.connectPrepared(selection)
       await probe.close()
       guard !closed, !Task.isCancelled else { return }
-      endpoint = try await app.ssh.bootstrapEndpoint(for: host)
+      endpoint = try await app.ssh.bootstrapEndpoint(for: selection)
     } catch {
       guard !closed else { return }
       phase = .failed(Self.problem(for: error))
@@ -277,9 +289,7 @@ final class RoamingTerminalController: TerminalSurfaceController {
 
     let client = RoamingClient(
       bootstrapper: SSHBootstrapper(endpoint: endpoint),
-      connector: QUICGrantConnector(
-        fallbackHost: endpoint.configuration.host
-      ),
+      connector: QUICGrantConnector(fallbackHost: endpoint.configuration.host),
       sink: display,
       configuration: RoamingClientConfiguration(initialGrid: grid)
     )
@@ -314,7 +324,7 @@ final class RoamingTerminalController: TerminalSurfaceController {
     } catch {
       guard !closed, self.client === client else { return }
       if error == .sessionLost || error == .sessionExited {
-        app.forgetSession(for: host)
+        app.forgetSession(for: selection)
       }
       if error == .authenticationFailed { app.forgetPassword(for: host) }
       phase = .failed(Self.problem(for: error, resuming: resuming))
@@ -327,15 +337,15 @@ final class RoamingTerminalController: TerminalSurfaceController {
     guard let app else { return }
     switch status.state {
     case .sessionLost:
-      app.forgetSession(for: model.host)
+      app.forgetSession(for: selection)
       phase = .failed(Self.problem(for: .sessionLost, resuming: false))
     case .sessionExited:
-      app.forgetSession(for: model.host)
+      app.forgetSession(for: selection)
       phase = .failed(Self.exited(status.exitStatus))
     case .userClosed: break
     default:
       if let id = status.sessionID {
-        app.rememberSession(id, for: model.host)
+        app.rememberSession(id, for: selection)
         // A retry reattaches the granted workspace; it never creates again.
         if intent == .create { intent = .resume(id, nil) }
       }
@@ -629,6 +639,8 @@ final class SSHShellController: TerminalSurfaceController {
   @ObservationIgnored
   private let access: SSHAccess
   @ObservationIgnored
+  private(set) var selection: HostConnectionSelection
+  @ObservationIgnored
   private var backend: SSHStreamBackend?
   @ObservationIgnored
   private(set) var connection: SSHConnection?
@@ -648,6 +660,8 @@ final class SSHShellController: TerminalSurfaceController {
   ) {
     self.model = model
     self.access = access ?? app.ssh
+    selection = model.selection ?? app.connectionSelection(for: model.host)
+    model.selection = selection
     let session = TerminalSession(
       columns: 80,
       rows: 24,
@@ -695,7 +709,9 @@ final class SSHShellController: TerminalSurfaceController {
     phase = .preparing(.localized("Signing in"))
     model.observe(.connecting)
     do {
-      let connection = try await access.connect(model.host)
+      selection = try await access.prepare(selection)
+      model.selection = selection
+      let connection = try await access.connectPrepared(selection)
       guard !closed else {
         await connection.close()
         return

@@ -72,6 +72,32 @@ public struct TerminalState: ~Copyable {
   /// no reply and requested flags are ignored, so programs keep legacy
   /// key encodings.
   public var keyboardProtocolEnabled = true
+  /// Whether DECRQCRA answers and XTCHECKSUM applies. Off by default: a
+  /// program can checksum one cell at a time and so read back the screen,
+  /// including other programs' output.
+  public var rectangleChecksumsEnabled = false
+  /// The checksum variant a full reset restores; setting it also selects it.
+  public var defaultChecksumFlags = ChecksumFlags() {
+    didSet { checksumFlags = defaultChecksumFlags }
+  }
+  /// The variant DECRQCRA computes (XTCHECKSUM).
+  public internal(set) var checksumFlags = ChecksumFlags()
+  /// Serves kitty clipboard reads (OSC 5522). Without it reads are
+  /// denied and paste events (mode 5522) are not offered.
+  public var kittyClipboardReader: KittyClipboard.Reader?
+  /// Applies committed kitty clipboard writes; without it writes fail
+  /// with ENOSYS.
+  public var kittyClipboardWriter: KittyClipboard.Writer?
+  /// Decoded bytes one write transaction may accumulate.
+  public var kittyClipboardWriteLimit = KittyClipboard.maxWriteBytes
+  var kittyClipboardGrants = KittyClipboard.Grants()
+  var kittyClipboardReadToken: UInt64 = 0
+  var pendingKittyClipboardReads: [KittyClipboard.PendingRead] = []
+  var kittyClipboardWriteToken: UInt64 = 0
+  var pendingKittyClipboardWrites: [KittyClipboard.PendingWrite] = []
+  /// The kitty drag-and-drop client registration (OSC 72), if any.
+  public internal(set) var dragAndDrop: KittyDragAndDrop.State?
+  var kittyClipboardWrite: KittyClipboard.WriteTransaction?
   /// Whether XTGETTCAP advertises OSC 52 clipboard writes (`Ms`).
   public var clipboardWritesAdvertised = true
   /// With `discardsReplies`, still answer the OSC 7501 support query: the
@@ -146,6 +172,8 @@ public struct TerminalState: ~Copyable {
   public package(set) var semanticState = SemanticState.none
   /// Which prompt rows the shell redraws after a resize (OSC 133 `redraw`).
   var promptRedraw = PromptRedraw.none
+  /// How clicks in the prompt reach the shell (OSC 133 ; A options).
+  public internal(set) var promptClick = PromptClick.none
   /// Where the command line being typed starts (OSC 133 ; B), as an
   /// offset into its logical line; that line's first row carries the
   /// grid's input-line flag, so the point follows scrolling and reflow.
@@ -844,13 +872,27 @@ public struct TerminalState: ~Copyable {
     case (0, 0x23, 0x7D), (0, 0x23, 0x71): popPen()  // XTPOPSGR # } and # q
     case (0x3F, 0x24, 0x70):  // DECRQM ? $ p
       let n = csi.value(0)
-      let state = Modes.dec(n).map { modes.contains($0) ? 1 : 2 } ?? 0
+      // Paste events are unusable unless their follow-up read is served.
+      let state =
+        n == 5522 && kittyClipboardReader == nil
+        ? 0 : Modes.dec(n).map { modes.contains($0) ? 1 : 2 } ?? 0
       reply("\u{1B}[?\(n);\(state)$y")
     case (0, 0x24, 0x70):  // ANSI DECRQM
       let n = csi.value(0)
       let state = Modes.ansi(n).map { modes.contains($0) ? 1 : 2 } ?? 0
       reply("\u{1B}[\(n);\(state)$y")
     case (0x3E, 0, 0x63): reply("\u{1B}[>1;10;0c")  // DA2
+    case (0x3E, 0, 0x6D):  // XTMODKEYS > m
+      // Only `modifyOtherKeys` state 2 changes encoding. Every valid
+      // request leaves it, as in Ghostty.
+      let resource = csi.value(0)
+      let value = csi.value(1)
+      guard csi.count <= 2, [0, 1, 2, 4].contains(resource) else { return }
+      if csi.count == 2, resource == 4, value == 2 {
+        modes.insert(.modifyOtherKeys)
+      } else {
+        modes.remove(.modifyOtherKeys)
+      }
     // XTVERSION
     case (0x3E, 0, 0x71):
       guard !discardsReplies,
@@ -867,6 +909,8 @@ public struct TerminalState: ~Copyable {
         modes.remove(.cursorBlink)
       }
     case (0, 0x21, 0x70): softReset()  // DECSTR
+    case (0, 0x2A, 0x79): requestRectangleChecksum(csi)  // DECRQCRA * y
+    case (0, 0x23, 0x79): selectChecksumExtension(csi)  // XTCHECKSUM # y
     case (0x3F, 0, 0x75) where !keyboardProtocolEnabled,
       (0x3E, 0, 0x75) where !keyboardProtocolEnabled,
       (0x3C, 0, 0x75) where !keyboardProtocolEnabled,
@@ -1080,10 +1124,13 @@ public struct TerminalState: ~Copyable {
       if Modes.mouseTracking.contains(mode) {
         modes.subtract(Modes.mouseTracking)
       }
-      if mode == .mouseSGR || mode == .mouseUTF8 {
-        modes.subtract([.mouseSGR, .mouseUTF8])
+      if Modes.mouseFormats.contains(mode) {
+        modes.subtract(Modes.mouseFormats)
       }
       modes.insert(mode)
+    } else if Modes.mouseFormats.contains(mode) {
+      // Like Ghostty, resetting any format returns to X10 encoding.
+      modes.subtract(Modes.mouseFormats)
     } else {
       modes.remove(mode)
     }
@@ -1222,6 +1269,13 @@ public struct TerminalState: ~Copyable {
     savedPrimaryModes = .initial
     savedAlternateModes = .initial
     modes = .initial
+    checksumFlags = defaultChecksumFlags
+    kittyClipboardGrants = KittyClipboard.Grants()
+    // The program that asked is gone: drop its unanswered reads.
+    pendingKittyClipboardReads = []
+    pendingKittyClipboardWrites = []
+    // A registration survives, as in kitty; only a split command ends.
+    dragAndDrop?.chunking = false
     cursorStyle = .block
     palette = defaultPalette
     scrollTop = 0

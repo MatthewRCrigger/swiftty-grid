@@ -152,6 +152,20 @@ public final class TerminalScreenModel: Identifiable {
   /// The live backend, created by the surface factory on first display.
   @ObservationIgnored
   var controller: (any TerminalSurfaceController)?
+  /// Non-secret selection made when the screen opens, before its lazy backend.
+  @ObservationIgnored
+  var selection: HostConnectionSelection?
+  /// The choice belongs to this screen, including before its backend starts.
+  @ObservationIgnored
+  var pendingWorkspaceIntent: WorkspaceIntent?
+
+  func takeWorkspaceIntent() -> WorkspaceIntent? {
+    guard !isClosed else { return nil }
+    defer { pendingWorkspaceIntent = nil }
+    return pendingWorkspaceIntent
+  }
+  /// A refused action leaves the current terminal and its connection intact.
+  var actionError: String?
   /// Set when the app closes this screen: a screen still on its way out
   /// never starts another backend.
   @ObservationIgnored
@@ -334,6 +348,11 @@ public final class RoamingAppModel {
   }
   /// SSH identities visible on this device, by name.
   public private(set) var identities: [SSHIdentityMetadata] = []
+  /// Older removals whose account was not recorded, requiring user review.
+  private(set) var keyDeletionReviews: [IdentityIntent] = []
+  private(set) var keyAccountReviews: [SSHIdentityMetadata] = []
+  /// Invalidates reviewed host/key actions even after switching away and back.
+  private(set) var accountGeneration = 0
   /// Every identity, deleted ones included, by ID.
   private var identityIndex: [UUID: SSHIdentityMetadata] = [:]
   public private(set) var syncSettings = SyncSettings()
@@ -403,10 +422,6 @@ public final class RoamingAppModel {
   private var savedHostsReadable = true
   @ObservationIgnored
   private let resumeStore: SessionResumeStore
-  /// Explicit workspace choices waiting for their host's next roaming
-  /// start (chooser selections and attention links).
-  @ObservationIgnored
-  private var pendingIntents: [UUID: WorkspaceIntent] = [:]
   @ObservationIgnored
   private var trustQueue:
     [(
@@ -440,6 +455,20 @@ public final class RoamingAppModel {
   /// Opt-in CloudKit metadata sync, when the build is configured for it.
   @ObservationIgnored
   public private(set) var sync: ConnectionSyncCoordinator?
+
+  /// Refreshes connection state when the app returns to the foreground.
+  func refreshConnections() async {
+    let generation = identityStore.accountGeneration
+    let synchronization = sync?.refresh()
+    let recovery = identityStore.startRecovery()
+    await synchronization?.value
+    await recovery.value
+    // Account reconciliation may invalidate the first recovery pass. Retry
+    // once in the selected context; local keys start before network fetches.
+    if generation != identityStore.accountGeneration {
+      await identityStore.recover()
+    }
+  }
   @ObservationIgnored
   private var accountObserver: (any NSObjectProtocol)?
 
@@ -459,7 +488,6 @@ public final class RoamingAppModel {
     self.store = store
     self.resumeStore = resumeStore
     self.companionSettings = Self.loadCompanionSettings()
-    self.resumableHosts = Set(resumeStore.all().keys)
     self.identityStore = SSHIdentityStore(
       app: self,
       secrets: secrets ?? IdentityKeychainConfiguration.secretStore(),
@@ -471,17 +499,16 @@ public final class RoamingAppModel {
       let sync = ConnectionSyncCoordinator(app: self, database: cloud)
       self.sync = sync
       // An iCloud identity needs a verified current account (§8.4).
-      identityStore.verifyICloudAccount = { [weak sync] in
-        guard let sync else { return false }
-        return (try? await sync.database.accountID()) != nil
+      identityStore.currentICloudAccount = { [weak sync] in
+        guard let sync else { return nil }
+        return try? await sync.database.accountID()
       }
       #if canImport(CloudKit) && !os(watchOS)
       accountObserver = NotificationCenter.default.addObserver(
         forName: .CKAccountChanged,
         object: nil,
         queue: .main
-      ) { [weak sync] _ in
-        MainActor.assumeIsolated { sync?.accountDidChange() }
+      ) { [weak sync] _ in MainActor.assumeIsolated { sync?.accountDidChange() }
       }
       #endif
     }
@@ -532,11 +559,19 @@ public final class RoamingAppModel {
   /// Installs a committed snapshot and invalidates prompts for hosts whose
   /// saved profile changed.
   private func apply(_ snapshot: ConnectionSnapshot) {
+    if connections.boundAccount != snapshot.boundAccount
+      || (connections.verifiedKeychainAccount != nil
+        && connections.verifiedKeychainAccount
+          != snapshot.verifiedKeychainAccount)
+    {
+      identityStore?.accountDidChange()
+    }
     let visible = snapshot.visibleHosts
     let identities = Set(visible)
     let changed = hosts.filter { !identities.contains($0) }
     connections = snapshot
     hosts = visible
+    refreshResumableHosts()
     for host in changed { invalidateConnectionPrompts(for: host) }
   }
 
@@ -546,7 +581,8 @@ public final class RoamingAppModel {
   @discardableResult
   func commitConnections(
     notifySync: Bool = true,
-    _ mutate: (inout ConnectionSnapshot) throws(ConnectionStore.StoreError) -> Void
+    _ mutate: (inout ConnectionSnapshot) throws(ConnectionStore.StoreError) ->
+      Void
   ) -> Bool {
     guard savedHostsReadable else {
       lastError = String(
@@ -592,6 +628,10 @@ public final class RoamingAppModel {
     _ host: HostProfile
   ) throws(HostProfile.ValidationError) -> Bool {
     try host.validate()
+    guard canMutateHost(host.id) else {
+      lastError = Self.hostChangedMessage
+      return false
+    }
     return commitConnections { snapshot throws(ConnectionStore.StoreError) in
       if !snapshot.hosts.contains(where: { $0.id == host.id }),
         snapshot.hosts.count >= ConnectionStore.maxHosts
@@ -602,12 +642,49 @@ public final class RoamingAppModel {
     }
   }
 
+  @discardableResult
+  func validateHostMutation(_ context: HostMutationContext) -> Bool {
+    guard hostMutationIsCurrent(context) else {
+      lastError = Self.hostChangedMessage
+      return false
+    }
+    return true
+  }
+
+  @discardableResult
+  func save(
+    _ host: HostProfile,
+    expecting context: HostMutationContext
+  ) throws(HostProfile.ValidationError) -> Bool {
+    guard context.id == host.id, validateHostMutation(context) else {
+      return false
+    }
+    return try save(host)
+  }
+
+  func delete(_ host: HostProfile, expecting context: HostMutationContext) {
+    guard context.original == host, validateHostMutation(context) else {
+      return
+    }
+    delete(host)
+  }
+
   public func delete(_ host: HostProfile) {
+    guard canMutateHost(host.id),
+      hosts.first(where: { $0.id == host.id }) == host
+    else {
+      lastError = Self.hostChangedMessage
+      return
+    }
+    let selection = connectionSelection(for: host)
     guard commitConnections({ $0.deleteHost(host.id) }) else { return }
-    if activeSession?.host.id == host.id { close() }
+    if let active = activeSession?.selection,
+      HostDataOwner(active) == HostDataOwner(selection)
+    {
+      close()
+    }
     invalidateConnectionPrompts(for: host)
-    forgetSession(for: host)
-    pendingIntents[host.id] = nil
+    forgetSession(for: selection)
   }
 
   private func invalidateConnectionPrompts(for host: HostProfile) {
@@ -621,9 +698,9 @@ public final class RoamingAppModel {
 
   // MARK: Identities
 
-  public func identity(_ id: UUID) -> SSHIdentityMetadata? {
-    identityIndex[id]
-  }
+  func invalidateAccountContext() { accountGeneration += 1 }
+
+  public func identity(_ id: UUID) -> SSHIdentityMetadata? { identityIndex[id] }
 
   /// Recomputes the values views read from `connections`, assigning each
   /// only when it changed so unaffected readers stay valid.
@@ -632,6 +709,18 @@ public final class RoamingAppModel {
       $0.name.localizedStandardCompare($1.name) == .orderedAscending
     }
     if identities != self.identities { self.identities = identities }
+    let accountReviews = connections.identities
+      .filter {
+        connections.unverifiedKeychainIdentities?.contains($0.id) == true
+          && !$0.isDeleted
+      }
+      .sorted { $0.id.uuidString < $1.id.uuidString }
+    if accountReviews != keyAccountReviews {
+      keyAccountReviews = accountReviews
+    }
+    let deletions = connections.intents.filter(\.requiresDeletionReview)
+      .sorted { $0.id.uuidString < $1.id.uuidString }
+    if deletions != keyDeletionReviews { keyDeletionReviews = deletions }
     // `ConnectionSnapshot.identity(_:)` returns the first match.
     let index = Dictionary(
       connections.identities.map { ($0.id, $0) },
@@ -645,12 +734,13 @@ public final class RoamingAppModel {
       hiddenCount = connections.hiddenCount
     }
     let conflicts = connections.hostConflicts
+      .filter { connections.isVisible(ConnectionSnapshot.hostRecord($0.key)) }
       .map { HostConflictItem(id: $0.key, conflict: $0.value) }
       .sorted { $0.id.uuidString < $1.id.uuidString }
     if conflicts != hostConflicts { hostConflicts = conflicts }
-    let reviews = connections.trustReviews.values.sorted {
-      $0.recordName < $1.recordName
-    }
+    let reviews = connections.trustReviews.values
+      .filter { connections.isVisible($0.recordName) }
+      .sorted { $0.recordName < $1.recordName }
     if reviews != trustReviews { trustReviews = reviews }
   }
 
@@ -676,13 +766,28 @@ public final class RoamingAppModel {
   /// this app (one active roaming terminal per client). Replacing a
   /// roaming session detaches it; the host keeps the shell.
   public func open(_ host: HostProfile, kind: TerminalKind = .roaming) {
-    if let activeSession, activeSession.host.id == host.id,
-      activeSession.kind == kind
+    open(connectionSelection(for: host), kind: kind)
+  }
+
+  private func open(
+    _ selection: HostConnectionSelection,
+    kind: TerminalKind,
+    replacing: Bool = false,
+    intent: WorkspaceIntent? = nil
+  ) {
+    if !replacing, let activeSession, activeSession.kind == kind,
+      activeSession.selection?.hasSameTarget(as: selection) == true
     {
       return
     }
     close()
-    let session = TerminalScreenModel(host: host, profile: profile, kind: kind)
+    let session = TerminalScreenModel(
+      host: selection.host,
+      profile: profile,
+      kind: kind
+    )
+    session.selection = selection
+    session.pendingWorkspaceIntent = intent
     session.onChange = { [weak self] model in
       guard let self else { return }
       transferPolicy.setPendingInput(model.pendingInputCount > 0)
@@ -692,11 +797,41 @@ public final class RoamingAppModel {
     onSessionObservation?(session.companionObservation)
   }
 
+  /// A fallback or new-shell action belongs to the screen that offered it.
+  /// Validate before detaching anything, including after legacy recovery awaits.
+  func openOrdinarySSH(from screen: TerminalScreenModel) async {
+    guard activeSession === screen, !screen.isClosed,
+      let selection = screen.selection
+    else { return }
+    screen.actionError = nil
+    do {
+      let prepared = try await ssh.prepare(selection)
+      guard activeSession === screen, !screen.isClosed, !Task.isCancelled else {
+        return
+      }
+      if let reference = prepared.identity {
+        do { try identityStore.validate(reference) } catch {
+          throw SSHAccessError.keyUnavailable(error)
+        }
+      }
+      open(prepared, kind: .ordinarySSH, replacing: true)
+    } catch {
+      guard activeSession === screen, !screen.isClosed, !Task.isCancelled else {
+        return
+      }
+      screen.actionError =
+        (error as? SSHAccessError)
+        .flatMap { $0 == .cancelled ? nil : $0.detail }
+        ?? Self.hostChangedMessage
+    }
+  }
+
   /// Closes the active terminal view. `.detach` keeps a roaming host
   /// shell for a later resume (spec §4); `.terminate` destroys it.
   public func close(_ mode: RoamingCloseMode = .detach) {
     guard let session = activeSession else { return }
     session.isClosed = true
+    session.pendingWorkspaceIntent = nil
     if let controller = session.controller {
       session.controller = nil
       let id = UUID()
@@ -707,7 +842,9 @@ public final class RoamingAppModel {
         self?.closing[id] = nil
       }
     }
-    if mode == .terminate { forgetSession(for: session.host) }
+    if mode == .terminate, let selection = session.selection {
+      forgetSession(for: selection)
+    }
     session.transition(to: .userClosed)
     session.onChange = nil
     session.previewLines = nil
@@ -768,16 +905,17 @@ public final class RoamingAppModel {
   /// chose. The previous terminal is detached through the ordinary close,
   /// never ended. Choosing the workspace already shown changes nothing.
   public func openWorkspace(_ host: HostProfile, intent: WorkspaceIntent) {
+    let selection = connectionSelection(for: host)
     // A reveal (pane focus or takeover) always reattaches.
     if case let .resume(id, nil) = intent, let active = activeSession,
-      active.host == host, active.kind == .roaming, active.sessionID == id
+      active.kind == .roaming, active.sessionID == id,
+      active.selection?.hasSameTarget(as: selection) == true
     {
       return
     }
     if activeSession != nil { close() }
-    if case let .resume(id, _) = intent { rememberSession(id, for: host) }
-    pendingIntents[host.id] = intent
-    open(host)
+    if case let .resume(id, _) = intent { rememberSession(id, for: selection) }
+    open(selection, kind: .roaming, intent: intent)
   }
 
   /// Resume Last Workspace: the remembered identity only. Returns false,
@@ -789,27 +927,39 @@ public final class RoamingAppModel {
     return true
   }
 
-  /// The explicit choice for `host`'s next start, consumed once.
-  func takeIntent(for host: HostProfile) -> WorkspaceIntent? {
-    pendingIntents.removeValue(forKey: host.id)
-  }
-
   // MARK: Resume (non-secret session identifiers only)
 
   /// The remembered roaming session for `host`, if any.
   public func resumableSessionID(for host: HostProfile) -> SessionID? {
-    resumeStore.sessionID(for: host.id)
+    let selection = connectionSelection(for: host)
+    guard hostMutationIsCurrent(selection.context) else { return nil }
+    return resumableSessionID(for: selection)
   }
 
-  func rememberSession(_ id: SessionID, for host: HostProfile) {
-    guard resumeStore.sessionID(for: host.id) != id else { return }
-    resumeStore.set(id, for: host.id)
-    resumableHosts.insert(host.id)
+  func resumableSessionID(for selection: HostConnectionSelection) -> SessionID?
+  { resumeStore.sessionID(for: HostDataOwner(selection)) }
+
+  /// Retained connections update their original owner even after account changes.
+  func rememberSession(_ id: SessionID, for selection: HostConnectionSelection)
+  {
+    let owner = HostDataOwner(selection)
+    guard resumeStore.sessionID(for: owner) != id else { return }
+    resumeStore.set(id, for: owner)
+    refreshResumableHosts()
   }
 
-  func forgetSession(for host: HostProfile) {
-    resumeStore.set(nil, for: host.id)
-    resumableHosts.remove(host.id)
+  func forgetSession(for selection: HostConnectionSelection) {
+    resumeStore.set(nil, for: HostDataOwner(selection))
+    refreshResumableHosts()
+  }
+
+  private func refreshResumableHosts() {
+    let resumable = Set(
+      hosts.compactMap { host in
+        resumableSessionID(for: host) == nil ? nil : host.id
+      }
+    )
+    if resumable != resumableHosts { resumableHosts = resumable }
   }
 
   // MARK: Trust prompts
@@ -1028,53 +1178,6 @@ public final class RoamingAppModel {
     if let data = try? JSONEncoder().encode(settings) {
       UserDefaults.standard.set(data, forKey: settingsKey)
     }
-  }
-}
-
-/// Remembered roaming session per saved host, so a cold launch can resume
-/// by session ID (spec §9). Session IDs are not credentials: attaching
-/// still needs fresh SSH authorization. Stored in `UserDefaults`.
-public struct SessionResumeStore: @unchecked Sendable {
-  public static let key = "roaming.resume.v1"
-  // UserDefaults synchronizes individual operations, not read/modify/write.
-  // Share ownership across instances, including separate handles for one suite.
-  // Recursive locking permits synchronous defaults observers to read the store.
-  private static let access = NSRecursiveLock()
-  let defaults: UserDefaults
-  let key: String
-
-  public init(
-    defaults: UserDefaults = .standard,
-    key: String = SessionResumeStore.key,
-  ) {
-    self.defaults = defaults
-    self.key = key
-  }
-
-  /// Host id to session id, skipping malformed entries.
-  public func all() -> [UUID: SessionID] {
-    Self.access.lock()
-    defer { Self.access.unlock() }
-    guard let raw = defaults.dictionary(forKey: key) else { return [:] }
-    var out: [UUID: SessionID] = [:]
-    for (host, session) in raw {
-      if let session = session as? String, let host = UUID(uuidString: host),
-        let session = SessionID(hex: session)
-      {
-        out[host] = session
-      }
-    }
-    return out
-  }
-
-  public func sessionID(for host: UUID) -> SessionID? { all()[host] }
-
-  public func set(_ session: SessionID?, for host: UUID) {
-    Self.access.lock()
-    defer { Self.access.unlock() }
-    var raw = defaults.dictionary(forKey: key) ?? [:]
-    raw[host.uuidString] = session?.hex
-    defaults.set(raw, forKey: key)
   }
 }
 

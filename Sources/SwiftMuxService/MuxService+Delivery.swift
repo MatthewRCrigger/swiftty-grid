@@ -248,6 +248,9 @@ extension MuxService {
       if case let .paste(s) = input, s.utf8.count > limits.maxPasteChunkBytes {
         return ack(MuxError(.resourceLimit, "text input record too large"))
       }
+      if !Self.clipboardInputIsBounded(input) {
+        return ack(MuxError(.invalidRequest, "clipboard input out of bounds"))
+      }
       let estimate = Self.estimate(input)
       guard runtime.reserve(estimate) else {
         return ack(MuxError(.resourceLimit, "pane input buffer is full"))
@@ -330,6 +333,22 @@ extension MuxService {
     32 > limits.inputBytesPerPane
   }
 
+  /// Paste events and drags list at most 16 types (and items) of the
+  /// sizes frames carry.
+  static func clipboardInputIsBounded(_ input: MuxInput) -> Bool {
+    func valid(_ types: [String]) -> Bool {
+      types.count <= 16
+        && types.allSatisfy {
+          !$0.isEmpty && $0.utf8.count <= FrameDropTarget.maxTypeBytes
+        }
+    }
+    return switch input {
+    case let .clipboardPaste(types), let .drag(.move(_, types)): valid(types)
+    case let .drag(.drop(_, items)): valid(items.map(\.mime))
+    default: true
+    }
+  }
+
   static func estimate(_ input: MuxInput) -> Int {
     switch input {
     case let .text(s): s.utf8.count
@@ -342,6 +361,11 @@ extension MuxService {
     // An SGR report with large coordinates.
     case .mouse: 32
     case .moveCursor: MuxInput.moveCursorBytes
+    case let .clipboardPaste(types): MuxInput.clipboardBytes(types: types)
+    case let .drag(.move(_, types)): MuxInput.clipboardBytes(types: types)
+    case let .drag(.drop(_, items)):
+      MuxInput.clipboardBytes(types: items.map(\.mime))
+    case .drag(.leave): 64
     }
   }
 

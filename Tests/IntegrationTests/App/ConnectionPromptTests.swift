@@ -130,31 +130,29 @@ extension MainActorIntegrationTests {
     }
 
     @Test(arguments: [false, true])
-    func queuedCancellationFinishesWithoutAnotherMainActorTurn(
+    func queuedCancellationRemovesPromptBeforeAnotherMainActorTurn(
       trust: Bool
     ) async throws {
       let app = RoamingAppModel()
       let firstHost = host("first")
       let secondHost = host("second")
-      let first = Task { await answer(app, host: firstHost, trust: trust) }
-      #expect(
-        try await promptEventually {
-          pendingHost(app, trust: trust) == firstHost.id
-        }
-      )
-      var started = false
-      var finished = false
-      let second = Task {
-        started = true
-        defer { finished = true }
-        return await answer(app, host: secondHost, trust: trust)
+      // Immediate tasks reach their prompt continuations before returning.
+      let first = Task.immediate {
+        await answer(app, host: firstHost, trust: trust)
       }
-      #expect(try await promptEventually { started })
+      #expect(pendingHost(app, trust: trust) == firstHost.id)
+      let second = Task.immediate {
+        await answer(app, host: secondHost, trust: trust)
+      }
       second.cancel()
-      await Task.yield()
-      #expect(finished)
       #expect(pendingHost(app, trust: trust) == firstHost.id)
       resolve(app, trust: trust, allow: true)
+      // There is deliberately no suspension between cancellation, resolving
+      // the visible prompt, and checking that the cancelled one cannot appear.
+      #expect(pendingHost(app, trust: trust) == nil)
+      if pendingHost(app, trust: trust) == secondHost.id {
+        resolve(app, trust: trust, allow: false)
+      }
       #expect(await first.value)
       #expect(!(await second.value))
       #expect(pendingHost(app, trust: trust) == nil)

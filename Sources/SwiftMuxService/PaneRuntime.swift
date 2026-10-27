@@ -17,7 +17,14 @@ enum PaneEvent: Sendable {
   case status(TerminalEpochID, [StatusChange])
   /// Process exited and output drained (or the drain bound elapsed).
   case finished(status: Int32, forced: Bool)
+  /// A kitty clipboard read or committed write for the controller to
+  /// answer (`completeClipboardRead` / `completeClipboardWrite`).
+  case clipboardRead(MuxClipboardRead)
+  case clipboardWrite(MuxClipboardWrite)
 }
+
+/// Events gathered off the parse path, shared with the emulator's hooks.
+final class PendingPaneEvents: Sendable { let events = Mutex<[PaneEvent]>([]) }
 
 /// One PTY, its process lifecycle and its authoritative terminal. Every
 /// operation runs on `queue` in order: output parsing, input writes,
@@ -104,6 +111,9 @@ final class PaneRuntime: @unchecked Sendable {
   let currentViewport = Atomic<UInt64>(0)
   /// New on creation and on every full reset (RIS).
   private var terminalEpoch = TerminalEpochID()
+  /// Clipboard requests the emulator deferred during a parse, emitted
+  /// with the batch's other events.
+  private let clipboardRequests = PendingPaneEvents()
   /// Status changes journaled per publish; past it the inbox resyncs
   /// from the records (intermediate transitions are then lost).
   static let statusJournalLimit = 4096
@@ -143,6 +153,46 @@ final class PaneRuntime: @unchecked Sendable {
     state.terminfoName = innerTerm
     state.keyboardProtocolEnabled = false
     state.clipboardWritesAdvertised = false
+    // The kitty clipboard reaches the controlling app, which may prompt;
+    // the service answers if no app can.
+    let requests = clipboardRequests
+    state.kittyClipboardReader = { [id] request in
+      requests.events.withLock {
+        $0.append(
+          .clipboardRead(
+            MuxClipboardRead(
+              pane: id,
+              token: request.token,
+              mimes: request.mimes,
+              list: request.list,
+              name: request.name,
+              granted: request.granted,
+              canRemember: request.canRemember
+            )
+          )
+        )
+      }
+      return .deferred
+    }
+    state.kittyClipboardWriter = { [id] request in
+      requests.events.withLock {
+        $0.append(
+          .clipboardWrite(
+            MuxClipboardWrite(
+              pane: id,
+              token: request.token,
+              contents: request.contents.map {
+                MuxClipboardContent(mime: $0.mime, data: Data($0.data))
+              },
+              name: request.name,
+              granted: request.granted,
+              canRemember: request.canRemember
+            )
+          )
+        )
+      }
+      return .deferred
+    }
     // OSC 7501 feeds the attention inbox, hidden or not.
     state.programStatusEnabled = true
     state.programStatusCapacity = limits.statusRecordsPerPane
@@ -339,9 +389,14 @@ final class PaneRuntime: @unchecked Sendable {
         onEvent?(.title(DisplayText.sanitize(raw)))
       case .bell: onEvent?(.bell)
       case let .workingDirectory(d): onEvent?(.workingDirectory(d))
-      default: break  // program clipboard writes are disabled
+      default: break  // OSC 52 clipboard writes are disabled
       }
     }
+    let requests = clipboardRequests.events.withLock { requests in
+      defer { requests.removeAll() }
+      return requests
+    }
+    for request in requests { onEvent?(request) }
     _ = state.takeDamage()
     noteChange()
   }
@@ -429,7 +484,11 @@ final class PaneRuntime: @unchecked Sendable {
           state.modes.isDisjoint(with: .mouseTracking)
             ? [] : [.mouse(Self.mouse(m))]
         case let .moveCursor(address, column):
-          cursorMoves(to: address, column: column).map(TerminalInput.key)
+          promptClick(to: address, column: column)
+        case let .clipboardPaste(types):
+          // Nothing when the program turned paste events off meanwhile.
+          state.kittyPasteEvent(available: types).map { [.bytes($0)] } ?? []
+        case let .drag(drag): dragReport(drag).map { [.bytes($0)] } ?? []
         }
       // Enhanced keyboard reporting is disabled in this profile.
       for terminalInput in terminalInputs {
@@ -441,7 +500,7 @@ final class PaneRuntime: @unchecked Sendable {
         )
       }
       switch input {
-      case .focus, .mouse: break
+      case .focus, .mouse, .drag: break
       case .moveCursor where bytes.isEmpty: break
       default:
         guard state.viewportOffset != 0 else { break }
@@ -457,19 +516,26 @@ final class PaneRuntime: @unchecked Sendable {
   }
 
   /// Arrow keys moving the shell's cursor to a cell of its command line,
-  /// or none when the address is stale or outside it.
-  private func cursorMoves(
+  /// or its `click_events` report; none when the address is stale or
+  /// outside it.
+  private func promptClick(
     to address: HistoryAddress,
     column: Int
-  ) -> [KeyEvent] {
+  ) -> [TerminalInput] {
     guard address.generation == state.addressingGeneration,
       address.alternateScreen == state.isAlternateScreen,
-      let moves = state.promptCursorMoves(
-        to: TerminalPoint(row: address.row, column: column)
-      ), moves.magnitude <= MuxInput.maxCursorMoves
+      let action = state.promptClickAction(
+        at: TerminalPoint(row: address.row, column: column)
+      )
     else { return [] }
+    let moves: Int
+    switch action {
+    case let .report(bytes): return [.bytes(bytes)]
+    case let .moves(count): moves = count
+    }
+    guard moves.magnitude <= MuxInput.maxCursorMoves else { return [] }
     return Array(
-      repeating: KeyEvent(moves < 0 ? .left : .right),
+      repeating: .key(KeyEvent(moves < 0 ? .left : .right)),
       count: Int(moves.magnitude)
     )
   }
@@ -827,6 +893,89 @@ final class PaneRuntime: @unchecked Sendable {
       advanceViewport()
       noteChange()
     }
+  }
+
+  /// The program's report of a native drag; nil without a registration.
+  /// Dropped items that could not be served in one reply are left out.
+  private func dragReport(_ drag: MuxDrag) -> [UInt8]? {
+    func position(_ p: MuxDragPosition) -> KittyDragAndDrop.MoveEvent {
+      var operations: KittyDragAndDrop.Operations = []
+      if p.allowsCopy { operations.insert(.copy) }
+      if p.allowsMove { operations.insert(.move) }
+      return KittyDragAndDrop.MoveEvent(
+        column: UInt32(clamping: max(0, p.column)),
+        row: UInt32(clamping: max(0, p.row)),
+        pixelX: Int32(clamping: p.pixelX),
+        pixelY: Int32(clamping: p.pixelY),
+        operations: operations
+      )
+    }
+    switch drag {
+    case let .move(p, types): return state.dragMove(position(p), mimes: types)
+    case let .drop(p, items):
+      return state.dragDrop(
+        position(p),
+        items:
+          items.filter { Self.replyFits([$0], reserve: writer.replyReserve) }
+          .map { KittyDragAndDrop.Item(mime: $0.mime, data: Array($0.data)) }
+      )
+    case .leave: return state.dragLeave()
+    }
+  }
+
+  /// Answers a deferred kitty clipboard read. Contents whose reply would
+  /// not fit the pane's reply reserve answer EIO rather than being lost.
+  func completeClipboardRead(_ token: UInt64, _ result: MuxClipboardReadResult)
+  {
+    queue.async { [self] in
+      guard !finished else { return }
+      let answer: KittyClipboard.ReadResult =
+        switch result {
+        case let .success(available, contents, remember):
+          Self.replyFits(contents, reserve: writer.replyReserve)
+            ? .success(
+              available: available,
+              contents: contents.map {
+                KittyClipboard.Content(mime: $0.mime, data: Array($0.data))
+              },
+              remember: remember
+            ) : .ioError
+        case .denied: .denied
+        case .unsupported: .unsupported
+        case .busy: .busy
+        case .ioError: .ioError
+        }
+      state.completeKittyClipboardRead(token, with: answer)
+      _ = enqueueReplies()
+    }
+  }
+
+  func completeClipboardWrite(
+    _ token: UInt64,
+    _ result: MuxClipboardWriteResult
+  ) {
+    queue.async { [self] in
+      guard !finished else { return }
+      let answer: KittyClipboard.WriteResult =
+        switch result {
+        case let .success(remember): .success(remember: remember)
+        case .denied: .denied
+        case .unsupported: .unsupported
+        case .busy: .busy
+        case .invalidData: .invalidData
+        case .ioError: .ioError
+        }
+      state.completeKittyClipboardWrite(token, with: answer)
+      _ = enqueueReplies()
+    }
+  }
+
+  /// Whether `contents`, base64-encoded in DATA packets, fit one reply.
+  static func replyFits(_ contents: [MuxClipboardContent], reserve: Int) -> Bool
+  {
+    let raw = contents.reduce(0) { $0 + $1.data.count + $1.mime.utf8.count }
+    let packets = contents.reduce(0) { $0 + $1.data.count / 4096 + 1 }
+    return (raw + 2) / 3 * 4 + packets * 96 + 1024 <= reserve
   }
 
   /// Full reset (RIS) of the emulator; the process keeps running.
@@ -1487,6 +1636,8 @@ final class PaneRuntime: @unchecked Sendable {
     case .insert: .insert
     case .delete: .delete
     case let .function(n): .function(min(max(n, 1), 12))
+    case let .keypad(k):
+      KeypadKey(rawValue: k.rawValue).map(Key.keypad) ?? .enter
     }
   }
 

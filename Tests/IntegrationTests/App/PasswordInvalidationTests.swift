@@ -168,7 +168,8 @@ extension MainActorIntegrationTests {
       switch invalidation {
       case .deletion:
         app.delete(host)
-        #expect(try app.save(host))
+        #expect(try !app.save(host))
+        #expect(app.hosts.isEmpty)  // A tombstone is never revived.
       case .edit:
         var edited = host
         edited.host = "edited.example"
@@ -217,7 +218,8 @@ extension MainActorIntegrationTests {
       switch invalidation {
       case .deletion:
         app.delete(host)
-        #expect(try app.save(host))
+        #expect(try !app.save(host))
+        #expect(app.hosts.isEmpty)  // A tombstone is never revived.
       case .edit:
         var edited = host
         edited.host = "edited.example"

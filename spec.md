@@ -55,6 +55,24 @@ stays on the main thread/render callback.
 Use immutable snapshots and coarse synchronization; avoid actors or locks in
 parser/grid loops and cross-thread terminal-state mutation.
 
+### SwiftPM C security settings
+
+The Xcode app wrappers compile Swift only; their C/Objective-C warnings do not
+configure the SwiftPM C targets `SwiftMuxLauncher` and `CAllocCounter`.
+Adding warning flags through `cSettings.unsafeFlags` remains deferred: it was
+not approved in the recorded security-settings review, and unsafe flags would
+prevent use of the affected package products as remote dependencies.
+`CLANG_WARN_SUSPICIOUS_IMPLICIT_CONVERSION`, `CLANG_WARN_ASSIGN_ENUM`,
+`GCC_WARN_SIGN_COMPARE` and `CLANG_ANALYZER_SECURITY_BUFFER_OVERFLOW_EXPERIMENTAL`
+would matter through those C targets rather than the Swift app wrappers.
+
+`ENABLE_C_BOUNDS_SAFETY` also remains deferred. It requires an annotation-based
+programming model, with `Sources/SwiftMuxLauncher/main.c` the candidate scope;
+the recorded adoption workflow is the `adopt-c-bounds-safety` skill. This is a
+separate source-adoption task, not an enabled build flag. App-target settings and
+platform exceptions live in
+[the roaming specification](spec.roaming.md#25-xcode-security-build-settings).
+
 ## Memory, parsing and Unicode
 
 - Common parser and cell-update paths must avoid heap allocation, input-to-`String`
@@ -123,7 +141,7 @@ characters, whitespace or malformed explicit padding reject the entire write.
 Clipboard reads are refused. Paste replaces editing, signal and escape controls
 with spaces. Unbracketed LF/CRLF becomes one CR; bracketed paste preserves line
 endings and frames empty input. Unsupported upstream protocols/API cases are
-tracked separately in [todo.tests.md](todo.tests.md).
+tracked in [the deferred terminal checks](todo.md#deferred-terminal-feature-checks).
 
 Committed typing/IME text without a physical key uses key code zero when Kitty
 flag 8 is set; flag 16 adds its Unicode scalars as associated text. Other flags

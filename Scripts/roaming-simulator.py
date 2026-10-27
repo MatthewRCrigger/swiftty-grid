@@ -13,6 +13,10 @@ import sys
 import tempfile
 import time
 
+# -I excludes the script directory; add only our trusted sibling modules.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from real_ssh_commands import defer_interrupts
+
 
 class FixtureError(Exception):
     pass
@@ -39,11 +43,15 @@ def stop_host(host, grace=5):
 
 @contextmanager
 def managed_host(command, log):
-    host = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL, stderr=log,
-                            start_new_session=True)
+    host = None
     failed = False
     try:
+        # A raising signal handler must not escape between creating the child
+        # and assigning the handle that cleanup needs to retire it.
+        with defer_interrupts():
+            host = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=log,
+                                    start_new_session=True)
         yield host
     except BaseException:
         failed = True
@@ -54,7 +62,8 @@ def managed_host(command, log):
             signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
         )
         try:
-            stop_host(host)
+            if host is not None:
+                stop_host(host)
         except Exception as error:
             print(f"Host cleanup failed: {error}", file=sys.stderr)
             if not failed:
@@ -130,15 +139,20 @@ def require_test_result(bundle, output):
         raise FixtureError(f"result bundle does not prove the runtime test passed; see {output}")
 
 
-def run(root, udid, platform):
+def run(root, udid, platform, configuration="debug"):
     workspace = Path(tempfile.mkdtemp(prefix="rsts.", dir="/tmp"))
     print(f"Workspace (results and host log): {workspace}", flush=True)
+    xcode_configuration = configuration.capitalize()
+    (workspace / "build-configuration.json").write_text(json.dumps({
+        "swiftpm": configuration, "xcode": xcode_configuration,
+    }) + "\n")
     with (workspace / "build.log").open("w") as log:
         for product in ["swiftmux-agent", "swmux-launcher", "swifttyd"]:
-            subprocess.run(["mise", "exec", "--", "swift", "build", "--product", product],
+            subprocess.run(["mise", "exec", "--", "swift", "build", "-c", configuration,
+                            "--product", product],
                            cwd=root, stdout=log, stderr=log, check=True)
     binary = Path(subprocess.check_output(
-        ["mise", "exec", "--", "swift", "build", "--show-bin-path"],
+        ["mise", "exec", "--", "swift", "build", "-c", configuration, "--show-bin-path"],
         cwd=root, text=True,
     ).strip())
     config = workspace / "config.json"
@@ -165,6 +179,7 @@ def run(root, udid, platform):
                 result = subprocess.run([
                     "xcodebuild", "-scheme", "RoamingRuntime", "-destination",
                     f"platform={platform} Simulator,id={udid}",
+                    "-configuration", xcode_configuration,
                     "-derivedDataPath", str(workspace / "build"),
                     "-resultBundlePath", str(bundle), "-collect-test-diagnostics", "never",
                     "-only-testing:RoamingRuntimeTests/RoamingRuntimeTests/"
@@ -187,6 +202,8 @@ def main():
     parser.add_argument("udid")
     parser.add_argument("platform", nargs="?", default="iOS",
                         choices=["iOS", "tvOS", "visionOS"])
+    parser.add_argument("--configuration", choices=["debug", "release"], default="debug",
+                        help="build configuration for both host products and simulator tests")
     args = parser.parse_args()
     if not args.udid.strip():
         parser.error("simulator UDID must not be empty")
@@ -197,7 +214,8 @@ def main():
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
     try:
-        status = run(Path(__file__).resolve().parent.parent, args.udid, args.platform)
+        status = run(Path(__file__).resolve().parent.parent, args.udid, args.platform,
+                     args.configuration)
         return status if status >= 0 else 128 - status
     except Interrupted as error:
         return 128 + error.signum

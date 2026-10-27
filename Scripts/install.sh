@@ -191,8 +191,16 @@ if [ -n "$reason" ]; then
   reregister=1
 fi
 
-running=0
-pgrep -xq swiftty && running=1
+# Inspect the exact destination before its old bundle is moved by publication.
+# The newly built executable implements this query even on a first install.
+running=$("$built/Contents/MacOS/swiftty" --running-app "$app") || {
+  echo "install.sh: cannot determine whether the destination app is running" >&2
+  exit 1
+}
+case "$running" in
+  running | stopped) ;;
+  *) echo "install.sh: invalid destination app state: $running" >&2; exit 1 ;;
+esac
 
 sudo_if_needed() {
   if [ -w "$1" ]; then shift; "$@"; else shift; sudo "$@"; fi
@@ -305,10 +313,11 @@ if [ "$roaming" -eq 1 ]; then
   fi
 fi
 
-if [ "$running" -eq 1 ]; then
+if [ "$running" = running ]; then
   echo "Swiftty is running the previous build; quit and reopen it to update."
 else
-  open "$app"
+  # A different copy can have the same bundle identifier. Open this copy.
+  open -n "$app"
 fi
 if [ "$roaming" -eq 1 ]; then
   i=0

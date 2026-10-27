@@ -47,7 +47,7 @@ public struct CloudRecord: Hashable, Sendable, Codable {
   }
 }
 
-/// CloudKit outcomes the coordinator distinguishes (§8.2).
+/// Sync outcomes the coordinator distinguishes (§8.2).
 public enum CloudSyncError: Error, Hashable, Sendable {
   case accountRequired
   case accountTemporarilyUnavailable
@@ -63,6 +63,8 @@ public enum CloudSyncError: Error, Hashable, Sendable {
   case changeTokenExpired
   /// Missing entitlement, bad container or permission failure.
   case permissionFailure
+  /// The local consent preference could not be persisted.
+  case settingsNotSaved
   /// Schema or validation rejection.
   case invalidRecord(String)
   case other(Int)
@@ -87,6 +89,8 @@ public enum CloudSyncError: Error, Hashable, Sendable {
     case .recordMissing: "A synced record was removed from iCloud."
     case .changeTokenExpired: "Refetching from iCloud."
     case .permissionFailure: "This build is not configured for iCloud sync."
+    case .settingsNotSaved:
+      "Sync settings could not be saved. Check storage and try again before closing the app."
     case .invalidRecord(let reason): "iCloud rejected a record (\(reason))."
     case .other(let code): "iCloud error \(code)."
     }

@@ -27,7 +27,10 @@ mise run uninstall [--purge] [-y]
 ```
 
 The native host runs tests serially because suites share AppKit state and use
-blocking dispatch handoffs. Allocation budgets run only with optimized code;
+blocking dispatch handoffs. Each manifest test bundle must exist and report a
+complete run. A missing or failing bundle fails the command; later bundles still
+run so their diagnostics are available. Completion is audited separately for
+each bundle. Allocation budgets run only with optimized code;
 `Scripts/test-native.sh -c release` checks them alongside the rest of the suite.
 
 `mise.toml` sets `SDKROOT` for swift.org toolchains. Build the UIKit frontend
@@ -184,6 +187,11 @@ app in place. Filesystems that refuse the atomic operation stop installation.
 Registration and optional roaming setup run after publication; they are separate
 steps. Interrupted copy/verification workers are killed and collected, and
 temporary-directory cleanup failures report the retained directory.
+Before replacement, the installer checks the destination bundle's running
+application through `swiftty --running-app APP_PATH`. A running copy there is
+left alone; otherwise the installer opens the selected installation as a new
+instance, even when another copy with the same name or bundle identifier is
+running elsewhere.
 
 `uninstall.sh` requires Python 3 to limit each shutdown command to ten seconds.
 Failed or timed-out shutdown checks preserve installation files and state.
@@ -485,10 +493,34 @@ Scripts/test-app-ui.sh '<xcodebuild destination>' [xcodebuild args]      # XCUIT
 Scripts/test-keychain-signed.sh '<destination>' [team-id]                # signed, app-hosted Keychain test
 ```
 
+`test-roaming-simulator.sh` accepts `--configuration release` to build both
+the native host products and simulator test bundle in Release; it defaults to
+Debug. The fixture records the selected configuration alongside its results.
+
 `test-real-ssh.sh` needs `container`. `swifttyd` is macOS-only, so the Linux
 VM's `/usr/local/libexec/swifttyd` relays `bootstrap --stdio` to an agent on
 this Mac. macOS Local Network privacy can deny test runners a route to the VM
 subnet, so the script reaches sshd through `container exec`.
+Set `RST_REAL_SSH_CONFIGURATION=release` to build and run the host, launcher,
+bootstrap helper and test bundle in Release; the default is `debug`.
+The wrapper compiles tests before starting the fixture and runs them without
+rebuilding while the host is live.
+
+The fixture keeps a private process owner for each host/bridge/relay, the UI-test
+build (`xcodebuild.log`) and optional Bonjour advertiser (`advertiser.log`). `stop`
+authenticates those owners and waits for child exit, escalating after six seconds
+while allowing the proxies to reap their own children. PID files alone never
+authorize signals. Missing owners, legacy PID-only records and failed cleanup
+retain their markers and return an error. A `start.lock` prevents concurrent
+startup/stop; if startup was forcibly killed, verify it has ended before removing
+that lock and retrying cleanup.
+The UI wrapper polls the collected build status so cancellation can stop an
+active build before retiring the rest of the fixture. A build that ignores TERM
+is killed and reaped after the same six-second grace period.
+Container deletion and listing each have a ten-second deadline and capped output.
+The container marker clears after successful deletion, or after a successful,
+validated listing confirms the recorded VM is already absent; failed commands
+and malformed listings alone never establish absence.
 
 Roaming verification record (2026-10-10, Xcode 27.0, OS 27 SDKs):
 
@@ -542,12 +574,28 @@ foreground only, never carries private keys or passwords, and keeps another
 iCloud account's data hidden after an account switch. tvOS keeps local key
 sign-in and generation, without import or sync.
 
-`hosts.json` is now a version-2 snapshot of all non-secret connection state.
-The first launch of this version migrates version-1 key labels to identities
-(device-only, same key, same fingerprint), keeps the original file as
-`hosts.v1.json`, and removes each legacy Keychain item only after its
-replacement is verified. Earlier builds cannot read the version-2 file and
-refuse to overwrite it.
+iCloud key operations use the configured account provider even when metadata
+sync is off. Interrupted operations retain their original account; enabling
+metadata sync does not move another account's pending work. Older interrupted
+creations without account information require explicit Restore in SSH Keys.
+Older removals appear under **Key Removals Needing Review**. Review the
+fingerprint before authorizing removal from the current iCloud account;
+failed removals remain queued for retry. Returning to the foreground retries
+interrupted key operations even when metadata sync is off.
+Completed iCloud keys also stay with their original account. Older descriptions
+without account information appear under **Keys Needing Account Review**;
+restoring one verifies its fingerprint in the current account without enabling
+metadata sync.
+Builds without an account provider still support device-only keys.
+
+`hosts.json` uses a version-4 snapshot of all non-secret connection state.
+It preserves separate account caches when record names collide and upgrades
+version-2 and version-3 snapshots, retaining records and queued edits while
+requiring review for older iCloud keys with unknown account ownership.
+Version-1 key labels migrate to device-only identities with the same key and
+fingerprint. Migration keeps the original file as `hosts.v1.json` and removes
+each legacy Keychain item only after its replacement is verified. Earlier builds reject the version-4 file when
+loading it.
 
 ## API and storage contracts
 
@@ -613,6 +661,7 @@ minimum-contrast = 3
 cursor-style = bar
 cursor-style-blink = false
 cursor-click-to-move = true
+rectangle-checksum-report = false
 copy-on-select = true
 link-url = true
 mouse-hide-while-typing = true
@@ -793,9 +842,12 @@ eight idle seconds and two background seconds with incoming output.
 
 ## Verification status
 
-The full macOS Debug/Release baseline passed 1,156 tests. Added keypad-mode coverage
-and 86 AppKit checks pass in both configurations. The hosted simulator
-passed 171 mobile tests. The current physical iPad build passed 169 correctness
+These results describe earlier tested builds. Current validation gaps are tracked
+in [todo.md](todo.md); historical device results do not verify the current tree.
+
+The earlier macOS Debug/Release baseline passed 1,156 tests. Added keypad-mode coverage
+and 86 AppKit checks passed in both configurations. The hosted simulator
+passed 171 mobile tests. The physical iPad build tested then passed 169 correctness
 tests and two separate frame-time tests. Release builds passed for visionOS and
 Mac Catalyst.
 
@@ -813,5 +865,5 @@ both devices. Scripted and hands-on USB shell checks with `vim`, `less`, `tmux`
 and `top` passed on the physical iPad. The user reported typing and scrolling
 equally responsive alongside Ghostty in the two-drawable Mac build.
 Battery consumption has not been measured.
-[todo.tests.md](todo.tests.md) lists deferred checks that need protocols or
-APIs Swiftty does not implement yet.
+[The consolidated backlog](todo.md#deferred-terminal-feature-checks) lists deferred
+checks that need protocols or APIs Swiftty does not implement yet.

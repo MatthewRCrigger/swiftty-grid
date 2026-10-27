@@ -14,7 +14,7 @@
 	<key>com.apple.security.files.user-selected.read-write</key>
 	<true/>
 	<!--
-	Enhanced Security (xcode-security-settings.md): hardened-process
+	Enhanced Security (spec.roaming.md §2.5): hardened-process
 	runtime protections, plus hardware memory tagging in soft mode
 	(simulated crash reports, no termination) until those reports are
 	clean. Checked pointer arithmetic is deferred.

@@ -201,7 +201,8 @@ final class SSHAccess {
 
   init(app: RoamingAppModel, trustStore: FileHostTrustStore? = nil) {
     self.app = app
-    let file = trustStore ?? FileHostTrustStore(fileURL: RoamingStorage.knownHostsURL)
+    let file =
+      trustStore ?? FileHostTrustStore(fileURL: RoamingStorage.knownHostsURL)
     self.trustFile = file
     self.trustStore = SyncedHostTrustStore(base: file, app: app)
   }
@@ -228,21 +229,47 @@ final class SSHAccess {
     retry: Bool = false,
     rejectedPassword: String? = nil
   ) async throws(SSHAccessError) -> SSHCredential {
-    let host = await migrated(host)
+    let host = try await migrated(host)
+    return try await credential(
+      for: host,
+      reference: authenticationReference(for: host),
+      retry: retry,
+      rejectedPassword: rejectedPassword
+    )
+  }
+
+  private func authenticationReference(
+    for host: HostProfile
+  ) -> SSHIdentityStore.AuthenticationReference? {
+    guard case .key(let id) = host.auth else { return nil }
+    return app?.identityStore.authenticationReference(id)
+  }
+
+  private func credential(
+    for host: HostProfile,
+    reference: SSHIdentityStore.AuthenticationReference?,
+    retry: Bool,
+    rejectedPassword: String?
+  ) async throws(SSHAccessError) -> SSHCredential {
     switch host.auth {
     case .password:
-      guard let app, let password = await app.password(
-        for: host, retry: retry, rejectedPassword: rejectedPassword
-      )
+      guard let app,
+        let password = await app.password(
+          for: host,
+          retry: retry,
+          rejectedPassword: rejectedPassword
+        )
       else { throw .cancelled }
       return .password(password)
-    case .key(let id):
-      guard let app else { throw .cancelled }
+    case .key:
+      guard let app, let reference else { throw .cancelled }
       do {
-        return .ed25519(try await app.identityStore.resolve(id).privateKey)
-      } catch .cancelled {
-        throw .cancelled
-      } catch { throw .keyUnavailable(error) }
+        return .ed25519(
+          try await app.identityStore.resolve(reference).privateKey
+        )
+      } catch .cancelled { throw .cancelled } catch {
+        throw .keyUnavailable(error)
+      }
     case .legacyKey: throw .keyNeedsRepair
     case .unsupported: throw .unsupportedAuthMethod
     }
@@ -251,12 +278,24 @@ final class SSHAccess {
   /// `host` as saved after any version-1 label migration in flight. Right
   /// after an upgrade, a connection waits for that pass rather than
   /// reporting a key that is about to migrate as needing repair.
-  func migrated(_ host: HostProfile) async -> HostProfile {
+  func migrated(_ host: HostProfile) async throws(SSHAccessError) -> HostProfile
+  {
+    guard !Task.isCancelled else { throw .cancelled }
     guard case .legacyKey = host.auth, let app,
       !app.connections.migration.completed || app.identityStore.isRecovering
     else { return host }
+    let context = app.hostMutationContext(for: host)
+    let wasCurrent = app.hostMutationIsCurrent(context)
     await app.identityStore.recover()
-    return app.hosts.first { $0.id == host.id } ?? host
+    guard !Task.isCancelled, context.accountGeneration == app.accountGeneration
+    else { throw .cancelled }
+    // Only a saved, unchanged legacy target may acquire its mapped identity.
+    // Unsaved or stale drafts cannot adopt a record merely sharing their UUID.
+    guard wasCurrent else { return host }
+    guard let current = app.hostAfterLegacyMigration(context) else {
+      throw .cancelled
+    }
+    return current
   }
 
   /// The bootstrap endpoint for `host`'s roaming client. A key host
@@ -264,16 +303,38 @@ final class SSHAccess {
   func bootstrapEndpoint(
     for host: HostProfile
   ) async throws(SSHAccessError) -> SSHEndpoint {
-    let host = await migrated(host)
-    if let source = keySource(for: host) { return endpoint(for: host, source: source) }
+    let host = try await migrated(host)
+    if let source = keySource(for: host) {
+      return endpoint(for: host, source: source)
+    }
     return endpoint(for: host, credential: try await credential(for: host))
+  }
+
+  /// A terminal's interactive probe and later bootstraps share one selection.
+  /// Never recapture identity metadata after the probe has suspended.
+  func bootstrapEndpoint(
+    for selection: HostConnectionSelection
+  ) async throws(SSHAccessError) -> SSHEndpoint {
+    guard let app, app.hostMutationIsCurrent(selection.context),
+      !Task.isCancelled
+    else { throw .cancelled }
+    if let source = keySource(reference: selection.identity) {
+      return endpoint(for: selection.host, source: source)
+    }
+    let credential = try await credential(
+      for: selection.host,
+      reference: selection.identity,
+      retry: false,
+      rejectedPassword: nil
+    )
+    return endpoint(for: selection.host, source: .fixed(credential))
   }
 
   /// The `authorized_keys` line for a key-authenticated host, from public
   /// metadata only: displaying it never reads or creates a private key.
   func publicKeyLine(for host: HostProfile) -> String? {
-    guard case .key(let id) = host.auth,
-      let identity = app?.identity(id), !identity.isDeleted
+    guard case .key(let id) = host.auth, let identity = app?.identity(id),
+      !identity.isDeleted
     else { return nil }
     return identity.authorizedKeysLine
   }
@@ -287,7 +348,60 @@ final class SSHAccess {
     interactive: Bool = true,
     expectedHostKeys: Set<String>? = nil
   ) async throws(SSHAccessError) -> SSHConnection {
-    let host = await migrated(host)
+    let host = try await migrated(host)
+    return try await authenticate(
+      host,
+      reference: authenticationReference(for: host),
+      interactive: interactive,
+      expectedHostKeys: expectedHostKeys
+    )
+  }
+
+  /// Reconcile only verified legacy migration; all other changes require a
+  /// new selection. No private key is retained by the returned value.
+  func prepare(
+    _ selection: HostConnectionSelection
+  ) async throws(SSHAccessError) -> HostConnectionSelection {
+    guard let app, selection.host.id == selection.context.id else {
+      throw .cancelled
+    }
+    var selection = selection
+    if !app.hostMutationIsCurrent(selection.context) {
+      guard let migrated = app.hostAfterLegacyMigration(selection.context),
+        migrated.auth != selection.host.auth
+      else { throw .cancelled }
+      selection = app.connectionSelection(for: migrated)
+    }
+    let host = try await migrated(selection.host)
+    if host == selection.host { return selection }
+    guard app.hostAfterLegacyMigration(selection.context) == host else {
+      throw .cancelled
+    }
+    return app.connectionSelection(for: host)
+  }
+
+  /// The selection is prepared separately so a browser can retain successful
+  /// migration even when authentication is subsequently cancelled.
+  func connectPrepared(
+    _ selection: HostConnectionSelection
+  ) async throws(SSHAccessError) -> SSHConnection {
+    guard let app, app.hostMutationIsCurrent(selection.context),
+      !Task.isCancelled
+    else { throw .cancelled }
+    return try await authenticate(
+      selection.host,
+      reference: selection.identity,
+      interactive: true,
+      expectedHostKeys: nil
+    )
+  }
+
+  private func authenticate(
+    _ host: HostProfile,
+    reference: SSHIdentityStore.AuthenticationReference?,
+    interactive: Bool,
+    expectedHostKeys: Set<String>?
+  ) async throws(SSHAccessError) -> SSHConnection {
     if !interactive, case .password = host.auth { throw .cancelled }
     switch host.auth {
     case .legacyKey: throw .keyNeedsRepair
@@ -303,7 +417,10 @@ final class SSHAccess {
     var rejectedPassword: String?
     while true {
       let credential = try await credential(
-        for: host, retry: retry, rejectedPassword: rejectedPassword
+        for: host,
+        reference: reference,
+        retry: retry,
+        rejectedPassword: rejectedPassword
       )
       do {
         return try await connect(
@@ -317,7 +434,9 @@ final class SSHAccess {
           throw .authenticationFailed(publicKeyLine: line)
         }
         retry = true
-        if case let .password(password) = credential { rejectedPassword = password }
+        if case let .password(password) = credential {
+          rejectedPassword = password
+        }
       }
     }
   }
@@ -366,9 +485,9 @@ final class SSHAccess {
       )
     } catch let error as SSHClientError {
       throw await map(error, host: host)
-    } catch is CancellationError {
-      throw .cancelled
-    } catch { throw .unreachable }
+    } catch is CancellationError { throw .cancelled } catch {
+      throw .unreachable
+    }
   }
 
   /// Asks the user about an unknown key for `host`. With a pairing code,
@@ -413,10 +532,15 @@ final class SSHAccess {
         trustDecider: decider
       )
     } catch let error as SSHClientError {
-      throw await map(error, host: host, interactive: interactive, credential: credential)
-    } catch is CancellationError {
-      throw .cancelled
-    } catch { throw .unreachable }
+      throw await map(
+        error,
+        host: host,
+        interactive: interactive,
+        credential: credential
+      )
+    } catch is CancellationError { throw .cancelled } catch {
+      throw .unreachable
+    }
   }
 
   /// The bootstrap endpoint for automatic roaming (re)connects. The host
@@ -425,18 +549,19 @@ final class SSHAccess {
   /// not hold the private key between them and a deleted or changed
   /// identity stops future attempts.
   func endpoint(for host: HostProfile, credential: SSHCredential) -> SSHEndpoint
-  {
-    endpoint(for: host, source: keySource(for: host) ?? .fixed(credential))
-  }
+  { endpoint(for: host, source: keySource(for: host) ?? .fixed(credential)) }
 
   /// A per-bootstrap identity lookup for a key host, else `nil`.
-  private func keySource(for host: HostProfile) -> SSHEndpoint.CredentialSource? {
-    guard case .key(let id) = host.auth, let store = app?.identityStore else {
-      return nil
-    }
+  private func keySource(for host: HostProfile) -> SSHEndpoint.CredentialSource?
+  { keySource(reference: authenticationReference(for: host)) }
+
+  private func keySource(
+    reference: SSHIdentityStore.AuthenticationReference?
+  ) -> SSHEndpoint.CredentialSource? {
+    guard let reference, let store = app?.identityStore else { return nil }
     return .resolved { @Sendable in
       do throws(IdentityResolutionError) {
-        return .ed25519(try await store.resolve(id).privateKey)
+        return .ed25519(try await store.resolve(reference).privateKey)
       } catch { throw SSHAccessError.keyUnavailable(error) }
     }
   }

@@ -6,12 +6,107 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 import unittest
 
 from real_ssh_test_fixture import ROOT, RealSSHFixture
 
 
 class RealSSHSetupTests(RealSSHFixture, unittest.TestCase):
+    def test_configuration_selects_all_host_products_and_their_binary_directory(self):
+        for selected in [None, "debug", "release"]:
+            with self.subTest(configuration=selected):
+                previous = len(self.calls())
+                settings = {} if selected is None else {"RST_REAL_SSH_CONFIGURATION": selected}
+                result = self.invoke(**settings)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                try:
+                    configuration = selected or "debug"
+                    builds = [args for name, args in self.calls()[previous:] if name == "mise"]
+                    expected = [["exec", "--", "swift", "build", "-c", configuration,
+                                 "--product", product]
+                                for product in ["swiftmux-agent", "swmux-launcher", "swifttyd"]]
+                    expected.append(["exec", "--", "swift", "build", "-c", configuration,
+                                     "--show-bin-path"])
+                    self.assertEqual(builds, expected)
+                    self.assertIn(f"export RST_REAL_SSH_CONFIGURATION={configuration}\n",
+                                  (self.state / "env").read_text())
+                finally:
+                    stopped = self.invoke("stop")
+                    self.assertEqual(stopped.returncode, 0, stopped.stderr)
+
+    def test_invalid_configuration_is_rejected_before_resource_commands(self):
+        for value in ["", "Release", "../release", "--help"]:
+            with self.subTest(configuration=value):
+                previous = len(self.calls())
+                result = self.invoke(RST_REAL_SSH_CONFIGURATION=value)
+                try:
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(self.calls()[previous:], [])
+                    self.assertFalse(self.state.exists())
+                finally:
+                    if self.state.exists():
+                        self.invoke("stop")
+
+    def test_concurrent_start_and_stop_cannot_take_over_pending_startup(self):
+        gate = self.directory / "build-release"
+        process = subprocess.Popen(
+            ["/bin/sh", str(self.script), "start", str(self.state)],
+            env={**self.environment, "FIXTURE_BUILD_GATE": str(gate)},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not gate.with_suffix(".waiting").exists():
+                self.assertIsNone(process.poll())
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            for action in ["start", "stop"]:
+                result = self.invoke(action)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("startup", result.stderr)
+            self.assertFalse(any(name == "swiftmux-agent" for name, _ in self.calls()))
+        finally:
+            gate.touch()
+            output, error = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 0, error)
+        self.assertEqual(output.strip(), str(self.state / "env"))
+        self.assertFalse((self.state / "start.lock").exists())
+        self.assertEqual(self.invoke("stop").returncode, 0)
+
+    def test_legacy_pid_marker_cannot_authorize_signaling_an_unrelated_process(self):
+        self.state.mkdir()
+        child = subprocess.Popen(["/bin/sleep", "30"])
+        try:
+            for role in ["host", "advertiser", "xcodebuild"]:
+                with self.subTest(role=role):
+                    marker = self.state / (role + ".pid")
+                    marker.write_text(str(child.pid))
+                    result = self.invoke("stop")
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIsNone(child.poll())
+                    self.assertEqual(marker.read_text(), str(child.pid))
+                    marker.unlink()
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+
+    def test_stop_waits_for_delayed_or_ignored_termination_before_removing_markers(self):
+        for settings in [{"FIXTURE_TERM_DELAY": "0.3"},
+                         {"FIXTURE_IGNORE_TERM": "host,bridge,relay"}]:
+            with self.subTest(settings=settings):
+                started = self.invoke(**settings)
+                self.assertEqual(started.returncode, 0, started.stderr)
+                pids = [int(p.read_text()) for p in self.state.glob("*.pid")]
+                result = self.invoke("stop", timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                # Success means retirement already completed, not eventual exit.
+                for pid in pids:
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(pid, 0)
+                self.assertFalse(list(self.state.glob("*.pid")))
+
     def test_success_hands_off_private_environment_and_stop_cleans_resources(self):
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -124,13 +219,17 @@ class RealSSHSetupTests(RealSSHFixture, unittest.TestCase):
 
     def test_existing_markers_are_refused_before_build_or_cleanup(self):
         self.state.mkdir()
-        marker = self.state / "host.pid"
-        marker.write_text(str(os.getpid()))
-        result = self.invoke()
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("already recorded", result.stderr)
-        self.assertEqual(marker.read_text(), str(os.getpid()))
-        self.assertEqual(self.calls(), [])
+        for name in ["host.pid", "advertiser.pid", "advertiser.owner",
+                     "xcodebuild.pid", "xcodebuild.owner"]:
+            with self.subTest(marker=name):
+                marker = self.state / name
+                marker.write_text(str(os.getpid()))
+                result = self.invoke()
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("already recorded", result.stderr)
+                self.assertEqual(marker.read_text(), str(os.getpid()))
+                self.assertEqual(self.calls(), [])
+                marker.unlink()
 
     def test_bad_pids_and_container_markers_never_become_kill_targets(self):
         self.state.mkdir()
@@ -148,7 +247,7 @@ class RealSSHSetupTests(RealSSHFixture, unittest.TestCase):
                 container.write_text(value)
                 self.assertEqual(self.invoke("stop").returncode, 1)
                 self.assertTrue(container.exists())
-        self.assertEqual(self.calls(), [])
+        self.assertTrue(all(name == "python3" for name, _ in self.calls()))
 
     def test_failed_container_removal_preserves_marker_and_reports_failure(self):
         self.state.mkdir()
@@ -158,6 +257,28 @@ class RealSSHSetupTests(RealSSHFixture, unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("cannot remove", result.stderr)
         self.assertEqual(marker.read_text(), "swiftty-rst-ssh-test")
+
+    def test_already_absent_container_is_successful_cleanup(self):
+        self.state.mkdir()
+        marker = self.state / "container.name"
+        marker.write_text("swiftty-rst-ssh-test\n")
+        result = self.invoke("stop", FIXTURE_CONTAINER_ABSENT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertIn(["container", ["list", "--all", "--format", "json"]], self.calls())
+
+    def test_failed_or_malformed_listing_cannot_prove_container_absence(self):
+        self.state.mkdir()
+        marker = self.state / "container.name"
+        for settings in [{"FIXTURE_FAILURE": "container-list"},
+                         *({"FIXTURE_CONTAINER_LIST": value} for value in
+                           ["", "{", "{}", "null", "[{}]", '[{"id":null}]',
+                            '[{"id":""}]', '[{"id":"swiftty-rst-ssh-test"}]'])]:
+            with self.subTest(settings=settings):
+                marker.write_text("swiftty-rst-ssh-test\n")
+                result = self.invoke("stop", FIXTURE_CONTAINER_ABSENT="1", **settings)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(marker.read_text(), "swiftty-rst-ssh-test\n")
 
     def test_broken_marker_link_is_refused_before_start(self):
         self.state.mkdir()
@@ -187,6 +308,8 @@ class RealSSHSetupTests(RealSSHFixture, unittest.TestCase):
             "#!" + sys.executable + "\n"
             "import os,sys\nfrom pathlib import Path\n"
             "root=Path(os.environ['FIXTURE_DIRECTORY'])\n"
+            "with (root/'calls.jsonl').open('a') as f:\n"
+            " import json; f.write(json.dumps(['fixture',sys.argv[1:]])+'\\n')\n"
             "if sys.argv[1]=='start': print(root/'state/env')\n"
             "else:\n"
             " with (root/'stop.calls').open('a') as f: f.write('stop\\n')\n"
@@ -209,6 +332,69 @@ class RealSSHSetupTests(RealSSHFixture, unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, expected, result.stderr)
                 self.assertEqual((self.directory / "stop.calls").read_text(), "stop\n")
+
+    def test_real_ssh_caller_uses_the_configuration_recorded_by_the_fixture(self):
+        caller = self.root / "Scripts/test-real-ssh.sh"
+        shutil.copyfile(ROOT / "Scripts/test-real-ssh.sh", caller)
+        self.install_stub_environment()
+        with (self.state / "env").open("a") as environment:
+            environment.write("export RST_REAL_SSH_CONFIGURATION=release\n")
+        result = subprocess.run(
+            ["/bin/sh", str(caller)],
+            env={**self.environment, "RST_REAL_SSH_CONFIGURATION": "release"},
+            capture_output=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tests = [args for name, args in self.calls() if name == "mise" and "test" in args]
+        self.assertEqual(len(tests), 1)
+        self.assertEqual(tests[0][:6], ["exec", "--", "swift", "test", "-c", "release"])
+        self.assertIn("--skip-build", tests[0])
+        calls = self.calls()
+        build = ["mise", ["exec", "--", "swift", "build", "-c", "release",
+                          "--build-tests", "-Xswiftc", "-enable-testing"]]
+        self.assertLess(calls.index(build), calls.index(["fixture", ["start"]]))
+        self.assertLess(calls.index(["fixture", ["start"]]), calls.index(["mise", tests[0]]))
+
+    def test_real_ssh_caller_rejects_configuration_mismatch_and_stops_fixture(self):
+        caller = self.root / "Scripts/test-real-ssh.sh"
+        shutil.copyfile(ROOT / "Scripts/test-real-ssh.sh", caller)
+        self.install_stub_environment()
+        with (self.state / "env").open("a") as environment:
+            environment.write("export RST_REAL_SSH_CONFIGURATION=release\n")
+        result = subprocess.run(
+            ["/bin/sh", str(caller)], env=self.environment,
+            capture_output=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(b"differs from the prebuilt tests", result.stderr)
+        self.assertEqual((self.directory / "stop.calls").read_text(), "stop\n")
+        self.assertFalse(any(name == "mise" and "test" in args for name, args in self.calls()))
+
+    def test_real_ssh_caller_build_failure_starts_no_fixture(self):
+        caller = self.root / "Scripts/test-real-ssh.sh"
+        shutil.copyfile(ROOT / "Scripts/test-real-ssh.sh", caller)
+        self.install_stub_environment()
+        result = subprocess.run(
+            ["/bin/sh", str(caller)],
+            env={**self.environment, "FIXTURE_FAILURE": "swift-build"},
+            capture_output=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 62, result.stderr)
+        self.assertFalse(any(name == "fixture" for name, _ in self.calls()))
+
+    def test_real_ssh_caller_rejects_invalid_configuration_before_building(self):
+        caller = self.root / "Scripts/test-real-ssh.sh"
+        shutil.copyfile(ROOT / "Scripts/test-real-ssh.sh", caller)
+        self.install_stub_environment()
+        for value in ["", "Release", "../release", "--help"]:
+            with self.subTest(configuration=value):
+                result = subprocess.run(
+                    ["/bin/sh", str(caller)],
+                    env={**self.environment, "RST_REAL_SSH_CONFIGURATION": value},
+                    capture_output=True, timeout=5,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(self.calls(), [])
 
     def test_real_ssh_caller_rejects_missing_or_skipped_test_evidence(self):
         caller = self.root / "Scripts/test-real-ssh.sh"

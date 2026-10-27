@@ -35,7 +35,7 @@ final class WorkspaceChooserModel {
   /// Rows shown; the service's own limits bound the reply further.
   static let maxRows = 256
 
-  let host: HostProfile
+  private(set) var host: HostProfile
   private(set) var phase: Phase = .connecting
   private(set) var rows: [Row] = []
   private(set) var serviceEpoch: SwiftMuxProtocol.ServerInstanceID?
@@ -54,7 +54,9 @@ final class WorkspaceChooserModel {
   @ObservationIgnored
   private let model: RoamingAppModel
   @ObservationIgnored
-  private let connector: any AttentionServiceConnector
+  private var context: HostMutationContext
+  @ObservationIgnored
+  private let connector: (any AttentionServiceConnector)?
   @ObservationIgnored
   private var service: (any RoamingAttentionMetadataService)?
   @ObservationIgnored
@@ -67,25 +69,25 @@ final class WorkspaceChooserModel {
   init(
     model: RoamingAppModel,
     host: HostProfile,
+    context: HostMutationContext? = nil,
     connector: (any AttentionServiceConnector)? = nil
   ) {
     self.model = model
     self.host = host
-    self.connector =
-      connector ?? RoamingAttentionConnector(model: model, detailedErrors: true)
+    let selection = context ?? model.hostMutationContext(for: host)
+    self.context = selection
+    self.connector = connector
   }
 
   /// Signs in if needed and lists workspaces. Superseded loads are
   /// cancelled and their late results ignored.
   func load() {
-    guard !closed else { return }
+    guard !closed, checkSelection() else { return }
     task?.cancel()
     generation += 1
     let generation = generation
     if rows.isEmpty { phase = .connecting }
-    task = Task {
-      await self.fetch(generation)
-    }
+    task = Task { await self.fetch(generation) }
   }
 
   private func fetch(_ generation: Int) async {
@@ -95,6 +97,7 @@ final class WorkspaceChooserModel {
       guard self.generation == generation, !closed, !Task.isCancelled else {
         return
       }
+      guard checkSelection() else { return }
       publish(metadata)
     } catch {
       guard self.generation == generation, !closed else { return }
@@ -106,8 +109,20 @@ final class WorkspaceChooserModel {
   private func connected() async throws(AttentionServiceError)
     -> any RoamingAttentionMetadataService
   {
+    guard checkSelection() else {
+      throw .other(RoamingAppModel.hostChangedMessage)
+    }
     if let service { return service }
     let navigationHost = NavigationHost(id: host.id, name: host.nickname)
+    // A successful legacy migration reconciles context. A later connection
+    // must use that selection rather than the initial legacy description.
+    let connector =
+      connector
+      ?? RoamingAttentionConnector(
+        model: model,
+        detailedErrors: true,
+        selection: context
+      )
     let opened = try await connector.connect(to: navigationHost)
     guard let metadata = opened as? any RoamingAttentionMetadataService else {
       await opened.close()
@@ -118,7 +133,8 @@ final class WorkspaceChooserModel {
         )
       )
     }
-    guard !closed, !Task.isCancelled else {
+    guard !closed, !Task.isCancelled, checkSelection(afterAuthentication: true)
+    else {
       await metadata.close()
       throw .other(String(localized: "Cancelled.", bundle: #bundle))
     }
@@ -136,8 +152,10 @@ final class WorkspaceChooserModel {
 
   /// Whether this app's roaming terminal shows `workspace` on this host.
   private func isShownHere(_ workspace: WorkspaceID) -> Bool {
-    guard let session = model.activeSession, session.host.id == host.id,
-      session.kind == .roaming
+    guard let session = model.activeSession, !session.isClosed,
+      session.kind == .roaming, let selection = session.selection,
+      HostDataOwner(selection)
+        == HostDataOwner(host: host, account: context.scope)
     else { return false }
     return session.sessionID == SessionID(workspace)
   }
@@ -147,7 +165,7 @@ final class WorkspaceChooserModel {
   /// Opens an existing workspace by identity. One held by another client
   /// asks for confirmation first.
   func choose(_ row: Row) {
-    guard !closed, !finished else { return }
+    guard !closed, !finished, checkSelection() else { return }
     if row.heldElsewhere {
       pendingTakeover = row
       return
@@ -157,6 +175,7 @@ final class WorkspaceChooserModel {
 
   /// The user confirmed taking control of exactly the generation shown.
   func confirmTakeover() {
+    guard !closed, checkSelection() else { return }
     guard let row = pendingTakeover else { return }
     pendingTakeover = nil
     open(row, confirmedTakeover: true)
@@ -164,13 +183,13 @@ final class WorkspaceChooserModel {
 
   /// New Workspace: the one explicit create.
   func createNew() {
-    guard !closed, !finished else { return }
+    guard !closed, !finished, checkSelection() else { return }
     finish()
     model.openWorkspace(host, intent: .create)
   }
 
   private func open(_ row: Row, confirmedTakeover: Bool) {
-    guard let epoch = serviceEpoch else { return }
+    guard !closed, checkSelection(), let epoch = serviceEpoch else { return }
     task?.cancel()
     generation += 1
     let generation = generation
@@ -189,7 +208,7 @@ final class WorkspaceChooserModel {
           observedEpoch: epoch,
           confirmedTakeover: confirmedTakeover
         )
-        guard self.model.hosts.contains(self.host) else { throw .notFound }
+        guard self.checkSelection() else { return }
         self.finish()
         self.model.openWorkspace(
           self.host,
@@ -219,8 +238,7 @@ final class WorkspaceChooserModel {
     guard metadata.serviceEpoch == observedEpoch else {
       throw .serviceRestarted
     }
-    guard
-      let current = metadata.workspaces?.first(where: { $0.id == row.id })
+    guard let current = metadata.workspaces?.first(where: { $0.id == row.id })
     else { throw .notFound }
     guard current.isAttached, !isShownHere(current.id) else { return nil }
     guard confirmedTakeover else { throw .leaseHeld }
@@ -228,6 +246,26 @@ final class WorkspaceChooserModel {
       current.leaseGeneration == row.summary.leaseGeneration
     else { throw .leaseChanged }
     return current.leaseGeneration
+  }
+
+  /// A chooser never reinterprets a retained UUID as a new account's host.
+  /// Invalid selections require reopening; close only this metadata service.
+  private func checkSelection(afterAuthentication: Bool = false) -> Bool {
+    if afterAuthentication, context.original == host,
+      let migrated = model.hostAfterLegacyMigration(context),
+      migrated.auth != host.auth
+    {
+      host = migrated
+      context = model.hostMutationContext(for: migrated)
+    }
+    guard context.original == host, model.hostMutationIsCurrent(context) else {
+      close()
+      rows = []
+      notice = RoamingAppModel.hostChangedMessage
+      phase = .failed(RoamingAppModel.hostChangedMessage)
+      return false
+    }
+    return true
   }
 
   // MARK: Lifetime
@@ -297,15 +335,18 @@ struct WorkspaceChooserView: View {
   @State
   private var chooser: WorkspaceChooserModel?
   let host: HostProfile
+  let context: HostMutationContext
   let app: RoamingAppModel
   let dismiss: () -> Void
 
   init(
     host: HostProfile,
+    context: HostMutationContext,
     app: RoamingAppModel,
     dismiss: @escaping () -> Void
   ) {
     self.host = host
+    self.context = context
     self.app = app
     self.dismiss = dismiss
   }
@@ -315,7 +356,11 @@ struct WorkspaceChooserView: View {
       WorkspaceChooserContent(chooser: chooser, app: app, dismiss: dismiss)
     } else {
       Color.clear.onAppear {
-        chooser = WorkspaceChooserModel(model: app, host: host)
+        chooser = WorkspaceChooserModel(
+          model: app,
+          host: host,
+          context: context
+        )
       }
     }
   }
@@ -337,8 +382,7 @@ private struct WorkspaceChooserContent: View {
         }
         content
       }
-      .glassListBackground()
-      .navigationTitle(chooser.host.nickname)
+      .glassListBackground().navigationTitle(chooser.host.nickname)
       .toolbar {
         ToolbarItem(placement: .cancellationAction) {
           Button(.localized("Cancel"), action: cancel)
@@ -373,8 +417,7 @@ private struct WorkspaceChooserContent: View {
         )
       }
     }
-    .modalConnectionPrompts(app)
-    .task { chooser.load() }
+    .modalConnectionPrompts(app).task { chooser.load() }
     .onChange(of: chooser.finished) { _, finished in if finished { dismiss() } }
     .onDisappear { chooser.close() }
   }

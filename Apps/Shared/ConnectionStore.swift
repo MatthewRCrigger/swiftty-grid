@@ -109,6 +109,32 @@ public struct IdentityIntent: Hashable, Sendable, Codable, Identifiable {
   public let reassign: [UUID]
   public var stage: Stage
   public let createdAt: Date
+  /// Account that authorized this operation; nil denotes local-only work.
+  /// Recovery never publishes an old account's intent into a new account.
+  public var account: String? = nil
+  /// The verified account authorizing synchronizable Keychain access,
+  /// independent of whether CloudKit metadata sync has ever been enabled.
+  public var keychainAccount: String? = nil
+
+  var requiresKeychainAccount: Bool {
+    if policy == .iCloudKeychain { return true }
+    if case .withdraw = kind { return true }
+    return false
+  }
+
+  var hasUnverifiedAccount: Bool {
+    requiresKeychainAccount && account == nil && keychainAccount == nil
+  }
+
+  /// Old creations with no account provenance may only be restored after
+  /// explicit review. Their host reassignment/deletion steps are not replayed.
+  var canRestoreAfterAccountReview: Bool {
+    hasUnverifiedAccount && kind != .deleteSecret
+  }
+
+  var requiresDeletionReview: Bool {
+    hasUnverifiedAccount && kind == .deleteSecret
+  }
 }
 
 /// Resumable version-1 label migration state (§9).
@@ -162,12 +188,17 @@ public struct AccountPartition: Hashable, Sendable, Codable {
   public var lastError: String?
   public var retryAt: Date?
   public var attempts = 0
+  /// Records displaced from the working set by another account's same-name
+  /// record. Optional for migration from the version-2 snapshot.
+  var cachedRecords: [String: CachedConnectionRecord]?
+  /// Account-local profile order, retained while records are displaced.
+  var hostOrder: [UUID]?
 }
 
 /// Every non-secret piece of connection state, committed atomically as one
 /// file (§5). Private keys, passwords and passphrases never appear here.
 public struct ConnectionSnapshot: Hashable, Sendable, Codable {
-  public static let version = 2
+  public static let version = 4
 
   public var version = Self.version
   /// Random per installation; the tie-breaker in logical revisions.
@@ -193,8 +224,15 @@ public struct ConnectionSnapshot: Hashable, Sendable, Codable {
   public var accounts: [String: AccountPartition] = [:]
   /// The CloudKit account local data is currently bound to, if any.
   public var boundAccount: String?
-  /// Record name → account for entities published to or received from an
-  /// account. Absent means local-only.
+  /// Last verified Keychain account, independent of metadata upload consent.
+  /// Cleared on an account-change notification and refreshed before recovery.
+  public var verifiedKeychainAccount: String?
+  /// Older local iCloud metadata whose owning account was never saved.
+  /// Explicit fingerprint/account review is required before use or upload.
+  var unverifiedKeychainIdentities: Set<UUID>?
+  /// Record name → owning account. iCloud identities acquire ownership when
+  /// created, independently of metadata sync; other records acquire it when
+  /// published or received. Absent means local-only or awaiting account review.
   public var scopes: [String: String] = [:]
 
   public init() {}
@@ -225,6 +263,16 @@ public struct ConnectionSnapshot: Hashable, Sendable, Codable {
 
   /// Whether `recordName` belongs to local-only data or the bound account.
   public func isVisible(_ recordName: String) -> Bool {
+    if recordName.hasPrefix("identity-"),
+      let id = UUID(uuidString: String(recordName.dropFirst(9)))
+    {
+      if unverifiedKeychainIdentities?.contains(id) == true { return false }
+      if identity(id)?.storage == .iCloudKeychain,
+        let scope = scopes[recordName]
+      {
+        return scope == (verifiedKeychainAccount ?? boundAccount)
+      }
+    }
     guard let scope = scopes[recordName] else { return true }
     return scope == boundAccount
   }
@@ -242,7 +290,7 @@ public struct ConnectionSnapshot: Hashable, Sendable, Codable {
     hosts.count(where: { !isVisible(Self.hostRecord($0.id)) })
       + identities.count(where: {
         !$0.isDeleted && !isVisible(Self.identityRecord($0.id))
-      })
+      }) + cachedHosts.count + cachedIdentities.count(where: { !$0.isDeleted })
   }
 
   public func identity(_ id: UUID) -> SSHIdentityMetadata? {
@@ -371,6 +419,7 @@ public struct ConnectionSnapshot: Hashable, Sendable, Codable {
     {
       return
     }
+    if let account = boundAccount { activateRecord(name, for: account) }
     let revision = tick()
     knownHosts[name] = KnownHostRecord(
       host: host.lowercased(),
@@ -401,9 +450,9 @@ public struct ConnectionSnapshot: Hashable, Sendable, Codable {
 /// complete file protection where the platform provides it.
 ///
 /// Version 1 (`{"version":1,"hosts":[…]}`) is read for migration only and
-/// its original bytes are kept as `hosts.v1.json` before the first v2
-/// write. Older builds report the v2 file as unreadable and refuse to
-/// overwrite it: there is no silent downgrade.
+/// its original bytes are kept as `hosts.v1.json` before the first upgraded
+/// write. Version 2 upgrades without changing its records. Version 3 keeps
+/// colliding account records; older builds reject it when loading.
 public struct ConnectionStore: Sendable {
   public enum StoreError: Error, Hashable, Sendable {
     case tooLarge
@@ -477,18 +526,19 @@ public struct ConnectionStore: Sendable {
         at: fileURL.deletingLastPathComponent(),
         withIntermediateDirectories: true
       )
-      if let existing = try? Data(contentsOf: fileURL) {
+      if let existing = try read(fileURL) {
+        _ = try Self.decode(existing)
         if Self.version(of: existing) == 1,
           !manager.fileExists(atPath: legacyURL.path)
         {
           try write(existing, to: legacyURL)
         }
-        if (try? Self.decode(existing)) != nil {
-          try write(existing, to: previousURL)
-        }
+        try write(existing, to: previousURL)
       }
       try write(data, to: fileURL)
-    } catch { throw .io(String(describing: type(of: error))) }
+    } catch let error as StoreError { throw error } catch {
+      throw .io(String(describing: type(of: error)))
+    }
   }
 
   /// The previous committed snapshot, when the current file is damaged.
@@ -498,12 +548,9 @@ public struct ConnectionStore: Sendable {
   }
 
   private func read(_ url: URL) throws(StoreError) -> Data? {
-    guard FileManager.default.fileExists(atPath: url.path) else { return nil }
     do {
-      let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-      guard size <= Self.maxFileBytes else { throw StoreError.tooLarge }
-      return try Data(contentsOf: url)
-    } catch let error as StoreError { throw error } catch {
+      return try BoundedFile.readIfPresent(url, limit: Self.maxFileBytes)
+    } catch BoundedFile.ReadError.tooLarge { throw .tooLarge } catch {
       throw .io(String(describing: type(of: error)))
     }
   }
@@ -536,15 +583,14 @@ public struct ConnectionStore: Sendable {
   static func encode(_ snapshot: ConnectionSnapshot) throws(StoreError) -> Data
   {
     try validateHosts(snapshot.hosts)
-    let live = snapshot.identities.filter { !$0.isDeleted }
-    guard live.count <= maxIdentities else { throw .tooManyIdentities }
-    for identity in snapshot.identities where !identity.isValid {
+    try validateCounts(snapshot)
+    for host in snapshot.cachedHosts where !host.isValid {
+      throw .invalidHost(host.id)
+    }
+    let identities = snapshot.identities + snapshot.cachedIdentities
+    for identity in identities where !identity.isValid {
       throw .invalidIdentity(identity.id)
     }
-    guard
-      snapshot.knownHosts.count(where: { $0.value.deletedAt == nil })
-        <= maxTrustEntries
-    else { throw .tooManyTrustEntries }
     let encoder = JSONEncoder()
     encoder.outputFormatting = [
       .prettyPrinted, .sortedKeys, .withoutEscapingSlashes,
@@ -555,26 +601,74 @@ public struct ConnectionStore: Sendable {
     return data
   }
 
+  /// The read and write limits include hidden account caches. Tombstones
+  /// remain bounded by file size, not by the live-entity allowance.
+  private static func validateCounts(
+    _ snapshot: ConnectionSnapshot
+  ) throws(StoreError) {
+    guard snapshot.hosts.count + snapshot.cachedHosts.count <= maxHosts else {
+      throw .tooManyHosts
+    }
+    guard
+      snapshot.identities.count(where: { !$0.isDeleted })
+        + snapshot.cachedIdentities.count(where: { !$0.isDeleted })
+        <= maxIdentities
+    else { throw .tooManyIdentities }
+    guard
+      snapshot.knownHosts.count(where: { $0.value.deletedAt == nil })
+        + snapshot.cachedKnownHosts.count(where: { $0.deletedAt == nil })
+        <= maxTrustEntries
+    else { throw .tooManyTrustEntries }
+  }
+
   static func decode(_ data: Data) throws(StoreError) -> ConnectionSnapshot {
     guard data.count <= maxFileBytes else { throw .tooLarge }
     guard let version = version(of: data) else { throw .malformed }
     switch version {
     case 1: return migrated(try HostProfileStore.decode(data))
-    case ConnectionSnapshot.version:
+    case 2, 3, ConnectionSnapshot.version:
       let decoder = JSONDecoder()
       decoder.dateDecodingStrategy = .iso8601
       guard
         let snapshot = try? decoder.decode(ConnectionSnapshot.self, from: data)
       else { throw .malformed }
-      guard snapshot.hosts.count <= maxHosts else { throw .tooManyHosts }
+      try validateCounts(snapshot)
       // Hand-edited duplicates or invalid entries are skipped, as in v1;
       // everything else must be valid.
       var ids: Set<UUID> = []
       var clean = snapshot
+      clean.version = ConnectionSnapshot.version
+      if version < 4 {
+        let unverified = snapshot.identities
+          .filter {
+            $0.storage == .iCloudKeychain && !$0.isDeleted
+              && snapshot.scopes[ConnectionSnapshot.identityRecord($0.id)]
+                == nil
+          }
+          .map(\.id)
+        if !unverified.isEmpty {
+          clean.unverifiedKeychainIdentities = Set(unverified)
+        }
+      }
+      if version == 2 {
+        for index in clean.intents.indices {
+          clean.intents[index].account =
+            snapshot.scopes[
+              ConnectionSnapshot.identityRecord(clean.intents[index].identityID)
+            ] ?? snapshot.boundAccount
+        }
+      }
       clean.hosts = snapshot.hosts.filter {
         $0.isValid && ids.insert($0.id).inserted
       }
-      guard snapshot.identities.allSatisfy(\.isValid) else { throw .malformed }
+      guard
+        (snapshot.identities + snapshot.cachedIdentities).allSatisfy(\.isValid),
+        snapshot.cachedHosts.allSatisfy(\.isValid),
+        snapshot.accounts.values.allSatisfy({ partition in
+          partition.cachedRecords?.allSatisfy { $0.value.matches(name: $0.key) }
+            ?? true
+        })
+      else { throw .malformed }
       return clean
     default: throw .unsupportedVersion(version)
     }

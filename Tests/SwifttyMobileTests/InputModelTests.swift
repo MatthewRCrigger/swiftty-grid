@@ -243,7 +243,13 @@ struct KeyTranslatorTests {
   @Test
   func `special keys`() throws {
     let cases: [(Int, Key)] = [
-      (Usage.returnOrEnter, .enter), (Usage.keypadEnter, .enter),
+      (Usage.returnOrEnter, .enter), (Usage.keypadEnter, .keypad(.enter)),
+      (Usage.keypad1, .keypad(.one)), (Usage.keypad1 + 9, .keypad(.zero)),
+      (Usage.keypad1 + 10, .keypad(.decimal)),
+      (Usage.keypadSlash, .keypad(.divide)),
+      (Usage.keypadSlash + 3, .keypad(.add)),
+      (Usage.keypadEqual, .keypad(.equal)),
+      (Usage.keypadComma, .keypad(.separator)),
       (Usage.tab, .tab), (Usage.backspace, .backspace), (Usage.escape, .escape),
       (Usage.up, .up), (Usage.down, .down), (Usage.left, .left),
       (Usage.right, .right), (Usage.home, .home), (Usage.end, .end),

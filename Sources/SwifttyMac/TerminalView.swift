@@ -128,6 +128,7 @@ public final class TerminalView: MTKView, MTKViewDelegate {
       }
     }
     Self.surfaces.add(self)
+    installKittyClipboard()
   }
 
   @available(*, unavailable)
@@ -179,6 +180,7 @@ public final class TerminalView: MTKView, MTKViewDelegate {
       guard capabilities.remoteClipboardWrites else { break }
       pasteboard.clearContents()
       pasteboard.setString(text, forType: .string)
+    case .dragAndDrop(.registration): dragAndDropRegistrationChanged()
     case let .pointerShape(name):
       applicationCursor = Self.cursor(named: name)
       window?.invalidateCursorRects(for: self)
@@ -868,16 +870,24 @@ public final class TerminalView: MTKView, MTKViewDelegate {
     if flags.contains(.control) { mods.insert(.control) }
     if flags.contains(.option) { mods.insert(.alt) }
     if flags.contains(.command) { mods.insert(.command) }
+    if flags.contains(.capsLock) { mods.insert(.capsLock) }
     return mods
   }
 
   package static let specialKeys: [UInt16: Key] = [
-    36: .enter, 76: .enter, 48: .tab, 51: .backspace, 53: .escape, 123: .left,
+    36: .enter, 76: .keypad(.enter), 48: .tab, 51: .backspace, 53: .escape, 123: .left,
     124: .right, 125: .down, 126: .up, 115: .home, 119: .end, 116: .pageUp,
     121: .pageDown, 117: .delete, 114: .insert, 122: .function(1),
     120: .function(2), 99: .function(3), 118: .function(4), 96: .function(5),
     97: .function(6), 98: .function(7), 100: .function(8), 101: .function(9),
     109: .function(10), 103: .function(11), 111: .function(12),
+    // Mac keypads have no NumLock: their keys always type.
+    82: .keypad(.zero), 83: .keypad(.one), 84: .keypad(.two),
+    85: .keypad(.three), 86: .keypad(.four), 87: .keypad(.five),
+    88: .keypad(.six), 89: .keypad(.seven), 91: .keypad(.eight),
+    92: .keypad(.nine), 65: .keypad(.decimal), 75: .keypad(.divide),
+    67: .keypad(.multiply), 78: .keypad(.subtract), 69: .keypad(.add),
+    81: .keypad(.equal),
   ]
 
   /// Keys of the US layout by virtual key code (kitty's base layout key).

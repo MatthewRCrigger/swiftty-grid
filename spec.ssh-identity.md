@@ -53,6 +53,8 @@ For this feature's first release, tvOS retains local key authentication and expl
 
 Add **Settings → SSH Keys** and a shortcut from the host editor. Each row displays name, Ed25519 algorithm, SHA-256 public fingerprint, storage policy, and local availability. Detail actions are Rename, Copy/Export Public Key where supported, Show Referencing Hosts, and Delete.
 
+An open key detail view retains the identity description and account generation it reviewed. An account notification, account switch (including switching away and back), deletion, or external metadata change invalidates its edits, confirmations, and pending repair input. Ask the user to reopen the key; a retained UI callback must never resolve the old UUID against a replacement account's record. A successful rename within that editor updates its reviewed description so further edits remain available.
+
 **Generate:** enter a name, select storage, and confirm. Default to **This device only**. Generate and save before publishing the identity to the picker. Show the public key and explain that it must be authorized on the server; creating a key does not install it remotely.
 
 **Import:** use a user-selected file, or an explicit paste action where supported. Show the parsed algorithm and fingerprint before confirmation. Import accepts OpenSSH Ed25519 private keys, unencrypted or passphrase-protected (§6.4). The fingerprint of an encrypted key is shown before its passphrase is requested, since its public key is stored in the clear; the passphrase is asked for only when the key is saved or used for repair, and a wrong one fails without saving anything. Never inspect the clipboard automatically or interpret imported text as a command.
@@ -70,6 +72,16 @@ Use the selected identity for pairing, workspace discovery/bootstrap, ordinary S
 Offer **Sync profiles and key metadata**, off by default, and **Sync trusted hosts**, separately off by default. Explain that hostnames, usernames, labels, and public keys are not private-key material but remain sensitive configuration.
 
 Secret synchronization is selected per identity at creation/import. Enabling metadata sync MUST NOT convert device-only keys into synchronizable items. Metadata sync can be disabled while existing iCloud Keychain identities remain OS-managed; the UI must explain that distinction.
+
+Disabling metadata sync stops new uploads immediately, even if the local settings
+write fails. In that case Settings shows sync as off and reports that the change
+could not be saved; the pending revocation is retried on refresh, including while
+signed out. Restoring writable storage must persist off without restarting
+uploads. Explicit re-enabling must succeed in persisting consent before syncing.
+A failed revocation write cannot guarantee the off preference survives app exit.
+The separate trusted-host toggle follows the same rule for publishing and adopting
+trusted keys, while leaving consented profile sync available. Both toggles report
+failed settings writes and show their effective consent state.
 
 Show separate metadata states (`off`, `pending`, `up to date`, `offline`, `account required`, `error`) and identity availability. A successful local Keychain write is not evidence that another device received the key. “Refresh” fetches metadata and retries local lookup; it must not claim to force iCloud Keychain delivery. [A1, A4]
 
@@ -111,6 +123,44 @@ Matching labels are never a credential-resolution rule. Fingerprints support dup
 5. Release application-held material promptly after authentication. A reconnect that needs SSH authentication resolves the identity again.
 
 Cancellation must prevent late authentication, generation, persistence, or profile changes. Background/noninteractive callers cannot open credential UI. Sync changes affect future attempts, not an already-captured connection target or live writer lease. Deleting an identity does not terminate a remote process or revoke a key already authorized on the server. [W4, W6]
+
+Deferred key lookups retain the selected public key, storage policy, record scope,
+and account generation. Recheck that selection before each new secret read,
+including after an interactive host-trust prompt and for every roaming bootstrap.
+A rename alone does not invalidate it. A new account, replacement key or storage
+policy must not be resolved under the earlier endpoint. A read already in progress
+continues against the metadata it captured and verifies the returned public key.
+Waiting for legacy migration may update only the selected, unchanged host to its
+mapped identity; it cannot substitute a same-UUID host from another account.
+
+SFTP retains a non-secret host/account/key selection from the row action or
+browser-view creation through delayed presentation and fresh sign-ins. Reconnect
+must not adopt a replacement account or key. Unsaved targets retain their absence
+so an arriving same-UUID host cannot silently take their place. Verified legacy
+migration is reconciled before authentication, including when the first sign-in
+is cancelled; stale connection completions cannot overwrite a newer selection.
+Existing authenticated SFTP handles and transfers continue on their captured
+connection. Renaming a key alone does not invalidate its authentication identity.
+Saved transfer checkpoints separately retain their host/account/endpoint/user
+owner across browser recreation and process restarts. They cannot be loaded by
+a replacement target with the same host UUID. Ownership review for legacy and
+formerly local transfers follows
+[roaming spec §10](spec.roaming.md#10-sftp-independent-resumable-file-operations).
+
+Opening a terminal screen captures the same non-secret selection before its lazy
+controller is created. Both ordinary SSH and roaming sign-in retain it through
+controller creation and legacy migration. The roaming trust/authentication probe
+and subsequent bootstrap must use that selection; completing a probe cannot
+recapture metadata from a replacement account. An already-authenticated ordinary
+shell continues on its existing connection when the account changes.
+
+Files, ordinary-SSH fallback and Open New SSH Shell retain the offering terminal's
+selection. A refused new-shell action leaves that screen and its connection
+intact and explains why it could not proceed. An action which finishes legacy
+migration after its screen closes or is replaced cannot replace the newer screen.
+Selecting a host anew reuses an existing screen only when its host/account/key
+selection still matches; an identical UUID or workspace ID alone is insufficient.
+A key rename alone remains compatible with reuse.
 
 ### 6.2 Import format and limits
 
@@ -218,6 +268,12 @@ Expect profiles, public identity records, and Keychain items in any order. Metad
 
 Keep local-only data separate from account-bound sync data. Partition cached records, queues, checkpoints, and operation intents by CloudKit account. Use an account-generation token so results from an old context cannot commit after a switch.
 
+The local snapshot format is version 4. When accounts use the same record name, retain each account's cached value, pending revision, tombstone, and conflict separately. Restore the selected account's cache even when its server change token has not advanced. Version-2 and version-3 snapshots upgrade in place; older builds reject version 4 because they cannot enforce its ownership-review state. CloudKit record schemas remain v1.
+
+Completed iCloud identities retain the verified Keychain account in their record scope even if metadata sync has never been enabled. Track the last verified Keychain account separately from the consented metadata binding, clear it on account-change notification, and refresh it during foreground reconciliation. Key visibility and mutation ownership checks must not grant metadata upload consent. An older unscoped iCloud identity is held for explicit account review: show its name and fingerprint, verify matching key material and a stable current account, then restore its existing description and references. Missing or mismatched material, remote deletion, or a changed account or saved description must leave it unavailable. Preserve any same-UUID records delivered while review is pending, and reconcile matching metadata when the user confirms the account.
+
+Journal the verified Keychain account independently of the metadata-sync binding. Recovery must match that account even when metadata sync has never been enabled. Explicit metadata consent may adopt pending local work only if its Keychain account also matches. Older unbound creations whose account was not recorded require explicit restoration; do not replay their reassignment or withdrawal steps automatically. An older deletion with unknown account ownership remains deferred until explicit review in SSH Keys verifies its fingerprint and authorizes removal in the current account. Preparing that review does not authorize deletion. Account or journal changes invalidate the review, and a missing item does not prove removal from its unknown original account. Persist an approved removal for retry, rechecking account and fingerprint before deleting; do not claim completion while removal remains pending.
+
 On sign-out/account switch, stop sync, invalidate in-flight work, quarantine the previous account's state, and do not publish it to the new account. Do not globally delete synchronizable Keychain items merely because the account changed. Require account confirmation and explicit consent before publishing local data to a newly selected account. Creating an iCloud identity requires a verified current account context, while local-only keys remain usable without iCloud.
 
 CloudKit account availability is not evidence that iCloud Keychain is enabled. The app cannot promise to control the OS's retention or propagation of already synchronizable items. UI explanations must distinguish app-level metadata controls from system Keychain behavior.
@@ -234,6 +290,10 @@ Run a resumable migration before enabling new identity writes or synchronization
 6. Remove a legacy item only after verified replacement and committed references, with cleanup recorded for retry. Document the point after which older builds cannot read the new store; never silently downgrade v2 to v1.
 
 Check actual signed access groups before migration. An entitlement change that loses access to old items blocks release until a tested compatibility path exists. Re-running after any interruption must preserve the same mappings and fingerprints.
+
+Before reusing a mapped UUID, verify that its device-only identity is live, visible in the selected account, unconflicted, and still backed by the expected key. Recheck after asynchronous verification and before publication. A hidden, displaced, deleted, or conflicting mapping leaves the host's legacy reference for explicit repair; it must not silently adopt another account's identity. An existing pending intent owns its migration until recovery settles it.
+
+A missing replacement can be repaired from the matching legacy item using the same UUID, including at the identity-count limit. If the original item is already gone, keep a known replacement retryable so explicit repair can finish migration later. Cleanup must account for references in displaced account caches and must compare the current legacy item's fingerprint before deletion. A changed item under the same label remains untouched, with cleanup retained for review or retry.
 
 ## 10. Implementation map and delivery sequence
 

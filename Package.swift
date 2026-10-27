@@ -131,7 +131,7 @@ let package = Package(
     ),
     .target(
       name: "SwiftMuxTerminal",
-      dependencies: ["SwiftMuxClient", "SwiftMuxProtocol"]
+      dependencies: ["SwiftMuxClient", "SwiftMuxProtocol", "SwifttyEngine"]
     ),
     .executableTarget(
       name: "SwiftMuxCLI",

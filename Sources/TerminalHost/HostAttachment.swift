@@ -32,6 +32,7 @@ final class HostAttachment: @unchecked Sendable {
     cancellationsPerSecond: RSTLimits.maxCancellationsPerSecond
   )
   var nextStreamID: UInt64 = 0
+  var highestSubmittedScreenRevision: UInt64 = 0
   var timerArmed = false
   var exitNoticeSent = false
 

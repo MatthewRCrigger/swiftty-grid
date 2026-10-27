@@ -51,7 +51,7 @@ public struct RoamingRootView: View {
     .attentionLinks(model)
     .task {
       model.load()
-      model.sync?.refresh()
+      Task { await model.refreshConnections() }
       if inbox == nil {
         inbox = RoamingInboxModel(model: model)
         inbox?.refresh(interactive: false)
@@ -64,7 +64,7 @@ public struct RoamingRootView: View {
       if phase == .active { inbox?.refresh(interactive: false) }
       // Foreground-only metadata sync (spec.ssh-identity.md §8.2).
       model.sync?.setActive(phase == .active)
-      if phase == .active { model.sync?.refresh() }
+      if phase == .active { Task { await model.refreshConnections() } }
       // Suspension pauses bulk SFTP work; a Mac window losing focus does
       // not (spec §10).
       switch model.profile.kind {

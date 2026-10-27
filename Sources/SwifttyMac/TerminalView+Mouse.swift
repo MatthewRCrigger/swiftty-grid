@@ -13,6 +13,16 @@ extension TerminalView {
     unclampedCell(at: convert(event.locationInWindow, from: nil))
   }
 
+  /// Backing-pixel position inside the padding, for SGR pixel reports.
+  func terminalPixel(for event: NSEvent) -> (x: Int, y: Int) {
+    let p = convert(event.locationInWindow, from: nil)
+    let scale = window?.backingScaleFactor ?? 2
+    return (
+      Int((p.x * scale - renderer.options.paddingX).rounded()),
+      Int(((bounds.height - p.y) * scale - renderer.options.paddingY).rounded())
+    )
+  }
+
   func unclampedCell(at p: NSPoint) -> (column: Int, row: Int) {
     let scale = window?.backingScaleFactor ?? 2
     let x = (p.x * scale - renderer.options.paddingX) / renderer.cellSize.width
@@ -39,6 +49,7 @@ extension TerminalView {
   ) {
     guard tracking else { return }
     let c = cell(for: event)
+    let pixel = terminalPixel(for: event)
     session.send(
       .mouse(
         MouseEvent(
@@ -46,7 +57,9 @@ extension TerminalView {
           button,
           column: c.column,
           row: c.row,
-          modifiers: Self.modifiers(event.modifierFlags)
+          modifiers: Self.modifiers(event.modifierFlags),
+          pixelX: pixel.x,
+          pixelY: pixel.y
         )
       )
     )
@@ -183,15 +196,16 @@ extension TerminalView {
   }
 
   /// Click-to-move: while the shell is editing a command line (OSC 133),
-  /// a click moves its cursor there with arrow keys.
+  /// a click moves its cursor there with arrow keys, or is reported to a
+  /// shell that asked for `click_events`.
   private func moveShellCursor(to p: TerminalPoint, generation: UInt64) {
     guard capabilities.textInput else { return }
-    let moves = session.withState { state in
+    let action = session.withState { state in
       state.addressingGeneration == generation
-        ? state.promptCursorMoves(to: p) : nil
+        ? state.promptClickAction(at: p) : nil
     }
-    guard let moves else { return }
-    for key in ClickToMove.keys(moves) { session.send(.key(key)) }
+    guard let action else { return }
+    for input in ClickToMove.inputs(action) { session.send(input) }
   }
 
   // MARK: Links and the pointer

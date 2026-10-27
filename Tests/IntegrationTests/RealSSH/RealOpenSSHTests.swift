@@ -260,22 +260,38 @@ struct RealOpenSSHTests {
         try await SFTPTransfers.upload(&manifest, client: first) { saved in
           latest.withLock { $0 = saved }
           checkpoints.withLock { $0 += 1 }
+          if saved.acknowledgedOffset > 0 {
+            // Cancel in the writer's task at its first durable prefix.
+            // A delayed observer must not accidentally test a completed upload.
+            withUnsafeCurrentTask { $0?.cancel() }
+          }
         }
       }
       try await RuntimeFixture.withCleanup {
         try await poll("some progress") { checkpoints.withLock { $0 } >= 2 }
-        interrupted.cancel()
-        _ = await interrupted.result
+        // Retain the late-observer reproduction: interruption must already
+        // have happened inside the checkpoint, regardless of this delay.
+        try await Task.sleep(for: .seconds(2))
+        #expect(interrupted.isCancelled)
+        if case .success = await interrupted.result {
+          Issue.record("the interrupted upload unexpectedly completed")
+        }
         upload = latest.withLock { $0 }
+        try #require(upload.acknowledgedOffset > 0)
+        try #require(upload.acknowledgedOffset < upload.sourceSize)
+        try #require(upload.state == .transferring)
       } cleanup: {
         interrupted.cancel()
         await first.close()
         _ = await interrupted.result
       }
+      let resumable = upload
       let second = try await connection.openSFTP()
       try await RuntimeFixture.withCleanup {
         try await SFTPTransfers.upload(&upload, client: second)
         #expect(upload.state == .completed)
+        #expect(upload.restartCount == resumable.restartCount)
+        #expect(upload.remoteTemporaryPath == resumable.remoteTemporaryPath)
 
         let destination = work.appendingPathComponent("downloaded.bin")
         var download = try SFTPTransfers.prepareDownload(

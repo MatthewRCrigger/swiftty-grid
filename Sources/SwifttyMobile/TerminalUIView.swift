@@ -141,6 +141,8 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   var pointerShapeName = ""
   #if !os(tvOS)
   var pointerInteraction: UIPointerInteraction?
+  /// Present while a program is registered for kitty drag-and-drop.
+  var dropInteraction: UIDropInteraction?
   #endif
 
   private var blink = BlinkState()
@@ -242,6 +244,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
     }
 
     installGestures()
+    installKittyClipboard()
     Self.surfaces.add(self)
     accessibilityLabel = "Terminal"
     accessibilityTraits = [.causesPageTurn, .allowsDirectInteraction]
@@ -305,6 +308,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
       _ = text
       #endif
     case .exited: onExit?()
+    case .dragAndDrop(.registration): dragAndDropRegistrationChanged()
     case let .pointerShape(name):
       pointerShapeName = name
       #if !os(tvOS)
@@ -941,6 +945,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   // MARK: Capabilities and privacy
 
   private func capabilitiesChanged() {
+    installKittyClipboard()
     let available = effectiveCapabilities
     lastModes = available.effectiveModes(programModes)
     if !available.textInput {

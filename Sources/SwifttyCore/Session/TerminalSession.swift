@@ -203,6 +203,7 @@ public final class TerminalSession: @unchecked Sendable {
       palette: configuration.palette,
     )
     state.programStatusEnabled = configuration.programStatusEnabled
+    state.rectangleChecksumsEnabled = configuration.rectangleChecksumsEnabled
     readBuffer = .allocate(byteCount: Self.readBufferSize, alignment: 16)
     encodeBuffer.reserveCapacity(256)
   }
@@ -236,6 +237,7 @@ public final class TerminalSession: @unchecked Sendable {
     try queue.sync {
       guard shouldStart() else { throw CancellationError() }
       precondition(process == nil, "session already started")
+      state.rectangleChecksumsEnabled = configuration.rectangleChecksumsEnabled
       let process = try PTYProcess.spawn(
         configuration,
         columns: state.columns,

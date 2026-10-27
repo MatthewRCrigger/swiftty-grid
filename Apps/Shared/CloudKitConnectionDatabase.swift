@@ -60,10 +60,9 @@ public final class CloudKitConnectionDatabase: ConnectionCloudDatabase {
 
   public func createZone() async throws(CloudSyncError) {
     do {
-      _ = try await database.modifyRecordZones(
-        saving: [CKRecordZone(zoneID: zoneID)],
-        deleting: []
-      )
+      // The single-zone API throws that zone's failure. A batch request can
+      // succeed while its per-zone save result contains an error.
+      _ = try await database.save(CKRecordZone(zoneID: zoneID))
     } catch { throw Self.map(error) }
   }
 
@@ -210,7 +209,8 @@ public final class CloudKitConnectionDatabase: ConnectionCloudDatabase {
   /// schema elements only, never field values.
   static func reason(_ error: CKError) -> String {
     let code = String(error.code.rawValue)
-    let detail = (error.userInfo[NSLocalizedDescriptionKey] as? String)?
+    let detail =
+      (error.userInfo[NSLocalizedDescriptionKey] as? String)?
       .split(whereSeparator: \.isNewline).joined(separator: " ")
       .trimmingCharacters(in: .whitespaces) ?? ""
     guard !detail.isEmpty else { return code }

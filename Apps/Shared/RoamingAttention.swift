@@ -25,21 +25,32 @@ struct RoamingAttentionConnector: AttentionServiceConnector {
   /// Report SSH failures by stage (host key, sign-in, reachability)
   /// instead of collapsing them, for screens that explain one host.
   var detailedErrors = false
+  /// A chooser retains the host it showed instead of resolving a new selection.
+  var selection: HostMutationContext?
 
+  @MainActor
   func connect(
     to host: NavigationHost
   ) async throws(AttentionServiceError) -> any AttentionService {
-    let profile = await MainActor.run { model.hosts.first { $0.id == host.id } }
-    guard let profile else { throw .notFound }
+    let profile: HostProfile
+    if let selection {
+      guard selection.id == host.id, model.hostMutationIsCurrent(selection),
+        let selected = selection.original
+      else { throw .other(RoamingAppModel.hostChangedMessage) }
+      profile = selected
+    } else {
+      guard let current = model.hosts.first(where: { $0.id == host.id }) else {
+        throw .notFound
+      }
+      profile = current
+    }
     let connection: SSHConnection
     do {
       connection = try await model.ssh.connect(
         profile,
         interactive: interactive
       )
-    } catch {
-      throw detailedErrors ? Self.describe(error) : Self.map(error)
-    }
+    } catch { throw detailedErrors ? Self.describe(error) : Self.map(error) }
     return RoamingAttentionService(
       model: model,
       host: profile,

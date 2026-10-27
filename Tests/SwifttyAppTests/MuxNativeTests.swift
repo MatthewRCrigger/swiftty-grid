@@ -37,7 +37,8 @@ struct MuxNativeTests {
     let endpoint = service.listenAnonymously()
     let connection = try await MuxConnection.connect(
       endpoint: endpoint,
-      frontend: .native
+      frontend: .native,
+      capabilities: MuxWorkspaceController.clientCapabilities
     )
     do {
       let launch = LaunchSpec(

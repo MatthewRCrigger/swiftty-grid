@@ -9,7 +9,6 @@
 // never while serving roaming clients.
 import Darwin
 import Foundation
-import Security
 import SwiftMuxProtocol
 import SwiftMuxService
 import TerminalHost
@@ -89,30 +88,6 @@ func siblingLauncher() -> String {
     .appending(path: "swmux-launcher").path
 }
 
-/// Peers must share this agent's signing team when it has one. Ad-hoc
-/// development builds fall back to the same-user check alone.
-func peerRequirement() -> String? {
-  var code: SecCode?
-  guard SecCodeCopySelf([], &code) == errSecSuccess, let code else {
-    return nil
-  }
-  var staticCode: SecStaticCode?
-  guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess,
-    let staticCode
-  else { return nil }
-  var info: CFDictionary?
-  guard
-    SecCodeCopySigningInformation(
-      staticCode,
-      SecCSFlags(rawValue: kSecCSSigningInformation),
-      &info
-    ) == errSecSuccess, let dict = info as? [String: Any],
-    let team = dict[kSecCodeInfoTeamIdentifier as String] as? String,
-    !team.isEmpty
-  else { return nil }
-  return "anchor apple generic and certificate leaf[subject.OU] = \"\(team)\""
-}
-
 let launcher = launcherPath ?? siblingLauncher()
 guard FileManager.default.isExecutableFile(atPath: launcher) else {
   FileHandle.standardError.write(
@@ -122,12 +97,22 @@ guard FileManager.default.isExecutableFile(atPath: launcher) else {
 }
 
 var configuration = MuxServiceConfiguration(launcherPath: launcher)
+do {
+  configuration.peerRequirement =
+    try PeerSigningPolicy.requirementForCurrentProcess()
+} catch {
+  FileHandle.standardError.write(
+    Data(
+      "swiftmux-agent: cannot establish peer signing policy: \(error)\n".utf8
+    )
+  )
+  exit(78)
+}
 let terminfo = InnerTerminfo.defaultDirectory
 if InnerTerminfo.install(into: terminfo) {
   configuration.innerTerm = SMX.innerTerm
   configuration.terminfoDirectory = terminfo.path
 }
-configuration.peerRequirement = peerRequirement()
 // Remote clients need the listener up while no local client is around.
 configuration.idleExitDelay = hostConfiguration == nil ? idleExit : nil
 
