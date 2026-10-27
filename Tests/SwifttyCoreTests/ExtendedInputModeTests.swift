@@ -69,12 +69,16 @@ struct ExtendedInputModeTests {
     #expect(
       key(.character("8"), .alt, text: "8", modes: m) == "\u{1B}[27;3;56~"
     )
-    #expect(key(.character(" "), .shift, text: " ", modes: m) == "\u{1B}[27;2;32~")
+    #expect(
+      key(.character(" "), .shift, text: " ", modes: m) == "\u{1B}[27;2;32~"
+    )
     // Shift alone still types its text.
     #expect(key(.character("a"), .shift, text: "A", modes: m) == "A")
     #expect(key(.character("a"), text: "a", modes: m) == "a")
     // Command never selects an encoding.
-    #expect(key(.character("p"), [.control, .command], modes: m) == "\u{1B}[27;5;112~")
+    #expect(
+      key(.character("p"), [.control, .command], modes: m) == "\u{1B}[27;5;112~"
+    )
   }
 
   @Test
@@ -185,16 +189,16 @@ struct ExtendedInputModeTests {
     let all: UInt8 = 0b11111
     #expect(
       encode(
-        .key(
-          KeyEvent(.character("j"), modifiers: caps, text: "J")
-        ),
+        .key(KeyEvent(.character("j"), modifiers: caps, text: "J")),
         flags: all
       ) == "\u{1B}[106;65;74u"
     )
     #expect(key(.character("j"), caps, text: "J", flags: 1) == "J")
     #expect(key(.enter, caps, flags: 1) == "\r")
     #expect(key(.up, caps, flags: 1) == "\u{1B}[1;65A")
-    #expect(key(.character("c"), [.control, .capsLock], flags: 1) == "\u{1B}[99;69u")
+    #expect(
+      key(.character("c"), [.control, .capsLock], flags: 1) == "\u{1B}[99;69u"
+    )
   }
 
   @Test

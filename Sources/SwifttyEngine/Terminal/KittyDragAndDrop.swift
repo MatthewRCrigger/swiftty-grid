@@ -14,7 +14,9 @@
 /// Specification: https://sw.kovidgoyal.net/kitty/dnd-protocol/
 public enum KittyDragAndDrop {
   public enum Operation: UInt32, Sendable {
-    case none = 0, copy = 1, move = 2
+    case none = 0
+    case copy = 1
+    case move = 2
 
     /// 1 copies, 2 moves, anything else is none.
     init(code: UInt32) { self = Operation(rawValue: code) ?? .none }
@@ -129,13 +131,16 @@ public enum KittyDragAndDrop {
           }
           var value: UInt64 = 0
           let start = i
-          while i < raw.endIndex, i - start < 10, (0x30 ... 0x39).contains(raw[i]) {
+          while i < raw.endIndex, i - start < 10,
+            (0x30 ... 0x39).contains(raw[i])
+          {
             value = value * 10 + UInt64(raw[i] - 0x30)
             i += 1
           }
           guard i > start, value <= UInt64(UInt32.max) else { return nil }
           let unsigned = UInt32(value)
-          let int = negative
+          let int =
+            negative
             ? 0 &- Int32(bitPattern: unsigned) : Int32(bitPattern: unsigned)
           switch key {
           case 0x6D: meta.more = unsigned != 0  // m
@@ -175,21 +180,19 @@ public enum KittyDragAndDrop {
 
     /// Types the client accepts drops of.
     public var registeredMimes: [String] {
-      registered.split(separator: 0x20).map { String(decoding: $0, as: UTF8.self) }
+      registered.split(separator: 0x20)
+        .map { String(decoding: $0, as: UTF8.self) }
     }
 
     /// The client's answer for the current drag; nil until it answers
     /// (default to copying), `.none` when it refuses.
-    public var clientAccepted: Operation? {
-      acceptInProgress ? nil : accepted
-    }
+    public var clientAccepted: Operation? { acceptInProgress ? nil : accepted }
 
     /// Types the client accepted for the current drag.
     public var acceptedTypes: [String] {
       guard !acceptInProgress else { return [] }
-      return acceptedMimes.split(separator: 0).map {
-        String(decoding: $0, as: UTF8.self)
-      }
+      return acceptedMimes.split(separator: 0)
+        .map { String(decoding: $0, as: UTF8.self) }
     }
 
     mutating func apply(_ raw: Metadata) -> Metadata {
@@ -217,18 +220,23 @@ public enum KittyDragAndDrop {
       acceptInProgress = false
     }
 
-    mutating func register(_ payload: ArraySlice<UInt8>, continuation: Bool, more: Bool)
-      -> Event?
-    {
+    mutating func register(
+      _ payload: ArraySlice<UInt8>,
+      continuation: Bool,
+      more: Bool
+    ) -> Event? {
       if !continuation { registered.removeAll(keepingCapacity: true) }
-      guard registered.count + payload.count <= maxMimeListBytes else { return nil }
+      guard registered.count + payload.count <= maxMimeListBytes else {
+        return nil
+      }
       registered += payload
       return more ? nil : .registration
     }
 
-    mutating func acceptStatus(_ meta: Metadata, _ payload: ArraySlice<UInt8>)
-      -> Event?
-    {
+    mutating func acceptStatus(
+      _ meta: Metadata,
+      _ payload: ArraySlice<UInt8>
+    ) -> Event? {
       if !acceptInProgress {
         acceptedMimes = []
         acceptInProgress = true
@@ -248,9 +256,11 @@ public enum KittyDragAndDrop {
       return .acceptance
     }
 
-    mutating func moveEvent(_ event: MoveEvent, mimes: [String], drop: Bool)
-      -> [UInt8]
-    {
+    mutating func moveEvent(
+      _ event: MoveEvent,
+      mimes: [String],
+      drop: Bool
+    ) -> [UInt8] {
       if !hovered { resetDrop() }
       hovered = true
       if drop {
@@ -263,7 +273,13 @@ public enum KittyDragAndDrop {
       let header =
         "t=\(drop ? "M" : "m"):x=\(event.column):y=\(event.row)"
         + ":X=\(event.pixelX):Y=\(event.pixelY):o=\(event.operations.rawValue)"
-      return encode(header, clientID, offered!.payload, base64: false, "\u{1B}\\")
+      return encode(
+        header,
+        clientID,
+        offered!.payload,
+        base64: false,
+        "\u{1B}\\"
+      )
     }
   }
 
@@ -278,7 +294,9 @@ public enum KittyDragAndDrop {
     base64: Bool,
     _ terminator: String
   ) -> [UInt8] {
-    let prefix = Array("\u{1B}]72;\(header)\(clientID != 0 ? ":i=\(clientID)" : "")".utf8)
+    let prefix = Array(
+      "\u{1B}]72;\(header)\(clientID != 0 ? ":i=\(clientID)" : "")".utf8
+    )
     guard !data.isEmpty else { return prefix + terminator.utf8 }
     let limit = base64 ? base64ChunkBytes : plainChunkBytes
     var out: [UInt8] = []
@@ -295,7 +313,11 @@ public enum KittyDragAndDrop {
     return out
   }
 
-  static func requestKeys(x: Int32 = 0, y: Int32 = 0, pixelY: Int32 = 0) -> String {
+  static func requestKeys(
+    x: Int32 = 0,
+    y: Int32 = 0,
+    pixelY: Int32 = 0
+  ) -> String {
     (x != 0 ? ":x=\(x)" : "") + (y != 0 ? ":y=\(y)" : "")
       + (pixelY != 0 ? ":Y=\(pixelY)" : "")
   }
@@ -342,11 +364,8 @@ extension TerminalState {
         _ = dragAndDrop!.apply(raw)
       }
       dragAndDrop!.clientID = meta.clientID
-      event = dragAndDrop!.register(
-        payload,
-        continuation: continuation,
-        more: meta.more
-      )
+      event = dragAndDrop!
+        .register(payload, continuation: continuation, more: meta.more)
     case .unregister:
       guard dragAndDrop != nil else { return }
       dragAndDrop = nil
@@ -354,8 +373,7 @@ extension TerminalState {
     case .status:
       guard dragAndDrop != nil else { return }
       event = dragAndDrop!.acceptStatus(meta, payload)
-    case .request:
-      event = dragAndDropRequest(meta, terminator: terminator)
+    case .request: event = dragAndDropRequest(meta, terminator: terminator)
     case .offer where meta.x != 0: break  // enabling or disabling drags
     case .offer, .present, .startDrag:
       replyDragAndDrop(

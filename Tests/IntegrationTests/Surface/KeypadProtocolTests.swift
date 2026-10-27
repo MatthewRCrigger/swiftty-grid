@@ -23,7 +23,9 @@ struct KeypadProtocolTests {
 
   @Test
   func `roaming clients downgrade keypad keys for hosts without the feature`() {
-    let one = InputOperation.key(SemanticKey(.keypad(.one), modifiers: .control))
+    let one = InputOperation.key(
+      SemanticKey(.keypad(.one), modifiers: .control)
+    )
     #expect(RoamingClient.operation(one, for: .keypadKeys) == one)
     #expect(
       RoamingClient.operation(one, for: [])
@@ -37,12 +39,16 @@ struct KeypadProtocolTests {
       RoamingClient.operation(.key(SemanticKey(.keypad(.end))), for: [])
         == .key(SemanticKey(.end))
     )
-    #expect(RoamingClient.operation(.key(SemanticKey(.keypad(.begin))), for: []) == nil)
+    #expect(
+      RoamingClient.operation(.key(SemanticKey(.keypad(.begin))), for: [])
+        == nil
+    )
     #expect(RoamingClient.operation(.paste("x"), for: []) == .paste("x"))
   }
 
   @Test
-  func `the roaming host forwards keypad keys only to services that take them`() {
+  func `the roaming host forwards keypad keys only to services that take them`()
+  {
     let key = SemanticKey(.keypad(.one), modifiers: [.shift])
     #expect(RoamingSession.muxKey(key, keypadKeys: true)?.0 == .keypad(.one))
     #expect(RoamingSession.muxKey(key, keypadKeys: true)?.1 == .shift)
@@ -64,9 +70,14 @@ struct KeypadProtocolTests {
   func `services advertise and encode keypad keys`() throws {
     #expect(ServiceFeatures.supported.contains(.keypadKeys))
     for key in MuxKeypadKey.allCases {
-      #expect(PaneRuntime.key(.keypad(key)) == .keypad(KeypadKey(rawValue: key.rawValue)!))
+      #expect(
+        PaneRuntime.key(.keypad(key))
+          == .keypad(KeypadKey(rawValue: key.rawValue)!)
+      )
       let encoded = try JSONEncoder().encode(MuxKey.keypad(key))
-      #expect(try JSONDecoder().decode(MuxKey.self, from: encoded) == .keypad(key))
+      #expect(
+        try JSONDecoder().decode(MuxKey.self, from: encoded) == .keypad(key)
+      )
     }
   }
 }

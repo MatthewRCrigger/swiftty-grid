@@ -46,10 +46,16 @@ struct KeypadWireTests {
   func `attached carries features and omits an empty list`() throws {
     let with = attached(.keypadKeys)
     let record = try ControlRecord.encode(with)
-    #expect(String(decoding: record.dropFirst(4), as: UTF8.self).contains(#""features":["keypadKeys"]"#))
+    #expect(
+      String(decoding: record.dropFirst(4), as: UTF8.self)
+        .contains(#""features":["keypadKeys"]"#)
+    )
     #expect(try ControlRecord.decodeBody(record.dropFirst(4)) == with)
     let without = try ControlRecord.encode(attached([]))
-    #expect(!String(decoding: without.dropFirst(4), as: UTF8.self).contains("features"))
+    #expect(
+      !String(decoding: without.dropFirst(4), as: UTF8.self)
+        .contains("features")
+    )
   }
 
   @Test
@@ -61,13 +67,15 @@ struct KeypadWireTests {
     )
     json["features"] = ["keypadKeys", "somethingNewer"]
     let body = try JSONSerialization.data(withJSONObject: json)
-    guard case let .attached(decoded) = try ControlRecord.decodeBody(Array(body))
+    guard
+      case let .attached(decoded) = try ControlRecord.decodeBody(Array(body))
     else {
       Issue.record("not attached")
       return
     }
     #expect(decoded.features == .keypadKeys)
-    guard case let .attached(old) = try ControlRecord.decodeBody(base.dropFirst(4))
+    guard
+      case let .attached(old) = try ControlRecord.decodeBody(base.dropFirst(4))
     else {
       Issue.record("not attached")
       return

@@ -875,9 +875,9 @@ public final class TerminalView: MTKView, MTKViewDelegate {
   }
 
   package static let specialKeys: [UInt16: Key] = [
-    36: .enter, 76: .keypad(.enter), 48: .tab, 51: .backspace, 53: .escape, 123: .left,
-    124: .right, 125: .down, 126: .up, 115: .home, 119: .end, 116: .pageUp,
-    121: .pageDown, 117: .delete, 114: .insert, 122: .function(1),
+    36: .enter, 76: .keypad(.enter), 48: .tab, 51: .backspace, 53: .escape,
+    123: .left, 124: .right, 125: .down, 126: .up, 115: .home, 119: .end,
+    116: .pageUp, 121: .pageDown, 117: .delete, 114: .insert, 122: .function(1),
     120: .function(2), 99: .function(3), 118: .function(4), 96: .function(5),
     97: .function(6), 98: .function(7), 100: .function(8), 101: .function(9),
     109: .function(10), 103: .function(11), 111: .function(12),

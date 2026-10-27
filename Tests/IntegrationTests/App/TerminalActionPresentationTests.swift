@@ -145,8 +145,20 @@ extension MainActorIntegrationTests.IdentityAccountBoundaryTests {
           object: nil
         )
         defer { NotificationCenter.default.removeObserver(displayed) }
-        _ = (menu as AnyObject).accessibilityPerformPress?()
-        try #require(try await waitForKeyUI { displayed.item != nil })
+        // A press can be dropped while the previous case's menu is still
+        // dismissing; press again until tracking begins.
+        var pressed = ContinuousClock.now - .seconds(1)
+        try #require(
+          try await waitForKeyUI {
+            if displayed.item == nil,
+              ContinuousClock.now - pressed >= .milliseconds(250)
+            {
+              pressed = .now
+              _ = (menu as AnyObject).accessibilityPerformPress?()
+            }
+            return displayed.item != nil
+          }
+        )
         let item = try #require(displayed.item)
         let target = try #require(item.target)
         let selector = try #require(item.action)

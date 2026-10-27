@@ -155,9 +155,7 @@ extension TerminalUIView {
       let url = LinkPolicy.openableURL(link.url)
     {
       UIApplication.shared.open(url)
-    } else if configuration.cursorClickToMove, let click,
-      click != .moves(0)
-    {
+    } else if configuration.cursorClickToMove, let click, click != .moves(0) {
       send(ClickToMove.inputs(click))
     }
   }

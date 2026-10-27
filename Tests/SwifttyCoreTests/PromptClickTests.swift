@@ -6,17 +6,13 @@ import Testing
 /// `Terminal: OSC133A click_events` and `cl` checks).
 struct PromptClickTests {
   @Test(arguments: [
-    ("", PromptClick.none),
-    (";aid=123", .none),
+    ("", PromptClick.none), (";aid=123", .none),
     (";click_events=1", .events(relative: false)),
-    (";click_events=2", .events(relative: true)),
-    (";click_events=0", .none),
-    (";click_events=yes", .none),
-    (";cl=line", .cursorKeys(.line)),
+    (";click_events=2", .events(relative: true)), (";click_events=0", .none),
+    (";click_events=yes", .none), (";cl=line", .cursorKeys(.line)),
     (";cl=m", .cursorKeys(.multiple)),
     (";cl=v", .cursorKeys(.conservativeVertical)),
-    (";cl=w", .cursorKeys(.smartVertical)),
-    (";cl=invalid", .none),
+    (";cl=w", .cursorKeys(.smartVertical)), (";cl=invalid", .none),
     (";click_events=1;cl=m", .events(relative: false)),
     (";cl=m;click_events=2", .events(relative: true)),
     (";click_events=0;cl=v", .cursorKeys(.conservativeVertical)),
@@ -33,7 +29,9 @@ struct PromptClickTests {
   }
 
   @Test
-  func `later prompts keep the setting unless they change it and reset clears it`() {
+  func
+    `later prompts keep the setting unless they change it and reset clears it`()
+  {
     var vt = VT(20, 5)
     vt.feed("\u{1B}]133;A;cl=m\u{7}$ \u{1B}]133;B\u{7}\r\n")
     vt.feed("\u{1B}]133;A\u{7}$ ")
@@ -56,9 +54,7 @@ struct PromptClickTests {
       vt.state.promptClickAction(at: TerminalPoint(row: row, column: 3))
         == .moves(-2)
     )
-    #expect(
-      ClickToMove.inputs(.moves(-2)).count == 2
-    )
+    #expect(ClickToMove.inputs(.moves(-2)).count == 2)
   }
 
   @Test(arguments: [false, true])
@@ -83,8 +79,9 @@ struct PromptClickTests {
     )
     // Clicks above the prompt are not the shell's.
     #expect(
-      vt.state.promptClickAction(at: TerminalPoint(row: promptRow - 1, column: 0))
-        == nil
+      vt.state.promptClickAction(
+        at: TerminalPoint(row: promptRow - 1, column: 0)
+      ) == nil
     )
     // Reports also apply while the prompt itself is drawn.
     vt.feed("\r\n\u{1B}]133;C\u{7}out\r\n\u{1B}]133;D;0\u{7}")
@@ -92,8 +89,7 @@ struct PromptClickTests {
     vt.feed("\u{1B}]133;A\u{7}")
     let next = vt.state.absoluteRow(viewportRow: vt.cursor.y)
     #expect(
-      vt.state.promptClickAction(at: TerminalPoint(row: next, column: 2))
-        != nil
+      vt.state.promptClickAction(at: TerminalPoint(row: next, column: 2)) != nil
     )
   }
 

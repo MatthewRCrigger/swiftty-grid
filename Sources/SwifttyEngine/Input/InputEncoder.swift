@@ -106,9 +106,7 @@ public enum KeypadKey: String, Sendable, Hashable, CaseIterable {
   }
 
   /// Kitty functional key code (KP_0 = 57399 ... KP_BEGIN = 57427).
-  var kittyCode: UInt32 {
-    57399 + UInt32(Self.allCases.firstIndex(of: self)!)
-  }
+  var kittyCode: UInt32 { 57399 + UInt32(Self.allCases.firstIndex(of: self)!) }
 }
 
 public struct KeyEvent: Sendable, Hashable {
@@ -384,8 +382,7 @@ public enum InputEncoder {
       let typed = event.text.map { Array($0.unicodeScalars) } ?? []
       let produced =
         typed.count == 1 && isKeyTextScalar(typed[0])
-        ? typed[0]
-        : mods.contains(.shift) ? event.shiftedKey ?? scalar : scalar
+        ? typed[0] : mods.contains(.shift) ? event.shiftedKey ?? scalar : scalar
       // Shift alone still types text, except for Space.
       guard !mods.subtracting(.shift).isEmpty || produced == " " else {
         return nil

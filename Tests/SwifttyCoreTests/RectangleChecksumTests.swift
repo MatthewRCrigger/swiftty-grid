@@ -57,8 +57,8 @@ struct RectangleChecksumTests {
   // Arguments omit ESC so test output stays free of terminal controls.
   @Test(arguments: [
     ("[7;1;2;3;4;5*y", true), ("[7*y", true), ("[*y", true),
-    ("[1;1;2;3*y", true), ("[1;1;1;1;1;1;1*y", false),
-    ("[1;1;1;1;1;1y", false), ("[1;1;1;1;1;1\"y", false),
+    ("[1;1;2;3*y", true), ("[1;1;1;1;1;1;1*y", false), ("[1;1;1;1;1;1y", false),
+    ("[1;1;1;1;1;1\"y", false),
   ])
   func `DECRQCRA accepts at most six parameters`(
     _ request: String,
@@ -69,11 +69,13 @@ struct RectangleChecksumTests {
     #expect(vt.takeOutput().hasPrefix("\u{1B}P") == replies)
   }
 
-  @Test(arguments: [
-    ("[#y", Flags()), ("[0#y", Flags()),
-    ("[5#y", Flags([.positive, .noTrim])), ("[48#y", Flags.full),
-    ("[1;2#y", Flags.undrawn),
-  ] as [(String, Flags)])
+  @Test(
+    arguments: [
+      ("[#y", Flags()), ("[0#y", Flags()),
+      ("[5#y", Flags([.positive, .noTrim])), ("[48#y", Flags.full),
+      ("[1;2#y", Flags.undrawn),
+    ] as [(String, Flags)]
+  )
   func `XTCHECKSUM keeps known bits and ignores extra parameters`(
     _ request: String,
     _ expected: Flags
@@ -120,8 +122,8 @@ struct RectangleChecksumTests {
     let all = abc + 0x64 + 0x65 + 0x66 + 0x67 + 0x68 + 0x69
     #expect(sum(&vt) == all)
     #expect(
-      sum(&vt, top: 2, left: 2, bottom: 3, right: 3)
-        == 0x65 + 0x66 + 0x68 + 0x69
+      sum(&vt, top: 2, left: 2, bottom: 3, right: 3) == 0x65 + 0x66 + 0x68
+        + 0x69
     )
     #expect(sum(&vt, top: 2, left: 3, bottom: 99, right: 99) == 0x66 + 0x69)
     #expect(sum(&vt, top: 3, bottom: 2) == 0)
@@ -158,14 +160,14 @@ struct RectangleChecksumTests {
 
   @Test
   func `video attributes add to each cell`() {
-    var vt = terminal(
-      "\u{1B}[1;4ma\u{1B}[0;7;5m \u{1B}[0;8m\u{1B}[1\"qb"
+    var vt = terminal("\u{1B}[1;4ma\u{1B}[0;7;5m \u{1B}[0;8m\u{1B}[1\"qb")
+    #expect(
+      sum(&vt, top: 1, bottom: 1) == 0x61 + 0x80 + 0x10 + 0x20 + 0x20 + 0x40
+        + 0x62 + 0x08 + 0x04
     )
     #expect(
-      sum(&vt, top: 1, bottom: 1)
-        == 0x61 + 0x80 + 0x10 + 0x20 + 0x20 + 0x40 + 0x62 + 0x08 + 0x04
+      sum(&vt, [.positive, .noAttributes], top: 1, bottom: 1) == 0x61 + 0x62
     )
-    #expect(sum(&vt, [.positive, .noAttributes], top: 1, bottom: 1) == 0x61 + 0x62)
   }
 
   @Test(arguments: ["3", "9", "2", "21"])
@@ -193,7 +195,10 @@ struct RectangleChecksumTests {
   func `combining marks count only in untrimmed DEC sums`() {
     var vt = terminal("e\u{301}")
     #expect(sum(&vt, top: 1, bottom: 1, right: 1) == 0x65)
-    #expect(sum(&vt, [.positive, .noTrim], top: 1, bottom: 1, right: 1) == 0x65 + 0x301)
+    #expect(
+      sum(&vt, [.positive, .noTrim], top: 1, bottom: 1, right: 1) == 0x65
+        + 0x301
+    )
     #expect(
       sum(&vt, [.positive, .noTrim, .full], top: 1, bottom: 1, right: 1) == 0x65
     )

@@ -249,13 +249,13 @@ struct KeyTranslatorTests {
       (Usage.keypadSlash, .keypad(.divide)),
       (Usage.keypadSlash + 3, .keypad(.add)),
       (Usage.keypadEqual, .keypad(.equal)),
-      (Usage.keypadComma, .keypad(.separator)),
-      (Usage.tab, .tab), (Usage.backspace, .backspace), (Usage.escape, .escape),
-      (Usage.up, .up), (Usage.down, .down), (Usage.left, .left),
-      (Usage.right, .right), (Usage.home, .home), (Usage.end, .end),
-      (Usage.pageUp, .pageUp), (Usage.pageDown, .pageDown),
-      (Usage.deleteForward, .delete), (Usage.insert, .insert),
-      (Usage.f1, .function(1)), (Usage.f1 + 11, .function(12)),
+      (Usage.keypadComma, .keypad(.separator)), (Usage.tab, .tab),
+      (Usage.backspace, .backspace), (Usage.escape, .escape), (Usage.up, .up),
+      (Usage.down, .down), (Usage.left, .left), (Usage.right, .right),
+      (Usage.home, .home), (Usage.end, .end), (Usage.pageUp, .pageUp),
+      (Usage.pageDown, .pageDown), (Usage.deleteForward, .delete),
+      (Usage.insert, .insert), (Usage.f1, .function(1)),
+      (Usage.f1 + 11, .function(12)),
     ]
     for (usage, key) in cases {
       #expect(

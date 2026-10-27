@@ -38,7 +38,9 @@ struct KeyHandlingTests {
     let enter = try key(76, "\r", [.numericPad])
     #expect(TerminalView.terminalKey(for: enter)?.key == .keypad(.enter))
     // Services with keypad names get them; older ones see typed text.
-    #expect(MuxPaneView.semanticKey(for: one, keypadKeys: true)?.0 == .keypad(.one))
+    #expect(
+      MuxPaneView.semanticKey(for: one, keypadKeys: true)?.0 == .keypad(.one)
+    )
     #expect(MuxPaneView.semanticKey(for: one, keypadKeys: false) == nil)
     #expect(MuxPaneView.semanticKey(for: enter, keypadKeys: false)?.0 == .enter)
     let caps = try key(0, "A", unmodified: "a", [.capsLock, .control])

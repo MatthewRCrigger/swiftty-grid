@@ -252,8 +252,7 @@ public actor RoamingClient {
     // The record must fit RST/1's control record limit once encoded
     // (escaped control characters grow a paste): an operation that could
     // never be sent would stall every later sequence behind it.
-    guard
-      let operation = Self.operation(input.operation, for: hostFeatures),
+    guard let operation = Self.operation(input.operation, for: hostFeatures),
       limits.permits(operation),
       Self.fitsControlRecord(operation, limit: limits.maxControlRecordBytes)
     else { return .refused(.invalid) }

@@ -784,7 +784,7 @@ struct QUICTransportTests {
     try await transportEventually { accepted.count == 1 }
     let (server, serverInbox) = try #require(accepted.all.first)
     let cancellations = UInt64(QUICOptions.concurrentSnapshotStreams) * 3
-    for stream in 1...cancellations {
+    for stream in 1 ... cancellations {
       await #expect(throws: RSTTransportError.canceled) {
         try await server.sendSnapshot(
           snapshotPayload(bodyLength: 100, fill: UInt8(stream)),
@@ -795,7 +795,7 @@ struct QUICTransportTests {
     }
     #expect(server.admittedSnapshotSendsForTesting == 0)
     var delivered: [[UInt8]] = []
-    for offset in 1...UInt64(QUICOptions.concurrentSnapshotStreams) * 2 {
+    for offset in 1 ... UInt64(QUICOptions.concurrentSnapshotStreams) * 2 {
       let replacement = snapshotPayload(
         bodyLength: 100,
         fill: 0x80 + UInt8(offset)

@@ -153,25 +153,24 @@ public enum KittyClipboard {
 
     /// The operation of well-formed metadata, without decoding values.
     static func operation(_ raw: ArraySlice<UInt8>) -> Operation? {
-      fields(raw)?["type"].flatMap {
-        Operation(rawValue: String(decoding: $0, as: UTF8.self))
-      }
+      fields(raw)?["type"]
+        .flatMap { Operation(rawValue: String(decoding: $0, as: UTF8.self)) }
     }
 
     /// Nil drops the packet; `InvalidValue` reports a value that is not
     /// base64 UTF-8 or exceeds a limit.
     static func parse(_ raw: ArraySlice<UInt8>) throws(InvalidValue) -> Self? {
       guard let fields = fields(raw),
-        let op = fields["type"].flatMap({
-          Operation(rawValue: String(decoding: $0, as: UTF8.self))
-        })
+        let op = fields["type"]
+          .flatMap({ Operation(rawValue: String(decoding: $0, as: UTF8.self)) })
       else { return nil }
       var result = Metadata(op: op)
-      result.primary = fields["loc"].map { $0.elementsEqual("primary".utf8) }
-        ?? false
+      result.primary =
+        fields["loc"].map { $0.elementsEqual("primary".utf8) } ?? false
       for c in fields["id"] ?? [] where result.id.count < maxIDLength {
         switch c {
-        case 0x61 ... 0x7A, 0x41 ... 0x5A, 0x30 ... 0x39, 0x2D, 0x5F, 0x2B, 0x2E:
+        case 0x61 ... 0x7A, 0x41 ... 0x5A, 0x30 ... 0x39, 0x2D, 0x5F, 0x2B,
+          0x2E:
           result.id.append(c)
         default: continue
         }
@@ -255,9 +254,8 @@ public enum KittyClipboard {
   /// A one-time password for a paste event.
   static func oneTimePassword() -> [UInt8] {
     var generator = SystemRandomNumberGenerator()
-    return (0 ..< passwordLength).map { _ in
-      passwordAlphabet.randomElement(using: &generator)!
-    }
+    return (0 ..< passwordLength)
+      .map { _ in passwordAlphabet.randomElement(using: &generator)! }
   }
 
   // MARK: Write transactions
@@ -347,7 +345,10 @@ public enum KittyClipboard {
         current = nil
       }
       var contents = entries.map {
-        Content(mime: $0.mime, data: Array(spool[$0.start ..< $0.start + $0.count]))
+        Content(
+          mime: $0.mime,
+          data: Array(spool[$0.start ..< $0.start + $0.count])
+        )
       }
       for (alias, target) in aliases {
         guard let data = contents.first(where: { $0.mime == target })?.data
@@ -393,7 +394,9 @@ public enum KittyClipboard {
     mime: String?,
     pw: [UInt8]?
   ) -> [UInt8] {
-    var out = Array("\u{1B}]5522;type=\(op.rawValue):status=\(status.rawValue)".utf8)
+    var out = Array(
+      "\u{1B}]5522;type=\(op.rawValue):status=\(status.rawValue)".utf8
+    )
     if primary { out += ":loc=primary".utf8 }
     if !id.isEmpty { out += ":id=".utf8 + id }
     if let mime { out += ":mime=".utf8 + Base64.encode(Array(mime.utf8)) }

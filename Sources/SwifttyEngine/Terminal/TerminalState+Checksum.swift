@@ -50,11 +50,12 @@ extension TerminalState {
   func rectangleChecksum(top: Int, left: Int, bottom: Int, right: Int) -> UInt16
   {
     let origin = modes.contains(.origin)
-    func limit(_ value: Int, _ fallback: Int, _ margin: Int, _ maximum: Int)
-      -> Int
-    {
-      min(max((value == 0 ? fallback : value) + margin, 1), maximum)
-    }
+    func limit(
+      _ value: Int,
+      _ fallback: Int,
+      _ margin: Int,
+      _ maximum: Int
+    ) -> Int { min(max((value == 0 ? fallback : value) + margin, 1), maximum) }
     let topMargin = origin ? scrollTop : 0
     let leftMargin = origin ? scrollLeft : 0
     let t = limit(top, 1, topMargin, rows)
@@ -103,11 +104,15 @@ extension TerminalState {
     return flags.contains(.positive) ? sum : 0 &- sum
   }
 
-  private enum ChecksumValue { case skip, undrawn, value(UInt16) }
+  private enum ChecksumValue {
+    case skip, undrawn
+    case value(UInt16)
+  }
 
-  private func checksumValue(_ cell: Cell, _ flags: ChecksumFlags)
-    -> ChecksumValue
-  {
+  private func checksumValue(
+    _ cell: Cell,
+    _ flags: ChecksumFlags
+  ) -> ChecksumValue {
     // xterm stores a placeholder outside 8 bits in a wide character's
     // right half, so the DEC sum counts it as ESC.
     if cell.flags.contains(.spacerTail) {
@@ -115,9 +120,10 @@ extension TerminalState {
     }
     // Grapheme ids start at zero; only a plain zero glyph is undrawn.
     guard cell.isGrapheme || cell.glyph != 0 else { return .undrawn }
-    let scalar =
-      cell.isGrapheme ? graphemes.scalars(cell.glyph)[0] : cell.glyph
-    if flags.contains(.full) { return .value(UInt16(truncatingIfNeeded: scalar)) }
+    let scalar = cell.isGrapheme ? graphemes.scalars(cell.glyph)[0] : cell.glyph
+    if flags.contains(.full) {
+      return .value(UInt16(truncatingIfNeeded: scalar))
+    }
     // xterm's `xtermCharSetDec` for ASCII. It sums the byte received
     // before character-set translation; only the translated scalar is
     // kept here, so DEC line drawing counts as outside 8 bits.

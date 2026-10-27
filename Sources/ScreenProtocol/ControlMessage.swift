@@ -287,7 +287,9 @@ extension ControlMessage: Codable {
       try u64(a.lastFullyAppliedInputSequence, .lastFullyAppliedInputSequence)
       if let p = a.partialInputSequence { try u64(p, .partialInputSequence) }
       try u64(a.resizeRevision, .resizeRevision)
-      if !a.features.isEmpty { try c.encode(a.features.names, forKey: .features) }
+      if !a.features.isEmpty {
+        try c.encode(a.features.names, forKey: .features)
+      }
     case let .input(i):
       try u64(i.attachmentEpoch, .attachmentEpoch)
       try u64(i.sequence, .sequence)
