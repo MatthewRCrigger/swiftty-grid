@@ -741,6 +741,7 @@ public final class RoamingSession: @unchecked Sendable {
     case let .input(input):
       // Input returns a history window to live output, as typing does
       // in a local terminal.
+      a.pendingViewportLines = 0
       if a.historyTop != nil {
         a.historyTop = nil
         contentChanged()
@@ -774,27 +775,46 @@ public final class RoamingSession: @unchecked Sendable {
     }
   }
 
-  /// Moves `a`'s history window on the pane's queue, reading only, then
-  /// presents it. Stale results for a replaced attachment are dropped.
+  /// Moves `a`'s history window. Requests that arrive while a move is
+  /// resolving accumulate and follow it, so a continuous swipe moves by
+  /// its whole distance instead of only its first step.
   private func moveHistoryWindow(by lines: Int, for a: HostAttachment) {
-    guard let pane = activePane, lines != 0 else { return }
+    let bound = Int(ControlMessage.maxViewportLines)
+    a.pendingViewportLines = min(
+      max(a.pendingViewportLines + lines, -bound),
+      bound
+    )
+    if !a.viewportMoveInFlight { resolveViewportMove(for: a) }
+  }
+
+  /// Resolves the accumulated movement on the pane's queue, reading only,
+  /// then presents it. Results for a replaced attachment, or overtaken by
+  /// input returning to live output, are dropped.
+  private func resolveViewportMove(for a: HostAttachment) {
+    guard let pane = activePane, a.pendingViewportLines != 0 else { return }
+    let lines = a.pendingViewportLines
+    a.pendingViewportLines = 0
+    a.viewportMoveInFlight = true
     let current = a.historyTop
     service.inspect(
       pane: pane,
       { ScreenExporter.historyTop($0, from: current, moving: lines) },
-      completion: { [weak self] top in
+      completion: { [weak self] resolved in
         self?.queue
           .async { [weak self] in
-            guard let self, a === self.attachment, a.isCurrent,
-              a.historyTop == current, let top
-            else { return }
-            guard top != current else { return }
-            a.historyTop = top
-            self.contentChanged()
+            a.viewportMoveInFlight = false
+            guard let self, a === self.attachment, a.isCurrent else { return }
+            // Nil `resolved`: the pane is gone. Nil top: live output.
+            if let top = resolved, a.historyTop == current, top != current {
+              a.historyTop = top
+              self.contentChanged()
+            }
+            self.resolveViewportMove(for: a)
           }
       }
     )
   }
+
 
   private func admit(_ input: ControlMessage.Input, from a: HostAttachment) {
     let sequence = input.sequence

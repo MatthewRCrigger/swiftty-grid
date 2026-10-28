@@ -38,6 +38,10 @@ final class HostAttachment: @unchecked Sendable {
   /// Absolute top row of this attachment's history window (`Viewport`),
   /// or nil to follow live output. Never moves the host's own view.
   var historyTop: Int?
+  /// `Viewport` movement received while a move is resolving on the pane,
+  /// applied next rather than dropped (a swipe sends many in a row).
+  var pendingViewportLines = 0
+  var viewportMoveInFlight = false
 
   init(connection: any RSTConnection, registry: SessionRegistry) {
     self.connection = connection
