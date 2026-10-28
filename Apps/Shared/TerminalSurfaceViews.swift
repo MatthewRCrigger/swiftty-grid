@@ -70,13 +70,10 @@ struct RoamingSurfaceView: View {
   private var showsFiles = false
 
   var body: some View {
-    TerminalDisplayView(
+    TerminalCanvas(
       session: controller.display,
       capabilities: controller.model.capabilities
     )
-    // The terminal lifts itself above the keyboard; SwiftUI must not
-    // shrink it, which would resize the grid.
-    .ignoresSafeArea(.keyboard, edges: .bottom)
     .uiTestingScreenProbe(controller.model).glassSurface().overlay { overlay }
     .safeAreaInset(edge: .bottom) {
       if controller.offersOrdinarySSH {
@@ -228,11 +225,10 @@ struct SSHSurfaceView: View {
         .font(.caption).padding(8)
         .glassPanel(cornerRadius: 0, tint: .yellow.opacity(0.2))
       }
-      TerminalDisplayView(
+      TerminalCanvas(
         session: controller.session,
         capabilities: controller.model.capabilities
       )
-      .ignoresSafeArea(.keyboard, edges: .bottom)
       .uiTestingScreenProbe(controller.model).glassSurface().overlay { overlay }
     }
     .ignoresSafeArea(.keyboard, edges: .bottom)
@@ -326,20 +322,49 @@ struct ProblemCard: View {
 
 // MARK: - Platform display
 
+/// The terminal over its own background, which reaches the bottom edge
+/// of the screen rather than stopping at the safe area.
+struct TerminalCanvas: View {
+  let session: TerminalSession
+  let capabilities: SurfaceCapabilities
+  @State
+  private var background: Color?
+
+  var body: some View {
+    #if canImport(UIKit)
+    TerminalDisplayView(
+      session: session,
+      capabilities: capabilities,
+      onBackgroundColor: { background = $0 }
+    )
+    // The terminal lifts itself above the keyboard; SwiftUI must not
+    // shrink it, which would resize the grid.
+    .ignoresSafeArea(.keyboard, edges: .bottom)
+    .background { background?.ignoresSafeArea(edges: .bottom) }
+    #else
+    TerminalDisplayView(session: session, capabilities: capabilities)
+    #endif
+  }
+}
+
 #if canImport(UIKit)
 /// Hosts `TerminalUIView` (iOS, iPadOS, Mac Catalyst, visionOS, tvOS).
 struct TerminalDisplayView: UIViewRepresentable {
   let session: TerminalSession
   let capabilities: SurfaceCapabilities
+  /// The terminal's opaque background color, for filling the margins
+  /// outside the view.
+  var onBackgroundColor: ((Color?) -> Void)?
 
   func makeUIView(context: Context) -> UIView {
     do {
       let view = try TerminalUIView(session: session)
       view.capabilities = capabilities
+      view.onBackgroundColor = backgroundHandler
       // App-switcher snapshots omit terminal content (spec §12).
       view.hidesContentWhenInactive = true
       DispatchQueue.main.async { _ = view.becomeFirstResponder() }
-      return view
+      return TerminalClipView(terminal: view)
     } catch {
       let label = UILabel()
       label.text = String(
@@ -353,9 +378,41 @@ struct TerminalDisplayView: UIViewRepresentable {
   }
 
   func updateUIView(_ view: UIView, context: Context) {
-    guard let view = view as? TerminalUIView, view.capabilities != capabilities
-    else { return }
+    guard let view = (view as? TerminalClipView)?.terminal else { return }
+    view.onBackgroundColor = backgroundHandler
+    guard view.capabilities != capabilities else { return }
     view.capabilities = capabilities
+  }
+
+  private var backgroundHandler: (UIColor) -> Void {
+    let handler = onBackgroundColor
+    return { color in
+      // A translucent fill would stack under the terminal's own.
+      handler?(color.cgColor.alpha >= 1 ? Color(uiColor: color) : nil)
+    }
+  }
+}
+
+/// Clips the terminal to its frame: lifted above a docked keyboard, its
+/// top scrolls out of view instead of over the navigation bar.
+final class TerminalClipView: UIView {
+  let terminal: TerminalUIView
+
+  init(terminal: TerminalUIView) {
+    self.terminal = terminal
+    super.init(frame: .zero)
+    clipsToBounds = true
+    addSubview(terminal)
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) { fatalError() }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    // Bounds and center, not frame: the lift is a transform.
+    terminal.bounds = CGRect(origin: .zero, size: bounds.size)
+    terminal.center = CGPoint(x: bounds.midX, y: bounds.midY)
   }
 }
 #elseif os(macOS)
