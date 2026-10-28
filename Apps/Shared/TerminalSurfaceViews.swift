@@ -74,6 +74,9 @@ struct RoamingSurfaceView: View {
       session: controller.display,
       capabilities: controller.model.capabilities
     )
+    // The terminal lifts itself above the keyboard; SwiftUI must not
+    // shrink it, which would resize the grid.
+    .ignoresSafeArea(.keyboard, edges: .bottom)
     .uiTestingScreenProbe(controller.model).glassSurface().overlay { overlay }
     .safeAreaInset(edge: .bottom) {
       if controller.offersOrdinarySSH {
@@ -229,8 +232,10 @@ struct SSHSurfaceView: View {
         session: controller.session,
         capabilities: controller.model.capabilities
       )
+      .ignoresSafeArea(.keyboard, edges: .bottom)
       .uiTestingScreenProbe(controller.model).glassSurface().overlay { overlay }
     }
+    .ignoresSafeArea(.keyboard, edges: .bottom)
     #if !os(tvOS)
     .toolbar {
       if controller.model.profile.sftp {
