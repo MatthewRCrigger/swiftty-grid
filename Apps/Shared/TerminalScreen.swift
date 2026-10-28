@@ -126,6 +126,10 @@ private let terminalStatusInTitle: Bool = {
 /// Paints the navigation bar and the safe areas with the terminal's
 /// background instead of the app's, with bar content legible on it. Only
 /// iPhone and iPad: Catalyst and visionOS keep their window chrome.
+///
+/// Only the top and bottom insets are filled, and the bar's own background
+/// is hidden: a translucent terminal background (`background-opacity`
+/// below 1) would otherwise stack over the terminal's own, or the bar's.
 private struct TerminalChromeBackground: ViewModifier {
   let color: Color?
 
@@ -133,9 +137,20 @@ private struct TerminalChromeBackground: ViewModifier {
     #if os(iOS) && !targetEnvironment(macCatalyst)
     if let color {
       content
-        .background { color.ignoresSafeArea() }
-        .toolbarBackground(color, for: .navigationBar)
-        .toolbarBackgroundVisibility(.visible, for: .navigationBar)
+        .background {
+          GeometryReader { proxy in
+            VStack(spacing: 0) {
+              color.frame(height: proxy.safeAreaInsets.top)
+              Spacer(minLength: 0)
+              color.frame(height: proxy.safeAreaInsets.bottom)
+            }
+            .ignoresSafeArea()
+          }
+          // The terminal lifts itself above the keyboard; the strip stays
+          // at the screen edge.
+          .ignoresSafeArea(.keyboard)
+        }
+        .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
         .toolbarColorScheme(color.isDark ? .dark : .light, for: .navigationBar)
     } else {
       content

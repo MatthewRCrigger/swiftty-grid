@@ -327,28 +327,46 @@ struct ProblemCard: View {
 struct TerminalCanvas: View {
   let session: TerminalSession
   let capabilities: SurfaceCapabilities
+  /// The terminal's background, translucent when the configuration's
+  /// `background-opacity` is below 1.
   @State
-  private var background: Color?
+  private var background: UIColorBox?
 
   var body: some View {
     #if canImport(UIKit)
     TerminalDisplayView(
       session: session,
       capabilities: capabilities,
-      onBackgroundColor: { background = $0 }
+      onBackgroundColor: { background = UIColorBox(color: $0) }
     )
     // The terminal lifts itself above the keyboard; SwiftUI must not
     // shrink it, which would resize the grid.
     .ignoresSafeArea(.keyboard, edges: .bottom)
-    .background { background?.ignoresSafeArea(edges: .bottom) }
-    .preference(key: TerminalBackgroundKey.self, value: background)
+    // A translucent fill would stack under the terminal's own.
+    .background {
+      if let background, background.isOpaque {
+        Color(uiColor: background.color).ignoresSafeArea(edges: .bottom)
+      }
+    }
+    .preference(
+      key: TerminalBackgroundKey.self,
+      value: background.map { Color(uiColor: $0.color) }
+    )
     #else
     TerminalDisplayView(session: session, capabilities: capabilities)
     #endif
   }
 }
 
-/// The terminal's opaque background color, reported up to
+#if canImport(UIKit)
+/// The reported background, kept as a `UIColor` so its opacity is known.
+struct UIColorBox: Equatable {
+  let color: UIColor
+  var isOpaque: Bool { color.cgColor.alpha >= 1 }
+}
+#endif
+
+/// The terminal's background color, at its own opacity, reported up to
 /// `TerminalScreen` so the navigation bar and safe areas can match it.
 struct TerminalBackgroundKey: PreferenceKey {
   static let defaultValue: Color? = nil
@@ -363,9 +381,9 @@ struct TerminalBackgroundKey: PreferenceKey {
 struct TerminalDisplayView: UIViewRepresentable {
   let session: TerminalSession
   let capabilities: SurfaceCapabilities
-  /// The terminal's opaque background color, for filling the margins
-  /// outside the view.
-  var onBackgroundColor: ((Color?) -> Void)?
+  /// The terminal's background color, for filling the margins outside
+  /// the view.
+  var onBackgroundColor: ((UIColor) -> Void)?
 
   func makeUIView(context: Context) -> UIView {
     do {
@@ -397,11 +415,9 @@ struct TerminalDisplayView: UIViewRepresentable {
 
   private var backgroundHandler: (UIColor) -> Void {
     let handler = onBackgroundColor
-    return { color in
-      // A translucent fill would stack under the terminal's own.
-      handler?(color.cgColor.alpha >= 1 ? Color(uiColor: color) : nil)
-    }
+    return { handler?($0) }
   }
+
 }
 
 /// Clips the terminal to its frame: lifted above a docked keyboard, its
