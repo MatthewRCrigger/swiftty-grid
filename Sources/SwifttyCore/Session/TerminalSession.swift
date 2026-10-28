@@ -113,6 +113,15 @@ public final class TerminalSession: @unchecked Sendable {
     set { callbacks.gridProposal = newValue }
   }
 
+  /// Receives viewport scrolling (positive reveals history) instead of
+  /// scrolling the displayed frame (presentation mode), so the remote
+  /// host can present its own history window. Called on `queue`, in order
+  /// with input.
+  public var viewportScrollHandler: (@Sendable (_ lines: Int) -> Void)? {
+    get { callbacks.viewportScroll }
+    set { callbacks.viewportScroll = newValue }
+  }
+
   /// Presentation mode: shows frames produced by a remote authoritative
   /// terminal. Never parses program output or encodes input.
   public let isPresentation: Bool
@@ -488,8 +497,14 @@ public final class TerminalSession: @unchecked Sendable {
     }
   }
 
+  /// Scrolls the viewport; a presentation session forwards the request to
+  /// `viewportScrollHandler` instead.
   public func scrollViewport(by lines: Int) {
     queue.async { [self] in
+      if isPresentation {
+        callbacks.viewportScroll?(lines)
+        return
+      }
       state.scrollViewport(by: lines)
       publish()
     }

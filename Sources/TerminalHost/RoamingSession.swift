@@ -738,7 +738,15 @@ public final class RoamingSession: @unchecked Sendable {
     }
     touch()
     switch message {
-    case let .input(input): admit(input, from: a)
+    case let .input(input):
+      // Input returns a history window to live output, as typing does
+      // in a local terminal.
+      if a.historyTop != nil {
+        a.historyTop = nil
+        contentChanged()
+      }
+      admit(input, from: a)
+    case let .viewport(_, lines): moveHistoryWindow(by: Int(lines), for: a)
     case let .screenAck(_, revision):
       guard revision <= a.highestSubmittedScreenRevision else {
         a.fail(.malformed)
@@ -764,6 +772,28 @@ public final class RoamingSession: @unchecked Sendable {
       a.fail(.malformed)
       detachOnQueue(a)
     }
+  }
+
+  /// Moves `a`'s history window on the pane's queue, reading only, then
+  /// presents it. Stale results for a replaced attachment are dropped.
+  private func moveHistoryWindow(by lines: Int, for a: HostAttachment) {
+    guard let pane = activePane, lines != 0 else { return }
+    let current = a.historyTop
+    service.inspect(
+      pane: pane,
+      { ScreenExporter.historyTop($0, from: current, moving: lines) },
+      completion: { [weak self] top in
+        self?.queue
+          .async { [weak self] in
+            guard let self, a === self.attachment, a.isCurrent,
+              a.historyTop == current, let top
+            else { return }
+            guard top != current else { return }
+            a.historyTop = top
+            self.contentChanged()
+          }
+      }
+    )
   }
 
   private func admit(_ input: ControlMessage.Input, from a: HostAttachment) {
@@ -1048,6 +1078,7 @@ public final class RoamingSession: @unchecked Sendable {
       if let cancel { a.connection.cancelSnapshot(stream: cancel) }
       screenRevision += 1
       let stamp = stamp(epoch: a.epoch)
+      let historyTop = a.historyTop
       a.nextStreamID += 1
       let stream = a.nextStreamID
       a.scheduler.started(stream: stream, revision: stamp.screenRevision)
@@ -1057,7 +1088,7 @@ public final class RoamingSession: @unchecked Sendable {
       // point (including final output after exit) is included.
       service.inspect(
         pane: pane,
-        { ScreenExporter.export($0, stamp: stamp) },
+        { ScreenExporter.export($0, stamp: stamp, historyTop: historyTop) },
         completion: { [weak self] snapshot in
           self?.queue
             .async { [weak self] in

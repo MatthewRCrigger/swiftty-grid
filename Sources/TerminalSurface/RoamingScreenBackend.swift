@@ -204,6 +204,11 @@ public final class RoamingScreenBackend: TerminalSurfaceBackend {
     await client.proposeGrid(columns: columns, rows: rows)
   }
 
+  /// Scrolls this client's history window on the host (when supported).
+  public func scrollViewport(by lines: Int) async {
+    await client.scrollViewport(by: lines)
+  }
+
   public func close() async { await client.close(.detach) }
 
   // MARK: Platform lifecycle

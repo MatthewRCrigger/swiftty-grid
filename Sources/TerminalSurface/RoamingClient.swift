@@ -294,6 +294,23 @@ public actor RoamingClient {
     return (try? ControlRecord.encode(probe, limit: limit)) != nil
   }
 
+  /// Moves this client's own window through the host's history by
+  /// `lines` (positive reveals older output). A no-op unless attached to
+  /// a host that advertises `historyViewport`; the host clamps the
+  /// window and returns it to live output on input.
+  public func scrollViewport(by lines: Int) {
+    guard lines != 0, let epoch, hostFeatures.contains(.historyViewport) else {
+      return
+    }
+    let bound = Int(ControlMessage.maxViewportLines)
+    send(.viewport(epoch: epoch, lines: Int64(min(max(lines, -bound), bound))))
+  }
+
+  /// Whether the attached host can present history windows.
+  public var supportsHistoryViewport: Bool {
+    epoch != nil && hostFeatures.contains(.historyViewport)
+  }
+
   /// Requests a grid from local view geometry. Sent as a `.resize`
   /// operation with an increasing resize revision once active; the
   /// displayed grid changes only with the host's snapshots.
@@ -864,7 +881,7 @@ public actor RoamingClient {
     case let .error(error):
       heard()
       handleError(error)
-    case .attach, .input, .screenAck, .detach, .terminate:
+    case .attach, .input, .screenAck, .detach, .terminate, .viewport:
       // Client-to-server messages are never valid from the host.
       connectionFailed(.protocolViolation)
     }

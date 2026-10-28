@@ -229,6 +229,62 @@ struct HostSessionTests {
   }
 
   @Test
+  func `viewport requests show this client's history window only`() async throws
+  {
+    try await withRegistry { registry in
+      let grant = try await registry.create(
+        grid: GridSize(columns: 40, rows: 8)
+      )
+      let session = try #require(registry.session(grant.sessionID))
+      let client = TestClient(registry)
+      let attached = try await client.attached(grant)
+      #expect(attached.features.contains(.historyViewport))
+      _ = try await client.snapshot("prompt") { screenText($0).contains("$") }
+      try await client.send(
+        input(
+          1,
+          1,
+          .committedText(
+            "i=0; while [ $i -lt 200 ]; do echo hist-$i; i=$((i+1)); done"
+          )
+        )
+      )
+      try await client.send(input(1, 2, .key(SemanticKey(.enter))))
+      _ = try await client.snapshot("output") {
+        $0.textLines.contains("hist-199")
+      }
+      // Scroll this attachment back through the pane's history.
+      try await client.send(.viewport(epoch: 1, lines: 100))
+      let window = try await client.snapshot("history window") { shot in
+        shot.textLines.contains { $0.hasPrefix("hist-") }
+          && !shot.textLines.contains("hist-199")
+      }
+      let shownRows = window.textLines.compactMap {
+        $0.hasPrefix("hist-") ? Int($0.dropFirst(5)) : nil
+      }
+      #expect(!shownRows.isEmpty && shownRows.max()! < 199)
+      #expect(!window.cursor.visible)
+      // The host's own view stays at live output.
+      let live = try #require(await session.currentSnapshot())
+      #expect(live.textLines.contains { $0.contains("$") })
+      // Moving past the newest line returns to live output.
+      try await client.send(.viewport(epoch: 1, lines: -1_000))
+      _ = try await client.snapshot("back to live") { shot in
+        shot.cursor.visible && shot.textLines.contains { $0.contains("$") }
+      }
+      // Input also returns a window to live output.
+      try await client.send(.viewport(epoch: 1, lines: 50))
+      _ = try await client.snapshot("window again") { !$0.cursor.visible }
+      try await client.send(input(1, 3, .committedText("echo after-$((1+1))")))
+      try await client.send(input(1, 4, .key(SemanticKey(.enter))))
+      _ = try await client.snapshot("live after input") {
+        $0.cursor.visible && $0.textLines.contains("after-2")
+      }
+      #expect(client.badFrames == 0)
+    }
+  }
+
+  @Test
   func `output keeps draining while detached and reattach shows current state`()
     async throws
   {

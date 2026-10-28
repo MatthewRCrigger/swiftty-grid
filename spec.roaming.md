@@ -387,9 +387,10 @@ Compression is independent per snapshot, without a cross-snapshot dictionary. Bo
 | `Detach` / `Detached` | Stop this attachment without destroying the shell |
 | `Terminate` / `Terminated` | Explicitly destroy the owned session |
 | `SessionExited` | Report shell exit status and final screen revision |
+| `Viewport` | With `historyViewport`: move this attachment's own history window |
 | `Error` | Bounded typed failure; never a stack trace or secret-bearing diagnostic |
 
-`Attached` includes `attachmentEpoch`, `writerID`, `lastFullyAppliedInputSequence`, any admitted partial-operation identifier, and current resize revision. Every subsequent control record is scoped to that epoch. It may also carry `features`, a list of additive behaviours the host accepts; peers ignore names they do not know, and an absent list means none. `keypadKeys` admits numeric keypad key names (`kp:one`, `kp:enter`, `kp:pageUp`, …, matching the client's keypad keys). Without it, clients send the main-keyboard key a keypad key types and drop Keypad Begin, which has none.
+`Attached` includes `attachmentEpoch`, `writerID`, `lastFullyAppliedInputSequence`, any admitted partial-operation identifier, and current resize revision. Every subsequent control record is scoped to that epoch. It may also carry `features`, a list of additive behaviours the host accepts; peers ignore names they do not know, and an absent list means none. `keypadKeys` admits numeric keypad key names (`kp:one`, `kp:enter`, `kp:pageUp`, …, matching the client's keypad keys). Without it, clients send the main-keyboard key a keypad key types and drop Keypad Begin, which has none. `historyViewport` admits `Viewport` (`attachmentEpoch`, signed `lines`, at most ±1,000,000; positive reveals older output). The host moves that attachment's own window through the primary screen's history, clamped to the retained rows and anchored to an absolute row so it stays put while output arrives, and exports it in place of the live screen with the cursor hidden. The host's own view never moves; the alternate screen has no window; input returns the window to live output, as does moving past the newest line. Clients send `Viewport` only to hosts that advertise the feature, so older hosts never see it.
 
 ### 7.3 Bounded snapshot scheduling
 

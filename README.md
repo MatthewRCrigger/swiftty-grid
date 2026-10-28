@@ -82,8 +82,11 @@ a roaming host). It never parses program output or encodes input:
 screen atomically, keeping the frame's cell widths, graphemes and wraps without
 reflow, and marks it fully damaged. `send` forwards committed text, key presses
 and pastes to `semanticInputHandler` (never `onWrite`), `resize` proposes the
-view's grid to `gridProposalHandler`, and history is disabled. Local selection
-and copy work on the displayed frame.
+view's grid to `gridProposalHandler`, and its own history is disabled:
+`scrollViewport(by:)` goes to `viewportScrollHandler`, which a roaming client
+turns into an RST/1 `Viewport` request so the host presents that client's own
+history window (hosts advertising `historyViewport`). Local selection and copy
+work on the displayed frame.
 
 Both frontends expose a settable `capabilities: SurfaceCapabilities` (default
 `.full`; set `.roaming` for remote presentation). Program-initiated clipboard writes (OSC

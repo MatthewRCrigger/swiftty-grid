@@ -216,6 +216,14 @@ final class RoamingTerminalController: TerminalSurfaceController {
         MainActor.assumeIsolated { self?.propose(columns: columns, rows: rows) }
       }
     }
+    // Scrolling moves this client's own history window on the host.
+    display.viewportScrollHandler = { [weak self] lines in
+      DispatchQueue.main.async {
+        MainActor.assumeIsolated {
+          self?.serial { await $0.scrollViewport(by: lines) }
+        }
+      }
+    }
     model.previewLines = { [display] in display.withState { $0.screenLines } }
     observeSystem()
   }
@@ -455,6 +463,7 @@ final class RoamingTerminalController: TerminalSurfaceController {
     #endif
     display.semanticInputHandler = nil
     display.gridProposalHandler = nil
+    display.viewportScrollHandler = nil
     let client = client
     // An already-dispatched detach finishes first. Neither it nor the
     // close needs the main actor.

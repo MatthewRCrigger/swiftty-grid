@@ -47,7 +47,14 @@ public enum ControlMessage: Hashable, Sendable {
   case terminate(epoch: UInt64)
   case terminated(epoch: UInt64)
   case sessionExited(epoch: UInt64, status: Int32, finalScreenRevision: UInt64)
+  /// Client to host, with `historyViewport`: move this attachment's own
+  /// window through the session's history by `lines` (positive reveals
+  /// older lines). The host clamps it; input returns it to live output.
+  case viewport(epoch: UInt64, lines: Int64)
   case error(RSTError)
+
+  /// Largest `viewport` movement one message may request.
+  public static let maxViewportLines: Int64 = 1_000_000
 
   public struct Attach: Hashable, Sendable, Codable {
     public var sessionID: SessionID
@@ -143,6 +150,7 @@ public enum ControlMessage: Hashable, Sendable {
     case .terminate: "Terminate"
     case .terminated: "Terminated"
     case .sessionExited: "SessionExited"
+    case .viewport: "Viewport"
     case .error: "Error"
     }
   }
@@ -155,7 +163,7 @@ public enum ControlMessage: Hashable, Sendable {
     case let .input(i): i.attachmentEpoch
     case let .inputAck(e, _), let .screenAck(e, _), let .ping(e, _),
       let .pong(e, _), let .detach(e), let .detached(e), let .terminate(e),
-      let .terminated(e), let .sessionExited(e, _, _):
+      let .terminated(e), let .sessionExited(e, _, _), let .viewport(e, _):
       e
     }
   }
@@ -166,7 +174,7 @@ extension ControlMessage: Codable {
     case type, sessionID, serverInstanceID, writerID, applicationToken,
       attachmentEpoch, lastFullyAppliedInputSequence, partialInputSequence,
       resizeRevision, sequence, operation, screenRevision, nonce, status,
-      finalScreenRevision, code, message, features
+      finalScreenRevision, code, message, features, lines
   }
 
   public init(from decoder: any Decoder) throws {
@@ -242,6 +250,16 @@ extension ControlMessage: Codable {
         status: try c.decode(Int32.self, forKey: .status),
         finalScreenRevision: try u64(.finalScreenRevision)
       )
+    case "Viewport":
+      let lines = try c.decode(Int64.self, forKey: .lines)
+      guard lines.magnitude <= Self.maxViewportLines.magnitude else {
+        throw DecodingError.dataCorruptedError(
+          forKey: .lines,
+          in: c,
+          debugDescription: "viewport movement too large"
+        )
+      }
+      self = .viewport(epoch: try u64(.attachmentEpoch), lines: lines)
     case "Error":
       let message = try c.decodeIfPresent(String.self, forKey: .message)
       guard (message?.utf8.count ?? 0) <= 1024 else {
@@ -310,6 +328,9 @@ extension ControlMessage: Codable {
       try u64(e, .attachmentEpoch)
       try c.encode(status, forKey: .status)
       try u64(revision, .finalScreenRevision)
+    case let .viewport(e, lines):
+      try u64(e, .attachmentEpoch)
+      try c.encode(lines, forKey: .lines)
     case let .error(error):
       try c.encode(error.code, forKey: .code)
       if let s = error.sequence { try u64(s, .sequence) }
@@ -326,11 +347,14 @@ public struct RSTFeatures: OptionSet, Hashable, Sendable {
 
   /// `kp:<key>` key names. Clients send the main-keyboard key without it.
   public static let keypadKeys = RSTFeatures(rawValue: 1 << 0)
+  /// The host accepts `Viewport` and presents the requested history
+  /// window to this attachment only; the host's own view never moves.
+  public static let historyViewport = RSTFeatures(rawValue: 1 << 1)
 
-  public static let supported: RSTFeatures = [.keypadKeys]
+  public static let supported: RSTFeatures = [.keypadKeys, .historyViewport]
 
   private static let wireNames: [(String, RSTFeatures)] = [
-    ("keypadKeys", .keypadKeys)
+    ("keypadKeys", .keypadKeys), ("historyViewport", .historyViewport),
   ]
 
   init(names: [String]) {

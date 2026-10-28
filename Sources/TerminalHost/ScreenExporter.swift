@@ -35,15 +35,43 @@ public enum ScreenExporter {
     }
   }
 
-  /// Copies the active screen. The result always passes
+  /// The history window top after moving `lines` (positive reveals older
+  /// lines) from `top` (nil: live output). Nil again at the live screen;
+  /// the alternate screen has no history window. Reads metadata only.
+  public static func historyTop(
+    _ state: borrowing TerminalState,
+    from top: Int?,
+    moving lines: Int
+  ) -> Int? {
+    guard !state.isAlternateScreen else { return nil }
+    let first = state.firstAbsoluteRow
+    let live = first + state.scrollbackCount
+    let start = min(max(top ?? live, first), live)
+    let (moved, overflow) = start.subtractingReportingOverflow(lines)
+    let next =
+      overflow ? (lines > 0 ? first : live) : min(max(moved, first), live)
+    return next >= live ? nil : next
+  }
+
+  /// Copies the active screen, or with `historyTop` the window of the
+  /// primary screen and its history starting at that absolute row,
+  /// without moving the terminal's own viewport. The result always passes
   /// `ScreenSnapshot.validate()` for grids within the RST/1 limits; larger
   /// host grids are clipped to `RSTLimits.maxColumns` × `maxRows`.
   public static func export(
     _ state: borrowing TerminalState,
-    stamp: Stamp
+    stamp: Stamp,
+    historyTop: Int? = nil
   ) -> ScreenSnapshot {
     let columns = min(max(state.columns, 1), RSTLimits.maxColumns)
     let rows = min(max(state.rows, 1), RSTLimits.maxRows)
+    // Absolute row shown first; the live screen unless a window is open.
+    let live = state.firstAbsoluteRow + state.scrollbackCount
+    let top =
+      state.isAlternateScreen
+      ? state.firstAbsoluteRow
+      : min(max(historyTop ?? live, state.firstAbsoluteRow), live)
+    let inHistory = !state.isAlternateScreen && top < live
     var styles = StyleTable(palette: state.palette)
     var cells: [[ScreenCell]] = []
     cells.reserveCapacity(rows)
@@ -55,7 +83,14 @@ public enum ScreenExporter {
     for y in 0 ..< rows {
       var row: [ScreenCell] = []
       row.reserveCapacity(columns)
-      let source = state.grid.cells(row: y)
+      guard let (source, isWrapped) = state.line(absoluteRow: top + y) else {
+        for _ in 0 ..< columns {
+          row.append(ScreenCell("", width: 1, style: 0))
+        }
+        cells.append(row)
+        wrapped.append(false)
+        continue
+      }
       var x = 0
       while x < columns {
         let cell = source[x]
@@ -85,7 +120,7 @@ public enum ScreenExporter {
         }
       }
       cells.append(row)
-      wrapped.append(state.grid.isWrapped(y))
+      wrapped.append(isWrapped)
     }
 
     var exportedStyles = styles.styles
@@ -117,7 +152,8 @@ public enum ScreenExporter {
       cursor: ScreenCursor(
         row: min(max(cursor.y, 0), rows - 1),
         column: min(max(cursor.x, 0), columns),
-        visible: state.modes.contains(.cursorVisible),
+        // The cursor is on the live screen, not in a history window.
+        visible: state.modes.contains(.cursorVisible) && !inHistory,
         shape: shape,
         blinking: state.modes.contains(.cursorBlink)
       ),

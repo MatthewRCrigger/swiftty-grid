@@ -35,6 +35,9 @@ final class HostAttachment: @unchecked Sendable {
   var highestSubmittedScreenRevision: UInt64 = 0
   var timerArmed = false
   var exitNoticeSent = false
+  /// Absolute top row of this attachment's history window (`Viewport`),
+  /// or nil to follow live output. Never moves the host's own view.
+  var historyTop: Int?
 
   init(connection: any RSTConnection, registry: SessionRegistry) {
     self.connection = connection

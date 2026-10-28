@@ -595,7 +595,10 @@ extension TerminalUIView {
       }
     case .viewport:
       horizontalScrollAccumulator.reset()
-      guard n != 0, effectiveCapabilities.scrollback else { return }
+      // A presentation session forwards scrolling to its host, which
+      // moves this client's own history window when it supports one.
+      guard n != 0, effectiveCapabilities.scrollback || session.isPresentation
+      else { return }
       session.scrollViewport(by: n)
     }
   }
