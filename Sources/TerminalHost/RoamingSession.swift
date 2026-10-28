@@ -1022,9 +1022,11 @@ public final class RoamingSession: @unchecked Sendable {
       case .delete: .delete
       case let .function(n): .function(n)
       case let .keypad(k):
-        keypadKeys
-          ? MuxKeypadKey(rawValue: k.rawValue).map(MuxKey.keypad)
-          : KeypadKey(rawValue: k.rawValue)?.mainKey.flatMap(Self.muxKey)
+        if keypadKeys {
+          MuxKeypadKey(rawValue: k.rawValue).map(MuxKey.keypad)
+        } else {
+          KeypadKey(rawValue: k.rawValue)?.mainKey.flatMap(Self.muxKey)
+        }
       }
     return name.map { ($0, modifiers) }
   }
