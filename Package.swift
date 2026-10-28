@@ -60,7 +60,13 @@ let package = Package(
     // Headless terminal engine: parser, state, history, input encoding
     // and PTY processes. No Metal, fonts or AppKit; the SwiftMux service
     // links only this.
-    .target(name: "SwifttyEngine", swiftSettings: core),
+    .target(
+      name: "SwifttyEngine",
+      dependencies: ["CScrollbackChecksum"],
+      swiftSettings: core
+    ),
+    // CRC-32C instructions for verifying compressed scrollback.
+    .target(name: "CScrollbackChecksum"),
     .target(
       name: "SwifttyCore",
       dependencies: ["SwifttyEngine"],

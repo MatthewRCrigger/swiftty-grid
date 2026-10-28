@@ -145,6 +145,9 @@ public final class TerminalSession: @unchecked Sendable {
   private var synchronizedGeneration: UInt64 = 0
   private var synchronizedTimeoutScheduled = false
   private var cellPixelSize = (width: 0, height: 0)
+  /// Idle scrollback compression; nil for presentation sessions and when
+  /// compression is off or unsupported.
+  private var scrollbackMaintenance: ScrollbackMaintenanceClient?
 
   static let readBufferSize = 64 * 1024
   /// Max bytes parsed per read event so snapshots can interleave.
@@ -204,8 +207,12 @@ public final class TerminalSession: @unchecked Sendable {
     )
     state.programStatusEnabled = configuration.programStatusEnabled
     state.rectangleChecksumsEnabled = configuration.rectangleChecksumsEnabled
+    state.setScrollbackCompression(
+      !presentation && configuration.scrollbackCompression
+    )
     readBuffer = .allocate(byteCount: Self.readBufferSize, alignment: 16)
     encodeBuffer.reserveCapacity(256)
+    updateScrollbackMaintenance()
   }
 
   deinit {
@@ -218,6 +225,7 @@ public final class TerminalSession: @unchecked Sendable {
     }
     teardown()
     #endif
+    scrollbackMaintenance?.cancel()
     readBuffer.deallocate()
   }
 
@@ -462,6 +470,7 @@ public final class TerminalSession: @unchecked Sendable {
         encoded?([])
         return
       }
+      noteScrollbackActivity()
       switch input {
       case let .key(event) where event.action == .release: break
       case .text, .key, .paste:
@@ -484,6 +493,65 @@ public final class TerminalSession: @unchecked Sendable {
       state.scrollViewport(by: lines)
       publish()
     }
+  }
+
+  // MARK: Scrollback storage
+
+  /// Requested and effective scrollback compression for this session.
+  public var scrollbackCompression: ScrollbackCompressionPolicy {
+    withState { $0.scrollbackCompression }
+  }
+
+  /// Metadata-only scrollback memory accounting; never restores history.
+  public var scrollbackStatistics: ScrollbackStatistics {
+    withState { $0.scrollbackStatistics }
+  }
+
+  /// Turns idle compression on or off. Turning it off stops maintenance
+  /// without decoding: compressed rows stay readable and restore on demand.
+  /// Presentation sessions keep history and compression off.
+  public func setScrollbackCompression(_ enabled: Bool) {
+    queue.async { [self] in
+      guard !isPresentation else { return }
+      state.setScrollbackCompression(enabled)
+      updateScrollbackMaintenance()
+    }
+  }
+
+  /// Registers with the process coordinator while compression is effective.
+  private func updateScrollbackMaintenance() {
+    guard !isPresentation, state.scrollbackCompression.effective else {
+      scrollbackMaintenance?.cancel()
+      scrollbackMaintenance = nil
+      return
+    }
+    if scrollbackMaintenance == nil {
+      scrollbackMaintenance = ScrollbackMaintenanceClient(
+        queue: queue,
+        step: { [weak self] generation in
+          self?.state.maintainScrollback(expectedGeneration: generation)
+        },
+        release: { [weak self] in self?.state.releaseScrollbackWorkspace() }
+      )
+    }
+    scrollbackMaintenance?.noteActivity(generation: state.scrollbackGeneration)
+  }
+
+  /// Records a batch of relevant activity; quiet output then compresses.
+  private func noteScrollbackActivity() {
+    guard let scrollbackMaintenance else { return }
+    _ = state.takeScrollbackMaintenanceDirty()
+    scrollbackMaintenance.noteActivity(generation: state.scrollbackGeneration)
+  }
+
+  /// After a borrowed read or capture promoted cold history, rearms
+  /// maintenance without postponing it or publishing anything.
+  private func rearmScrollbackMaintenanceIfNeeded() {
+    guard let scrollbackMaintenance, state.takeScrollbackMaintenanceDirty()
+    else { return }
+    scrollbackMaintenance.requestMaintenance(
+      generation: state.scrollbackGeneration
+    )
   }
 
   /// Current OSC 7501 records; with `onProgramStatusChange`, all a
@@ -587,7 +655,9 @@ public final class TerminalSession: @unchecked Sendable {
         return held
       }
       drawnCursor = currentCursor
-      return builder.build(from: &state, overscan: overscan)
+      let snapshot = builder.build(from: &state, overscan: overscan)
+      rearmScrollbackMaintenanceIfNeeded()
+      return snapshot
     }
   }
 
@@ -635,9 +705,13 @@ public final class TerminalSession: @unchecked Sendable {
     _ body: (borrowing TerminalState) throws -> R
   ) rethrows -> R {
     if DispatchQueue.getSpecific(key: queueKey) == true {
+      defer { rearmScrollbackMaintenanceIfNeeded() }
       return try body(state)
     }
-    return try queue.sync { try body(state) }
+    return try queue.sync {
+      defer { rearmScrollbackMaintenanceIfNeeded() }
+      return try body(state)
+    }
   }
 
   // MARK: Presentation
@@ -725,6 +799,7 @@ public final class TerminalSession: @unchecked Sendable {
 
   /// Flushes replies and events, then notifies the frontend once.
   private func publish() {
+    noteScrollbackActivity()
     if synchronizedGeneration != state.synchronizedOutputGeneration {
       synchronizedGeneration = state.synchronizedOutputGeneration
       synchronizedSince = DispatchTime.now().uptimeNanoseconds

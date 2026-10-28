@@ -79,12 +79,15 @@ extension TerminalState {
       )
     }
     if screenOnly { return }
+    // Scratch reads: checking never changes residency under test.
     for i in 0 ..< grid.historyCount {
-      let error = checkCells(grid.historyLine(i).cells)
+      let error = grid.withHistoryLine(i) { cells, _ in checkCells(cells) }
       precondition(error == nil, "history row \(i): \(error ?? "")")
     }
     for i in 0 ..< inactiveGrid.historyCount {
-      let error = checkCells(inactiveGrid.historyLine(i).cells)
+      let error = inactiveGrid.withHistoryLine(i) { cells, _ in
+        checkCells(cells)
+      }
       precondition(error == nil, "inactive history row \(i): \(error ?? "")")
     }
     #endif

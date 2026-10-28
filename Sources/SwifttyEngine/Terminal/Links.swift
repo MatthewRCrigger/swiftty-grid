@@ -17,19 +17,26 @@ extension TerminalState {
     at p: TerminalPoint,
     detectURLs: Bool = true
   ) -> TerminalLink? {
-    guard let (cells, _) = line(absoluteRow: p.row), p.column >= 0,
-      p.column < cells.count
+    guard p.column >= 0, p.column < columns,
+      let (column, id, lo, hi) = withLine(
+        absoluteRow: p.row,
+        { cells, _ in
+          var column = p.column
+          if cells[column].width == 0, column > 0 { column -= 1 }
+          let id = cells[column].attributes.link
+          var lo = column
+          var hi = column
+          if id != 0 {
+            while lo > 0, cells[lo - 1].attributes.link == id { lo -= 1 }
+            while hi + 1 < cells.count, cells[hi + 1].attributes.link == id {
+              hi += 1
+            }
+          }
+          return (column, id, lo, hi)
+        }
+      )
     else { return nil }
-    var column = p.column
-    if cells[column].width == 0, column > 0 { column -= 1 }
-    let id = cells[column].attributes.link
     if id != 0, let url = hyperlink(id) {
-      var lo = column
-      var hi = column
-      while lo > 0, cells[lo - 1].attributes.link == id { lo -= 1 }
-      while hi + 1 < cells.count, cells[hi + 1].attributes.link == id {
-        hi += 1
-      }
       return TerminalLink(
         url: url,
         range: TerminalRange(
@@ -43,7 +50,7 @@ extension TerminalState {
     // The logical line around `p`, mapping each UTF-16 unit to its
     // cell so regex offsets work directly with combining marks and emoji.
     var top = p.row
-    while let (_, wrapped) = line(absoluteRow: top - 1), wrapped { top -= 1 }
+    while isWrapped(absoluteRow: top - 1) == true { top -= 1 }
     var text = String.UnicodeScalarView()
     var points: [TerminalPoint] = []
     func append(_ scalar: Unicode.Scalar, at point: TerminalPoint) {
@@ -52,26 +59,31 @@ extension TerminalState {
       if scalar.value > 0xFFFF { points.append(point) }
     }
     var row = top
-    while let (rowCells, wrapped) = line(absoluteRow: row) {
-      for x in 0 ..< rowCells.count where !rowCells[x].isSpacer {
-        let cell = rowCells[x]
-        let point = TerminalPoint(row: row, column: x)
-        if cell.isGrapheme {
-          var hasContent = false
-          let scalars = graphemeScalars(cell.glyph)
-          for value in scalars {
-            if let scalar = Unicode.Scalar(value) {
-              append(scalar, at: point)
-              hasContent = true
+    while let wrapped = withLine(
+      absoluteRow: row,
+      { rowCells, wrapped in
+        for x in 0 ..< rowCells.count where !rowCells[x].isSpacer {
+          let cell = rowCells[x]
+          let point = TerminalPoint(row: row, column: x)
+          if cell.isGrapheme {
+            var hasContent = false
+            let scalars = graphemeScalars(cell.glyph)
+            for value in scalars {
+              if let scalar = Unicode.Scalar(value) {
+                append(scalar, at: point)
+                hasContent = true
+              }
             }
+            if !hasContent { append(" ", at: point) }
+          } else if cell.glyph != 0, let scalar = Unicode.Scalar(cell.glyph) {
+            append(scalar, at: point)
+          } else {
+            append(" ", at: point)
           }
-          if !hasContent { append(" ", at: point) }
-        } else if cell.glyph != 0, let scalar = Unicode.Scalar(cell.glyph) {
-          append(scalar, at: point)
-        } else {
-          append(" ", at: point)
         }
+        return wrapped
       }
+    ) {
       guard wrapped else { break }
       row += 1
     }
@@ -93,9 +105,10 @@ extension TerminalState {
       }
       let start = points[match.range.location]
       var end = points[match.range.location + count - 1]
-      if let (cells, _) = line(absoluteRow: end.row),
-        cells[end.column].width == 2
-      {
+      if withLine(
+        absoluteRow: end.row,
+        { cells, _ in cells[end.column].width == 2 }
+      ) == true {
         end.column += 1
       }
       let range = TerminalRange(start: start, end: end)

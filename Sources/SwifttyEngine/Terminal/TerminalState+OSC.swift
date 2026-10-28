@@ -339,13 +339,14 @@ extension TerminalState {
       mark(grid._unsafeCells(row: y), grid.extent(y), &used)
       mark(inactiveGrid._unsafeCells(row: y), inactiveGrid.extent(y), &used)
     }
+    // Compressed history is scanned without promotion: a link slot still
+    // referenced by cold cells is never recycled.
     for i in 0 ..< grid.historyCount {
-      let line = grid.historyLine(i).cells
-      mark(line, line.count, &used)
+      grid.withHistoryLine(i) { line, _ in mark(line, line.count, &used) }
     }
     for i in 0 ..< inactiveGrid.historyCount {
-      let line = inactiveGrid.historyLine(i).cells
-      mark(line, line.count, &used)
+      inactiveGrid.withHistoryLine(i) { line, _ in mark(line, line.count, &used)
+      }
     }
     freeHyperlinkSlots = (0 ..< hyperlinks.count).filter { !used[$0 + 1] }
       .reversed()
@@ -363,9 +364,10 @@ extension TerminalState {
       { return true }
     }
     for index in 0 ..< inactiveGrid.historyCount
-    where inactiveGrid.historyLine(index).cells
-      .contains(where: { $0.attributes.link == id })
-    { return true }
+    where inactiveGrid.withHistoryLine(
+      index,
+      { cells, _ in cells.contains(where: { $0.attributes.link == id }) }
+    ) { return true }
     return false
   }
 

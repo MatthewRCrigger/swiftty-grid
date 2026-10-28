@@ -1,3 +1,5 @@
+import Synchronization
+
 /// Owns chunk allocation, row metadata, and the screen/history row pool.
 @usableFromInline
 struct GridStorage: ~Copyable {
@@ -7,8 +9,8 @@ struct GridStorage: ~Copyable {
   static let chunkRows = 1 << chunkShift
 
   let capacity: Int  // physical rows: screen + history
-  let chunks: UnsafeMutablePointer<UnsafeMutablePointer<Cell>>
-  var chunkCount = 0
+  /// Cell backing, unit descriptors and cold payloads.
+  var store: CellStore
   let rowMap: UnsafeMutablePointer<Int32>
   let wrapped: UnsafeMutablePointer<Bool>
   /// Per physical row: `RowMark` raw value (OSC 133 semantic prompts),
@@ -21,19 +23,43 @@ struct GridStorage: ~Copyable {
   var history: Scrollback
   let historyLimitBytes: Int
   let maxHistoryRows: Int
+  /// Whether the mapped backend was requested (kept across resize).
+  let reclaimable: Bool
+  /// Identifies this pool; reset and resize replace it, so maintenance
+  /// scheduled against an older generation becomes a no-op.
+  let generation: UInt64
   /// Lines scrolled off the top with no history to keep them.
   var dropped = 0
   #if SWIFTTY_INTERNAL_CHECKS
   private let checkOwners: UnsafeMutablePointer<UInt8>
   #endif
 
+  private static let generations = Atomic<UInt64>(0)
+
+  /// History rows for a byte and row budget at `columns`; nonpositive byte
+  /// budgets disable history, positive ones keep at least one row.
+  static func historyRows(
+    columns: Int,
+    historyLimitBytes: Int,
+    maxHistoryRows: Int
+  ) -> Int {
+    let rowBytes = checkedAllocationCount(
+      max(1, columns),
+      MemoryLayout<Cell>.stride
+    )
+    return historyLimitBytes > 0
+      ? min(max(0, maxHistoryRows), max(1, historyLimitBytes / rowBytes)) : 0
+  }
+
   /// History uses at most `historyLimitBytes` of cell storage, rounded up
   /// to one row; `maxHistoryRows` imposes an additional cap. Zero disables it.
+  /// `reclaimable` selects the mapped backend where it is supported.
   init(
     columns: Int,
     rows: Int,
     historyLimitBytes: Int = 0,
-    maxHistoryRows: Int = 100_000
+    maxHistoryRows: Int = 100_000,
+    reclaimable: Bool = true
   ) {
     let columns = max(1, columns)
     let rows = max(1, rows)
@@ -41,40 +67,45 @@ struct GridStorage: ~Copyable {
     self.rows = rows
     self.historyLimitBytes = historyLimitBytes
     self.maxHistoryRows = max(0, maxHistoryRows)
+    self.reclaimable = reclaimable
     precondition(columns <= Int(Int32.max), "too many columns")
     precondition(rows <= Int(Int32.max), "too many rows")
     _ = checkedAllocationCount(
       columns,
       Self.chunkRows * MemoryLayout<Cell>.stride
     )
-    let rowBytes = checkedAllocationCount(columns, MemoryLayout<Cell>.stride)
-    let historyRows =
-      historyLimitBytes > 0
-      ? min(self.maxHistoryRows, max(1, historyLimitBytes / rowBytes)) : 0
+    let historyRows = Self.historyRows(
+      columns: columns,
+      historyLimitBytes: historyLimitBytes,
+      maxHistoryRows: maxHistoryRows
+    )
     precondition(historyRows <= Int(Int32.max) - rows, "too many physical rows")
     capacity = rows + historyRows
     history = Scrollback(capacity: historyRows)
+    generation = Self.generations.wrappingAdd(1, ordering: .relaxed).newValue
     #if SWIFTTY_INTERNAL_CHECKS
     checkOwners = .allocate(capacity: capacity)
     checkOwners.initialize(repeating: 0, count: capacity)
     #endif
-    chunks = .allocate(
-      capacity: (capacity + Self.chunkRows - 1) >> Self.chunkShift
+    extents = .allocate(capacity: capacity)
+    extents.initialize(repeating: 0, count: capacity)
+    // Screen-only pools gain nothing from reclaimable mappings.
+    store = CellStore(
+      columns: columns,
+      capacity: capacity,
+      extents: extents,
+      mapped: reclaimable && historyRows > 0
     )
     rowMap = .allocate(capacity: rows)
     wrapped = .allocate(capacity: capacity)
     wrapped.initialize(repeating: false, count: capacity)
     marks = .allocate(capacity: capacity)
     marks.initialize(repeating: 0, count: capacity)
-    extents = .allocate(capacity: capacity)
-    extents.initialize(repeating: 0, count: capacity)
     free = .allocate(capacity: capacity)
     for y in 0 ..< rows { rowMap[y] = takeRow() }
   }
 
   deinit {
-    for i in 0 ..< chunkCount { chunks[i].deallocate() }
-    chunks.deallocate()
     rowMap.deallocate()
     wrapped.deallocate()
     marks.deallocate()
@@ -85,38 +116,79 @@ struct GridStorage: ~Copyable {
     #endif
   }
 
+  var chunkCount: Int { store.chunkCount }
+
+  /// Raw row cells. Screen rows are always resident; history rows must be
+  /// promoted (`ensureResident`) or read through `store.withRow` first.
   @inline(__always)
   func physical(_ id: Int32) -> UnsafeMutablePointer<Cell> {
-    let p = Int(id)
-    return chunks[p >> Self.chunkShift] + (p & (Self.chunkRows - 1)) * columns
+    #if SWIFTTY_INTERNAL_CHECKS
+    precondition(store.isResident(id), "raw access to a cold row")
+    #endif
+    return store.physical(id)
   }
 
-  /// A blank row id: from the free list, or a newly allocated chunk.
+  /// A blank row id: from the free list, or a new chunk.
   mutating func takeRow() -> Int32 {
     if freeCount == 0 {
-      let first = chunkCount << Self.chunkShift
-      let count = min(Self.chunkRows, capacity - first)
-      precondition(count > 0, "row pool exhausted")
-      let chunk = UnsafeMutablePointer<Cell>
-        .allocate(capacity: Self.chunkRows * columns)
-      // Rows beyond the capacity never enter the free list. Leave their pages untouched.
-      chunk.initialize(repeating: .blank, count: count * columns)
-      chunks[chunkCount] = chunk
-      chunkCount += 1
-      for id in stride(from: first + count - 1, through: first, by: -1) {
+      let ids = store.allocateChunk()
+      for id in ids.reversed() {
         free[freeCount] = Int32(id)
         freeCount += 1
       }
     }
     freeCount -= 1
-    return free[freeCount]
+    let id = free[freeCount]
+    store.prepareFreeRow(id)
+    store.setOwner(id, .used)
+    return id
   }
 
+  /// Pushes screen row `top` into history and returns the row that
+  /// replaces it on screen: the recycled oldest line, or a fresh row.
+  @inline(__always)
+  mutating func pushHistory(_ top: Int32) -> Int32 {
+    guard let evicted = history.push(top) else { return growHistory(top) }
+    // The evicted row returns to the screen; ownership metadata is
+    // unchanged. Checked here rather than through a `CellStore` method so
+    // the warm line feed never materializes the store for a call.
+    if store.geometry.unitsPerChunk != 1
+      || store.units[Int(evicted) &>> Self.chunkShift].state != .resident
+    {
+      restoreRecycled(evicted)
+    }
+    return evicted
+  }
+
+  /// Neighbouring retained rows may share the evicted row's units, so
+  /// they are restored rather than discarded.
+  @inline(never)
+  private mutating func restoreRecycled(_ id: Int32) {
+    store.ensureResident(id, .recycle)
+  }
+
+  /// The ring is still filling: `top` joins history and a free row
+  /// replaces it on screen.
+  @inline(never)
+  private mutating func growHistory(_ top: Int32) -> Int32 {
+    store.noteWrite(top)
+    return takeRow()
+  }
+
+  /// Releases history without decoding cold units: payloads are dropped,
+  /// fully free units reclaimed and mixed units keep their live rows.
   mutating func clearHistory() {
     dropped = 0
     for index in 0 ..< history.count {
+      store.setOwner(history.id(index), .free)
+    }
+    store.discardFreeUnits()
+    for index in 0 ..< history.count {
       let id = history.id(index)
-      Grid.fill(physical(id), Int(extents[Int(id)]), .blank)
+      // Rows in discarded units are blanked when reused.
+      if store.owner(id) == .free {
+        Grid.fill(physical(id), Int(extents[Int(id)]), .blank)
+      }
       extents[Int(id)] = 0
       wrapped[Int(id)] = false
       marks[Int(id)] = 0
@@ -124,6 +196,7 @@ struct GridStorage: ~Copyable {
       freeCount += 1
     }
     history.removeAll { _ in }
+    store.releaseIdleWorkspace()
   }
 
   func checkBounds() -> Bool {
@@ -135,41 +208,83 @@ struct GridStorage: ~Copyable {
   }
 
   /// `screenOnly` skips history and free rows, keeping the cost independent
-  /// of scrollback size.
+  /// of scrollback size. Cold rows are inspected through scan scratch, so
+  /// checking never changes residency; uninitialized rows are skipped.
   func checkInvariants(screenOnly: Bool = false) -> Bool {
     let allocated = min(capacity, chunkCount * Self.chunkRows)
     guard checkBounds() else { return false }
     func checkExtent(_ id: Int) -> Bool {
       let end = Int(extents[id])
       guard end >= 0 && end <= columns else { return false }
-      let row = physical(Int32(id))
-      for x in end ..< columns where !row[x].isBlank { return false }
-      return true
+      if store.owner(Int32(id)) == .uninitialized { return end == 0 }
+      return store.withRow(Int32(id)) { row in
+        for x in end ..< columns where !row[x].isBlank { return false }
+        return true
+      }
     }
     #if SWIFTTY_INTERNAL_CHECKS
     checkOwners.update(repeating: 0, count: allocated)
-    func claim(_ id: Int32) -> Bool {
+    func claim(_ id: Int32, _ owner: RowOwner) -> Bool {
       guard id >= 0 && Int(id) < allocated, checkOwners[Int(id)] == 0 else {
         return false
       }
       checkOwners[Int(id)] = 1
-      return true
+      return store.owner(id) == owner
+        || owner == .free && store.owner(id) == .uninitialized
     }
     #else
     var owners = Set<Int32>()
-    func claim(_ id: Int32) -> Bool {
+    func claim(_ id: Int32, _ owner: RowOwner) -> Bool {
       id >= 0 && Int(id) < allocated && owners.insert(id).inserted
+        && (store.owner(id) == owner
+          || owner == .free && store.owner(id) == .uninitialized)
     }
     #endif
-    for y in 0 ..< rows where !claim(rowMap[y]) { return false }
+    for y in 0 ..< rows where !claim(rowMap[y], .used) { return false }
+    // Every active-screen unit is resident.
+    for y in 0 ..< rows where !store.isResident(rowMap[y]) { return false }
     if screenOnly {
       for y in 0 ..< rows where !checkExtent(Int(rowMap[y])) { return false }
       return true
     }
-    for i in 0 ..< history.count where !claim(history.id(i)) { return false }
-    for i in 0 ..< freeCount where !claim(free[i]) { return false }
+    for i in 0 ..< history.count where !claim(history.id(i), .used) {
+      return false
+    }
+    for i in 0 ..< freeCount where !claim(free[i], .free) { return false }
     for id in 0 ..< allocated where !checkExtent(id) { return false }
-    return true
+    return checkUnits()
   }
 
+  /// Units holding live screen rows.
+  func screenUnits() -> Set<Int> {
+    var units = Set<Int>()
+    for y in 0 ..< rows {
+      let (first, last) = store.unitSpan(rowMap[y])
+      for g in first ... last { units.insert(g) }
+    }
+    return units
+  }
+
+  /// No cold unit holds a live, free or uninitialized row, and only
+  /// compressed units own payloads.
+  func checkUnits() -> Bool {
+    let screen = screenUnits()
+    for g in 0 ..< store.unitCount {
+      let owners = store.ownership(g)
+      let unit = store.units[g]
+      guard unit.rows == Int32(store.unitRows(g).count) else { return false }
+      switch unit.state {
+      case .resident: if unit.payload != nil { return false }
+      case .compressed:
+        if unit.payload == nil || owners.free != 0 || screen.contains(g) {
+          return false
+        }
+      case .discarded:
+        if unit.payload != nil || owners.uninitialized != Int(unit.rows) {
+          return false
+        }
+      }
+    }
+    return true
+  }
 }

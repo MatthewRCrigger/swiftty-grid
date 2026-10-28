@@ -235,7 +235,14 @@ public struct Configuration: Sendable, Equatable {
   public var mouseHideWhileTyping = false
   public var linkURL = true
 
+  /// History cell budget in bytes (`scrollback-limit`, canonically
+  /// `scrollback-limit-bytes`); zero disables history.
   public var scrollbackLimit = 10_000_000
+  /// Finite cap on history rows (`scrollback-limit-lines`); zero disables
+  /// history.
+  public var scrollbackLimitLines = 100_000
+  /// Compress idle history where supported (`scrollback-compression`).
+  public var scrollbackCompression = true
   /// Ghostty command syntax: shell expansion by default, or `direct:` arguments.
   public var command: String?
   public var workingDirectory: String?
@@ -565,11 +572,9 @@ public struct Configuration: Sendable, Equatable {
     case "link-url":
       guard let b = bool(defaults.linkURL) else { return invalid() };
       linkURL = b
-    case "scrollback-limit":
-      guard let v = value.isEmpty ? defaults.scrollbackLimit : Int(value),
-        v >= 0
-      else { return invalid() }
-      scrollbackLimit = v
+    case "scrollback-limit", "scrollback-limit-bytes", "scrollback-limit-lines",
+      "scrollback-compression":
+      return setScrollback(key, value)
     case "command": command = value.isEmpty ? nil : value
     case "working-directory":
       guard !value.utf8.contains(0) else { return invalid() }
@@ -589,6 +594,38 @@ public struct Configuration: Sendable, Equatable {
         return error
       }
     default: return "unknown key"
+    }
+    return nil
+  }
+
+  /// `scrollback-limit` and `scrollback-limit-bytes` share one field; the
+  /// last valid assignment wins. Limits are finite and nonnegative.
+  private mutating func setScrollback(_ key: String, _ value: String) -> String?
+  {
+    let defaults = Configuration()
+    func invalid() -> String { "invalid value \(value)" }
+    func count(_ defaultValue: Int) -> Int? {
+      guard let v = value.isEmpty ? defaultValue : Int(value), v >= 0 else {
+        return nil
+      }
+      return v
+    }
+    switch key {
+    case "scrollback-limit-lines":
+      guard let v = count(defaults.scrollbackLimitLines) else {
+        return invalid()
+      }
+      scrollbackLimitLines = v
+    case "scrollback-compression":
+      switch value {
+      case "": scrollbackCompression = defaults.scrollbackCompression
+      case "true": scrollbackCompression = true
+      case "false": scrollbackCompression = false
+      default: return invalid()
+      }
+    default:
+      guard let v = count(defaults.scrollbackLimit) else { return invalid() }
+      scrollbackLimit = v
     }
     return nil
   }
@@ -824,6 +861,8 @@ public struct Configuration: Sendable, Equatable {
     )
     if let command { s.command = Self.commandArguments(command) }
     s.scrollbackLimitBytes = scrollbackLimit
+    s.scrollbackLimitRows = scrollbackLimitLines
+    s.scrollbackCompression = scrollbackCompression
     s.palette = palette(for: scheme)
     s.rectangleChecksumsEnabled = rectangleChecksumReport
     return s

@@ -111,7 +111,41 @@ extension TerminalState {
     row >= firstAbsoluteRow && row - firstAbsoluteRow < addressableRows
   }
 
+  /// Reads absolute row `row` without changing history residency; nil
+  /// once it has left history. The cells may be scan scratch, valid only
+  /// inside `body`, which must not read another row.
+  package func withLine<R>(
+    absoluteRow row: Int,
+    _ body: (UnsafeBufferPointer<Cell>, Bool) throws -> R
+  ) rethrows -> R? {
+    guard row >= firstAbsoluteRow else { return nil }
+    let index = row - firstAbsoluteRow
+    guard index >= 0, index < addressableRows else { return nil }
+    let history = isAlternateScreen ? 0 : grid.historyCount
+    if index < history {
+      return try grid.withHistoryLine(index) { cells, wrapped in
+        try body(cells, wrapped)
+      }
+    }
+    return try body(
+      grid._unsafeCells(row: index - history),
+      grid.isWrapped(index - history)
+    )
+  }
+
+  /// Wrap flag of absolute row `row` from metadata alone; nil once it has
+  /// left history.
+  package func isWrapped(absoluteRow row: Int) -> Bool? {
+    guard row >= firstAbsoluteRow else { return nil }
+    let index = row - firstAbsoluteRow
+    guard index >= 0, index < addressableRows else { return nil }
+    let history = isAlternateScreen ? 0 : grid.historyCount
+    return index < history
+      ? grid.isHistoryWrapped(index) : grid.isWrapped(index - history)
+  }
+
   /// Cells of absolute row `row`, or nil once it has left history.
+  /// Restores a cold row; read-only scans use `withLine(absoluteRow:_:)`.
   package func line(
     absoluteRow row: Int
   ) -> (cells: UnsafeBufferPointer<Cell>, wrapped: Bool)? {
@@ -161,19 +195,21 @@ extension TerminalState {
     var out = String.UnicodeScalarView()
     var pendingNewline = false
     for row in start.row ... end.row {
-      guard let (cells, wrapped) = line(absoluteRow: row) else { continue }
-      var lo = rectangle ? left : row == start.row ? start.column : 0
-      let hi = rectangle ? right : row == end.row ? end.column : columns - 1
-      // A selection touching either half includes the whole glyph.
-      if lo > 0, lo < cells.count, cells[lo].flags.contains(.spacerTail),
-        cells[lo - 1].width == 2
-      {
-        lo -= 1
-      }
+      guard let wrapped = isWrapped(absoluteRow: row) else { continue }
       var lineScalars = String.UnicodeScalarView()
-      if lo <= hi {
-        for x in lo ... min(hi, cells.count - 1) where !cells[x].isSpacer {
-          appendText(of: cells[x], to: &lineScalars)
+      withLine(absoluteRow: row) { cells, _ in
+        var lo = rectangle ? left : row == start.row ? start.column : 0
+        let hi = rectangle ? right : row == end.row ? end.column : columns - 1
+        // A selection touching either half includes the whole glyph.
+        if lo > 0, lo < cells.count, cells[lo].flags.contains(.spacerTail),
+          cells[lo - 1].width == 2
+        {
+          lo -= 1
+        }
+        if lo <= hi {
+          for x in lo ... min(hi, cells.count - 1) where !cells[x].isSpacer {
+            appendText(of: cells[x], to: &lineScalars)
+          }
         }
       }
       let joinsNext = !rectangle && wrapped && row != end.row
@@ -320,8 +356,10 @@ extension TerminalState {
   ) -> (start: TerminalPoint, end: TerminalPoint) {
     let p = clamp(p)
     func cls(_ q: TerminalPoint) -> Int? {
-      guard let (cells, _) = line(absoluteRow: q.row) else { return nil }
-      var column = q.column
+      withLine(absoluteRow: q.row) { cells, _ in cls(cells, q.column) }
+    }
+    func cls(_ cells: UnsafeBufferPointer<Cell>, _ column: Int) -> Int {
+      var column = column
       var cell = cells[column]
       // Wrap padding can follow a wide glyph's tail. Walk through
       // both spacer cells to classify its visible character.
@@ -359,11 +397,11 @@ extension TerminalState {
   ) -> (start: TerminalPoint, end: TerminalPoint) {
     let p = clamp(p)
     var top = p.row
-    while top > firstAbsoluteRow, let (_, wrapped) = line(absoluteRow: top - 1),
-      wrapped
-    { top -= 1 }
+    while top > firstAbsoluteRow, isWrapped(absoluteRow: top - 1) == true {
+      top -= 1
+    }
     var bottom = p.row
-    while let (_, wrapped) = line(absoluteRow: bottom), wrapped,
+    while isWrapped(absoluteRow: bottom) == true,
       bottom < firstAbsoluteRow + addressableRows - 1
     { bottom += 1 }
     return (
@@ -376,16 +414,14 @@ extension TerminalState {
   private func step(_ p: TerminalPoint, by delta: Int) -> TerminalPoint? {
     if delta < 0 {
       if p.column > 0 { return TerminalPoint(row: p.row, column: p.column - 1) }
-      guard let (_, wrapped) = line(absoluteRow: p.row - 1), wrapped else {
-        return nil
-      }
+      guard isWrapped(absoluteRow: p.row - 1) == true else { return nil }
       return TerminalPoint(row: p.row - 1, column: columns - 1)
     }
     if p.column < columns - 1 {
       return TerminalPoint(row: p.row, column: p.column + 1)
     }
-    guard let (_, wrapped) = line(absoluteRow: p.row), wrapped,
-      line(absoluteRow: p.row + 1) != nil
+    guard isWrapped(absoluteRow: p.row) == true,
+      isWrapped(absoluteRow: p.row + 1) != nil
     else { return nil }
     return TerminalPoint(row: p.row + 1, column: 0)
   }
@@ -465,23 +501,24 @@ extension TerminalState {
     let range = searchMatches[index]
     guard range.start.row >= firstAbsoluteRow,
       range.end.row >= firstAbsoluteRow,
-      line(absoluteRow: range.start.row) != nil,
-      let (cells, _) = line(absoluteRow: range.end.row),
-      cells.indices.contains(range.end.column)
+      isWrapped(absoluteRow: range.start.row) != nil
     else { return nil }
-    var start = Cursor()
-    var end = Cursor()
-    start.x = range.start.column
-    start.y = range.start.row - firstAbsoluteRow - grid.historyCount
-    end.x = range.end.column
-    if cells[end.x].flags.contains(.spacerTail), end.x > 0 { end.x -= 1 }
-    end.y = range.end.row - firstAbsoluteRow - grid.historyCount
-    return SearchReflowMark(
-      matchIndex: index,
-      start: start,
-      end: end,
-      endWidth: max(1, Int(cells[end.x].width))
-    )
+    return withLine(absoluteRow: range.end.row) { cells, _ in
+      guard cells.indices.contains(range.end.column) else { return nil }
+      var start = Cursor()
+      var end = Cursor()
+      start.x = range.start.column
+      start.y = range.start.row - firstAbsoluteRow - grid.historyCount
+      end.x = range.end.column
+      if cells[end.x].flags.contains(.spacerTail), end.x > 0 { end.x -= 1 }
+      end.y = range.end.row - firstAbsoluteRow - grid.historyCount
+      return SearchReflowMark(
+        matchIndex: index,
+        start: start,
+        end: end,
+        endWidth: max(1, Int(cells[end.x].width))
+      )
+    } ?? nil
   }
 
   /// Updates an active search after direct state changes. Parsing and
@@ -595,26 +632,34 @@ extension TerminalState {
     }
     var row = firstAbsoluteRow
     let last = firstAbsoluteRow + addressableRows
-    while row < last, let (cells, wrapped) = line(absoluteRow: row) {
-      for x in 0 ..< cells.count where !cells[x].isSpacer {
-        let cell = cells[x]
-        let point = TerminalPoint(row: row, column: x)
-        if cell.isGrapheme {
-          var hasContent = false
-          let scalars = graphemeScalars(cell.glyph)
-          for value in scalars {
-            if let scalar = Unicode.Scalar(value) {
+    // Rows stream through scan scratch: searched history stays cold.
+    while row < last,
+      let wrapped = withLine(
+        absoluteRow: row,
+        { cells, wrapped in
+          for x in 0 ..< cells.count where !cells[x].isSpacer {
+            let cell = cells[x]
+            let point = TerminalPoint(row: row, column: x)
+            if cell.isGrapheme {
+              var hasContent = false
+              let scalars = graphemeScalars(cell.glyph)
+              for value in scalars {
+                if let scalar = Unicode.Scalar(value) {
+                  append(scalar, at: point, width: cell.width)
+                  hasContent = true
+                }
+              }
+              if !hasContent { append(" ", at: point, width: cell.width) }
+            } else if cell.glyph != 0, let scalar = Unicode.Scalar(cell.glyph) {
               append(scalar, at: point, width: cell.width)
-              hasContent = true
+            } else {
+              append(" ", at: point, width: cell.width)
             }
           }
-          if !hasContent { append(" ", at: point, width: cell.width) }
-        } else if cell.glyph != 0, let scalar = Unicode.Scalar(cell.glyph) {
-          append(scalar, at: point, width: cell.width)
-        } else {
-          append(" ", at: point, width: cell.width)
+          return wrapped
         }
-      }
+      )
+    {
       row += 1
       if !wrapped { matched = 0 }
     }

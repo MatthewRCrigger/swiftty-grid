@@ -612,6 +612,30 @@ before mutating its owner. Grid writes require exclusive access;
 Indices and allocation sizes are checked before accessing memory. Nonpositive
 screen dimensions are clamped to one.
 
+History storage is reclaimable and, on macOS and iOS/iPadOS, compressed when
+idle. History
+chunks use dedicated page-aligned mappings divided into compression units of at
+most 256 KiB; after 250 ms without output, input, viewport or resize activity,
+the owning session or SwiftMux pane encodes at most one unit per step on its own
+queue (LZ4 through Apple's Compression framework, verified by CRC-32C). The
+viewport, recent captures, the next eviction rows and both live screens stay
+resident. Warm row access is O(1) with no Swiftty heap allocation; a cold
+borrowed read restores its units in place, costing O(bytes of those units)
+plus page commitment, and never invalidates another borrowed row. Search,
+selection copy, ANSI dumps, link detection, OSC 8 reclamation, invariant checks
+and reflow read cold history through at most two units of scratch without
+restoring it. Clearing history drops compressed units without decoding them and
+returns fully free units' pages to the system. Retention limits count
+uncompressed history cells, so compression never changes which rows are kept.
+Compression runs no timers when idle and never redraws, publishes, or changes
+addressing or search generations. A compressed unit that fails its integrity
+check traps (fail-fast). macOS and iOS/iPadOS use this backend; Catalyst,
+visionOS and tvOS keep uncompressed heap chunks.
+`TerminalState.scrollbackStatistics` reports logical, resident, compressed,
+metadata, workspace, protected, eligible and reclaimed bytes from metadata
+alone; `scrollbackCompression` reports the requested and effective policy with
+the fallback reason.
+
 Snapshot spans borrow the snapshot. Retaining a snapshot preserves its cells
 while later frames reuse other pool entries. Grapheme ids belong to the snapshot
 that produced the cell; passing a cell from another snapshot to
@@ -666,11 +690,21 @@ copy-on-select = true
 link-url = true
 mouse-hide-while-typing = true
 window-padding-x = 6
-scrollback-limit = 20000000
+scrollback-limit-bytes = 20000000
+scrollback-limit-lines = 100000
+scrollback-compression = true
 command = /opt/homebrew/bin/fish
 keybind = super+shift+k=clear_screen
 keybind = ctrl+shift+arrow_up=jump_to_prompt:-1
 ```
+
+`scrollback-limit-bytes` (alias `scrollback-limit`; the last assignment wins)
+budgets uncompressed history cells per terminal (default 10,000,000);
+`scrollback-limit-lines` caps physical history rows (default 100,000). Zero
+disables history; negative, overflowing and `unlimited` values are rejected.
+`scrollback-compression` (default `true`) compresses idle history where
+supported; turning it off stops maintenance without decoding existing history.
+Limits apply when a terminal is created.
 
 Style-specific font families use `-bold`, `-italic` and `-bold-italic` suffixes.
 `font-style` (and the same suffixes) selects a named face such as `Retina`;

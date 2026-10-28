@@ -65,6 +65,8 @@ final class PaneRuntime: @unchecked Sendable {
   // MARK: Queue-owned state
 
   private var state: TerminalState
+  /// Idle history compression on this pane's queue; nil when off.
+  private var scrollbackMaintenance: ScrollbackMaintenanceClient?
   private var parser = Parser()
   private var writer: PaneWriter
   private let observePaneIO: (@Sendable (PaneID, PaneIOObservation) -> Void)?
@@ -129,6 +131,7 @@ final class PaneRuntime: @unchecked Sendable {
     historyBytes: Int,
     innerTerm: String = SMX.fallbackInnerTerm,
     limits: MuxLimits,
+    scrollbackCompression: Bool = true,
     observingIO: (@Sendable (PaneID, PaneIOObservation) -> Void)? = nil,
   ) {
     self.id = id
@@ -199,9 +202,20 @@ final class PaneRuntime: @unchecked Sendable {
     state.programStatusJournalLimit = Self.statusJournalLimit
     writer = PaneWriter(replyReserve: limits.replyReserveBytes)
     readBuffer = .allocate(byteCount: limits.readTurnBytes, alignment: 16)
+    state.setScrollbackCompression(scrollbackCompression)
+    if state.scrollbackCompression.effective {
+      scrollbackMaintenance = ScrollbackMaintenanceClient(
+        queue: queue,
+        step: { [weak self] generation in
+          self?.state.maintainScrollback(expectedGeneration: generation)
+        },
+        release: { [weak self] in self?.state.releaseScrollbackWorkspace() }
+      )
+    }
   }
 
   deinit {
+    scrollbackMaintenance?.cancel()
     // Weak source callbacks cannot run once deinitialization starts.
     // Transfer exclusive reaping without retaining the service or PTY.
     exitSource?.cancel()
@@ -398,7 +412,26 @@ final class PaneRuntime: @unchecked Sendable {
     }
     for request in requests { onEvent?(request) }
     _ = state.takeDamage()
+    noteScrollbackActivity()
     noteChange()
+  }
+
+  /// One activity record per batch; storage work never changes
+  /// `changeCount`, damage or published frames.
+  private func noteScrollbackActivity() {
+    guard let scrollbackMaintenance else { return }
+    _ = state.takeScrollbackMaintenanceDirty()
+    scrollbackMaintenance.noteActivity(generation: state.scrollbackGeneration)
+  }
+
+  /// After a capture or inspection promoted cold history, rearms
+  /// maintenance without postponing it.
+  private func rearmScrollbackMaintenanceIfNeeded() {
+    guard let scrollbackMaintenance, state.takeScrollbackMaintenanceDirty()
+    else { return }
+    scrollbackMaintenance.requestMaintenance(
+      generation: state.scrollbackGeneration
+    )
   }
 
   /// Converts the status journal into owned changes, splitting it at
@@ -466,6 +499,7 @@ final class PaneRuntime: @unchecked Sendable {
   /// Admission happened in the service; `estimate` was reserved.
   func write(_ input: MuxInput, estimate: Int) {
     queue.async { [self] in
+      noteScrollbackActivity()
       guard master >= 0, exitStatus == nil else {
         release(estimate)
         return
@@ -1165,6 +1199,7 @@ final class PaneRuntime: @unchecked Sendable {
       let shownRevision =
         viewport?.revision ?? currentViewport.load(ordering: .relaxed)
       if let saved { restore(offset: saved.offset, search: saved.search) }
+      rearmScrollbackMaintenanceIfNeeded()
       if let viewport {
         fit(
           &screen,
@@ -1404,6 +1439,23 @@ final class PaneRuntime: @unchecked Sendable {
   /// Plain text of the visible screen (tests, diagnostics).
   func screenLines() -> [String] { queue.sync { state.screenLines } }
 
+  /// Metadata-only history storage accounting (tests, diagnostics).
+  var scrollbackStatistics: ScrollbackStatistics {
+    queue.sync { state.scrollbackStatistics }
+  }
+
+  /// Runs idle maintenance to completion now, as the coordinator would
+  /// after a quiet period (tests). Publishes nothing.
+  func compressScrollbackForTesting() -> ScrollbackStatistics {
+    queue.sync {
+      var budget = ScrollbackMaintenanceBudget()
+      budget.maximumCandidates = 1 << 20
+      budget.maximumUnits = 1 << 20
+      while state.maintainScrollback(budget: budget) == .pending {}
+      return state.scrollbackStatistics
+    }
+  }
+
   /// Captures teardown progress in pane order without signaling or reaping.
   func terminationStateForTesting() -> String {
     queue.sync {
@@ -1423,7 +1475,13 @@ final class PaneRuntime: @unchecked Sendable {
   func inspect<T: Sendable>(
     _ body: @escaping @Sendable (borrowing TerminalState) -> T,
     completion: @escaping @Sendable (T) -> Void,
-  ) { queue.async { [self] in completion(body(state)) } }
+  ) {
+    queue.async { [self] in
+      let value = body(state)
+      rearmScrollbackMaintenanceIfNeeded()
+      completion(value)
+    }
+  }
 
   var size: (columns: Int, rows: Int) {
     queue.sync { (state.columns, state.rows) }

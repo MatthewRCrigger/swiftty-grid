@@ -204,7 +204,7 @@ extension TerminalState {
 
   private var cursorLogicalLineStart: Int {
     var top = screenAbsoluteRow(cursor.y)
-    while top > firstAbsoluteRow, line(absoluteRow: top - 1)?.wrapped == true {
+    while top > firstAbsoluteRow, isWrapped(absoluteRow: top - 1) == true {
       top -= 1
     }
     return top
@@ -342,8 +342,11 @@ extension TerminalState {
       if m == .prompt || m == .promptContinuation { break }
       end += 1
     }
-    while end > start, let line = line(absoluteRow: end),
-      !line.cells.contains(where: { !$0.isBlank })
+    while end > start,
+      withLine(
+        absoluteRow: end,
+        { cells, _ in !cells.contains(where: { !$0.isBlank }) }
+      ) == true
     { end -= 1 }
     return (
       TerminalPoint(row: start, column: 0),
@@ -393,8 +396,8 @@ extension TerminalState {
     // The edited line runs from the input start through the cursor's
     // row and any rows it wraps into.
     var lastRow = cursorRow
-    while let (_, wrapped) = line(absoluteRow: lastRow), wrapped,
-      line(absoluteRow: lastRow + 1) != nil
+    while isWrapped(absoluteRow: lastRow) == true,
+      isWrapped(absoluteRow: lastRow + 1) != nil
     { lastRow += 1 }
     guard p.row >= start.row, p.row <= lastRow, start.row <= cursorRow else {
       return nil
@@ -406,8 +409,10 @@ extension TerminalState {
     // End of the typed text: just past the last non-blank cell.
     var end = linear(cursorPoint)
     for row in start.row ... lastRow {
-      guard let (cells, _) = line(absoluteRow: row) else { continue }
-      if let x = cells.lastIndex(where: { !$0.isBlank }) {
+      let last = withLine(absoluteRow: row) { cells, _ in
+        cells.lastIndex(where: { !$0.isBlank })
+      }
+      if let x = last ?? nil {
         end = max(end, linear(TerminalPoint(row: row, column: x + 1)))
       }
     }
@@ -419,11 +424,14 @@ extension TerminalState {
     for i in min(target, from) ..< max(target, from) {
       let row = start.row + i / columns
       let column = i % columns
-      guard let (cells, _) = line(absoluteRow: row), column < cells.count else {
+      let spacer = withLine(absoluteRow: row) { cells, _ in
+        column < cells.count ? cells[column].isSpacer : nil
+      }
+      guard let isSpacer = spacer ?? nil else {
         moves += 1  // blank space past the text
         continue
       }
-      if !cells[column].isSpacer { moves += 1 }
+      if !isSpacer { moves += 1 }
     }
     return target < from ? -moves : moves
   }

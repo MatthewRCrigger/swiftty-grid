@@ -208,6 +208,8 @@ public struct TerminalState: ~Copyable {
 
   let widths = UnicodeWidth.table
   var lastPrinted: UInt32 = 0
+  /// Whether idle maintenance may compress history (`scrollbackCompression`).
+  var scrollbackCompressionRequested = true
 
   /// Creates a blank terminal; nonpositive screen dimensions become one.
   /// History uses `scrollbackLimitBytes`, capped by `scrollbackLimitRows`.
@@ -1459,18 +1461,19 @@ public struct TerminalState: ~Copyable {
         fresh.adopt(&row[x], from: graphemes)
       }
     }
-    for i in 0 ..< grid.historyCount {
-      let line = grid.historyMutableCells(i)
+    grid.rewriteHistory { line in
       for x in line.indices where line[x].isGrapheme {
         fresh.adopt(&line[x], from: graphemes)
       }
     }
-    for i in 0 ..< inactiveGrid.historyCount {
-      let line = inactiveGrid.historyMutableCells(i)
+    inactiveGrid.rewriteHistory { line in
       for x in line.indices where line[x].isGrapheme {
         fresh.adopt(&line[x], from: graphemes)
       }
     }
+    // Every referring cell was rewritten, cold history included.
+    grid.noteSharedTableChange()
+    inactiveGrid.noteSharedTableChange()
     // Live clusters alone may exceed the threshold; wait for as much
     // garbage again so compaction stays amortized.
     fresh.compactionLimit = max(

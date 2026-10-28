@@ -53,11 +53,8 @@ enum TerminalReflow {
     // Per cursor: logical line, offset in it, and pending wrap.
     var marks = cursors.map { _ in (line: -1, offset: 0, pending: false) }
     let history = grid.historyCount
-    for p in 0 ..< history + lastRow + 1 {
-      let (row, wrapped) =
-        p < history
-        ? grid.historyLine(p)
-        : (grid._unsafeCells(row: p - history), grid.isWrapped(p - history))
+    // Cold history is read through scan scratch rather than restored.
+    func visit(_ p: Int, _ row: UnsafeBufferPointer<Cell>, _ wrapped: Bool) {
       let bits =
         p < history ? grid.historyMarkBits(p) : grid.markBits(p - history)
       if !lineOpen {
@@ -92,6 +89,17 @@ enum TerminalReflow {
         cells.append(row[k])
       }
       if !wrapped || !rewrap { lineOpen = false }
+    }
+    for p in 0 ..< history + lastRow + 1 {
+      if p < history {
+        grid.withHistoryLine(p) { row, wrapped in visit(p, row, wrapped) }
+      } else {
+        visit(
+          p,
+          grid._unsafeCells(row: p - history),
+          grid.isWrapped(p - history)
+        )
+      }
     }
     lineStarts.append(cells.count)
 

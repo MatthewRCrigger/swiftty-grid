@@ -355,8 +355,10 @@ with the rules of `Configuration.sessionConfiguration()`:
   terminal variables it requires over it.
 
 New tabs reuse the workspace's spec; splits start a login shell in the split
-pane's directory. `scrollback-limit` is not carried: the service applies its
-own history limit to every pane.
+pane's directory. `scrollback-limit` (and `scrollback-limit-bytes`,
+`scrollback-limit-lines`, `scrollback-compression`) is not carried: the service
+applies its own history limit to every pane, and its local
+`MuxServiceConfiguration.scrollbackCompression` decides idle compression.
 
 ### Layout model
 
@@ -560,6 +562,16 @@ OSC-heavy and CSI-heavy benchmarks. Measure throughput, CPU time, allocations,
 peak RSS, frame time and p95 input-to-render latency on Apple Silicon Release
 builds; also measure frame time on a physical iPad. Prioritize measurable latency,
 throughput and iOS battery behavior over generic architecture or Swift purity.
+
+Scrollback compression (`spec.scrollback.md`) adds these gates: output into a
+full compressed ring reaches ≥98% of uncompressed throughput with restoration
+timed; idle encoding of one ≤256 KiB unit stays below 1 ms p99; a cold 120×80
+viewport capture stays within p95 4 ms and p99 8 ms; text corpora save ≥70% of
+the accounted backing of eligible cold units; read-only scans leave history
+compressed; clearing history decodes nothing. `swiftty-bench --only
+scrollback-memory,scrollback-compression,scrollback-resume` measures them.
+Retention budgets count uncompressed history cells, so compression never
+changes which rows are kept or SwiftMux pane admission.
 
 Tests must cover:
 
