@@ -31,6 +31,9 @@ public struct TerminalScreen: View {
   /// its ack is not worth showing.
   @State
   private var pendingVisible = false
+  /// The terminal's own background, once the surface reports it.
+  @State
+  private var terminalBackground: Color?
   let onClose: () -> Void
 
   public init(model: TerminalScreenModel, onClose: @escaping () -> Void) {
@@ -61,6 +64,10 @@ public struct TerminalScreen: View {
       }
     }
     .modifier(PendingInputDelay(model: model, visible: $pendingVisible))
+    .onPreferenceChange(TerminalBackgroundKey.self) { color in
+      MainActor.assumeIsolated { terminalBackground = color }
+    }
+    .modifier(TerminalChromeBackground(color: terminalBackground))
     .navigationTitle(model.host.nickname)
     .alert(
       Text("Unable to open shell", bundle: #bundle),
@@ -115,6 +122,42 @@ private let terminalStatusInTitle: Bool = {
   false
   #endif
 }()
+
+/// Paints the navigation bar and the safe areas with the terminal's
+/// background instead of the app's, with bar content legible on it. Only
+/// iPhone and iPad: Catalyst and visionOS keep their window chrome.
+private struct TerminalChromeBackground: ViewModifier {
+  let color: Color?
+
+  func body(content: Content) -> some View {
+    #if os(iOS) && !targetEnvironment(macCatalyst)
+    if let color {
+      content
+        .background { color.ignoresSafeArea() }
+        .toolbarBackground(color, for: .navigationBar)
+        .toolbarBackgroundVisibility(.visible, for: .navigationBar)
+        .toolbarColorScheme(color.isDark ? .dark : .light, for: .navigationBar)
+    } else {
+      content
+    }
+    #else
+    content
+    #endif
+  }
+}
+
+#if os(iOS) && !targetEnvironment(macCatalyst)
+extension Color {
+  /// Relative luminance below the midpoint (WCAG weights).
+  fileprivate var isDark: Bool {
+    var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+    guard UIColor(self).getRed(&r, green: &g, blue: &b, alpha: &a) else {
+      return true
+    }
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.5
+  }
+}
+#endif
 
 /// Shows pending input only once it outlives a normal round trip. Its own
 /// modifier, so the count changing with each keystroke and ack invalidates

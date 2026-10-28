@@ -341,9 +341,20 @@ struct TerminalCanvas: View {
     // shrink it, which would resize the grid.
     .ignoresSafeArea(.keyboard, edges: .bottom)
     .background { background?.ignoresSafeArea(edges: .bottom) }
+    .preference(key: TerminalBackgroundKey.self, value: background)
     #else
     TerminalDisplayView(session: session, capabilities: capabilities)
     #endif
+  }
+}
+
+/// The terminal's opaque background color, reported up to
+/// `TerminalScreen` so the navigation bar and safe areas can match it.
+struct TerminalBackgroundKey: PreferenceKey {
+  static let defaultValue: Color? = nil
+
+  static func reduce(value: inout Color?, nextValue: () -> Color?) {
+    value = value ?? nextValue()
   }
 }
 

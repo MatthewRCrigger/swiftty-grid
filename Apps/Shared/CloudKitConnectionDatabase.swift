@@ -209,10 +209,15 @@ public final class CloudKitConnectionDatabase: ConnectionCloudDatabase {
   /// schema elements only, never field values.
   static func reason(_ error: CKError) -> String {
     let code = String(error.code.rawValue)
-    let detail =
+    var detail =
       (error.userInfo[NSLocalizedDescriptionKey] as? String)?
       .split(whereSeparator: \.isNewline).joined(separator: " ")
       .trimmingCharacters(in: .whitespaces) ?? ""
+    // Drop the "Error saving record <CKRecordID …> to server:" preamble so
+    // the bound keeps the server's explanation, not the record ID.
+    if let range = detail.range(of: " to server: ") {
+      detail = String(detail[range.upperBound...])
+    }
     guard !detail.isEmpty else { return code }
     return code + ": " + String(detail.prefix(160))
   }
