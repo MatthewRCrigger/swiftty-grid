@@ -220,7 +220,7 @@ final class RoamingTerminalController: TerminalSurfaceController {
     display.viewportScrollHandler = { [weak self] lines in
       DispatchQueue.main.async {
         MainActor.assumeIsolated {
-          self?.serial { await $0.scrollViewport(by: lines) }
+          _ = self?.serial { await $0.scrollViewport(by: lines) }
         }
       }
     }
