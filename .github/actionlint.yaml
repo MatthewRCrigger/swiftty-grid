@@ -1,0 +1,4 @@
+# The Namespace label selects a managed runner profile, not a local runner.
+self-hosted-runner:
+  labels:
+    - namespace-profile-mac

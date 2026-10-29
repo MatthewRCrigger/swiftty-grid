@@ -32,8 +32,16 @@ final class HostAttachment: @unchecked Sendable {
     cancellationsPerSecond: RSTLimits.maxCancellationsPerSecond
   )
   var nextStreamID: UInt64 = 0
+  var highestSubmittedScreenRevision: UInt64 = 0
   var timerArmed = false
   var exitNoticeSent = false
+  /// Absolute top row of this attachment's history window (`Viewport`),
+  /// or nil to follow live output. Never moves the host's own view.
+  var historyTop: Int?
+  /// `Viewport` movement received while a move is resolving on the pane,
+  /// applied next rather than dropped (a swipe sends many in a row).
+  var pendingViewportLines = 0
+  var viewportMoveInFlight = false
 
   init(connection: any RSTConnection, registry: SessionRegistry) {
     self.connection = connection

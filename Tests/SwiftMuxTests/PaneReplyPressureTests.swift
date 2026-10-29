@@ -20,7 +20,7 @@ struct PaneReplyPressureTests {
     body=b'4;'+b'1;?;'*2047+b';;'
     request=b'\x1b]'+body+b'\x1b\\'
     if mode=='exit': request=b'\x1bP+q544E\x1b\\'
-    expected=b'\x1b]4;1;rgb:cccc/6666/6666\x1b\\'*(2047*count)
+    expected=b'\x1b]4;1;rgb:bfbf/3939/2a2a\x1b\\'*(2047*count)
     os.write(1,b'READY\n')
     def queries():
         data=request*count

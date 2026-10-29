@@ -134,7 +134,7 @@ struct ConfigurationFileReaderTests {
         .write(to: first.appendingPathComponent("Swiftty Dark"))
       #expect(
         Themes.colors(named: "Swiftty Dark", searching: [first])?.background
-          == 0x282C34
+          == 0x0C1021
       )
     }
   }

@@ -68,11 +68,13 @@ targets:
     platform: $platform
     sources:
       - { path: "$repository_root/Tests/KeychainRuntime/KeychainRuntimeTests.swift" }
+      - { path: "$repository_root/Tests/KeychainRuntime/IdentityKeychainRuntimeTests.swift" }
       - { path: "$repository_root/Tests/Support/RuntimeFixture.swift" }
       - { path: "$repository_root/Tests/Support/KeychainRuntimeCleanup.swift" }
     dependencies:
       - { target: KeychainHost }
       - { package: Swiftty, product: SSHClient }
+      - { package: Swiftty, product: SSHIdentity }
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $bundle.tests

@@ -70,6 +70,17 @@ public struct ThemeSelection: Sendable, Equatable {
   public var light: String
   public var dark: String
 
+  /// The built-in themes, following the appearance.
+  public static let `default` = ThemeSelection(
+    light: "Swiftty Light",
+    dark: "Swiftty Dark"
+  )
+
+  public init(light: String, dark: String) {
+    self.light = light
+    self.dark = dark
+  }
+
   init?(parsing value: String) {
     let value = value.trimmingCharacters(in: .whitespaces)
     guard !value.isEmpty else { return nil }
@@ -217,11 +228,21 @@ public struct Configuration: Sendable, Equatable {
   public var cursorStyleBlink: Bool?
   public var cursorOpacity = 1.0
   public var cursorClickToMove = true
+  /// DECRQCRA replies (`rectangle-checksum-report`). Off by default: a
+  /// program could checksum one cell at a time and read the screen back.
+  public var rectangleChecksumReport = false
   public var copyOnSelect = false
   public var mouseHideWhileTyping = false
   public var linkURL = true
 
+  /// History cell budget in bytes (`scrollback-limit`, canonically
+  /// `scrollback-limit-bytes`); zero disables history.
   public var scrollbackLimit = 10_000_000
+  /// Finite cap on history rows (`scrollback-limit-lines`); zero disables
+  /// history.
+  public var scrollbackLimitLines = 100_000
+  /// Compress idle history where supported (`scrollback-compression`).
+  public var scrollbackCompression = true
   /// Ghostty command syntax: shell expansion by default, or `direct:` arguments.
   public var command: String?
   public var workingDirectory: String?
@@ -550,6 +571,11 @@ public struct Configuration: Sendable, Equatable {
     case "cursor-click-to-move":
       guard let b = bool(defaults.cursorClickToMove) else { return invalid() };
       cursorClickToMove = b
+    case "rectangle-checksum-report":
+      guard let b = bool(defaults.rectangleChecksumReport) else {
+        return invalid()
+      }
+      rectangleChecksumReport = b
     case "copy-on-select":
       switch value {
       case "": copyOnSelect = defaults.copyOnSelect
@@ -565,11 +591,9 @@ public struct Configuration: Sendable, Equatable {
     case "link-url":
       guard let b = bool(defaults.linkURL) else { return invalid() };
       linkURL = b
-    case "scrollback-limit":
-      guard let v = value.isEmpty ? defaults.scrollbackLimit : Int(value),
-        v >= 0
-      else { return invalid() }
-      scrollbackLimit = v
+    case "scrollback-limit", "scrollback-limit-bytes", "scrollback-limit-lines",
+      "scrollback-compression":
+      return setScrollback(key, value)
     case "command": command = value.isEmpty ? nil : value
     case "working-directory":
       guard !value.utf8.contains(0) else { return invalid() }
@@ -589,6 +613,38 @@ public struct Configuration: Sendable, Equatable {
         return error
       }
     default: return "unknown key"
+    }
+    return nil
+  }
+
+  /// `scrollback-limit` and `scrollback-limit-bytes` share one field; the
+  /// last valid assignment wins. Limits are finite and nonnegative.
+  private mutating func setScrollback(_ key: String, _ value: String) -> String?
+  {
+    let defaults = Configuration()
+    func invalid() -> String { "invalid value \(value)" }
+    func count(_ defaultValue: Int) -> Int? {
+      guard let v = value.isEmpty ? defaultValue : Int(value), v >= 0 else {
+        return nil
+      }
+      return v
+    }
+    switch key {
+    case "scrollback-limit-lines":
+      guard let v = count(defaults.scrollbackLimitLines) else {
+        return invalid()
+      }
+      scrollbackLimitLines = v
+    case "scrollback-compression":
+      switch value {
+      case "": scrollbackCompression = defaults.scrollbackCompression
+      case "true": scrollbackCompression = true
+      case "false": scrollbackCompression = false
+      default: return invalid()
+      }
+    default:
+      guard let v = count(defaults.scrollbackLimit) else { return invalid() }
+      scrollbackLimit = v
     }
     return nil
   }
@@ -730,17 +786,15 @@ public struct Configuration: Sendable, Equatable {
   // MARK: Derived values
 
   /// The terminal palette for `scheme`: built-in defaults, then the
-  /// theme, then colors set directly.
+  /// theme (the default theme when unset), then colors set directly.
   public func palette(for scheme: ColorScheme = .dark) -> Palette {
     var palette = Palette.standard
-    if let theme {
-      palette =
-        Themes.colors(
-          named: theme.name(for: scheme),
-          searching: themeDirectories
-        )?
-        .applied(to: palette) ?? palette
-    }
+    palette =
+      Themes.colors(
+        named: (theme ?? .default).name(for: scheme),
+        searching: themeDirectories
+      )?
+      .applied(to: palette) ?? palette
     return colors.applied(to: palette)
   }
 
@@ -826,7 +880,10 @@ public struct Configuration: Sendable, Equatable {
     )
     if let command { s.command = Self.commandArguments(command) }
     s.scrollbackLimitBytes = scrollbackLimit
+    s.scrollbackLimitRows = scrollbackLimitLines
+    s.scrollbackCompression = scrollbackCompression
     s.palette = palette(for: scheme)
+    s.rectangleChecksumsEnabled = rectangleChecksumReport
     return s
   }
 

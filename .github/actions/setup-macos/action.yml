@@ -1,0 +1,24 @@
+name: Set up macOS
+description: Verify the Apple toolchain and install optional native test tools.
+inputs:
+  test-tools:
+    description: Install ripgrep and tmux for native tests and formatting.
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Verify toolchain
+      shell: bash
+      run: |
+        test "$(uname -m)" = arm64
+        sw_vers -productVersion | grep -E '^27\.'
+        xcodebuild -version
+        swift --version | head -1 | grep -E 'Swift version 6\.4'
+        xcrun --sdk macosx --show-sdk-version | grep -E '^27\.'
+    - name: Install test tools
+      if: inputs.test-tools == 'true'
+      shell: bash
+      env:
+        HOMEBREW_NO_AUTO_UPDATE: '1'
+        HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      run: brew install ripgrep tmux

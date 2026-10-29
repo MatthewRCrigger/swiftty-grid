@@ -422,8 +422,13 @@ extension MuxInboxRefreshTests {
       )
     )
     try #require(await until { controller.inbox.revision == 15 })
-    view.draw(in: view)
-    #expect(view.presented?.frame.identity.revision == (stale ? 1 : 2))
+    // Inbox delivery does not order the asynchronous frame presentation.
+    #expect(
+      await until {
+        view.draw(in: view)
+        return view.presented?.frame.identity.revision == (stale ? 1 : 2)
+      }
+    )
     frame.identity.attachment = attachment
     frame.identity.revision = 3
     service.sendEvent(.frame(frame))

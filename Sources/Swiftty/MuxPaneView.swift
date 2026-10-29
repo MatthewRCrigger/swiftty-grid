@@ -104,6 +104,9 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
 
   /// Newest imported presentation not yet admitted for drawing.
   private var pending: MuxPresentation?
+  /// Types the pane's program accepts drops of (kitty OSC 72), as
+  /// registered with AppKit; nil when it takes none.
+  var dropTypes: [String]?
   /// The presentation last accepted by the renderer: the baseline for
   /// selection, IME placement and accessibility.
   private(set) var presented: MuxPresentation?
@@ -309,6 +312,10 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
     pending = presentation
     if frozen == nil { needsDisplay = true }
     selectPendingOutput(in: presentation)
+    let target =
+      features.contains(.dropTargets)
+      ? presentation.frame.dropTarget?.types : nil
+    if target != dropTypes { dropTargetChanged(target) }
   }
 
   /// Rebind/reattach/server change: drop every cached presentation.
@@ -411,7 +418,12 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
       return
     }
     // While composing, every key belongs to the input method.
-    if !hasMarkedText(), let key = Self.semanticKey(for: event) {
+    if !hasMarkedText(),
+      let key = Self.semanticKey(
+        for: event,
+        keypadKeys: features.contains(.keypadKeys)
+      )
+    {
       clearSelection()
       controller?.send(.key(key.0, key.1), to: pane)
       return
@@ -423,12 +435,23 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
 
   /// Special keys and control combinations; nil for text, which goes
   /// through the input method and arrives once as committed text.
-  static func semanticKey(for event: NSEvent) -> (MuxKey, MuxKeyModifiers)? {
+  /// Keypad keys need `keypadKeys`; otherwise typing ones go through the
+  /// input method and the rest map to the keys they mirror.
+  static func semanticKey(
+    for event: NSEvent,
+    keypadKeys: Bool = false
+  ) -> (MuxKey, MuxKeyModifiers)? {
     var mods: MuxKeyModifiers = []
     let flags = event.modifierFlags
     if flags.contains(.shift) { mods.insert(.shift) }
     if flags.contains(.option) { mods.insert(.alt) }
     if flags.contains(.control) { mods.insert(.control) }
+    if case let .keypad(k) = TerminalView.specialKeys[event.keyCode] {
+      if keypadKeys, let keypad = MuxKeypadKey(rawValue: k.rawValue) {
+        return (.keypad(keypad), mods)
+      }
+      if k.text != nil { return nil }
+    }
     if let key = TerminalView.specialKeys[event.keyCode],
       let mapped = muxKey(key)
     {
@@ -461,6 +484,7 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
     case .insert: .insert
     case .delete: .delete
     case let .function(n): .function(n)
+    case let .keypad(k): k.mainKey.flatMap(muxKey)
     }
   }
 
@@ -482,6 +506,18 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
 
   @objc
   func paste(_ sender: Any?) {
+    // A program asking for kitty paste events reads what it wants itself.
+    if features.contains(.kittyClipboard), modes.contains(.kittyPasteEvents) {
+      clearSelection()
+      controller?
+        .send(
+          .clipboardPaste(
+            types: Array(TerminalView.mimeTypes(on: .general).prefix(16))
+          ),
+          to: pane
+        )
+      return
+    }
     guard let text = NSPasteboard.general.string(forType: .string),
       !text.isEmpty
     else { return }
@@ -581,7 +617,10 @@ extension MuxPaneView: @MainActor NSTextInputClient {
   override func doCommand(by selector: Selector) {
     // Keys the input method did not turn into text: send as typed.
     guard let event = interpretingEvent else { return }
-    if let key = Self.semanticKey(for: event) {
+    if let key = Self.semanticKey(
+      for: event,
+      keypadKeys: features.contains(.keypadKeys)
+    ) {
       controller?.send(.key(key.0, key.1), to: pane)
     } else if let text = event.characters, !text.isEmpty {
       controller?.send(.text(text), to: pane)

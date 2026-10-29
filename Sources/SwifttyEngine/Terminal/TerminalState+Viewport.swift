@@ -48,7 +48,9 @@ extension TerminalState {
   }
 
   /// Borrowed visible row cells, including the scrolled viewport.
-  /// O(1), with no allocation; mutation requires ending the borrow.
+  /// Mutation requires ending the borrow. O(1) and allocation-free when
+  /// warm; a cold history row is restored in place first (see
+  /// `scrollbackCells(at:)`).
   @_lifetime(borrow self)
   public func viewportCells(row y: Int) -> Span<Cell> {
     precondition(y >= 0 && y < rows)
@@ -57,7 +59,11 @@ extension TerminalState {
     return _overrideLifetime(span, borrowing: self)
   }
 
-  /// Borrowed primary history cells, oldest first. O(1), no allocation.
+  /// Borrowed primary history cells, oldest first. A cold row is restored
+  /// in place without invalidating other borrowed rows.
+  /// - Complexity: O(1) when warm, with no Swiftty heap allocation; when
+  ///   cold, O(bytes of the intersecting compression units) plus page
+  ///   commitment.
   @_lifetime(borrow self)
   public func scrollbackCells(at index: Int) -> Span<Cell> {
     let buffer = scrollbackLine(index).cells
@@ -118,8 +124,15 @@ extension TerminalState {
     (0 ..< rows).map { Self.text(of: viewportRow($0).cells, self) }
   }
 
+  /// Text of history line `index`; reading never restores cold history.
   public func scrollbackText(_ index: Int) -> String {
-    Self.text(of: scrollbackLine(index).cells, self)
+    if isAlternateScreen {
+      return inactiveGrid.withHistoryLine(index) { cells, _ in
+        Self.text(of: cells, self)
+      }
+    }
+    return grid.withHistoryLine(index) { cells, _ in Self.text(of: cells, self)
+    }
   }
 
   private static func text(

@@ -5,6 +5,8 @@ let core: [SwiftSetting] = [.enableExperimentalFeature("Lifetimes")]
 
 let package = Package(
   name: "swiftty",
+  // Source language of the String Catalogs in the UI targets.
+  defaultLocalization: "en",
   // Deployment minimums for every included Apple product profile
   // (spec.roaming.md §2.1). Declarations are not proof of compatibility:
   // the watch companion links CompanionModel and MuxNavigation, and
@@ -21,12 +23,14 @@ let package = Package(
     .library(name: "SessionCore", targets: ["SessionCore"]),
     .library(name: "ScreenProtocol", targets: ["ScreenProtocol"]),
     .library(name: "SSHClient", targets: ["SSHClient"]),
+    .library(name: "SSHIdentity", targets: ["SSHIdentity"]),
     .library(name: "AppleTransport", targets: ["AppleTransport"]),
     .library(name: "TerminalHost", targets: ["TerminalHost"]),
     .library(name: "TerminalSurface", targets: ["TerminalSurface"]),
     .library(name: "CompanionModel", targets: ["CompanionModel"]),
     .library(name: "RoamingApp", targets: ["RoamingApp"]),
     .library(name: "MuxNavigation", targets: ["MuxNavigation"]),
+    .library(name: "HostConnection", targets: ["HostConnection"]),
     .executable(name: "swiftty", targets: ["Swiftty"]),
     .executable(name: "swiftty-bench", targets: ["SwifttyBench"]),
     .executable(name: "swmux", targets: ["SwiftMuxCLI"]),
@@ -36,26 +40,33 @@ let package = Package(
     .executable(name: "swifttyd", targets: ["Swifttyd"]),
   ],
   dependencies: [
-    .package(url: "https://github.com/apple/swift-nio.git", from: "2.86.0"),
-    .package(url: "https://github.com/apple/swift-nio-ssh.git", from: "0.11.0"),
+    .package(url: "https://github.com/apple/swift-nio.git", from: "2.104.0"),
+    .package(url: "https://github.com/apple/swift-nio-ssh.git", from: "0.15.0"),
     .package(
       url: "https://github.com/apple/swift-nio-transport-services.git",
-      from: "1.25.0"
+      from: "1.28.0"
     ),
     .package(
       url: "https://github.com/apple/swift-crypto.git",
-      "3.0.0" ..< "5.0.0"
+      // NIOSSH 0.15.0 currently requires Crypto < 5.0.0.
+      "4.5.2" ..< "6.0.0"
     ),
     .package(
       url: "https://github.com/apple/swift-certificates.git",
-      from: "1.10.0"
+      from: "1.21.0"
     ),
   ],
   targets: [
     // Headless terminal engine: parser, state, history, input encoding
     // and PTY processes. No Metal, fonts or AppKit; the SwiftMux service
     // links only this.
-    .target(name: "SwifttyEngine", swiftSettings: core),
+    .target(
+      name: "SwifttyEngine",
+      dependencies: ["CScrollbackChecksum"],
+      swiftSettings: core
+    ),
+    // CRC-32C instructions for verifying compressed scrollback.
+    .target(name: "CScrollbackChecksum"),
     .target(
       name: "SwifttyCore",
       dependencies: ["SwifttyEngine"],
@@ -70,8 +81,9 @@ let package = Package(
       name: "Swiftty",
       dependencies: [
         "SwifttyCore", "SwifttyMac", "SwiftMuxClient", "SwiftMuxBridge",
-        "MuxNavigation", "MuxNavigationSMX",
-      ]
+        "MuxNavigation", "MuxNavigationSMX", "HostConnection",
+      ],
+      resources: [.process("Localizable.xcstrings")]
     ),
     // SwiftMux (spec.multiplexer.md): shared messages, engine bridge,
     // service, PTY launcher, client connection and frontends.
@@ -107,7 +119,8 @@ let package = Package(
     // Foundation only, so the watch companion can link it.
     .target(
       name: "MuxNavigation",
-      dependencies: ["SwiftMuxProtocol", "CompanionModel"]
+      dependencies: ["SwiftMuxProtocol", "CompanionModel"],
+      resources: [.process("Localizable.xcstrings")]
     ),
     // The navigator's local SwiftMux (XPC) service adapter; macOS only.
     .target(
@@ -124,7 +137,7 @@ let package = Package(
     ),
     .target(
       name: "SwiftMuxTerminal",
-      dependencies: ["SwiftMuxClient", "SwiftMuxProtocol"]
+      dependencies: ["SwiftMuxClient", "SwiftMuxProtocol", "SwifttyEngine"]
     ),
     .executableTarget(
       name: "SwiftMuxCLI",
@@ -176,6 +189,18 @@ let package = Package(
         ), .product(name: "Crypto", package: "swift-crypto"),
       ]
     ),
+    // SSH identities (spec.ssh-identity.md): metadata, Keychain storage,
+    // read-only resolution and bounded OpenSSH key import. Client-only:
+    // never linked by the engine, SwiftMux, swifttyd or the watch.
+    .target(
+      name: "SSHIdentity",
+      dependencies: [
+        "SSHClient", .product(name: "Crypto", package: "swift-crypto"),
+        // AES-CTR/CBC for encrypted key import; already linked by X509.
+        .product(name: "CryptoExtras", package: "swift-crypto"),
+      ],
+      resources: [.process("Localizable.xcstrings")]
+    ),
     // Network framework QUIC, TLS identity and pinning policy.
     .target(
       name: "AppleTransport",
@@ -206,6 +231,11 @@ let package = Package(
     ),
     // Bounded watch/iPhone status DTOs; no SSH/RST secrets, no Swiftty.
     .target(name: "CompanionModel"),
+    // Pairing-code descriptor and Bonjour discovery contract shared by the
+    // native Mac exporter and the direct-client importer
+    // (spec.connection-setup.md). Foundation only: no UI, credentials,
+    // PTYs or network I/O.
+    .target(name: "HostConnection"),
     // Shared app model and per-platform UI for the direct clients
     // (Apps/* app targets are thin XcodeGen wrappers around this).
     .target(
@@ -213,11 +243,13 @@ let package = Package(
       dependencies: [
         "SessionCore", "ScreenProtocol", "SSHClient", "TerminalSurface",
         "CompanionModel", "SwifttyCore", "SwifttyMobile", "MuxNavigation",
-        // AppKit surface for the native Mac client only; never Catalyst.
+        "HostConnection", "SSHIdentity",
+        // AppKit surface for native macOS builds (the SwiftPM test host).
         .target(name: "SwifttyMac", condition: .when(platforms: [.macOS])),
         .product(name: "Crypto", package: "swift-crypto"),
       ],
       path: "Apps/Shared",
+      resources: [.process("Localizable.xcstrings")],
       swiftSettings: core
     ),
     // The fixed no-PTY SSH bootstrap helper; relays to the service.
@@ -257,6 +289,18 @@ let package = Package(
       ]
     ),
     .testTarget(
+      name: "HostConnectionTests",
+      dependencies: ["HostConnection", "TestSupport"]
+    ),
+    .testTarget(
+      name: "SSHIdentityTests",
+      dependencies: [
+        "SSHIdentity", "SSHClient",
+        .product(name: "Crypto", package: "swift-crypto"),
+      ],
+      resources: [.copy("Fixtures")]
+    ),
+    .testTarget(
       name: "MuxAttentionTests",
       dependencies: ["MuxAttention", "SwiftMuxProtocol"]
     ),
@@ -265,7 +309,7 @@ let package = Package(
       dependencies: [
         "Swiftty", "SwifttyMac", "SwifttyCore", "TestSupport",
         "SwiftMuxService", "SwiftMuxClient", "SwiftMuxProtocol",
-        "SwiftMuxExport", "MuxNavigation", "MuxNavigationSMX",
+        "SwiftMuxExport", "MuxNavigation", "MuxNavigationSMX", "HostConnection",
       ]
     ),
     .testTarget(
@@ -280,6 +324,7 @@ let package = Package(
         "SessionCore", "ScreenProtocol", "SSHClient", "AppleTransport",
         "TerminalHost", "TerminalSurface", "SwifttyCore", "TestSupport",
         "RoamingApp", "SwiftMuxProtocol", "SwiftMuxService", "SwiftMuxClient",
+        "HostConnection", "MuxNavigation", "SSHIdentity",
         .product(name: "NIOCore", package: "swift-nio"),
         .product(name: "NIOPosix", package: "swift-nio"),
         .product(name: "NIOSSH", package: "swift-nio-ssh"),

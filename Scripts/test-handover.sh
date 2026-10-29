@@ -82,7 +82,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: $bundle
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Roaming SSH connects to your Mac.
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Swiftty connects to your Mac.
 YML
 cd "$workspace/handover"
 xcodegen generate --spec project.yml >/dev/null

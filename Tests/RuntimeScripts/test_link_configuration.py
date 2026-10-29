@@ -14,10 +14,15 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-TARGETS = ["MobileClient", "MacClient", "CatalystClient", "VisionClient"]
+TARGETS = ["MobileClient", "CatalystClient", "VisionClient"]
 ENTITLEMENT = "com.apple.developer.associated-domains"
 TEAM = "TEAMID1234"
-BUNDLES = ["dev.swiftty.fixture.mobile", "dev.swiftty.fixture.mac"]
+BUNDLES = ["dev.swiftty.fixture.mobile", "dev.swiftty.fixture.catalyst"]
+BONJOUR = "_swiftty._tcp"
+MULTICAST = "com.apple.developer.networking.multicast"
+# spec.ssh-identity.md §10: one access group for entitlements and runtime.
+ACCESS_GROUP = "$(AppIdentifierPrefix)dev.chr33s.swiftty"
+KEYCHAIN = {"keychain-access-groups": [ACCESS_GROUP]}
 TOOL = '''#!/PYTHON
 import json, os, sys
 from pathlib import Path
@@ -37,7 +42,8 @@ class LinkConfigurationTests(unittest.TestCase):
         self.root = Path(directory.name)
         self.environment = dict(os.environ)
         for key in ["SWIFTTY_LINK_DOMAINS", "SWIFTTY_LINK_MODE",
-                    "SWIFTTY_PROVISIONING_PROFILE", "NOTARY_PROFILE"]:
+                    "SWIFTTY_PROVISIONING_PROFILE", "NOTARY_PROFILE",
+                    "NOTARY_KEY_ID", "SWIFTTY_CLOUDKIT_CONTAINER"]:
             self.environment.pop(key, None)
 
     def run_script(self, name, *arguments, **environment):
@@ -69,11 +75,12 @@ class LinkConfigurationTests(unittest.TestCase):
                 domains = ["links.example.com", "other.example.com"]
                 info = self.read_plist(output / "AttentionLinks.plist")
                 base_info = self.read_plist(ROOT / "Apps/Config/AttentionLinks.plist")
-                self.assertEqual(info, {**base_info, "SwifttyAssociatedDomains": domains})
+                self.assertEqual(info, {**base_info, "SwifttyAssociatedDomains": domains,
+                                        "SwifttyKeychainAccessGroup": ACCESS_GROUP})
                 suffix = "?mode=developer" if mode else ""
                 for target in TARGETS:
                     base = ROOT / f"Apps/{target}/{target}.entitlements"
-                    expected = self.read_plist(base) if base.exists() else {}
+                    expected = {**(self.read_plist(base) if base.exists() else {}), **KEYCHAIN}
                     expected[ENTITLEMENT] = [f"applinks:{domain}{suffix}" for domain in domains]
                     self.assertEqual(self.read_plist(output / f"{target}.entitlements"), expected)
 
@@ -85,7 +92,9 @@ class LinkConfigurationTests(unittest.TestCase):
         for target in TARGETS:
             base = ROOT / f"Apps/{target}/{target}.entitlements"
             self.assertEqual(self.read_plist(output / f"{target}.entitlements"),
-                             self.read_plist(base) if base.exists() else {})
+                             {**(self.read_plist(base) if base.exists() else {}), **KEYCHAIN})
+        self.assertNotIn("SwifttyCloudKitContainer",
+                         self.read_plist(output / "AttentionLinks.plist"))
         for setting in [{"SWIFTTY_LINK_DOMAINS": "invalid_domain.example"},
                         {"SWIFTTY_LINK_DOMAINS": "links.example.com", "SWIFTTY_LINK_MODE": "invalid"}]:
             with self.subTest(setting=setting):
@@ -94,6 +103,60 @@ class LinkConfigurationTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 64, result.stderr)
                 self.assertFalse(rejected.exists())
 
+    def test_cloudkit_is_opt_in_and_never_shells_container(self):
+        output = self.root / "cloud"
+        container = "iCloud.dev.chr33s.swiftty"
+        self.assert_success(self.run_script(
+            "configure-links.sh", output, SWIFTTY_CLOUDKIT_CONTAINER=container))
+        info = self.read_plist(output / "AttentionLinks.plist")
+        self.assertEqual(info["SwifttyCloudKitContainer"], container)
+        for target in TARGETS:
+            entitlements = self.read_plist(output / f"{target}.entitlements")
+            self.assertEqual(entitlements["com.apple.developer.icloud-container-identifiers"],
+                             [container])
+            self.assertEqual(entitlements["com.apple.developer.icloud-services"], ["CloudKit"])
+            self.assertEqual(entitlements["keychain-access-groups"], [ACCESS_GROUP])
+        for value in ["iCloud.dev.chr33s.shell", "dev.chr33s.swiftty", "iCloud.bad name"]:
+            with self.subTest(value=value):
+                rejected = self.root / "rejected-cloud"
+                result = self.run_script("configure-links.sh", rejected,
+                                         SWIFTTY_CLOUDKIT_CONTAINER=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((rejected / "MobileClient.entitlements").exists())
+
+    def test_generated_client_plist_carries_the_bonjour_declaration(self):
+        output = self.root / "generated"
+        self.assert_success(self.run_script("configure-links.sh", output))
+        base = self.read_plist(ROOT / "Apps/Config/AttentionLinks.plist")
+        info = self.read_plist(output / "AttentionLinks.plist")
+        self.assertEqual(base["NSBonjourServices"], [BONJOUR])
+        self.assertEqual(info["NSBonjourServices"], [BONJOUR])
+        self.assertEqual(info["CFBundleURLTypes"], base["CFBundleURLTypes"])
+        for target in TARGETS:
+            self.assertNotIn(MULTICAST, self.read_plist(output / f"{target}.entitlements"))
+
+    def test_project_declares_camera_only_for_the_scanning_client(self):
+        project = (ROOT / "Apps/project.yml").read_text()
+        blocks = {}
+        current = None
+        for line in project.splitlines():
+            if line.startswith("  ") and not line.startswith("   ") and line.rstrip().endswith(":"):
+                current = line.strip()[:-1]
+                blocks[current] = []
+            elif current is not None:
+                blocks[current].append(line)
+        camera = [name for name, lines in blocks.items()
+                  if any("NSCameraUsageDescription" in line for line in lines)]
+        self.assertEqual(camera, ["MobileClient"])
+        watch = "\n".join(blocks["WatchCompanion"])
+        for key in ["NSCameraUsageDescription", "NSLocalNetworkUsageDescription",
+                    "AttentionLinks.plist", "RoamingApp", "HostConnection"]:
+            self.assertNotIn(key, watch)
+        self.assertIn("Find and connect to your Mac", project)
+        self.assertNotIn(MULTICAST, project)
+        for entitlements in (ROOT / "Apps").glob("*/*.entitlements"):
+            self.assertNotIn(MULTICAST, entitlements.read_text())
+
     def test_native_package_preserves_literal_domains_without_real_build_or_signing(self):
         tools = self.root / "bin"
         tools.mkdir()
@@ -101,15 +164,19 @@ class LinkConfigurationTests(unittest.TestCase):
         products.mkdir()
         for name in ["swiftty", "swiftmux-agent", "swmux-launcher", "swmux"]:
             (products / name).write_text("owned fixture executable\n")
-        resources = products / "swiftty_SwifttyCore.bundle"
-        resources.mkdir()
-        (resources / "fixture").write_text("owned resource\n")
+        for target in ["SwifttyCore", "Swiftty", "MuxNavigation"]:
+            resources = products / f"swiftty_{target}.bundle"
+            resources.mkdir()
+            (resources / "fixture").write_text("owned resource\n")
         for name in ["swift", "codesign"]:
             executable = tools / name
             executable.write_text(TOOL.replace("/PYTHON", sys.executable))
             executable.chmod(0o700)
         (self.root / "applinks:links.example.comXmode=developer").touch()
         (self.root / "applinks:links.example.comYmode=developer").touch()
+        # The script copies the app icon from the repository-relative
+        # Resources directory of its working directory.
+        (self.root / "Resources").symlink_to(ROOT / "Resources")
         for mode in ["", "developer"]:
             with self.subTest(mode=mode):
                 output = self.root / ("package " + (mode or "normal"))
@@ -127,8 +194,15 @@ class LinkConfigurationTests(unittest.TestCase):
                             ["links.example.com", "other.example.com"]]
                 self.assertEqual(self.read_plist(output / "Swiftty.entitlements"), {ENTITLEMENT: expected})
                 app = output / "Swiftty GRID.app"
-                self.assertEqual(self.read_plist(app / "Contents/Info.plist")["SwifttyAssociatedDomains"],
+                info = self.read_plist(app / "Contents/Info.plist")
+                self.assertEqual(info["SwifttyAssociatedDomains"],
                                  ["links.example.com", "other.example.com"])
+                # Foreground discovery (spec.connection-setup.md D5): a
+                # real array, a purpose string, and no multicast entitlement.
+                self.assertEqual(info["NSBonjourServices"], [BONJOUR])
+                self.assertTrue(info["NSLocalNetworkUsageDescription"].strip())
+                self.assertEqual(info["CFBundleURLTypes"][0]["CFBundleURLSchemes"], ["swiftty"])
+                self.assertNotIn(MULTICAST, self.read_plist(output / "Swiftty.entitlements"))
                 commands = [json.loads(line) for line in calls.read_text().splitlines()]
                 self.assertEqual(sum(name == "swift" for name, _ in commands), 2)
                 self.assertEqual(sum(name == "codesign" for name, _ in commands), 5)

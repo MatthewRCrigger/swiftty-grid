@@ -13,8 +13,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SCHEMES = ["MobileClient", "MacClient", "CatalystClient", "VisionClient",
-           "TVClient", "WatchCompanion"]
+SCHEMES = ["MobileClient", "CatalystClient", "VisionClient", "TVClient",
+           "WatchCompanion"]
 TOOL = r'''#!/PYTHON
 import json, os, plistlib, resource, sys, tempfile
 from pathlib import Path
@@ -38,7 +38,7 @@ def break_report(stage):
             (directory / "saved-report").write_bytes(evidence.read_bytes())
             evidence.unlink()
             evidence.mkdir()
-        elif stage == "MacClient":
+        elif stage == "CatalystClient":
             evidence.rmdir()
             evidence.write_bytes((directory / "saved-report").read_bytes())
     if os.environ.get("FIXTURE_BREAK_REPORT") == stage:
@@ -57,12 +57,12 @@ elif name == "xcodegen":
     root = Path(args[args.index("--project") + 1])
     generated = root / "Config/Generated"
     generated.mkdir(parents=True, exist_ok=True)
-    for target in ["MobileClient", "MacClient", "CatalystClient", "VisionClient"]:
+    for target in ["MobileClient", "CatalystClient", "VisionClient"]:
         (generated / (target + ".entitlements")).write_bytes(plistlib.dumps({
             "com.apple.developer.associated-domains": ["applinks:links.example.test"]}))
     bad = os.environ.get("FIXTURE_BAD_ENTITLEMENT")
-    if bad == "missing": (generated / "MacClient.entitlements").unlink()
-    elif bad == "malformed": (generated / "MacClient.entitlements").write_text("not a plist")
+    if bad == "missing": (generated / "CatalystClient.entitlements").unlink()
+    elif bad == "malformed": (generated / "CatalystClient.entitlements").write_text("not a plist")
     sys.exit(int(os.environ.get("FIXTURE_GENERATE_CODE", "0")))
 elif name == "xcodebuild":
     if args == ["-version"]: print("Xcode fixture 27.0")
@@ -181,14 +181,13 @@ class PlatformBuildEvidenceTests(unittest.TestCase):
                 destination = call["args"][call["args"].index("-destination") + 1]
                 self.assertEqual(destination, {
                     "MobileClient": "generic/platform=iOS Simulator",
-                    "MacClient": "generic/platform=macOS",
                     "CatalystClient": "generic/platform=macOS,variant=Mac Catalyst",
                     "VisionClient": "generic/platform=visionOS Simulator",
                     "TVClient": "generic/platform=tvOS Simulator",
                     "WatchCompanion": "generic/platform=watchOS Simulator",
                 }[scheme])
         rows = [line for line in report.splitlines() if "app-source warnings:" in line]
-        self.assertEqual(len(rows), 6)
+        self.assertEqual(len(rows), 5)
         self.assertTrue(all("PASS; app-source warnings: 1" in line for line in rows))
 
     def test_default_report_is_created_in_the_owned_workspace(self):
@@ -249,7 +248,7 @@ class PlatformBuildEvidenceTests(unittest.TestCase):
         self.assert_all_builds_collected()
         report = self.evidence.read_text()
         rows = [line for line in report.splitlines() if "app-source warnings:" in line]
-        self.assertEqual(len(rows), 5)
+        self.assertEqual(len(rows), 4)
         self.assertFalse(any(row.startswith("MobileClient") for row in rows))
         self.assertIn("Scope of this evidence", report)
         self.assertIn(report, result.stdout)
@@ -322,7 +321,7 @@ class PlatformBuildEvidenceTests(unittest.TestCase):
         self.assert_all_builds_collected()
         rows = [line for line in self.evidence.read_text().splitlines()
                 if "app-source warnings:" in line]
-        self.assertEqual(len(rows), 6)
+        self.assertEqual(len(rows), 5)
         self.assertTrue(all("PASS; app-source warnings: 0" in line for line in rows))
 
 

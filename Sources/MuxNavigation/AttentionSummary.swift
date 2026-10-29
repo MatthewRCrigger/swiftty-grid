@@ -76,18 +76,23 @@ public struct AttentionSummary: Sendable, Equatable, Codable {
   }
 
   /// "2 min ago" style text relative to `now`.
+  /// A format style rather than a `RelativeDateTimeFormatter`, which
+  /// would be allocated again for every row on every redraw.
   public func relativeTime(now: Date) -> String {
-    let formatter = RelativeDateTimeFormatter()
-    formatter.unitsStyle = .short
-    return formatter.localizedString(for: min(updatedAt, now), relativeTo: now)
+    Date.AnchoredRelativeFormatStyle(
+      anchor: min(updatedAt, now),
+      presentation: .numeric,
+      unitsStyle: .abbreviated
+    )
+    .format(now)
   }
 
   /// A one-line, non-secret label: never the program title or message.
-  public var categoryLabel: String {
+  public var categoryLabel: LocalizedStringResource {
     switch category {
-    case .needsYou: "Needs you"
-    case .failure: "Failed"
-    case .result: "Result"
+    case .needsYou: LocalizedStringResource("Needs you", bundle: #bundle)
+    case .failure: LocalizedStringResource("Failed", bundle: #bundle)
+    case .result: LocalizedStringResource("Result", bundle: #bundle)
     }
   }
 

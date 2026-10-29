@@ -32,7 +32,7 @@ extension MainActorIntegrationTests {
       let defaults = try #require(UserDefaults(suiteName: domain))
       defer { defaults.removePersistentDomain(forName: domain) }
       let model = RoamingAppModel(
-        store: HostProfileStore(
+        store: ConnectionStore(
           fileURL: directory.appendingPathComponent("hosts.json")
         ),
         resumeStore: SessionResumeStore(defaults: defaults)

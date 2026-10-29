@@ -11,7 +11,10 @@ struct TVClientApp: App {
   var body: some Scene {
     WindowGroup {
       RoamingRootView(model: model)
-        .environment(\.terminalSurfaceFactory, .live(model))
+        .environment(
+          \.terminalSurfaceFactory,
+          LiveTerminalSurfaceFactory(app: model)
+        )
     }
   }
 }

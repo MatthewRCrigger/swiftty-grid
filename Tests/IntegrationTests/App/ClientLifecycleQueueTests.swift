@@ -165,6 +165,32 @@ extension MainActorIntegrationTests {
       await fixture.client.close()
     }
 
+    @Test
+    func callsRunWhileTheMainQueueIsBlocked() async throws {
+      let fixture = try RoamingFixture()
+      try #require(try await fixture.startActive())
+      let queue = ClientLifecycleQueue()
+      queue.use(fixture.client)
+      // A quit blocks the main queue while it waits for a close, which
+      // first waits for the call already dispatched.
+      await withCheckedContinuation { continuation in
+        DispatchQueue.main.async {
+          let call = queue.enqueue { client in
+            await client.proposeGrid(columns: 30, rows: 4)
+          }
+          let finished = DispatchSemaphore(value: 0)
+          Task.detached {
+            await call?.value
+            finished.signal()
+          }
+          #expect(finished.wait(timeout: .now() + 2) == .success)
+          continuation.resume()
+        }
+      }
+      #expect(await eventually { await fixture.host.columns == 30 })
+      await fixture.client.close()
+    }
+
     private func eventually(
       _ timeout: Duration = .seconds(2),
       _ condition: @MainActor () async -> Bool,

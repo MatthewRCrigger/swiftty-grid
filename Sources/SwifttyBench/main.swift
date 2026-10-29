@@ -21,7 +21,8 @@ struct Options: Sendable {
   static let names: Set<String> = [
     "ascii", "utf8", "utf8-cjk", "utf8-latin", "compiler-log", "cat-source",
     "csi-heavy", "osc-heavy", "scroll", "redraw", "scroll-frames", "resize",
-    "latency", "storage",
+    "latency", "storage", "scrollback-memory", "scrollback-compression",
+    "scrollback-resume",
   ]
 
   static func parse(
@@ -748,3 +749,6 @@ runScrollFrames()
 runResize()
 runLatency()
 runStorageBenchmarks()
+runScrollbackMemoryBenchmarks()
+runScrollbackCompressionBenchmarks()
+runScrollbackResumeBenchmarks()

@@ -46,7 +46,7 @@ The following feature table describes the full-client profile. §2.1 narrows it 
 | Plain SSH fallback when the helper or UDP is unavailable | Automatic conversion of a roaming session into a plain SSH session |
 | Unicode text, common terminal attributes, alternate screen, keyboard/paste | Terminal graphics, remote clipboard writes, speculative echo |
 
-A direct client may manage several saved sessions, but **only one roaming terminal is actively attached per client application at a time in the minimal UI**. Each server session permits one controlling client across all platforms. New platforms do not enable concurrent writers or automatic cross-device credential synchronization. The watchOS companion does not attach to RST/1 or acquire a writer lease.
+A direct client may manage several saved sessions, but **only one roaming terminal is actively attached per client application at a time in the minimal UI**. Each server session permits one controlling client across all platforms. New platforms do not enable concurrent writers or automatic cross-device credential synchronization. [spec.ssh-identity.md](spec.ssh-identity.md) supersedes the device-only credential exclusion for iPhone, iPad, Mac Catalyst and visionOS: SSH identities stay device-only by default, and syncing one through iCloud Keychain, or syncing profiles and public metadata through CloudKit, is an explicit per-identity or per-setting opt-in. The watchOS companion does not attach to RST/1 or acquire a writer lease.
 
 No Mosh, tssh, tsshd, trzsz, or ZMODEM interoperability is claimed. No additional file-transfer utility is required on macOS: Remote Login provides SSH and SFTP. [S2]
 
@@ -56,8 +56,7 @@ No Mosh, tssh, tsshd, trzsz, or ZMODEM interoperability is claimed. No additiona
 |---|---|---|
 | iPhone client | iOS 27.0 | Full client: SSH shell/exec, roaming terminal, SFTP |
 | iPad client | iPadOS 27.0 | Full client: SSH shell/exec, roaming terminal, SFTP |
-| Native Mac client | macOS 27.0 | Full client plus optional app-local PTY |
-| Mac Catalyst client | Mac Catalyst 27.0, running on macOS 27.x | Full remote client using the UIKit-derived frontend; no app-local PTY |
+| Mac client | Mac Catalyst 27.0, running on macOS 27.x | Full remote client using the UIKit-derived frontend; no app-local PTY (local shells are Swiftty.app's, Appendix A) |
 | Spatial client | visionOS 27.0 | Full remote client in a native window; immersive presentation deferred |
 | Television client | tvOS 27.0 | SSH shell/exec and roaming terminal; keyboard/focus-oriented UI; no SFTP in v1 |
 | Watch companion | watchOS 27.0 with paired iOS 27.x app | Read-only, timestamped session status and optional bounded text preview; no direct SSH, QUIC, SFTP, or shell input |
@@ -116,6 +115,80 @@ All included products require distinct build and device/runtime evidence. Test i
 For each advertised platform, cover the 27.0 baseline and the selected shipping 27.x runtime, recording exact toolchain, SDK, runtime, entitlements, dependency revisions, and exercised features. Run SSH/RST tests on every direct client and SFTP tests on every full client; use companion-specific tests rather than direct-network tests on watchOS. Cellular handover applies only to devices with cellular capability; other clients require applicable path-switch, sleep/suspend, and reconnect tests.
 
 Platforms may be implemented in stages, but all rows above remain in product scope. Do not claim the complete platform family is released until every included profile passes its applicable gates. Linux/Windows porting and older-OS CI are not part of these gates.
+
+**macOS integration evidence, 2026-10-27:** `Scripts/test-real-ssh.sh` passed all
+four real-OpenSSH tests with both the default Network.framework transport and
+`RST_REAL_SSH_POSIX=1`, using Swift 6.4.1, the macOS 27.0 SDK and macOS 27.0.1
+(26A434). The debug tests cover host-key decisions, an ordinary SSH shell,
+SSH bootstrap followed by QUIC attachment, and SFTP upload/download. The SFTP
+test now cancels at a partial checkpoint and proves continuation on a new client
+without restarting, retaining its 1,000,003-byte payload and default request
+window. Both event streams passed the completion audit and fixture cleanup
+succeeded. This is Mac integration evidence; Release, other platform profiles,
+physical-device behavior and the full acceptance matrix remain separate gates.
+
+### 2.5 Xcode security build settings
+
+The XcodeGen targets `MobileClient`, `CatalystClient`, `VisionClient`, `TVClient`
+and `WatchCompanion` use `Apps/project.yml` as the source of build settings; the
+generated `.xcodeproj` is gitignored. Base entitlements live in
+`Apps/<Target>/<Target>.entitlements` and are merged by
+`Scripts/configure-links.sh` into `Apps/Config/Generated/`. The following records
+the Xcode 27 configuration and compatibility findings from 2026-10-21; revalidate
+toolchain limitations when upgrading Xcode.
+
+**Enabled configuration:**
+
+- Set `ENABLE_ENHANCED_SECURITY` in project-level `settings.base`, inherited by
+  all five targets. It enables pointer authentication (arm64 + arm64e), security
+  compiler warnings, `GCC_WARN_SHADOW`, typed allocator support and libc++ hardening,
+  subject to the target overrides below.
+- `Scripts/configure-arm64e-packages.sh`, invoked by XcodeGen's `postGenCommand`,
+  sets `iOSPackagesShouldBuildARM64e` in the generated workspace's
+  `WorkspaceSettings.xcsettings`. Shared app logic lives in Swift packages, so
+  app-wrapper slices alone do not provide pointer-authentication coverage. The
+  inspected Xcode 27 frameworks recognize this key, with no `macOS…` or
+  `visionOS…` variants; device packages build as arm64e for iOS, visionOS and
+  watchOS, while Catalyst and tvOS packages remain arm64.
+- Set project-level `EXCLUDED_ARCHS[sdk=*simulator*]` to `x86_64`. With the package
+  flag enabled, simulator packages build for arm64 only; an x86_64 app slice fails
+  to resolve those modules. The configured macOS 27 host baseline is Apple silicon.
+- MobileClient, CatalystClient and VisionClient enable
+  `com.apple.security.hardened-process`, its `enhanced-security-version-string`
+  set to `2`, `hardened-heap`, `dyld-ro`, and `platform-restrictions-string` set to
+  `2`. They also enable `checked-allocations` and `checked-allocations.soft-mode`
+  under that entitlement prefix. Soft mode produces simulated crash reports
+  without terminating; disable it only after reports are clean on A19 / M5 or
+  later hardware.
+- XcodeGen's default presets already provide `GCC_WARN_ABOUT_RETURN_TYPE=YES_ERROR`,
+  `GCC_WARN_UNINITIALIZED_AUTOS=YES_AGGRESSIVE`,
+  `GCC_WARN_64_TO_32_BIT_CONVERSION` and `CLANG_WARN_EMPTY_BODY`. They are not
+  duplicated in `project.yml`. The app targets compile only Swift, so these
+  C/Objective-C warnings and analyzer settings have little effect there.
+
+**Compatibility overrides:** CatalystClient and TVClient set
+`ENABLE_POINTER_AUTHENTICATION=NO` and
+`ENABLE_HARDWARE_CHECKED_POINTER_ARITHMETIC_SLICE=NO`. Generic device builds on
+2026-10-21 could not import `RoamingApp` into an arm64e app slice because Xcode 27
+did not produce matching package slices. Other Enhanced Security settings remain
+enabled, including Catalyst's hardened-process entitlements. Remove these
+overrides only after matching package builds are supported and validated.
+
+**Deferred decisions:**
+
+- MobileClient's `ENABLE_HARDWARE_CHECKED_POINTER_ARITHMETIC_SLICE` and
+  `com.apple.security.hardened-process.checked-allocations.enforce-checked-pointer-arithmetic-overflow`
+  remain disabled. The recorded hardware requirement is A20 Pro or later, with
+  no soft mode. Most app code is Swift, where integer overflow already traps;
+  the C surface is mainly swift-nio shims and system zlib. Revisit after one or
+  two releases of clean memory-tagging soft-mode reports, first in TestFlight.
+- TVClient and WatchCompanion inherit the project build setting but have no
+  Enhanced Security entitlements: the capability's recorded platform scope is
+  iOS, macOS, visionOS and DriverKit. Revisit if platform support changes.
+- Native SwiftPM app/helper signing is a separate boundary; see
+  [native packaging security](spec.multiplexer.md#native-packaging-security).
+  Package C warnings and annotation-based bounds safety are specified in
+  [the core build policy](spec.md#swiftpm-c-security-settings).
 
 ## 3. Components and dependency boundary
 
@@ -282,6 +355,12 @@ Use one bidirectional stream for control and input. Send each screen snapshot on
 
 A snapshot stream is reliable while useful, but may be canceled when superseded. Loss within that stream can delay its completion; independent streams do not remove shared congestion or all latency. This is intentionally simpler than a generic state-delta protocol.
 
+Snapshot bytes and control records in the same direction also share connection-level
+flow-control credit. A peer withholding reads can exhaust that credit and delay
+newer snapshots and control records. Delayed-reader tests must verify bounded work
+and prompt recovery after reads resume; independent ordering does not guarantee
+progress beyond the advertised connection limit. [S10, §4]
+
 ### 7.2 Record format
 
 Control records are `UInt32BE(length)` followed by a UTF-8 JSON object. The length excludes its own four bytes. Every object has a `type` field. Binary data uses base64; 64-bit counters use decimal strings. Reject unknown message types in version 1 and ignore unknown optional object fields.
@@ -295,6 +374,8 @@ UInt32BE    encodedLength
 Byte[]      encoded snapshot JSON
 ```
 
+A sender that abandons a snapshot before writing its record ends the stream with an empty FIN instead; the receiver releases that stream without delivering anything.
+
 Compression is independent per snapshot, without a cross-snapshot dictionary. Bound lengths before allocation and during decompression. RFC 1950 is the required framing, not an unspecified “deflate” variant. [S12]
 
 | Message | Purpose |
@@ -306,9 +387,10 @@ Compression is independent per snapshot, without a cross-snapshot dictionary. Bo
 | `Detach` / `Detached` | Stop this attachment without destroying the shell |
 | `Terminate` / `Terminated` | Explicitly destroy the owned session |
 | `SessionExited` | Report shell exit status and final screen revision |
+| `Viewport` | With `historyViewport`: move this attachment's own history window |
 | `Error` | Bounded typed failure; never a stack trace or secret-bearing diagnostic |
 
-`Attached` includes `attachmentEpoch`, `writerID`, `lastFullyAppliedInputSequence`, any admitted partial-operation identifier, and current resize revision. Every subsequent control record is scoped to that epoch.
+`Attached` includes `attachmentEpoch`, `writerID`, `lastFullyAppliedInputSequence`, any admitted partial-operation identifier, and current resize revision. Every subsequent control record is scoped to that epoch. It may also carry `features`, a list of additive behaviours the host accepts; peers ignore names they do not know, and an absent list means none. `keypadKeys` admits numeric keypad key names (`kp:one`, `kp:enter`, `kp:pageUp`, …, matching the client's keypad keys). Without it, clients send the main-keyboard key a keypad key types and drop Keypad Begin, which has none. `historyViewport` admits `Viewport` (`attachmentEpoch`, signed `lines`, at most ±1,000,000; positive reveals older output). The host moves that attachment's own window through the primary screen's history, clamped to the retained rows and anchored to an absolute row so it stays put while output arrives, and exports it in place of the live screen with the cursor hidden. The host's own view never moves; the alternate screen has no window; input returns the window to live output, as does moving past the newest line. Clients send `Viewport` only to hosts that advertise the feature, so older hosts never see it.
 
 ### 7.3 Bounded snapshot scheduling
 
@@ -319,6 +401,34 @@ Retain at most **two in-flight snapshot streams and one latest unsent snapshot r
 - Acknowledgment of revision R retires all streams older than R. Promote a surviving newer stream to protected status, or create one from current state.
 
 The client displays only the newest complete revision. Partial snapshots are never visible. If transport credit is exhausted, replace the unsent reference rather than adding a queue entry.
+
+The host rejects a `ScreenAck` beyond the highest revision submitted for sending
+on that attachment, before advancing acknowledgment state or retiring streams.
+Captured screens still waiting for encoding are outside this bound. A valid
+acknowledgment may precede completion of its transport send; zero, duplicate and
+older acknowledgments remain harmless. An impossible acknowledgment closes the
+attachment with `malformed` while retaining the session for reattachment.
+
+Incoming snapshots retain their native stream credit until their delivery callback
+finishes. This bounds queued and active snapshot deliveries together to four.
+Keep every admitted complete payload until decoding: arrival order across streams
+does not establish revision order, so evicting the earliest arrival could discard
+the newest screen while a control callback is still running.
+
+The host runs one snapshot encoder at a time, sharing two active work slots with
+transport sends. A canceled send retains its slot until the transport call returns,
+including across attachment replacement. Waiting captures are limited to the
+current attachment's scheduler-owned streams; superseded captures are discarded
+before encoding, and stale encoding results cannot start a send. This bounds work
+even when encoding or transport completion is delayed.
+
+The QUIC transport also caps unfinished native snapshot sends, including stream
+creation, at eight per connection. Cancelling a caller does not return this
+admission slot while its native write remains pending; the native completion
+returns it. A send abandoned before submission releases its slot immediately.
+Replacing a snapshot records the old stream's pending retirement atomically, so
+a completion racing replacement cannot leave the stream waiting for a callback
+that already ran.
 
 Capture at most 30 times/second, only while attached and dirty. Lower cadence under backpressure. All send paths must respect QUIC flow control, and control/input processing must not wait for compression or rendering.
 
@@ -377,9 +487,25 @@ When a mobile/spatial/TV scene becomes backgrounded or unavailable, stop accepti
 
 Use available background time only for bounded cleanup, then stop networking. No audio, VoIP, location, or background-task workaround is part of this design. iOS may suspend or terminate the process; Apple's background mechanisms provide limited or scheduled runtime, not an indefinitely running terminal. [S14]
 
-For native macOS and Mac Catalyst, loss of window focus alone MUST NOT be treated as process suspension. Honor explicit disconnect, termination, sleep, and network-loss events; preserve the host session and prevent stale input. Each platform adapter maps its actual lifecycle events into the common state machine and validates them on that platform. No Apple client receives an indefinite-background-execution guarantee.
+For the Mac Catalyst client, loss of window focus alone MUST NOT be treated as process suspension. Honor explicit disconnect, termination, sleep, and network-loss events; preserve the host session and prevent stale input. Each platform adapter maps its actual lifecycle events into the common state machine and validates them on that platform. No Apple client receives an indefinite-background-execution guarantee.
 
-On foreground return or recovery from sleep, reconnect as needed and obtain a complete current screen before enabling input. On cold launch, reauthenticate with SSH and resume by session ID. Distinguish “temporarily unreachable” from an authenticated “session no longer exists.”
+On foreground return or recovery from sleep, reconnect as needed and obtain a complete current screen before enabling input. On cold launch, reauthenticate with SSH and resume by session ID. Distinguish “temporarily unreachable” from an authenticated “session no longer exists.” A client attaches only to a workspace the user chose or explicitly created; a remembered session ID is a convenience for resuming, never permission to create a replacement ([spec.connection-setup.md](spec.connection-setup.md) §1.3).
+
+Remembered workspace choices belong to the saved host UUID, its account scope
+(or local-only scope), normalized hostname, port and remote username. Host/key
+renames and credential rotation preserve that choice. A different account or
+endpoint has a separate choice, including across cold launches; returning to
+the original owner restores its choice. A retained terminal's status and close
+callbacks update only its captured owner. The visible resume indicators track
+the currently selected hosts. These identifiers remain nonsecret and never
+replace fresh SSH authorization.
+
+Legacy UUID-only choices lack verifiable ownership and are not automatically
+adopted. Keep them separate; users can select the existing workspace again from
+the authenticated workspace chooser. Likewise, binding a formerly local host to
+an account does not silently adopt its earlier choice. Pending create, resume
+and reveal intents belong to the individual terminal screen and are discarded
+when that screen closes, even if its lazy backend never started.
 
 If UDP is blocked, offer ordinary SSH. This opens a **different** shell; the retained roaming shell remains available until expiry. Same-session RST tunneling through an SSH channel is a later extension, not a hidden v1 promise.
 
@@ -398,6 +524,32 @@ Limit the UI to regular files, directory navigation, upload, download, cancel, a
 Keep directory rows associated with their displayed path: clear old rows when listing starts and reject superseded list results, including repeated refreshes of the same path. Upload preparation belongs to its presentation; cancellation or dismissal must prevent late manifests, overwrite prompts and uploads from appearing in a reopened browser. Join owned preparation and discard any late staged file or staging result whose checkpoint cannot be saved.
 
 Transfer checkpoints are nonsecret JSON capped at 64 KiB per file. Validate regular-file type and size on the opened descriptor before reading, enforce the read cap if the file grows, and reject invalid progress or oversized encoding before replacing a checkpoint.
+
+The complete checkpoint envelope records the saved host UUID, owning account
+scope, configured SSH endpoint and remote username. A fresh browser loads only
+matching transfers; a changed account, endpoint or username cannot resume,
+remove or export the old target's files. Key rotation and display-name changes
+do not change the remote file owner. Returning to the original account/endpoint
+restores its saved transfers. Existing authenticated transfers keep their captured
+owner while running, including across account changes.
+Resuming or removing a transfer acquires its latest durable checkpoint together
+with exclusive use. Another browser's cached progress cannot replace a newer
+checkpoint or repeat a completed transfer, and removal uses the current temporary
+paths after a restart.
+
+Older checkpoints without ownership remain on disk and require explicit review
+and confirmation before assignment to a host/account. The same review is offered
+when a previously local host becomes cloud-bound. Incomplete recovered transfers
+restart with fresh staging/temporary paths and no inherited overwrite approval;
+old remote temporary files are left untouched. Completed downloads remain locally
+exportable after confirmation. Assignment itself never starts a connection or
+transfer. Cancelled, superseded or changed-account reviews cannot publish a late
+staged copy, and a running transfer cannot be claimed by another browser. The
+owner and reviewed checkpoint are rechecked before durable replacement; malformed
+or newer owned envelopes cannot downgrade to legacy records.
+Removing a download unlinks only its named local file and removes an empty
+containing directory; it never recursively removes sibling files or a directory
+which has replaced the downloaded file.
 
 For upload, first stage an immutable local source in app-controlled storage. Create a uniquely named remote temporary file beside the destination. Use positioned writes, never append mode. Track the highest contiguous acknowledged offset, not the highest offset submitted.
 
@@ -428,7 +580,6 @@ Sources/
   CompanionModel/    bounded watch/iPhone status DTOs; no SSH/RST secrets
 Apps/
   MobileClient/      iOS/iPadOS full client and iPhone companion bridge
-  MacClient/         native macOS full client; optional local PTY
   CatalystClient/    UIKit-derived full remote client
   VisionClient/      windowed visionOS full remote client
   TVClient/          tvOS SSH/roaming terminal; no SFTP
@@ -492,14 +643,14 @@ All tests below are release gates for their applicable platform profile unless l
 | A7 | Resize repeatedly during alternate-screen use and reconnect | Correct final dimensions, cursor, buffer, and revision ordering |
 | A8 | Run shell editing, `vim`, `less`, `top`, Unicode, combining marks, and wide characters | Server snapshot and client cell model agree for the supported profile |
 | A9 | Trigger terminal queries and malicious clipboard/graphics/control sequences | Replies occur once on the host; unsupported side effects are blocked and buffers remain bounded |
-| A10 | Background/unavailable-scene tests for mobile/spatial/TV clients; sleep and separate relaunch tests for native Mac/Catalyst | Warm or SSH-authorized cold reattachment to the same retained shell; losing Mac window focus alone does not detach; no claim of continued execution while suspended |
+| A10 | Background/unavailable-scene tests for mobile/spatial/TV clients; sleep and separate relaunch tests for the Catalyst Mac client | Warm or SSH-authorized cold reattachment to the same retained shell; losing Mac window focus alone does not detach; no claim of continued execution while suspended |
 | A11 | Present wrong SSH key, wrong TLS pin, expired capability, old attachment epoch, or early input | Fail closed; no shell input accepted |
 | A12 | Restart helper or reboot Mac | Client reports session loss; it never replays commands into a new shell automatically |
 | A13 | Block UDP while leaving SSH reachable | Honest ordinary-SSH fallback; old roaming session is not presented as resumed |
 | A14 | Interrupt SFTP after arbitrary requests; alter prefix; lose rename response | Correct resume or explicit restart/conflict; never falsely report a completed verified file |
 | A15 | Concurrent file transfer and interactive typing | Bounded queues; bulk transfer can yield; no deadlock or cross-stream application blockage |
 | A16 | Fuzz bootstrap, message decoder, decompressor, terminal parser, input state machine, and companion payload decoder | No unbounded allocation, crash, unauthorized operation, or invalid state transition |
-| A17 | Exercise platform-specific profiles | Catalyst desktop input/file access, visionOS window/input/accessibility, and tvOS focus/keyboard/trust prompts pass; tvOS exposes no SFTP; local PTY remains native-macOS-only; all direct clients use identical RST semantics |
+| A17 | Exercise platform-specific profiles | Catalyst desktop input/file access, visionOS window/input/accessibility, and tvOS focus/keyboard/trust prompts pass; tvOS exposes no SFTP; no direct client has a local PTY; all direct clients use identical RST semantics |
 | A18 | Pair physical Apple Watch and iPhone; force unreachable/stale state, lifecycle changes, malformed previews, and opt-out | Companion remains read-only; timestamps stay honest; no network credentials or RST lease exposed; bounds enforced; preview privacy honored; phone is not kept alive or logged in by watch refresh |
 | A19 | Attempt attachment from two client platforms | The existing one-writer policy is enforced; rejected or replaced attachment cannot replay stale input; watch refresh creates no attachment |
 
@@ -509,7 +660,7 @@ Measure typing latency, data usage, CPU, wakeups, and memory separately. Do not 
 
 ## 14. Implementation gates and independent-development record
 
-**Gate 0 — prove the Apple OS 27 platform boundary.** Resolve Swift 6.4 dependencies with the 27.0 deployment targets in §2.1; establish separate build paths for every included profile and pass applicable A0 checks. Demonstrate SSH host verification, no-PTY bootstrap, an independent host PTY, a pinned QUIC connection, multiple snapshot streams with cancellation, and terminal snapshot extraction through the adapter selected in Appendix A. Verify certificate/Keychain integration on every direct-client platform, including physical-device runs and distinct native Mac/Catalyst destinations. Verify the separate watch/iPhone companion path without adding SSH/QUIC to the watch target. Do not add older-platform compatibility work. If a required Network API is unsuitable on the supported 27.x systems, revise this specification before replacing it with custom UDP security.
+**Gate 0 — prove the Apple OS 27 platform boundary.** Resolve Swift 6.4 dependencies with the 27.0 deployment targets in §2.1; establish separate build paths for every included profile and pass applicable A0 checks. Demonstrate SSH host verification, no-PTY bootstrap, an independent host PTY, a pinned QUIC connection, multiple snapshot streams with cancellation, and terminal snapshot extraction through the adapter selected in Appendix A. Verify certificate/Keychain integration on every direct-client platform, including physical-device runs and the Mac Catalyst destination. Verify the separate watch/iPhone companion path without adding SSH/QUIC to the watch target. Do not add older-platform compatibility work. If a required Network API is unsuitable on the supported 27.x systems, revise this specification before replacing it with custom UDP security.
 
 **Gate 1 — first vertical slice.** One configured host, one shell, full snapshot display, semantic keyboard input, resize, and explicit detach/reattach. Match server/client cell models. No prediction, deltas, or feature expansion.
 
@@ -615,7 +766,6 @@ The product comprises:
 | Product | v1 profile |
 |---|---|
 | iOS 27 / iPadOS 27 | Full SSH, SFTP, and roaming-terminal client |
-| Native macOS 27 | Full remote client and optional local PTY backend |
 | Mac Catalyst 27 on macOS 27 | Full remote client using a UIKit-derived frontend; no local PTY |
 | visionOS 27 | Full remote client in a native window |
 | tvOS 27 | SSH and roaming terminal; focus/keyboard UI; no SFTP |
@@ -813,8 +963,7 @@ Separate reusable model/input/snapshot code from platform-specific views or proc
 | Target | Required integration |
 |---|---|
 | iOS/iPadOS | Existing mobile frontend plus external SSH/RST backends, document access, touch/hardware keyboard, and lifecycle recovery |
-| Native macOS | Existing AppKit frontend or extracted reusable library; full remote features; optional local PTY; Mac sleep/relaunch handling |
-| Mac Catalyst | Adapt the UIKit frontend for desktop menus, shortcuts, pointer/window behavior, document access, and entitlement checks; no local PTY or embedded launchd agent |
+| Mac Catalyst | Adapt the UIKit frontend for desktop menus, shortcuts, pointer/window behavior, document access, entitlement checks, and Mac sleep (IOKit power notifications)/quit handling; no local PTY or embedded launchd agent |
 | visionOS | Windowed native frontend sharing rendering/frame logic; validate text/keyboard input, focus, accessibility, resizing, and document access; immersive scenes deferred |
 | tvOS | Focus-first shell/roaming frontend; tested external keyboard/text entry; explicit trust prompts; disable touch-only, clipboard, SFTP, and local-process actions that the profile does not provide |
 | watchOS | Independent SwiftUI status/optional text-preview UI through the paired iPhone; no Swiftty frame import, host credentials, direct networking, or command execution |
@@ -825,7 +974,7 @@ The watch companion follows the main spec's 16 KiB payload limit, one pending re
 
 #### A.6.3 Lifecycle, files, and release evidence
 
-Keep per-platform input, file-access, and lifecycle adapters instead of assuming identical UIKit behavior. Losing a Mac/Catalyst window's focus is not a disconnect event; sleep, termination, and network loss still need recovery. Mobile/spatial/TV unavailable scenes follow their validated suspension policy. The watch never keeps the phone alive. SFTP applies only to full clients, with the same resume/integrity requirements and platform-specific document access.
+Keep per-platform input, file-access, and lifecycle adapters instead of assuming identical UIKit behavior. Losing a Mac window's focus is not a disconnect event; sleep, termination, and network loss still need recovery. Mobile/spatial/TV unavailable scenes follow their validated suspension policy. The watch never keeps the phone alive. SFTP applies only to full clients, with the same resume/integrity requirements and platform-specific document access.
 
 The 27.0 baseline does not remove optional-capability or later-27.x availability checks. Before claiming support, pass each destination's build, simulator where applicable, physical hardware, input, trust, snapshot, and lifecycle gates. Test native Mac and Catalyst separately; test visionOS/tvOS and a paired watch/iPhone on physical devices. Record exact runtimes, entitlements, and dependency revisions. Upstream platform declarations and simulator tests alone are not release evidence.
 
@@ -864,7 +1013,7 @@ Gates apply according to the capability matrix: direct-terminal gates exclude wa
 | Safety policy | Remote clipboard/URL actions disabled; malformed and oversized snapshots rejected before rendering |
 | Resource behavior | Blocked network does not exhaust snapshot storage, UI queues, terminal queues, or input bounds |
 | SFTP independence | On full clients only, transfer bytes bypass terminal parsing and interrupted transfer resumes under the original integrity rules; tvOS/watchOS expose no SFTP UI |
-| Platform input and lifecycle | Catalyst desktop handling, visionOS window/focus/input, and tvOS focus/keyboard verified; native Mac/Catalyst focus loss alone does not detach; A17 passes |
+| Platform input and lifecycle | Catalyst desktop handling, visionOS window/focus/input, and tvOS focus/keyboard verified; Mac (Catalyst) focus loss alone does not detach; A17 passes |
 | Watch companion | Physical paired-device testing, explicit stale/capture-time display, 16 KiB bounds, one pending refresh, opt-in preview, and no credentials/input/login/host attachment; A18 passes |
 | Cross-platform ownership | One host writer across direct-client types; stale epochs cannot inject input; watch refresh acquires no lease; A19 passes |
 

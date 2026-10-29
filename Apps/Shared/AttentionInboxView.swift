@@ -12,8 +12,8 @@ struct AttentionInboxView: View {
   @Bindable
   var inbox: RoamingInboxModel
   let model: RoamingAppModel
-  @Environment(\.openAttention)
-  private var openAttention
+  @Environment(AttentionRouter.self)
+  private var router: AttentionRouter?
 
   var body: some View {
     List {
@@ -21,78 +21,39 @@ struct AttentionInboxView: View {
         Text(emptyText).foregroundStyle(.secondary)
           .listRowBackground(Color.clear)
       }
-      section("Needs you", inbox.entries.filter { $0.item.category != .result })
-      section("Results", inbox.entries.filter { $0.item.category == .result })
+      section(.localized("Needs you"), inbox.needsYouEntries)
+      section(.localized("Results"), inbox.resultEntries)
       hostProblems
     }
-    .glassListBackground().navigationTitle("Inbox").inboxRefreshable(inbox)
+    .glassListBackground().navigationTitle(.localized("Inbox"))
+    .inboxRefreshable(inbox)
     .toolbar {
       ToolbarItem(placement: .automatic) {
-        Button("Refresh", systemImage: "arrow.clockwise") { inbox.refresh() }
+        Button(.localized("Refresh"), systemImage: "arrow.clockwise") {
+          inbox.refresh()
+        }
       }
     }
     .task { if inbox.refreshedAt == nil { inbox.refresh() } }
   }
 
-  private var emptyText: String {
-    inbox.refreshedAt == nil ? "Loading…" : "Nothing needs you."
+  private var emptyText: LocalizedStringResource {
+    inbox.refreshedAt == nil
+      ? .localized("Loading…") : .localized("Nothing needs you.")
   }
 
   @ViewBuilder
   private func section(
-    _ title: String,
+    _ title: LocalizedStringResource,
     _ entries: [RoamingInboxModel.Entry]
   ) -> some View {
     if !entries.isEmpty {
-      Section(title) { ForEach(entries) { entry in row(entry) } }
+      Section(title) {
+        ForEach(entries) { entry in
+          AttentionInboxRow(entry: entry, inbox: inbox, router: router)
+        }
+      }
         .listRowBackground(Color.clear)
-    }
-  }
-
-  private func row(_ entry: RoamingInboxModel.Entry) -> some View {
-    let item = entry.item
-    let snoozed = item.isSnoozed(at: .now)
-    return Button {
-      openAttention(inbox.destination(for: entry))
-    } label: {
-      VStack(alignment: .leading, spacing: 2) {
-        HStack {
-          Text(label(item)).font(.headline)
-          if !item.seen { Image(systemName: "circle.fill").font(.caption2) }
-          Spacer()
-          Text(item.updatedAt, style: .relative).font(.caption)
-            .foregroundStyle(.secondary)
-        }
-        if let title = Self.plain(item.status.title ?? item.status.message) {
-          Text(verbatim: title).lineLimit(2)
-        }
-        Text(
-          verbatim: [
-            entry.host.name, Self.plain(item.status.app),
-            snoozed ? "snoozed" : nil,
-          ]
-          .compactMap { $0 }.joined(separator: " · ")
-        )
-        .font(.caption).foregroundStyle(.secondary)
-      }
-    }
-    .contextMenu {
-      Button("Snooze 1 Hour", systemImage: "moon.zzz") {
-        inbox.perform(
-          .snooze(reference(item), until: .now.addingTimeInterval(3600)),
-          on: entry
-        )
-      }
-      if snoozed {
-        Button("Unsnooze", systemImage: "bell") {
-          inbox.perform(.snooze(reference(item), until: nil), on: entry)
-        }
-      }
-      if item.category != .needsYou {
-        Button("Mark Reviewed", systemImage: "checkmark") {
-          inbox.perform(.markReviewed(reference(item)), on: entry)
-        }
-      }
     }
   }
 
@@ -106,7 +67,7 @@ struct AttentionInboxView: View {
       return nil
     }
     if !failures.isEmpty {
-      Section("Unavailable") {
+      Section(.localized("Unavailable")) {
         ForEach(failures, id: \.id) { failure in
           Text(verbatim: "\(failure.name): \(failure.reason)").font(.caption)
         }
@@ -114,24 +75,79 @@ struct AttentionInboxView: View {
       .listRowBackground(Color.clear)
     }
   }
+}
+
+/// One inbox entry. Its own view, so a row redraws only when its entry
+/// changes rather than with every redraw of the list.
+private struct AttentionInboxRow: View {
+  let entry: RoamingInboxModel.Entry
+  let inbox: RoamingInboxModel
+  let router: AttentionRouter?
+
+  var body: some View {
+    let item = entry.item
+    let snoozed = item.isSnoozed(at: .now)
+    Button {
+      router?.open(inbox.destination(for: entry))
+    } label: {
+      VStack(alignment: .leading, spacing: 2) {
+        HStack {
+          Text(label(item)).font(.headline)
+          if !item.seen { Image(systemName: "circle.fill").font(.caption2) }
+          Spacer()
+          Text(item.updatedAt, style: .relative).font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        if let title = entry.title {
+          Text(verbatim: title).lineLimit(2)
+        }
+        let names = Text(
+          verbatim: [entry.host.name, entry.appName].compactMap { $0 }
+            .joined(separator: " · ")
+        )
+        (snoozed ? Text("\(names) · snoozed", bundle: #bundle) : names)
+          .font(.caption).foregroundStyle(.secondary)
+      }
+    }
+    .contextMenu {
+      Button(.localized("Snooze 1 Hour"), systemImage: "moon.zzz") {
+        inbox.perform(
+          .snooze(reference(item), until: .now.addingTimeInterval(3600)),
+          on: entry
+        )
+      }
+      if snoozed {
+        Button(.localized("Unsnooze"), systemImage: "bell") {
+          inbox.perform(.snooze(reference(item), until: nil), on: entry)
+        }
+      }
+      if item.category != .needsYou {
+        Button(.localized("Mark Reviewed"), systemImage: "checkmark") {
+          inbox.perform(.markReviewed(reference(item)), on: entry)
+        }
+      }
+    }
+  }
 
   private func reference(_ item: AttentionItem) -> AttentionReference {
     AttentionReference(source: item.source, occurrence: item.occurrence)
   }
 
-  private func label(_ item: AttentionItem) -> String {
+  private func label(_ item: AttentionItem) -> LocalizedStringResource {
     switch item.category {
     case .needsYou:
       switch item.status.kind {
-      case .permission: "Permission needed"
-      case .auth: "Sign-in needed"
-      case .question, nil: "Question"
+      case .permission: .localized("Permission needed")
+      case .auth: .localized("Sign-in needed")
+      case .question, nil: .localized("Question")
       }
-    case .failure: "Failed"
-    case .result: "Finished"
+    case .failure: .localized("Failed")
+    case .result: .localized("Finished")
     }
   }
+}
 
+nonisolated enum AttentionInboxText {
   /// Untrusted program text as one plain line.
   static func plain(_ text: String?) -> String? {
     guard let text else { return nil }

@@ -36,14 +36,28 @@ public struct Modes: OptionSet, Sendable, Hashable {
   public static let column132 = Modes(rawValue: 1 << 25)  // DECCOLM 3
   public static let colorSchemeUpdates = Modes(rawValue: 1 << 26)  // 2031
   public static let inBandResize = Modes(rawValue: 1 << 27)  // 2048
+  public static let backarrowKey = Modes(rawValue: 1 << 28)  // DECBKM 67
+  public static let mouseURXVT = Modes(rawValue: 1 << 29)  // 1015
+  public static let mouseSGRPixels = Modes(rawValue: 1 << 30)  // 1016
+  // 1035: keypad keys stay numeric even under DECKPAM, as in Ghostty.
+  public static let ignoreKeypadWithNumLock = Modes(rawValue: 1 << 31)
+  /// xterm `modifyOtherKeys` state 2 (`CSI > 4 ; 2 m`); not a DEC mode.
+  public static let modifyOtherKeys = Modes(rawValue: 1 << 32)
+  /// Kitty paste events (5522): pastes become OSC 5522 listings.
+  public static let kittyPasteEvents = Modes(rawValue: 1 << 33)
 
   /// Grapheme clustering (2027) is on by default, like Ghostty's
   /// `grapheme-width-method = unicode`; Ghostty's bare `Terminal` has it off.
   public static let initial: Modes = [
     .autowrap, .cursorVisible, .alternateScroll, .graphemeCluster,
+    .ignoreKeypadWithNumLock,
   ]
   public static let mouseTracking: Modes = [
     .mouseX10, .mouseNormal, .mouseButton, .mouseAny,
+  ]
+  /// Mutually exclusive report formats; none selects X10 encoding.
+  public static let mouseFormats: Modes = [
+    .mouseUTF8, .mouseSGR, .mouseURXVT, .mouseSGRPixels,
   ]
 
   /// DEC private mode number → flag, for DECSET/DECRST/DECRQM.
@@ -59,6 +73,8 @@ public struct Modes: OptionSet, Sendable, Hashable {
     case 25: .cursorVisible
     case 40: .enableColumnMode
     case 45: .reverseWrap
+    case 66: .keypadApplication  // DECNKM
+    case 67: .backarrowKey
     case 69: .leftRightMargin
     case 1045: .reverseWrapExtended
     case 2027: .graphemeCluster
@@ -69,10 +85,14 @@ public struct Modes: OptionSet, Sendable, Hashable {
     case 1005: .mouseUTF8
     case 1006: .mouseSGR
     case 1007: .alternateScroll
+    case 1015: .mouseURXVT
+    case 1016: .mouseSGRPixels
+    case 1035: .ignoreKeypadWithNumLock
     case 2004: .bracketedPaste
     case 2026: .synchronizedOutput
     case 2031: .colorSchemeUpdates
     case 2048: .inBandResize
+    case 5522: .kittyPasteEvents
     case 47, 1047, 1049: .alternateScreen
     default: nil
     }

@@ -857,7 +857,8 @@ public actor MuxService {
       runSearch(nil, step: forward, pane: pane, workspace: leased, reply: reply)
     case let .endSearch(pane):
       runSearch(nil, step: nil, pane: pane, workspace: leased, reply: reply)
-    case .clearScreen, .resetTerminal, .link, .commandOutput:
+    case .clearScreen, .resetTerminal, .link, .commandOutput,
+      .clipboardReadResult, .clipboardWriteResult:
       handleTerminal(command, workspace: leased, reply: reply)
     case .status, .listWorkspaces, .newWorkspace, .endWorkspace,
       .renameWorkspace, .detachActive, .endAllWorkspaces, .attach, .detach,
@@ -899,6 +900,18 @@ public actor MuxService {
         return fail(MuxError(.notFound, "pane"))
       }
       runtime.commandOutput(at: address) { reply(.success(.commandOutput($0))) }
+    case let .clipboardReadResult(pane, token, result):
+      guard let runtime = attachedRuntime(pane, in: leased) else {
+        return fail(MuxError(.notFound, "pane"))
+      }
+      runtime.completeClipboardRead(token, result)
+      ok()
+    case let .clipboardWriteResult(pane, token, result):
+      guard let runtime = attachedRuntime(pane, in: leased) else {
+        return fail(MuxError(.notFound, "pane"))
+      }
+      runtime.completeClipboardWrite(token, result)
+      ok()
     default: fail(MuxError(.invalidRequest, "not a terminal command"))
     }
   }
@@ -1251,6 +1264,26 @@ public actor MuxService {
         panes.removeValue(forKey: id)
       }
       checkIdle()
+    case let .clipboardRead(request):
+      // Only an app that answers may see it; otherwise refuse at once so
+      // the program is not left waiting.
+      if let client,
+        clients[client]?.hello?.capabilities.contains(.clipboardRequests)
+          == true
+      {
+        send(.event(.clipboardRead(request)), to: client)
+      } else {
+        panes[id]?.runtime.completeClipboardRead(request.token, .denied)
+      }
+    case let .clipboardWrite(request):
+      if let client,
+        clients[client]?.hello?.capabilities.contains(.clipboardRequests)
+          == true
+      {
+        send(.event(.clipboardWrite(request)), to: client)
+      } else {
+        panes[id]?.runtime.completeClipboardWrite(request.token, .unsupported)
+      }
     }
   }
 

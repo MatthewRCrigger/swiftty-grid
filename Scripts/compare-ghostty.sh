@@ -40,6 +40,6 @@ for data in "${inputs[@]}"; do
     -n ghostty "$(command_line "$ghostty" +terminal-stream "--data=$data" "--terminal-cols=$cols" "--terminal-rows=$rows")" \
     -n swiftty "$(command_line "$swiftty" stream "--data=$data" "--terminal-cols=$cols" "--terminal-rows=$rows")" \
     > "$out/$name.txt" 2>&1
-  summary=$(jq -r '[.results[] | "\(.command)=\(.median*1000|floor)ms"] | join("  ")' "$out/$name.json")
+  summary=$(jq -r '[.results[] | "\(.name)=\(.summary.time_wall_clock.median*1000|floor)ms"] | join("  ")' "$out/$name.json")
   printf '%-22s %s\n' "$name" "$summary"
 done

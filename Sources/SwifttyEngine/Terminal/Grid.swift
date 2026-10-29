@@ -18,10 +18,11 @@ public struct Grid: ~Copyable {
   public private(set) var columns: Int
   public private(set) var rows: Int
 
-  private var storage: GridStorage
+  var storage: GridStorage
 
   /// Creates a blank grid. Nonpositive dimensions become one.
-  /// History cell allocation is lazy, in chunks of at most 64 usable rows.
+  /// History cell allocation is lazy, in chunks of at most 64 usable rows;
+  /// on supported platforms history uses reclaimable, compressible mappings.
   /// - Complexity: O(rows * columns + historyCapacity).
   public init(
     columns: Int,
@@ -29,11 +30,29 @@ public struct Grid: ~Copyable {
     historyLimitBytes: Int = 0,
     maxHistoryRows: Int = 100_000
   ) {
+    self.init(
+      columns: columns,
+      rows: rows,
+      historyLimitBytes: historyLimitBytes,
+      maxHistoryRows: maxHistoryRows,
+      reclaimable: true
+    )
+  }
+
+  /// `reclaimable: false` forces the uncompressed heap backend.
+  package init(
+    columns: Int,
+    rows: Int,
+    historyLimitBytes: Int,
+    maxHistoryRows: Int,
+    reclaimable: Bool
+  ) {
     storage = GridStorage(
       columns: columns,
       rows: rows,
       historyLimitBytes: historyLimitBytes,
-      maxHistoryRows: maxHistoryRows
+      maxHistoryRows: maxHistoryRows,
+      reclaimable: reclaimable
     )
     self.columns = storage.columns
     self.rows = storage.rows
@@ -42,6 +61,18 @@ public struct Grid: ~Copyable {
   @inline(__always)
   private func physical(_ id: Int32) -> UnsafeMutablePointer<Cell> {
     storage.physical(id)
+  }
+
+  /// A retained history row, restored in place if cold. Promotion never
+  /// demotes or moves another unit, so earlier borrows stay valid.
+  @inline(__always)
+  private func promoted(
+    _ id: Int32,
+    _ reason: ScrollbackRestoreReason = .read
+  ) -> UnsafeMutablePointer<Cell> {
+    storage.store.ensureResident(id, reason)
+    storage.store.noteAccess(id)
+    return storage.store.physical(id)
   }
 
   // MARK: Access
@@ -55,11 +86,15 @@ public struct Grid: ~Copyable {
     return _overrideLifetime(span, borrowing: self)
   }
 
-  /// Borrowed history cells, oldest first. O(1), with no allocation.
+  /// Borrowed history cells, oldest first; valid only while this grid is
+  /// borrowed. A cold row is restored in place without invalidating other
+  /// borrowed rows.
+  /// - Complexity: O(1) when warm, with no allocation; when cold,
+  ///   O(bytes of the intersecting compression units) plus page commitment.
   @_lifetime(borrow self)
   public func historyCells(at index: Int) -> Span<Cell> {
     let span = Span(
-      _unsafeStart: physical(storage.history.id(index)),
+      _unsafeStart: promoted(storage.history.id(index)),
       count: columns
     )
     return _overrideLifetime(span, borrowing: self)
@@ -223,14 +258,29 @@ public struct Grid: ~Copyable {
   public var historyCapacity: Int { storage.history.capacity }
 
   /// History line `index` (0 = oldest): full-width cells and wrap flag.
+  /// Promotes a cold row; read-only scans use `withHistoryLine`.
   func historyLine(
     _ index: Int
   ) -> (cells: UnsafeBufferPointer<Cell>, wrapped: Bool) {
     let id = storage.history.id(index)
     return (
-      UnsafeBufferPointer(start: physical(id), count: columns),
+      UnsafeBufferPointer(start: promoted(id), count: columns),
       storage.wrapped[Int(id)]
     )
+  }
+
+  /// Reads history line `index` without changing residency. The buffer
+  /// may be scan scratch: it is valid only inside `body`, which must not
+  /// start another history scan.
+  func withHistoryLine<R, E: Error>(
+    _ index: Int,
+    _ body: (UnsafeBufferPointer<Cell>, Bool) throws(E) -> R
+  ) throws(E) -> R {
+    let id = storage.history.id(index)
+    let wrapped = storage.wrapped[Int(id)]
+    return try storage.store.withRow(id) { cells throws(E) in
+      try body(cells, wrapped)
+    }
   }
 
   public func historyMark(_ index: Int) -> RowMark {
@@ -253,11 +303,24 @@ public struct Grid: ~Copyable {
       : storage.marks[p] & ~GridStorage.inputLineBit
   }
 
-  func historyMutableCells(_ index: Int) -> UnsafeMutableBufferPointer<Cell> {
-    UnsafeMutableBufferPointer(
-      start: physical(storage.history.id(index)),
-      count: Int(storage.extents[Int(storage.history.id(index))])
-    )
+  /// Rewrites every history row in place, oldest first (grapheme
+  /// compaction): cold units are restored once up front, then each row's
+  /// cells up to its extent are passed to `body`.
+  func rewriteHistory(_ body: (UnsafeMutableBufferPointer<Cell>) -> Void) {
+    let store = storage.store.shared
+    if store.pointee.compressedUnits > 0 {
+      storage.store.restoreAll(.compaction)
+    }
+    for i in 0 ..< storage.history.count {
+      let id = storage.history.id(i)
+      body(
+        UnsafeMutableBufferPointer(
+          start: storage.store.physical(id),
+          count: Int(storage.extents[Int(id)])
+        )
+      )
+    }
+    storage.store.invalidateVerdicts()
   }
 
   /// Moves top rows into history, recycling evicted rows.
@@ -277,7 +340,7 @@ public struct Grid: ~Copyable {
     }
     for _ in 0 ..< min(count, bottom + 1) {
       let top = storage.rowMap[0]
-      let fresh = storage.history.push(top) ?? storage.takeRow()
+      let fresh = storage.pushHistory(top)
       if bottom > 0 {
         storage.rowMap.update(from: storage.rowMap + 1, count: bottom)
       }
@@ -305,7 +368,8 @@ public struct Grid: ~Copyable {
   }
 
   /// Recycles history rows and resets eviction counts without allocating.
-  /// O(historyCount + stored history cells).
+  /// Compressed units are discarded without decoding and fully free units
+  /// release their physical backing. O(historyCount + resident history cells).
   public mutating func clearHistory() {
     storage.clearHistory()
     _checkInvariants()
@@ -442,6 +506,8 @@ public struct Grid: ~Copyable {
   ) {
     var n = min(source.count, columns)
     while n > 0, source[n - 1].isBlank { n -= 1 }
+    storage.store.ensureResident(id, .recycle)
+    storage.store.noteWrite(id)
     let base = physical(id)
     if n > 0 { base.update(from: source.baseAddress!, count: n) }
     // Blank the remainder only up to the previous extent.
@@ -472,30 +538,36 @@ public struct Grid: ~Copyable {
       rows: newRows,
       historyLimitBytes: storage.historyLimitBytes,
       maxHistoryRows: storage.maxHistoryRows,
+      reclaimable: storage.reclaimable
     )
     // A wide character whose tail is cut off becomes blank on both
     // screen and history rows. Omit its lead before copying the row.
-    func retainedCount(_ row: UnsafeMutablePointer<Cell>, extent: Int) -> Int {
+    func retainedCount(_ row: UnsafePointer<Cell>, extent: Int) -> Int {
       let count = min(extent, newColumns)
       return count > 0 && row[count - 1].width == 2 ? count - 1 : count
     }
+    // Cold source rows are read through scan scratch, not restored.
     for i in 0 ..< storage.history.count {
       let id = storage.history.id(i)
-      let source = physical(id)
-      fresh.appendHistory(
-        UnsafeBufferPointer(
-          start: source,
-          count: retainedCount(source, extent: Int(storage.extents[Int(id)]))
-        ),
-        wrapped: newColumns == columns && storage.wrapped[Int(id)],
-        marks: storage.marks[Int(id)],
-      )
+      storage.store.withRow(id) { source in
+        fresh.appendHistory(
+          UnsafeBufferPointer(
+            start: source.baseAddress!,
+            count: retainedCount(
+              source.baseAddress!,
+              extent: Int(storage.extents[Int(id)])
+            )
+          ),
+          wrapped: newColumns == columns && storage.wrapped[Int(id)],
+          marks: storage.marks[Int(id)],
+        )
+      }
       if newColumns != columns {
         fresh.clearWrapPadding(fresh.storage.history.id(fresh.historyCount - 1))
       }
     }
     for y in 0 ..< min(rows, newRows) {
-      let source = _unsafeRow(y)
+      let source = UnsafePointer(_unsafeRow(y))
       fresh.setRow(
         y,
         UnsafeBufferPointer(
@@ -521,10 +593,13 @@ public struct Grid: ~Copyable {
       rows: newRows,
       historyLimitBytes: storage.historyLimitBytes,
       maxHistoryRows: storage.maxHistoryRows,
+      reclaimable: storage.reclaimable
     )
   }
 
-  func checkInvariants() -> Bool { storage.checkInvariants() }
+  func checkInvariants(screenOnly: Bool = false) -> Bool {
+    storage.checkInvariants(screenOnly: screenOnly)
+  }
 
   @inline(__always)
   func _checkInvariants() {

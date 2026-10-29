@@ -80,6 +80,7 @@ extension MuxService {
       historyBytes: historyBytes,
       innerTerm: configuration.innerTerm,
       limits: limits,
+      scrollbackCompression: configuration.scrollbackCompression,
       observingIO: configuration.observePaneIO
     )
     if let theme { runtime.setTheme(theme) }

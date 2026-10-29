@@ -7,7 +7,13 @@ import Testing
 import TestSupport
 
 /// Hot paths must not touch the heap once warmed up (spec §13).
-@Suite(.serialized)
+@Suite(
+  .serialized,
+  .enabled(
+    if: !_isDebugAssertConfiguration(),
+    "Allocation budgets require optimized code; CI checks them in Release."
+  )
+)
 struct AllocationTests {
   @Test(
     .enabled(if: MTLCreateSystemDefaultDevice() != nil),
@@ -164,6 +170,41 @@ struct AllocationTests {
     parser.consume(span, into: &state)
     _ = state.takeDamage()
     return alloc_counter_stop()
+  }
+
+  /// A realistic ring: output beyond full capacity recycles rows without
+  /// heap allocation, including when the recycled rows were compressed.
+  @Test(arguments: [false, true])
+  func `full history rings do not allocate per output row`(_ compressed: Bool) {
+    var state = TerminalState(
+      columns: 120,
+      rows: 40,
+      scrollbackLimitBytes: 120 * 16 * 3_000
+    )
+    var parser = Parser()
+    let lines = Array(
+      String(
+        repeating: "\u{1B}[32mcompiling module.swift\u{1B}[0m output line\r\n",
+        count: 2_000
+      )
+      .utf8
+    )
+    let span = lines.span
+    for _ in 0 ..< 3 { parser.consume(span, into: &state) }
+    #expect(state.grid.historyCount == state.grid.historyCapacity)
+    if compressed {
+      var budget = ScrollbackMaintenanceBudget()
+      budget.maximumCandidates = 1 << 20
+      budget.maximumUnits = 1 << 20
+      while state.maintainScrollback(budget: budget) == .pending {}
+      #expect(state.scrollbackStatistics.compressedUnits > 0)
+    }
+    alloc_counter_start()
+    parser.consume(span, into: &state)
+    _ = state.takeDamage()
+    let count = alloc_counter_stop()
+    if compressed { #expect(state.scrollbackStatistics.recycleRestores > 0) }
+    #expect(count == 0)
   }
 
   @Test

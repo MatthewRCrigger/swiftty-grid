@@ -91,8 +91,10 @@ final class TestServerState: Sendable {
   /// Exit immediately after accepting a shell, without emitting output.
   let shellExitStatus = Mutex<Int?>(nil)
   let bootstrapRequests = Mutex<[BootstrapRequest]>([])
-  /// When set, `forwardHelperPath bootstrap --stdio` hands its stdin
-  /// envelope to this responder (a real `BootstrapService`).
+  /// Failure for create/resume requests; list and terminate keep their replies.
+  let bootstrapFailure = Mutex<BootstrapErrorCode>(.unknownSession)
+  /// When set, either helper path hands its stdin envelope to this responder
+  /// (a real `BootstrapService`, or a delayed response in lifecycle tests).
   let bootstrapForwarder = Mutex<(@Sendable ([UInt8]) async -> [UInt8])?>(nil)
 }
 
@@ -529,13 +531,16 @@ final class TestSessionHandler: ChannelInboundHandler {
       send(context, Array("out:".utf8) + stdin)
       send(context, Array("err".utf8), type: .stdErr)
       exit(context, status: 3)
-    case TestSSHServer.helperPath + suffix:
-      send(context, Array("helper diagnostics".utf8), type: .stdErr)
-      send(context, bootstrapReply())
-      exit(context, status: 0)
-    case TestSSHServer.forwardHelperPath + suffix:
+    case TestSSHServer.helperPath + suffix,
+      TestSSHServer.forwardHelperPath + suffix:
       guard let forward = state.bootstrapForwarder.withLock({ $0 }) else {
-        exit(context, status: 1)
+        if command == TestSSHServer.helperPath + suffix {
+          send(context, Array("helper diagnostics".utf8), type: .stdErr)
+          send(context, bootstrapReply())
+          exit(context, status: 0)
+        } else {
+          exit(context, status: 1)
+        }
         return
       }
       let input = stdin
@@ -579,7 +584,7 @@ final class TestSessionHandler: ChannelInboundHandler {
         switch request.operation {
         case .list: .sessions([])
         case .terminate: .terminated(request.sessionID!)
-        default: .failure(.unknownSession)
+        default: .failure(state.bootstrapFailure.withLock { $0 })
         }
     } else {
       response = .failure(.malformed)

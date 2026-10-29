@@ -16,6 +16,11 @@ final class MuxInputAdmission: Sendable {
     case let .text(text), let .paste(text): text.utf8.count
     case .key, .focus, .mouse: 32
     case .moveCursor: MuxInput.moveCursorBytes
+    case let .clipboardPaste(types): MuxInput.clipboardBytes(types: types)
+    case let .drag(.move(_, types)): MuxInput.clipboardBytes(types: types)
+    case let .drag(.drop(_, items)):
+      MuxInput.clipboardBytes(types: items.map(\.mime))
+    case .drag(.leave): 64
     }
   }
 

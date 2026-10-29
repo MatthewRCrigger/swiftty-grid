@@ -228,3 +228,28 @@ extension MuxNativeTests {
     #expect((c.ratio(at: []) ?? 1) < before)
   }
 }
+
+extension MuxNativeTests {
+  @Test(.enabled(if: hasMetal))
+  func `listing-only clipboard reads are answered without a prompt`()
+    async throws
+  {
+    let f = try await open()
+    defer { f.controller.close() }
+    let c = f.controller
+    let pane = try #require(c.activePane)
+    let view = try #require(c.views[pane])
+    c.send(
+      .text(
+        "stty raw -echo; printf '\\033]5522;type=read:id=r1;Lg==\\007'; cat -v\r"
+      ),
+      to: pane
+    )
+    #expect(
+      await waitPresented(view) {
+        $0.lines.joined().contains("type=read:status=OK:id=r1")
+          && $0.lines.joined().contains("type=read:status=DONE:id=r1")
+      } != nil
+    )
+  }
+}

@@ -661,22 +661,26 @@ struct ParserTests {
       String(repeating: "漢", count: prefix)
       + String(repeating: "\u{80}©éœδя\u{7FE}\u{7FF}", count: 3) + "😀a"
     let bytes = Array(text.utf8)
+    // Every split has the same bytewise reference. Compute it once so full
+    // invariant scans do not repeat thousands of bytewise feeds per split.
+    var reference = VT(65, 20)
+    for byte in bytes { reference.feed(bytes: [byte]) }
+    let expectedLines = reference.lines
+    let expectedCursor = reference.state.cursor
+    let expectedHistory = (0 ..< reference.state.scrollbackCount)
+      .map { reference.state.scrollbackText($0) }
     let boundary = prefix * 3
     for split in Array(boundary ... boundary + 32) + [
       bytes.count - 1, bytes.count,
     ] {
       var actual = VT(65, 20)
-      var reference = VT(65, 20)
       actual.feed(bytes: Array(bytes[..<split]))
       actual.feed(bytes: Array(bytes[split...]))
-      for byte in bytes { reference.feed(bytes: [byte]) }
-      #expect(TestFixture(actual.lines) == TestFixture(reference.lines))
-      #expect(actual.state.cursor == reference.state.cursor)
+      #expect(TestFixture(actual.lines) == TestFixture(expectedLines))
+      #expect(actual.state.cursor == expectedCursor)
       let history = (0 ..< actual.state.scrollbackCount)
         .map { actual.state.scrollbackText($0) }
-      let expected = (0 ..< reference.state.scrollbackCount)
-        .map { reference.state.scrollbackText($0) }
-      #expect(history == expected)
+      #expect(history == expectedHistory)
     }
   }
 
@@ -925,7 +929,7 @@ struct ParserTests {
     vt.feed("\(ESC)]11;?\u{07}")
     #expect(
       TestFixture(vt.takeOutput())
-        == TestFixture("\(ESC)]11;rgb:2828/2c2c/3434\u{07}")
+        == TestFixture("\(ESC)]11;rgb:0c0c/1010/2121\u{07}")
     )
     vt.feed("\(ESC)]4;1;rgb:ff/00/80\(ESC)\\\(ESC)]4;1;?\(ESC)\\")
     #expect(

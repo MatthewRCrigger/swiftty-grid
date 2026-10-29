@@ -14,10 +14,16 @@ public struct SessionConfiguration: Sendable {
   /// Cap on history lines (Ghostty's `scrollback-limit-lines`).
   /// Nonpositive values disable history.
   public var scrollbackLimitRows = 100_000
+  /// Compress idle history (`scrollback-compression`). Effective only on
+  /// validated backends; presentation sessions never compress.
+  public var scrollbackCompression = true
   public var palette = Palette.standard
   /// Consume OSC 7501 program status and answer its support query
   /// (`TerminalState.programStatusEnabled`).
   public var programStatusEnabled = false
+  /// Answer DECRQCRA rectangle checksums
+  /// (`TerminalState.rectangleChecksumsEnabled`).
+  public var rectangleChecksumsEnabled = false
 
   public init(
     command: [String]? = nil,

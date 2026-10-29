@@ -6,11 +6,10 @@
 #
 # destination selects the app:
 #   'platform=iOS Simulator,id=<udid>'       MobileClient
-#   'platform=macOS'                         MacClient
 #   'platform=macOS,variant=Mac Catalyst'    CatalystClient
 #   'platform=iOS,id=<device-udid>'          MobileClient on a physical device
 #                                            (set RST_PUBLIC_HOST)
-# Mac and device destinations sign with Apple Development for team $RST_UI_TEAM
+# Mac Catalyst and device destinations sign with Apple Development for team $RST_UI_TEAM
 # (default 72KB9YQR7B) using locally installed profiles; nothing is
 # provisioned. Extra args go to xcodebuild, e.g.
 #   -only-testing:AppUITests/RoamingAppUITests/testRejectUnknownHostKey
@@ -35,7 +34,6 @@ case $destination in
   # A physical iPhone or iPad: needs RST_PUBLIC_HOST=<this Mac's LAN IP>
   # so the device reaches swifttyd and the SSH relay over the network.
   *"platform=iOS,"*) platform=iOS; app=MobileClient; device=YES ;;
-  *macOS*) platform=macOS; app=MacClient ;;
   *) echo "unsupported destination: $destination" >&2; exit 2 ;;
 esac
 
@@ -67,7 +65,7 @@ if [ $device = YES ] && [ -z "${RST_PUBLIC_HOST:-}" ]; then
   echo "physical devices need RST_PUBLIC_HOST=<this Mac's LAN address>" >&2
   exit 2
 fi
-if [ $platform = macOS ] || [ $catalyst = YES ] || [ $device = YES ]; then
+if [ $catalyst = YES ] || [ $device = YES ]; then
   signing="CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: $team
         CODE_SIGN_IDENTITY: Apple Development"
@@ -80,26 +78,31 @@ case $app in
     sources="[{ path: \"$apps/MobileClient\" }]"
     deps="- { package: Swiftty, product: RoamingApp }
       - { package: Swiftty, product: CompanionModel }"
-    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mobile
-        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Roaming SSH connects to Macs on your local network.
+    # RST_UI_BUNDLE_SUFFIX installs a separate app identity with fresh
+    # permission state (e.g. a Local Network denial run) without touching
+    # an installed client's data.
+    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty${RST_UI_BUNDLE_SUFFIX:-}
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Find and connect to your Mac to access terminal workspaces on your local network.
+        INFOPLIST_KEY_NSCameraUsageDescription: Scan the connection code displayed by your Mac.
+        INFOPLIST_FILE: $apps/Config/AttentionLinks.plist
         TARGETED_DEVICE_FAMILY: \"1,2\"
         SUPPORTS_MACCATALYST: NO
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: >-
+          UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft
+          UIInterfaceOrientationLandscapeRight
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: >-
+          UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown
+          UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
         INFOPLIST_KEY_UILaunchScreen_Generation: YES" ;;
   CatalystClient)
     sources="[{ path: \"$apps/CatalystClient\", excludes: [\"*.entitlements\"] }]"
     deps="- { package: Swiftty, product: RoamingApp }"
-    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.catalyst
+    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty
         SUPPORTS_MACCATALYST: YES
         DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
         TARGETED_DEVICE_FAMILY: \"2,6\"
         CODE_SIGN_ENTITLEMENTS: $apps/CatalystClient/CatalystClient.entitlements
         INFOPLIST_KEY_UILaunchScreen_Generation: YES" ;;
-  MacClient)
-    sources="[{ path: \"$apps/MacClient\", excludes: [\"*.entitlements\"] }]"
-    deps="- { package: Swiftty, product: RoamingApp }"
-    app_settings="PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mac
-        CODE_SIGN_ENTITLEMENTS: $apps/MacClient/MacClient.entitlements
-        ENABLE_HARDENED_RUNTIME: YES" ;;
 esac
 
 project="$workspace/project"
@@ -127,7 +130,7 @@ targets:
     settings:
       base:
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
-        INFOPLIST_KEY_CFBundleDisplayName: Roaming SSH
+        INFOPLIST_KEY_CFBundleDisplayName: Swiftty
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
         SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
         $app_settings
@@ -152,17 +155,37 @@ schemes:
 YML
 (cd "$project" && xcodegen generate --quiet --spec project.yml)
 
+# Optional Nearby Macs fixture: RST_UI_ADVERTISE=<instance name> registers
+# _swiftty._tcp for the relayed SSH port with the system DNS-SD service,
+# as the Mac's Connect a Device panel does, for the run's duration. The
+# fixture's process owner retires it on normal exit and interruption alike.
+if [ -n "${RST_UI_ADVERTISE:-}" ]; then
+  python3 -I "$repository_root/Scripts/real-ssh-process.py" start "$workspace" advertiser \
+    dns-sd -R "$RST_UI_ADVERTISE" _swiftty._tcp local "$RST_REAL_SSH_PORT" \
+    txtvers=1 product=swiftty >/dev/null
+fi
+
 echo "Testing $app on $destination (result bundle: $workspace/result.xcresult)"
-status=0
+TEST_RUNNER_RST_UI_SCAN=${RST_UI_SCAN:-} \
+TEST_RUNNER_RST_UI_NEARBY=${RST_UI_ADVERTISE:-} \
+TEST_RUNNER_RST_UI_LOCAL_NETWORK=${RST_UI_LOCAL_NETWORK:-allow} \
 TEST_RUNNER_RST_UI_HOST=$RST_REAL_SSH_HOST \
 TEST_RUNNER_RST_UI_PORT=$RST_REAL_SSH_PORT \
 TEST_RUNNER_RST_UI_USER=$RST_REAL_SSH_USER \
 TEST_RUNNER_RST_UI_PASSWORD=$RST_REAL_SSH_PASSWORD \
 TEST_RUNNER_RST_UI_FINGERPRINT=$RST_REAL_SSH_FINGERPRINT \
+  python3 -I "$repository_root/Scripts/real-ssh-process.py" start "$workspace" xcodebuild \
   xcodebuild -project "$project/RoamingUITests.xcodeproj" -scheme RoamingUITests \
   -destination "$destination" -derivedDataPath "$workspace/build" \
   -resultBundlePath "$workspace/result.xcresult" -collect-test-diagnostics never \
-  "$@" test >"$workspace/xcodebuild.log" 2>&1 || status=$?
+  "$@" test >/dev/null
+# A foreground build defers shell traps until it exits. Bounded status queries
+# let INT/TERM enter cleanup while the owned build is still running.
+status=running
+while [ "$status" = running ]; do
+  status=$(python3 -I "$repository_root/Scripts/real-ssh-process.py" status "$workspace" xcodebuild)
+  [ "$status" != running ] || sleep 0.1
+done
 grep -E "Test Case|error:|XCTAssert|failed|TEST (SUCCEEDED|FAILED)|Signing Identity" \
   "$workspace/xcodebuild.log" | grep -Ev "^ *[0-9]+ \|" | uniq | tail -60
 [ $status -eq 0 ] || echo "xcodebuild failed ($status); log: $workspace/xcodebuild.log" >&2

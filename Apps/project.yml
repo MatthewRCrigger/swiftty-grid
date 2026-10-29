@@ -5,17 +5,28 @@
 # Generate with Scripts/build-platforms.sh (the .xcodeproj is not
 # committed). `swifttyd` is a SwiftPM executable and is not built here.
 #
+# Universal purchase: MobileClient, CatalystClient, VisionClient and
+# TVClient share one bundle ID, so they are the iOS, macOS (Mac Catalyst),
+# visionOS and tvOS platforms of a single App Store Connect app and a
+# single TestFlight entry; the watch app's ID extends it. The native macOS
+# terminal (Swiftty.app, Scripts/package-swiftmux.sh) is SwiftPM-built,
+# unsandboxed and distributed separately with Developer ID.
+#
 # Universal Links are configured at generation time: set
 # SWIFTTY_LINK_DOMAINS (comma-separated) before running xcodegen and the
 # preGenCommand writes Config/Generated/ (spec.inbox.md §4.4).
-name: RoamingClients
+name: Swiftty
 
 options:
   # Writes Config/Generated/AttentionLinks.plist and the per-target
   # entitlements from SWIFTTY_LINK_DOMAINS (no associated domains when
   # unset). Runs from this directory.
   preGenCommand: ../Scripts/configure-links.sh
-  bundleIdPrefix: dev.swiftty.roaming
+  # Builds the local package's code with arm64e too, so pointer
+  # authentication (ENABLE_ENHANCED_SECURITY below) covers RoamingApp and
+  # the rest of the linked package code, not just the thin app targets.
+  postGenCommand: ../Scripts/configure-arm64e-packages.sh Swiftty.xcodeproj
+  bundleIdPrefix: dev.chr33s.swiftty
   createIntermediateGroups: true
   deploymentTarget:
     iOS: "27.0"
@@ -42,18 +53,46 @@ settings:
     CURRENT_PROJECT_VERSION: "1"
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     DEAD_CODE_STRIPPING: YES
-    # Resources/Assets.xcassets (iOS, watchOS and macOS images; tvOS and
-    # visionOS need layered icons and have none yet).
+    # Enhanced Security (spec.roaming.md §2.5): pointer authentication
+    # (arm64e), security compiler warnings, typed allocators and libc++
+    # hardening for every target. The runtime protections are the
+    # com.apple.security.hardened-process entitlements in
+    # Apps/<Target>/<Target>.entitlements (iOS, Catalyst, visionOS only).
+    ENABLE_ENHANCED_SECURITY: YES
+    # Extract the app targets' localizable literals into their String
+    # Catalogs (Apps/WatchCompanion/Localizable.xcstrings) on build.
+    SWIFT_EMIT_LOC_STRINGS: YES
+    # With iOSPackagesShouldBuildARM64e (postGenCommand) Xcode builds the
+    # package products for arm64 only on the simulator, so an app slice
+    # for x86_64 cannot import them. macOS 27 runs only on Apple silicon,
+    # so the Intel simulator slice is never used.
+    "EXCLUDED_ARCHS[sdk=*simulator*]": x86_64
+    # Automatic signing for Xcode Cloud archives (Apps/ci_scripts). XcodeGen
+    # substitutes SWIFTTY_TEAM_ID at generation time; when it is unset the
+    # literal reference expands to an empty team and local unsigned builds
+    # are unaffected.
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ${SWIFTTY_TEAM_ID}
+    # Resources/Assets.xcassets (iOS and macOS images). watchOS has its own
+    # Apps/WatchCompanion/Assets.xcassets: actool flags a watchOS icon slot
+    # as an unassigned child when compiling for macOS (Catalyst). tvOS and
+    # visionOS need layered icons: Apps/TVClient/Assets.xcassets and
+    # Apps/VisionClient/Assets.xcassets, generated from icon.svg by
+    # Scripts/gen-platform-icons.swift.
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
 
 # Shared Info.plist keys for direct clients. No UIBackgroundModes: the
 # clients never claim background execution (spec §9).
 directClientSettings: &directClientSettings
+  # Covers Nearby Macs (Bonjour browsing for _swiftty._tcp, declared in
+  # Config/AttentionLinks.plist's NSBonjourServices) and SSH/QUIC
+  # connections to Macs on the local network (spec.connection-setup.md D5).
   INFOPLIST_KEY_NSLocalNetworkUsageDescription: >-
-    Roaming SSH connects to Macs on your local network over SSH and QUIC.
+    Find and connect to your Mac to access terminal workspaces on your local
+    network.
   INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
-  INFOPLIST_KEY_CFBundleDisplayName: Roaming SSH
-  INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: YES
+  INFOPLIST_KEY_CFBundleDisplayName: Swiftty
+  INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
   # Attention deep links (spec.inbox.md §4.4): registers the `swiftty`
   # URL scheme, merged into the generated Info.plist, with no Universal
   # Link domains. Targets that support Universal Links instead use
@@ -69,7 +108,12 @@ targets:
   MobileClient:
     type: application
     platform: iOS
-    sources: [MobileClient, ../Resources/Assets.xcassets]
+    sources:
+      # Entitlements are merged into Config/Generated/ by the
+      # preGenCommand, not bundled as a resource.
+      - path: MobileClient
+        excludes: ["*.entitlements"]
+      - ../Resources/Assets.xcassets
     scheme: {}
     dependencies:
       - package: Swiftty
@@ -87,7 +131,10 @@ targets:
       base:
         <<: *directClientSettings
         INFOPLIST_FILE: Config/Generated/AttentionLinks.plist
-        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mobile
+        PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty
+        # Scan Mac Code; the only target that uses the camera.
+        INFOPLIST_KEY_NSCameraUsageDescription: >-
+          Scan the connection code displayed by your Mac.
         CODE_SIGN_ENTITLEMENTS: Config/Generated/MobileClient.entitlements
         TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_MACCATALYST: NO
@@ -101,27 +148,6 @@ targets:
           UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown
           UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
 
-  # Native macOS full client; the only target with an app-local PTY.
-  MacClient:
-    type: application
-    platform: macOS
-    sources:
-      - path: MacClient
-        excludes: ["*.entitlements"]
-      - ../Resources/Assets.xcassets
-    scheme: {}
-    dependencies:
-      - package: Swiftty
-        product: RoamingApp
-    settings:
-      base:
-        <<: *directClientSettings
-        INFOPLIST_FILE: Config/Generated/AttentionLinks.plist
-        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mac
-        CODE_SIGN_ENTITLEMENTS: Config/Generated/MacClient.entitlements
-        ENABLE_HARDENED_RUNTIME: YES
-        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
-
   # UIKit-derived full remote client, built only as a Mac Catalyst
   # destination. No local PTY; never the swifttyd agent.
   CatalystClient:
@@ -131,7 +157,8 @@ targets:
       - path: CatalystClient
         excludes: ["*.entitlements"]
       - ../Resources/Assets.xcassets
-    scheme: {}
+    # Scheme defined under `schemes:` below so the archive can be named
+    # "Swiftty" rather than after the target.
     dependencies:
       - package: Swiftty
         product: RoamingApp
@@ -139,8 +166,20 @@ targets:
       base:
         <<: *directClientSettings
         INFOPLIST_FILE: Config/Generated/AttentionLinks.plist
-        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.catalyst
+        PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty
+        # Swiftty.app is the native Mac terminal; Finder shows the bundle's
+        # file name, so this one installs as "Swiftty Remote.app".
+        PRODUCT_NAME: Swiftty Remote
+        INFOPLIST_KEY_CFBundleDisplayName: Swiftty Remote
         SUPPORTS_MACCATALYST: YES
+        # Mac Catalyst only: it shares the universal-purchase ID with
+        # MobileClient, so an iOS build of this target could replace the
+        # real iOS app (with its watch app) in App Store Connect.
+        SUPPORTED_PLATFORMS: macosx
+        # Default archives and generic macOS destinations must also use
+        # UIKit's Catalyst SDK variant rather than native AppKit.
+        SDKROOT: macosx
+        SDK_VARIANT: iosmac
         DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
         SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
@@ -148,12 +187,30 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Config/Generated/CatalystClient.entitlements
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        # Mac Catalyst links with a hard-coded
+        # `-L$(TOOLCHAIN_DIR)/usr/lib/swift/maccatalyst`. When the Xcode 27
+        # IDE has the Metal toolchain installed it puts that toolchain first,
+        # so TOOLCHAIN_DIR resolves to Metal.xctoolchain, which has no Swift
+        # libraries, and every link step warns "Search path ... not found".
+        # Pin the Swift toolchain; this target compiles no Metal shaders.
+        TOOLCHAINS: com.apple.dt.toolchain.XcodeDefault
+        # Pointer authentication off for this target only: Xcode builds
+        # package products as arm64e only for the iOS-family SDKs it covers
+        # with iOSPackagesShouldBuildARM64e, not for Mac Catalyst, so an arm64e
+        # build cannot import RoamingApp ("Unable to resolve module
+        # dependency"). The rest of Enhanced Security still applies. Lift
+        # this when Xcode builds packages as arm64e here
+        # (spec.roaming.md §2.5).
+        ENABLE_POINTER_AUTHENTICATION: NO
+        ENABLE_HARDWARE_CHECKED_POINTER_ARITHMETIC_SLICE: NO
 
   # Windowed visionOS full remote client.
   VisionClient:
     type: application
     platform: visionOS
-    sources: [VisionClient]
+    sources:
+      - path: VisionClient
+        excludes: ["*.entitlements"]
     scheme: {}
     dependencies:
       - package: Swiftty
@@ -162,7 +219,7 @@ targets:
       base:
         <<: *directClientSettings
         INFOPLIST_FILE: Config/Generated/AttentionLinks.plist
-        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.vision
+        PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty
         CODE_SIGN_ENTITLEMENTS: Config/Generated/VisionClient.entitlements
         TARGETED_DEVICE_FAMILY: "7"
 
@@ -179,8 +236,18 @@ targets:
     settings:
       base:
         <<: *directClientSettings
-        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.tv
+        PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty
         TARGETED_DEVICE_FAMILY: "3"
+        ASSETCATALOG_COMPILER_APPICON_NAME: App Icon & Top Shelf Image
+        # Pointer authentication off for this target only: Xcode builds
+        # package products as arm64e only for the iOS-family SDKs it covers
+        # with iOSPackagesShouldBuildARM64e, not for tvOS, so an arm64e
+        # build cannot import RoamingApp ("Unable to resolve module
+        # dependency"). The rest of Enhanced Security still applies. Lift
+        # this when Xcode builds packages as arm64e here
+        # (spec.roaming.md §2.5).
+        ENABLE_POINTER_AUTHENTICATION: NO
+        ENABLE_HARDWARE_CHECKED_POINTER_ARITHMETIC_SLICE: NO
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
 
   # Read-only watch companion. Links ONLY CompanionModel and the
@@ -191,7 +258,7 @@ targets:
   WatchCompanion:
     type: application
     platform: watchOS
-    sources: [WatchCompanion, ../Resources/Assets.xcassets]
+    sources: [WatchCompanion]
     scheme: {}
     dependencies:
       - package: Swiftty
@@ -200,9 +267,28 @@ targets:
         product: MuxNavigation
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.swiftty.roaming.mobile.watchkitapp
+        PRODUCT_BUNDLE_IDENTIFIER: dev.chr33s.swiftty.watchkitapp
         TARGETED_DEVICE_FAMILY: "4"
-        INFOPLIST_KEY_CFBundleDisplayName: Roaming SSH
-        INFOPLIST_KEY_WKCompanionAppBundleIdentifier: dev.swiftty.roaming.mobile
+        INFOPLIST_KEY_CFBundleDisplayName: Swiftty
+        INFOPLIST_KEY_WKCompanionAppBundleIdentifier: dev.chr33s.swiftty
         INFOPLIST_KEY_WKRunsIndependentlyOfCompanionApp: NO
         SKIP_INSTALL: YES
+schemes:
+  # Same as the generated target scheme, plus an archive name: Xcode names
+  # archives after the scheme, so without this the Organizer shows
+  # "CatalystClient" instead of "Swiftty".
+  CatalystClient:
+    build:
+      targets:
+        CatalystClient: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
+      customArchiveName: Swiftty

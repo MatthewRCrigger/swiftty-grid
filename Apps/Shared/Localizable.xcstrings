@@ -1,0 +1,98 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "%lld hosts keep this key selected and will not connect until you choose another key." : {
+      "comment" : "Plural: the number of saved hosts that still use the key.",
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld host keeps this key selected and will not connect until you choose another key."
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld hosts keep this key selected and will not connect until you choose another key."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "%lld items from another iCloud account are hidden." : {
+      "comment" : "Plural: the number of synced items hidden from this account.",
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld item from another iCloud account is hidden."
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld items from another iCloud account are hidden."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "%lld panes" : {
+      "comment" : "Plural: a workspace's pane count.",
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld pane"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld panes"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "%lld tabs" : {
+      "comment" : "Plural: a workspace's tab count.",
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld tab"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld tabs"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}

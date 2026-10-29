@@ -89,7 +89,10 @@ extension MainActorIntegrationTests {
       }
       #expect(model.path == rejected)
       #expect(model.entries.isEmpty)
-      #expect(model.message == "This folder could not be listed.")
+      #expect(
+        model.message.map { String(localized: $0) }
+          == "This folder could not be listed."
+      )
       #expect(model.status == .ready)
       fixture.server.state.faults.withLock { $0.rejectedDirectoryPaths = [] }
       await model.open(
@@ -270,7 +273,10 @@ extension MainActorIntegrationTests {
       try Data([9]).write(to: blockedStore)
       await model.upload(from: source)
       #expect(model.transfers.isEmpty)
-      #expect(model.message == "The file could not be staged for upload.")
+      #expect(
+        model.message.map { String(localized: $0) }
+          == "The file could not be staged for upload."
+      )
       let path = try #require(staged.withLock { $0 })
       #expect(!FileManager.default.fileExists(atPath: path))
       #expect(try Data(contentsOf: blockedStore) == Data([9]))

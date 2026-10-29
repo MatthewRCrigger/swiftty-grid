@@ -14,8 +14,8 @@ struct WatchAttentionSection: View {
     if !summaries.isEmpty {
       VStack(alignment: .leading, spacing: 6) {
         Text("Attention").font(.caption.bold())
-        ForEach(Array(summaries.enumerated()), id: \.offset) { _, summary in
-          row(summary)
+        ForEach(rows, id: \.id) { row in
+          self.row(row.summary)
         }
         if handoff != nil {
           Label("Continue on your iPhone or Mac", systemImage: "iphone.and.arrow.forward")
@@ -33,6 +33,16 @@ struct WatchAttentionSection: View {
         activity.isEligibleForSearch = false
         activity.isEligibleForPublicIndexing = false
       }
+    }
+  }
+
+  /// Rows keyed by their handoff locator, which names one occurrence, so
+  /// a row keeps its identity when items above it come and go. A summary
+  /// without one falls back to its position (locators are base64url and
+  /// never contain "#").
+  private var rows: [(id: String, summary: AttentionSummary)] {
+    summaries.enumerated().map { offset, summary in
+      (summary.locator ?? "#\(offset)", summary)
     }
   }
 

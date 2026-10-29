@@ -30,7 +30,8 @@ public actor RoamingClient {
 
   enum AttachOutcome: Sendable {
     case active
-    case unreachable
+    /// The connect failed; carries the transport's reason.
+    case unreachable(String)
     case closed
     case timedOut
     case rejected(RSTErrorCode)
@@ -62,6 +63,8 @@ public actor RoamingClient {
   private var connectionGeneration: UInt64 = 0
   private var reader = ControlRecordReader()
   private var epoch: UInt64?
+  /// What the attached host accepts beyond plain RST/1.
+  private var hostFeatures: RSTFeatures = []
   private var earlySnapshot: DecodedScreen?
   private var outbox: [[UInt8]] = []
   private var pumpGeneration: UInt64?
@@ -107,6 +110,7 @@ public actor RoamingClient {
   private var currentStatus = RoamingStatus()
   private var statusHandler: (@Sendable (RoamingStatus) -> Void)?
   private var lastFailure: RoamingFailure?
+  private var lastFailureDetail: String?
   private var lastScreenAt: Date?
   private var refusedInputCount = 0
 
@@ -248,20 +252,34 @@ public actor RoamingClient {
     // The record must fit RST/1's control record limit once encoded
     // (escaped control characters grow a paste): an operation that could
     // never be sent would stall every later sequence behind it.
-    guard limits.permits(input.operation),
-      Self.fitsControlRecord(
-        input.operation,
-        limit: limits.maxControlRecordBytes
-      )
+    guard let operation = Self.operation(input.operation, for: hostFeatures),
+      limits.permits(operation),
+      Self.fitsControlRecord(operation, limit: limits.maxControlRecordBytes)
     else { return .refused(.invalid) }
     let entry: ClientInputQueue.Entry
-    do { entry = try queue.enqueue(input.operation) } catch .full {
+    do { entry = try queue.enqueue(operation) } catch .full {
       return .refused(.backpressure)
     } catch { return .refused(.invalid) }
     self.queue = queue
     sendInput(entry, epoch: epoch)
     publish()
     return .accepted(sequence: entry.sequence)
+  }
+
+  /// `operation` as a host with `features` accepts it: keypad keys become
+  /// the keys they type without `keypadKeys`. Nil when nothing matches.
+  static func operation(
+    _ operation: InputOperation,
+    for features: RSTFeatures
+  ) -> InputOperation? {
+    guard !features.contains(.keypadKeys), case var .key(key) = operation,
+      case let .keypad(keypad) = key.name
+    else { return operation }
+    guard let main = KeypadKey(rawValue: keypad.rawValue)?.mainKey,
+      let name = SemanticKeyName(main)
+    else { return nil }
+    key.name = name
+    return .key(key)
   }
 
   /// Whether `operation` encodes within the control record limit at the
@@ -274,6 +292,23 @@ public actor RoamingClient {
       .init(attachmentEpoch: .max, sequence: .max, operation: operation)
     )
     return (try? ControlRecord.encode(probe, limit: limit)) != nil
+  }
+
+  /// Moves this client's own window through the host's history by
+  /// `lines` (positive reveals older output). A no-op unless attached to
+  /// a host that advertises `historyViewport`; the host clamps the
+  /// window and returns it to live output on input.
+  public func scrollViewport(by lines: Int) {
+    guard lines != 0, let epoch, hostFeatures.contains(.historyViewport) else {
+      return
+    }
+    let bound = Int(ControlMessage.maxViewportLines)
+    send(.viewport(epoch: epoch, lines: Int64(min(max(lines, -bound), bound))))
+  }
+
+  /// Whether the attached host can present history windows.
+  public var supportsHistoryViewport: Bool {
+    epoch != nil && hostFeatures.contains(.historyViewport)
   }
 
   /// Requests a grid from local view geometry. Sent as a `.resize`
@@ -459,7 +494,9 @@ public actor RoamingClient {
         default: break
         }
         attemptFailed(.attachRejected(code))
-      case .unreachable: attemptFailed(.unreachable)
+      // SSH already granted this attachment: only the QUIC route failed.
+      case let .unreachable(reason):
+        attemptFailed(.endpointUnreachable, detail: reason)
       case .closed: attemptFailed(.connectionLost)
       case .timedOut: attemptFailed(.attachTimedOut)
       case .protocolViolation: attemptFailed(.protocolViolation)
@@ -467,13 +504,13 @@ public actor RoamingClient {
     }
   }
 
-  private func attemptFailed(_ failure: RoamingFailure) {
+  private func attemptFailed(_ failure: RoamingFailure, detail: String? = nil) {
     dropConnection()
     failedAttempts += 1
     // Repeated failures may mean the helper restarted: ask SSH, which
     // distinguishes "unreachable" from "session no longer exists".
     if failedAttempts % 3 == 0 { needsFreshGrant = true }
-    noteFailure(failure)
+    noteFailure(failure, detail: detail)
     move(to: .reconnecting)
   }
 
@@ -499,7 +536,7 @@ public actor RoamingClient {
     } catch DeadlineOperationError.timedOut {
       return .timedOut
     } catch ProviderOperationError.busy { return .timedOut } catch {
-      return .unreachable
+      return .unreachable(Self.reason(error))
     }
     guard !Task.isCancelled, lifecycle.state == .attaching,
       connectionGeneration == gen
@@ -596,8 +633,10 @@ public actor RoamingClient {
       let failure = Self.failure(for: error)
       noteFailure(failure)
       switch failure {
-      // A changed host key or failed login blocks automatic retries.
-      case .hostKeyRejected, .authenticationFailed: return .stop
+      // A changed host key, failed login or unreadable key blocks
+      // automatic retries.
+      case .hostKeyRejected, .authenticationFailed, .credentialUnavailable:
+        return .stop
       default: return .retry
       }
     }
@@ -842,7 +881,7 @@ public actor RoamingClient {
     case let .error(error):
       heard()
       handleError(error)
-    case .attach, .input, .screenAck, .detach, .terminate:
+    case .attach, .input, .screenAck, .detach, .terminate, .viewport:
       // Client-to-server messages are never valid from the host.
       connectionFailed(.protocolViolation)
     }
@@ -861,6 +900,7 @@ public actor RoamingClient {
       return
     }
     epoch = attached.attachmentEpoch
+    hostFeatures = attached.features
     heard()
     store.fence(epoch: attached.attachmentEpoch)
     self.store = store
@@ -986,6 +1026,7 @@ public actor RoamingClient {
         backoff.reset()
         failedAttempts = 0
         lastFailure = nil
+        lastFailureDetail = nil
         finishAttach(.active)
         maybeSendGrid()
       }
@@ -1015,7 +1056,9 @@ public actor RoamingClient {
         .init(
           attachmentEpoch: epoch,
           sequence: entry.sequence,
-          operation: entry.operation
+          // A retry may reach an older host than the one that queued it.
+          operation: Self.operation(entry.operation, for: hostFeatures)
+            ?? entry.operation
         )
       )
     )
@@ -1182,9 +1225,27 @@ public actor RoamingClient {
     return true
   }
 
-  private func noteFailure(_ failure: RoamingFailure) {
+  private func noteFailure(_ failure: RoamingFailure, detail: String? = nil) {
     lastFailure = failure
+    lastFailureDetail = detail
     publish()
+  }
+
+  /// A connect error as one bounded line: what the network or TLS stack
+  /// said, so an unreachable endpoint is distinguishable from a refused
+  /// handshake or a certificate mismatch.
+  public static func reason(_ error: any Error) -> String {
+    let text: String =
+      switch error as? RSTTransportError {
+      case let .handshake(message)?: message
+      case .pinMismatch?: "the Mac's certificate does not match the grant"
+      case .resourceLimit?: "the grant's limits are invalid"
+      case let other?: String(describing: other)
+      case nil: String(describing: error)
+      }
+    let line = text.split(whereSeparator: \.isNewline).joined(separator: " ")
+      .trimmingCharacters(in: .whitespaces)
+    return String((line.isEmpty ? "unknown error" : line).prefix(200))
   }
 
   private func publish() {
@@ -1198,7 +1259,9 @@ public actor RoamingClient {
       title: store?.current?.title ?? "",
       exitStatus: exitStatus,
       lastFailure: lastFailure,
-      reconnectAttempt: backoff.attempt
+      lastFailureDetail: lastFailureDetail,
+      reconnectAttempt: backoff.attempt,
+      roamingEndpoint: grant?.endpoint
     )
     guard next != currentStatus else { return }
     currentStatus = next
@@ -1228,6 +1291,7 @@ public actor RoamingClient {
     switch error as? RemoteBootstrapError {
     case .hostKeyRejected: .hostKeyRejected
     case .authenticationFailed: .authenticationFailed
+    case .credentialUnavailable: .credentialUnavailable
     case .protocolViolation: .protocolViolation
     case .unreachable, nil: .unreachable
     }
@@ -1239,6 +1303,7 @@ public actor RoamingClient {
     switch failure {
     case .hostKeyRejected: .hostKeyRejected
     case .authenticationFailed: .authenticationFailed
+    case .credentialUnavailable: .credentialUnavailable
     case .protocolViolation: .protocolViolation
     default: .unreachable
     }

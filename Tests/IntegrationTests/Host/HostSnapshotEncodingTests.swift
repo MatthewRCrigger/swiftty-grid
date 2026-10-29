@@ -6,15 +6,21 @@ import Synchronization
 @testable import TerminalHost
 import Testing
 
-private final class SnapshotReceiver: Sendable {
+final class SnapshotReceiver: Sendable {
   let connection: InMemoryRSTConnection
   let attachment: HostAttachment
   private let screens = Mutex<[ScreenSnapshot]>([])
 
-  init(_ registry: SessionRegistry) {
+  init(
+    _ registry: SessionRegistry,
+    wrapServer: (InMemoryRSTConnection) -> any RSTConnection = { $0 }
+  ) {
     let (client, server) = InMemoryRSTConnection.pair()
     connection = client
-    attachment = HostAttachment(connection: server, registry: registry)
+    attachment = HostAttachment(
+      connection: wrapServer(server),
+      registry: registry
+    )
     client.start(
       RSTConnectionHandler(
         onControl: { _ in },
@@ -103,8 +109,10 @@ struct HostSnapshotEncodingTests {
     )
   }
 
-  @Test
-  func lateEncodingFailureCannotRetireReplacementStream() async throws {
+  @Test(arguments: [false, true])
+  func lateEncodingCannotRetireOrDeliverIntoReplacementStream(
+    fails: Bool
+  ) async throws {
     try await withRegistry(
       launch: { shellLaunch("exec /bin/sleep 30") },
       { registry in
@@ -129,7 +137,7 @@ struct HostSnapshotEncodingTests {
               if release.wait(timeout: .now() + 10) == .timedOut {
                 Issue.record("encoding gate timed out")
               }
-              throw FramingError.snapshotTooLarge
+              if fails { throw FramingError.snapshotTooLarge }
             }
             return try SnapshotFrame.encode(screen)
           }

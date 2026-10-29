@@ -16,6 +16,7 @@ final class SessionCallbacks: @unchecked Sendable {
     var inputHandler: (@Sendable (TerminalInput) -> Void)?
     var ptyInputAdmission: PTYInputAdmission?
     var gridProposal: (@Sendable (Int, Int) -> Void)?
+    var viewportScroll: (@Sendable (Int) -> Void)?
   }
 
   private let lock = NSLock()
@@ -190,6 +191,22 @@ final class SessionCallbacks: @unchecked Sendable {
       lock.lock()
       let previous = state.gridProposal
       state.gridProposal = newValue
+      lock.unlock()
+      withExtendedLifetime(previous) {}
+    }
+  }
+
+  var viewportScroll: (@Sendable (Int) -> Void)? {
+    get {
+      lock.lock()
+      let handler = state.viewportScroll
+      lock.unlock()
+      return handler
+    }
+    set {
+      lock.lock()
+      let previous = state.viewportScroll
+      state.viewportScroll = newValue
       lock.unlock()
       withExtendedLifetime(previous) {}
     }

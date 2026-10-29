@@ -231,7 +231,8 @@ extension ViewLifecycleTests {
     view.insertText("a")
     _ = session.snapshot()
     #expect(view.heldKeys[4] == nil)
-    #expect(writes.withLock { $0 } == Array("a".utf8))
+    // Unassociated text under all-key reporting reports key zero, not the press.
+    #expect(writes.withLock { $0 } == Array("\u{1B}[0u".utf8))
   }
 
   @Test(.enabled(if: hasMetal), arguments: [false, true])

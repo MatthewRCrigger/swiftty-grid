@@ -10,7 +10,10 @@ struct VisionClientApp: App {
   var body: some Scene {
     WindowGroup {
       RoamingRootView(model: model)
-        .environment(\.terminalSurfaceFactory, .live(model))
+        .environment(
+          \.terminalSurfaceFactory,
+          LiveTerminalSurfaceFactory(app: model)
+        )
     }
     // Links reuse an open window rather than spawning one per link.
     .handlesExternalEvents(matching: ["*"])

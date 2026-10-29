@@ -6,14 +6,17 @@
 # usage: Scripts/package-swiftmux.sh [signing-identity] [output-dir]
 #   signing-identity  Developer ID identity, or "-" for ad-hoc (default).
 #                     Ad-hoc builds only get the same-user peer check.
-#   NOTARY_PROFILE    notarytool keychain profile (xcrun notarytool
-#                     store-credentials); when set with a Developer ID
-#                     identity, the app is notarized, stapled and assessed.
+#   NOTARY_PROFILE or NOTARY_KEY_ID/NOTARY_ISSUER_ID/NOTARY_KEY
+#                     notarization credentials (Scripts/notarize.sh); when
+#                     set with a Developer ID identity, the app is
+#                     notarized, stapled and assessed.
 #   SWIFTTY_LINK_DOMAINS  comma-separated Universal Link domains; see below.
 #   SWIFTTY_LINK_MODE     "developer" signs applinks:<domain>?mode=developer.
 #   SWIFTTY_PROVISIONING_PROFILE  provisioning profile embedded as
 #                     Contents/embedded.provisionprofile; macOS honours
 #                     the associated-domains entitlement only with one.
+#   SWIFTTY_VERSION   CFBundleShortVersionString (default 0.2).
+#   SWIFTTY_BUILD     CFBundleVersion (default 1).
 set -eu
 # Domain records are deliberately word-split below. Their developer-mode
 # suffix is literal text, even when the caller has matching filenames.
@@ -23,6 +26,18 @@ identity=${1:--}
 out=${2:-.build/package}
 label=com.chr33s.swiftty.swiftmux
 bundle_id=com.chr33s.swiftty
+version=${SWIFTTY_VERSION:-0.2}
+build=${SWIFTTY_BUILD:-1}
+# Up to three dot-separated integers each, as the bundle keys require.
+for number in "$version" "$build"; do
+  # Digits and single dots only (no newline can pass), at most two dots.
+  case $number in
+    '' | *[!0-9.]* | .* | *. | *..* | *.*.*.*)
+      echo "package-swiftmux: invalid version or build number: $number" >&2
+      exit 64
+      ;;
+  esac
+done
 
 # Attention deep links (spec.inbox.md §4.4): the `swiftty` scheme is
 # always registered. SWIFTTY_LINK_DOMAINS (comma-separated hostnames,
@@ -47,7 +62,9 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" \
 for exe in swiftty swiftmux-agent swmux-launcher swmux; do
   cp "$bin/$exe" "$app/Contents/MacOS/$exe"
 done
-cp -R "$bin/swiftty_SwifttyCore.bundle" "$app/Contents/Resources/"
+for bundle in SwifttyCore Swiftty MuxNavigation; do
+  cp -R "$bin/swiftty_$bundle.bundle" "$app/Contents/Resources/"
+done
 
 # The app icon, from the asset catalog's macOS images.
 icons=Resources/Assets.xcassets/AppIcon.appiconset
@@ -76,8 +93,8 @@ cat > "$app/Contents/Info.plist" <<EOF
   <key>CFBundleExecutable</key><string>swiftty</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>$version</string>
+  <key>CFBundleVersion</key><string>$build</string>
   <key>LSMinimumSystemVersion</key><string>27.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>CFBundleURLTypes</key>
@@ -89,6 +106,9 @@ cat > "$app/Contents/Info.plist" <<EOF
     </dict>
   </array>
   <key>SwifttyAssociatedDomains</key><array>$link_domains</array>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Swiftty makes this Mac discoverable to your iPhone and iPad while Connect a Device is open, so they can find it on your local network.</string>
+  <key>NSBonjourServices</key><array><string>_swiftty._tcp</string></array>
 </dict>
 </plist>
 EOF
@@ -149,11 +169,7 @@ codesign --force --options runtime "$timestamp" --sign "$identity" \
   ${entitlements:+--entitlements "$entitlements"} "$app"
 codesign --verify --strict --verbose=1 "$app"
 
-if [ -n "${NOTARY_PROFILE:-}" ] && [ "$identity" != "-" ]; then
-  zip="$out/Swiftty-notarize.zip"
-  ditto -c -k --keepParent "$app" "$zip"
-  xcrun notarytool submit "$zip" --keychain-profile "$NOTARY_PROFILE" --wait
-  xcrun stapler staple "$app"
-  spctl --assess --type execute --verbose=2 "$app"
+if [ -n "${NOTARY_PROFILE:-}${NOTARY_KEY_ID:-}" ] && [ "$identity" != "-" ]; then
+  "$(dirname "$0")/notarize.sh" "$app"
 fi
 echo "$app"

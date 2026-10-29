@@ -18,6 +18,7 @@ public enum OuterColor: Hashable, Sendable {
 public struct OuterStyle: Hashable, Sendable {
   public var foreground: OuterColor = .default
   public var background: OuterColor = .default
+  public var underlineColor: OuterColor = .default
   /// Engine `CellFlags` bits (structural bits never set here).
   public var flags: UInt16 = 0
 
@@ -39,16 +40,31 @@ public struct OuterStyle: Hashable, Sendable {
   public init(
     foreground: OuterColor = .default,
     background: OuterColor = .default,
+    underlineColor: OuterColor = .default,
     flags: UInt16 = 0
   ) {
     self.foreground = foreground
     self.background = background
+    self.underlineColor = underlineColor
     self.flags = flags
   }
 
-  init(_ s: FrameStyle) {
-    foreground = OuterColor(raw: s.foreground)
-    background = OuterColor(raw: s.background)
+  init(_ s: FrameStyle, palette: FramePalette, underlineColors: [UInt32]) {
+    func resolve(_ raw: UInt32, defaultColor: UInt32) -> OuterColor {
+      switch OuterColor(raw: raw) {
+      case .default: .rgb(defaultColor)
+      case let .palette(index): .rgb(palette.colors[Int(index)])
+      case let .rgb(value): .rgb(value)
+      }
+    }
+    foreground = resolve(s.foreground, defaultColor: palette.foreground)
+    background = resolve(s.background, defaultColor: palette.background)
+    if s.underlineColor != 0 {
+      underlineColor = resolve(
+        underlineColors[Int(s.underlineColor) - 1],
+        defaultColor: palette.foreground
+      )
+    }
     flags = s.flags
   }
 
@@ -87,6 +103,12 @@ public struct OuterStyle: Hashable, Sendable {
     case let .palette(i): p.append("48;5;\(i)")
     case let .rgb(v):
       p.append("48;2;\(v >> 16 & 0xFF);\(v >> 8 & 0xFF);\(v & 0xFF)")
+    }
+    switch underlineColor {
+    case .default: break  // SGR 0 restores the foreground underline color.
+    case let .palette(i): p.append("58;5;\(i)")
+    case let .rgb(v):
+      p.append("58;2;\(v >> 16 & 0xFF);\(v >> 8 & 0xFF);\(v & 0xFF)")
     }
     return "\u{1B}[" + p.joined(separator: ";") + "m"
   }
@@ -145,9 +167,7 @@ public struct ScreenBuffer: Equatable, Sendable {
     cells[i] = cell
   }
 
-  /// Writes `text` left to right (one cell per character; for UI strings).
-  /// A character the outer terminal would act on rather than draw shows
-  /// as "?", so measurements by character count still hold.
+  /// Writes chrome text in display cells, clipping only at grapheme boundaries.
   public mutating func write(
     _ text: String,
     x: Int,
@@ -157,10 +177,16 @@ public struct ScreenBuffer: Equatable, Sendable {
   ) {
     var cx = x
     let end = min(columns, limit.map { x + $0 } ?? columns)
-    for ch in text where cx < end {
-      let shown = DisplayText.draws(ch) ? String(ch) : "?"
-      put(ScreenCell(text: shown, style: style), x: cx, y: y)
-      cx += 1
+    for glyph in TerminalText.glyphs(text) {
+      guard cx + glyph.width <= end else { break }
+      if cx >= 0 {
+        put(
+          ScreenCell(text: glyph.text, width: UInt8(glyph.width), style: style),
+          x: cx,
+          y: y
+        )
+      }
+      cx += glyph.width
     }
   }
 

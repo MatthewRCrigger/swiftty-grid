@@ -52,6 +52,19 @@ private struct MuxCommandPayload {
     }
   }
 
+  private mutating func clipboard(
+    _ contents: [MuxClipboardContent]
+  ) throws(MuxError) {
+    try add(
+      count: contents.count,
+      stride: MemoryLayout<MuxClipboardContent>.stride
+    )
+    for content in contents {
+      try text(content.mime)
+      try add(content.data.count)
+    }
+  }
+
   private mutating func count(_ command: MuxCommand) throws(MuxError) {
     // Exhaustive: a new command case must explicitly account for its payload.
     switch command {
@@ -90,6 +103,11 @@ private struct MuxCommandPayload {
       try add(count: panes.count, stride: MemoryLayout<PaneID>.stride)
     case .setViewport: try add(MemoryLayout<ViewportRequest>.stride)
     case let .search(_, query): try text(query)
+    case let .clipboardReadResult(_, _, .success(available, contents, _)):
+      try add(count: available.count, stride: MemoryLayout<String>.stride)
+      for mime in available { try text(mime) }
+      try clipboard(contents)
+    case .clipboardReadResult, .clipboardWriteResult: break
     case .status, .listWorkspaces, .detachActive, .endAllWorkspaces, .quiesce,
       .detach, .observeWorkspaces, .subscribeInbox, .selectTab, .endTab,
       .focusPane, .toggleZoom, .endPane, .scroll, .searchStep, .endSearch,

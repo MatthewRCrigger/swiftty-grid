@@ -12,21 +12,34 @@ import WatchConnectivity
 @MainActor
 @Observable
 final class WatchCompanionModel {
+  /// A working copy for updates that must commit together.
   private struct State {
-    var store = WatchCompanionStore()
-    var attention: [AttentionSummary] = []
+    var store: WatchCompanionStore
+    var attention: [AttentionSummary]
     var pendingContext: WatchApplicationContext?
   }
 
-  private var state = State()
-
-  private(set) var store: WatchCompanionStore {
-    get { state.store }
-    set { state.store = newValue }
-  }
+  /// Separate stored properties, so a view that reads one is not
+  /// invalidated by a change to another.
+  private(set) var store = WatchCompanionStore()
   /// Redacted attention summaries from the paired iPhone's last inbox
   /// refresh (`AttentionSummaryBatch`). Read-only: no SSH, no input.
-  var attention: [AttentionSummary] { state.attention }
+  private(set) var attention: [AttentionSummary] = []
+  /// Never read by views.
+  @ObservationIgnored
+  private var pendingContext: WatchApplicationContext?
+
+  /// Commits only the fields that changed.
+  private var state: State {
+    get {
+      State(store: store, attention: attention, pendingContext: pendingContext)
+    }
+    set {
+      if newValue.store != store { store = newValue.store }
+      if newValue.attention != attention { attention = newValue.attention }
+      pendingContext = newValue.pendingContext
+    }
+  }
   #if canImport(WatchConnectivity)
   @ObservationIgnored
   private var delegate: WatchSessionDelegate?

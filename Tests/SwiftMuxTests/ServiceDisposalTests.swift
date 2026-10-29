@@ -144,7 +144,9 @@ struct ServiceDisposalTests {
     import ctypes,os,signal,sys,time
     assert ctypes.CDLL(None).login_tty(3)==0
     signal.signal(signal.SIGHUP,signal.SIG_IGN)
-    with open(os.path.join(sys.argv[1],'pid'),'w') as f: f.write(str(os.getpid()))
+    path=os.path.join(sys.argv[1],'pid')
+    with open(path+'.tmp','w') as f: f.write(str(os.getpid()))
+    os.replace(path+'.tmp',path)
     os.write(4,b'S exec 0\\n')
     os.close(4)
     time.sleep(8)

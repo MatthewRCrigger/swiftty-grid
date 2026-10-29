@@ -225,14 +225,14 @@ extension MainActorIntegrationTests {
 
     @Test
     func `capabilities follow the terminal kind`() {
-      let mac = PlatformProfile.profile(for: .mac)
+      let mac = PlatformProfile.profile(for: .catalyst)
       #expect(
         TerminalScreenModel(host: host, profile: mac).capabilities
           == mac.roamingSurface
       )
       #expect(
-        TerminalScreenModel(host: host, profile: mac, kind: .localShell)
-          .capabilities == mac.localSurface
+        TerminalScreenModel(host: host, profile: mac, kind: .ordinarySSH)
+          .capabilities == mac.sshSurface
       )
       let tv = PlatformProfile.profile(for: .tv)
       #expect(!tv.sftp)

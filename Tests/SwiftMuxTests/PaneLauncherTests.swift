@@ -103,15 +103,20 @@ struct PaneLauncherTests {
       ofItemAtPath: executable.path
     )
     var launcher = PaneLauncher(
-      launcherPath: executable.path,
+      // Start the signed interpreter directly so cold script launch checks
+      // do not consume the deadline this fixture is testing.
+      launcherPath: "/bin/sh",
       innerTerm: "xterm-256color",
       terminfoDirectory: nil
     )
     launcher.launchTimeout = .seconds(1)
+    var spec = shellLaunch()
+    // /bin/sh receives the fixture script in the launcher's directory slot.
+    spec.workingDirectory = executable.path
     let start = ContinuousClock.now
     do {
       let child = try launcher.launch(
-        shellLaunch(),
+        spec,
         pane: PaneID(),
         workspace: WorkspaceID(),
         columns: 80,

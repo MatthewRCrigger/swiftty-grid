@@ -7,14 +7,14 @@
 # - Generates Apps/project.yml with XcodeGen. The project must sit beside
 #   the spec because Xcode resolves the local package path (`..`) and the
 #   entitlements paths relative to the project directory, so it is written
-#   to Apps/RoamingClients.xcodeproj, which is gitignored (*.xcodeproj) and
+#   to Apps/Swiftty.xcodeproj, which is gitignored (*.xcodeproj) and
 #   never committed. Derived data, logs and evidence go to a temp dir.
 # - XcodeGen's preGenCommand runs Scripts/configure-links.sh, which writes
 #   Apps/Config/Generated/ from SWIFTTY_LINK_DOMAINS (spec.inbox.md §4.4).
 #   The evidence records the associated domains each target was given:
 #   none when the variable is unset.
 # - Builds each app with CODE_SIGNING_ALLOWED=NO for: iOS Simulator,
-#   macOS, Mac Catalyst, visionOS Simulator, tvOS Simulator and watchOS
+#   Mac Catalyst, visionOS Simulator, tvOS Simulator and watchOS
 #   Simulator.
 # - Builds the swifttyd helper with SwiftPM.
 # - Writes an evidence file with toolchain/SDK versions, destinations and
@@ -40,7 +40,7 @@ echo "Workspace: $work"
 xcodegen generate --quiet \
   --spec "$repository_root/Apps/project.yml" \
   --project "$repository_root/Apps" || { echo "xcodegen failed" >&2; exit 1; }
-project="$repository_root/Apps/RoamingClients.xcodeproj"
+project="$repository_root/Apps/Swiftty.xcodeproj"
 
 # Resolve package dependencies once so per-target builds share the result.
 xcodebuild -resolvePackageDependencies -project "$project" \
@@ -113,7 +113,7 @@ else
 fi
 record_evidence echo
 record_evidence echo "## Universal Links (SWIFTTY_LINK_DOMAINS=${SWIFTTY_LINK_DOMAINS:-})"
-for target in MobileClient MacClient CatalystClient VisionClient; do
+for target in MobileClient CatalystClient VisionClient; do
   entitlements="$repository_root/Apps/Config/Generated/$target.entitlements"
   if domains=$(/usr/bin/python3 -I - "$entitlements" <<'PY'
 import plistlib, sys
@@ -171,7 +171,6 @@ build() {
 }
 
 build MobileClient "generic/platform=iOS Simulator"
-build MacClient "generic/platform=macOS"
 build CatalystClient "generic/platform=macOS,variant=Mac Catalyst"
 build VisionClient "generic/platform=visionOS Simulator"
 build TVClient "generic/platform=tvOS Simulator"

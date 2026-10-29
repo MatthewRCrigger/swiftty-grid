@@ -206,9 +206,9 @@ public struct Palette: Sendable, Equatable {
 
   public static let standard: Palette = {
     let base: [UInt32] = [
-      0x1D1F21, 0xCC6666, 0xB5BD68, 0xF0C674, 0x81A2BE, 0xB294BB, 0x8ABEB7,
-      0xC5C8C6, 0x666666, 0xD54E53, 0xB9CA4A, 0xE7C547, 0x7AA6DA, 0xC397D8,
-      0x70C0B1, 0xEAEAEA,
+      0x0C1021, 0xBF392A, 0x61CE3C, 0xFBDE2D, 0x8DA6CE, 0xFF6400, 0xBECDE6,
+      0xF8F8F8, 0x7F90AA, 0xD74E41, 0xD8FA3C, 0xFBDE2D, 0xD5E0F3, 0xFF6400,
+      0xFFFFFF, 0xFFFFFF,
     ]
     var colors = InlineArray<256, UInt32>(repeating: 0)
     for i in 0 ..< 16 { colors[i] = base[i] }
@@ -223,8 +223,8 @@ public struct Palette: Sendable, Equatable {
     }
     return Palette(
       colors: colors,
-      foreground: 0xFFFFFF,
-      background: 0x282C34,
+      foreground: 0xF8F8F8,
+      background: 0x0C1021,
       cursor: 0xFFFFFF
     )
   }()

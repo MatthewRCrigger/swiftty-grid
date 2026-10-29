@@ -27,19 +27,35 @@ public enum KeyTranslator {
     public static let left = 0x50
     public static let down = 0x51
     public static let up = 0x52
+    public static let keypadSlash = 0x54  // * - + follow
     public static let keypadEnter = 0x58
+    public static let keypad1 = 0x59  // ... 9, 0, period follow
+    public static let keypadEqual = 0x67
+    public static let keypadComma = 0x85
     public static let leftControl = 0xE0  // ... right GUI = 0xE7
   }
 
   static let specialKeys: [Int: Key] = {
     var keys: [Int: Key] = [
-      Usage.returnOrEnter: .enter, Usage.keypadEnter: .enter, Usage.tab: .tab,
-      Usage.backspace: .backspace, Usage.escape: .escape, Usage.left: .left,
-      Usage.right: .right, Usage.down: .down, Usage.up: .up, Usage.home: .home,
-      Usage.end: .end, Usage.pageUp: .pageUp, Usage.pageDown: .pageDown,
-      Usage.deleteForward: .delete, Usage.insert: .insert,
+      Usage.returnOrEnter: .enter, Usage.keypadEnter: .keypad(.enter),
+      Usage.tab: .tab, Usage.backspace: .backspace, Usage.escape: .escape,
+      Usage.left: .left, Usage.right: .right, Usage.down: .down, Usage.up: .up,
+      Usage.home: .home, Usage.end: .end, Usage.pageUp: .pageUp,
+      Usage.pageDown: .pageDown, Usage.deleteForward: .delete,
+      Usage.insert: .insert,
     ]
     for n in 1 ... 12 { keys[Usage.f1 + n - 1] = .function(n) }
+    let operators: [KeypadKey] = [.divide, .multiply, .subtract, .add]
+    for (i, k) in operators.enumerated() {
+      keys[Usage.keypadSlash + i] = .keypad(k)
+    }
+    let digits: [KeypadKey] = [
+      .one, .two, .three, .four, .five, .six, .seven, .eight, .nine, .zero,
+      .decimal,
+    ]
+    for (i, k) in digits.enumerated() { keys[Usage.keypad1 + i] = .keypad(k) }
+    keys[Usage.keypadEqual] = .keypad(.equal)
+    keys[Usage.keypadComma] = .keypad(.separator)
     return keys
   }()
 
@@ -279,6 +295,28 @@ public enum AccessoryKey: Hashable, Sendable {
     }
   }
 
+  /// SF Symbol drawn instead of `title`, for keys with a standard glyph.
+  public var symbolName: String? {
+    switch self {
+    case .escape: "escape"
+    case .control: "control"
+    case .alt: "option"
+    case .tab: "arrow.right.to.line"
+    default: nil
+    }
+  }
+
+  /// What VoiceOver says for the key.
+  public var accessibilityName: String {
+    switch self {
+    case .escape: "Escape"
+    case .control: "Control"
+    case .alt: "Alt"
+    case .tab: "Tab"
+    default: title
+    }
+  }
+
   /// The sticky modifier this key toggles.
   public var modifier: KeyModifiers? {
     switch self {
@@ -389,6 +427,14 @@ public struct GridGeometry: Equatable, Sendable {
     let x = (point.x * scale - padding.x) / cellSize.width
     let y = (point.y * scale - padding.y) / cellSize.height
     return (TerminalGeometry.cellIndex(x), TerminalGeometry.cellIndex(y))
+  }
+
+  /// Pixel position inside the padding, for SGR pixel reports.
+  public func pixel(at point: CGPoint) -> (x: Int, y: Int) {
+    (
+      Int((point.x * scale - padding.x).rounded()),
+      Int((point.y * scale - padding.y).rounded())
+    )
   }
 
   /// Rect of a cell in view points.

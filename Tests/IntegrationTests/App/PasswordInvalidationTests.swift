@@ -168,7 +168,8 @@ extension MainActorIntegrationTests {
       switch invalidation {
       case .deletion:
         app.delete(host)
-        #expect(try app.save(host))
+        #expect(try !app.save(host))
+        #expect(app.hosts.isEmpty)  // A tombstone is never revived.
       case .edit:
         var edited = host
         edited.host = "edited.example"
@@ -176,7 +177,7 @@ extension MainActorIntegrationTests {
         #expect(try app.save(host))
       case .rejectedPassword: app.forgetPassword(for: host)
       case .reload:
-        let store = HostProfileStore(
+        let store = ConnectionStore(
           fileURL: fixture.directory.appendingPathComponent("hosts.json")
         )
         var edited = host
@@ -217,7 +218,8 @@ extension MainActorIntegrationTests {
       switch invalidation {
       case .deletion:
         app.delete(host)
-        #expect(try app.save(host))
+        #expect(try !app.save(host))
+        #expect(app.hosts.isEmpty)  // A tombstone is never revived.
       case .edit:
         var edited = host
         edited.host = "edited.example"
@@ -225,7 +227,7 @@ extension MainActorIntegrationTests {
         #expect(try app.save(host))
       case .rejectedPassword: app.forgetPassword(for: host)
       case .reload:
-        let store = HostProfileStore(
+        let store = ConnectionStore(
           fileURL: fixture.directory.appendingPathComponent("hosts.json")
         )
         var edited = host
@@ -264,7 +266,7 @@ private struct Fixture {
     suite = "password-invalidation-" + UUID().uuidString
     defaults = try #require(UserDefaults(suiteName: suite))
     app = RoamingAppModel(
-      store: HostProfileStore(
+      store: ConnectionStore(
         fileURL: directory.appendingPathComponent("hosts.json")
       ),
       resumeStore: SessionResumeStore(defaults: defaults),

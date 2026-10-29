@@ -11,13 +11,17 @@ case "${1:-format}" in
   *) echo 'usage: format-swift.sh [format|check]' >&2; exit 2 ;;
 esac
 
+# Xcode includes swift-format even when its toolchain bin directory is not
+# on PATH (as on a fresh CI runner).
+formatter=$(command -v swift-format || xcrun --find swift-format)
+
 file_list=$(mktemp "${TMPDIR:-/tmp}/swiftty-format.XXXXXX")
 trap 'rm -f "$file_list"' EXIT
 trap 'exit 1' HUP INT TERM
-# Generated Unicode tables retain their generator's formatting.
+# Generated Unicode and Blowfish tables retain their generator's formatting.
 # Finish discovery before a formatter can consume a partial file list.
 if rg --files -0 Sources Tests Scripts -g '*.swift' \
-  -g '!Tables.swift' -g '!GraphemeBreakTables.swift' -g '!GraphemeBreakTestData.swift' \
+  -g '!Tables.swift' -g '!BlowfishTables.swift' -g '!GraphemeBreakTables.swift' -g '!GraphemeBreakTestData.swift' \
   > "$file_list"; then
   :
 else
@@ -28,6 +32,6 @@ else
   fi
 fi
 if [ -s "$file_list" ]; then
-  xargs -0 swift-format "$@" --configuration .swift-format < "$file_list"
+  xargs -0 "$formatter" "$@" --configuration .swift-format < "$file_list"
 fi
-swift-format "$@" --configuration .swift-format Package.swift
+"$formatter" "$@" --configuration .swift-format Package.swift

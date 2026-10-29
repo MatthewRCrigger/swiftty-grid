@@ -2,16 +2,132 @@ import Foundation
 
 /// How a saved host authenticates. A *reference* only: secrets live in
 /// the Keychain or are prompted for, never in a `HostProfile`.
+///
+/// Version 2 encodes `{"type": …}` explicitly (spec.ssh-identity.md §5).
+/// The version-1 synthesized shape is read for migration only, and an
+/// unknown variant written by a newer build is preserved verbatim.
 public enum AuthMethodReference: Hashable, Sendable, Codable {
   /// Prompt for a password at connect time; nothing is stored here.
   case password
-  /// An app-managed Ed25519 key stored in the Keychain under `label`.
-  case keychainKey(label: String)
+  /// A reusable SSH identity, by stable UUID. Renaming the identity never
+  /// changes this reference.
+  case key(identityID: UUID)
+  /// A version-1 label awaiting migration or explicit repair. Never
+  /// resolves to a credential and never creates a key.
+  case legacyKey(label: String)
+  /// A variant this build does not understand, kept for round-tripping.
+  case unsupported(JSONValue)
 
+  /// Localized plain text: it can name a key the user chose.
   public var summary: String {
     switch self {
-    case .password: "Password"
-    case .keychainKey(let label): "Key \u{201C}\(label)\u{201D}"
+    case .password: String(localized: "Password", bundle: #bundle)
+    case .key: String(localized: "SSH key", bundle: #bundle)
+    case .legacyKey(let label):
+      String(
+        localized: "Key \u{201C}\(label)\u{201D} (needs repair)",
+        bundle: #bundle
+      )
+    case .unsupported:
+      String(localized: "Unsupported sign-in method", bundle: #bundle)
+    }
+  }
+
+  public var identityID: UUID? {
+    if case .key(let id) = self { return id }
+    return nil
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case type, identity, label
+    // Version-1 synthesized enum keys.
+    case password, keychainKey
+  }
+
+  public init(from decoder: any Decoder) throws {
+    let raw = try JSONValue(from: decoder)
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    if let type = try? container.decode(String.self, forKey: .type) {
+      switch type {
+      case "password": self = .password
+      case "key":
+        self = .key(
+          identityID: try container.decode(UUID.self, forKey: .identity)
+        )
+      case "legacyKey":
+        self = .legacyKey(
+          label: try container.decode(String.self, forKey: .label)
+        )
+      default: self = .unsupported(raw)
+      }
+      return
+    }
+    if container.contains(.password) {
+      self = .password
+    } else if let legacy = try? container.nestedContainer(
+      keyedBy: CodingKeys.self,
+      forKey: .keychainKey
+    ), let label = try? legacy.decode(String.self, forKey: .label) {
+      self = .legacyKey(label: label)
+    } else {
+      self = .unsupported(raw)
+    }
+  }
+
+  public func encode(to encoder: any Encoder) throws {
+    if case .unsupported(let raw) = self {
+      try raw.encode(to: encoder)
+      return
+    }
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    switch self {
+    case .password: try container.encode("password", forKey: .type)
+    case .key(let id):
+      try container.encode("key", forKey: .type)
+      try container.encode(id, forKey: .identity)
+    case .legacyKey(let label):
+      try container.encode("legacyKey", forKey: .type)
+      try container.encode(label, forKey: .label)
+    case .unsupported: break
+    }
+  }
+}
+
+/// Lossless JSON for preserving data a newer build wrote.
+public indirect enum JSONValue: Hashable, Sendable, Codable {
+  case null
+  case bool(Bool)
+  case number(Double)
+  case string(String)
+  case array([JSONValue])
+  case object([String: JSONValue])
+
+  public init(from decoder: any Decoder) throws {
+    let container = try decoder.singleValueContainer()
+    if container.decodeNil() {
+      self = .null
+    } else if let value = try? container.decode(Bool.self) {
+      self = .bool(value)
+    } else if let value = try? container.decode(Double.self) {
+      self = .number(value)
+    } else if let value = try? container.decode(String.self) {
+      self = .string(value)
+    } else if let value = try? container.decode([JSONValue].self) {
+      self = .array(value)
+    } else {
+      self = .object(try container.decode([String: JSONValue].self))
+    }
+  }
+
+  public func encode(to encoder: any Encoder) throws {
+    var container = encoder.singleValueContainer()
+    switch self {
+    case .null: try container.encodeNil()
+    case .bool(let value): try container.encode(value)
+    case .number(let value): try container.encode(value)
+    case .string(let value): try container.encode(value)
+    case .array(let value): try container.encode(value)
+    case .object(let value): try container.encode(value)
     }
   }
 }
@@ -71,7 +187,7 @@ public struct HostProfile: Hashable, Sendable, Codable, Identifiable {
     guard !username.isEmpty, username.utf8.count <= Self.maxUsernameLength,
       Self.isPrintable(username, allowSpaces: false), !username.hasPrefix("-")
     else { throw .invalidUsername }
-    if case .keychainKey(let label) = auth {
+    if case .legacyKey(let label) = auth {
       guard !label.isEmpty, label.count <= Self.maxKeyLabelLength,
         Self.isPrintable(label, allowSpaces: true)
       else { throw .invalidKeyLabel }

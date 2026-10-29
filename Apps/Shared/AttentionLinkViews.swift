@@ -42,72 +42,28 @@ extension View {
   }
 }
 
-/// Opens an attention destination in the current scene's navigator.
-struct OpenAttentionAction {
-  var handler: @MainActor (AttentionDestination) -> Void = { _ in }
-  @MainActor
-  func callAsFunction(_ destination: AttentionDestination) {
-    handler(destination)
-  }
-}
-
-extension EnvironmentValues {
-  @Entry
-  var openAttention = OpenAttentionAction()
-}
-
-struct AttentionLinkRouting: ViewModifier {
-  let model: RoamingAppModel
-  @State
-  private var session: AttentionLinkSession?
-  @State
+/// Opens attention destinations in the current scene's navigator and owns
+/// the presented link session. An observable reference in the environment,
+/// not a closure: SwiftUI cannot compare closures, so a closure-valued
+/// entry would invalidate every reader on each write.
+@MainActor
+@Observable
+final class AttentionRouter {
+  @ObservationIgnored
+  private let model: RoamingAppModel
+  private(set) var session: AttentionLinkSession?
+  @ObservationIgnored
   private var startTask: Task<Void, Never>?
 
-  func body(content: Content) -> some View {
-    content.onOpenURL { url in open { await $0.open(url) } }
-      .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
-        guard let url = activity.webpageURL else { return }
-        open { await $0.open(url) }
-      }
-      .onContinueUserActivity(AttentionHandoffRequest.activityType) {
-        activity in
-        // A watch handoff carries only a locator; it is resolved through
-        // this device's hosts like any link and never grants a lease.
-        guard
-          let request = AttentionHandoffRequest(userInfo: activity.userInfo),
-          let destination = try? request.destination()
-        else { return }
-        open { await $0.open(destination) }
-      }
-      // Inbox entries open through the same navigator, in this scene.
-      .environment(
-        \.openAttention,
-        OpenAttentionAction { destination in open { await $0.open(destination) }
-        }
-      )
-      // iPadOS/visionOS/Catalyst: an attention link goes to an existing
-      // window (this one, when it is frontmost) instead of a new scene;
-      // every scene shares the one app model and its single terminal.
-      .preferringAttentionEvents()
-      .sheet(item: presentedSession) { session in
-        AttentionDestinationView(navigator: session.navigator) {
-          dismissSession(session.id)
-        }
-        .macSheetFrame(width: 440, height: 320).presentationBackground(.clear)
-        .connectionPrompts(model).onDisappear { session.navigator.cancel() }
-      }
-      .onDisappear { if let session { dismissSession(session.id) } }
+  init(model: RoamingAppModel) {
+    self.model = model
   }
 
-  private var presentedSession: Binding<AttentionLinkSession?> {
-    let id = session?.id
-    return Binding(
-      get: { session },
-      set: { if $0 == nil, let id { dismissSession(id) } }
-    )
+  func open(_ destination: AttentionDestination) {
+    open { await $0.open(destination) }
   }
 
-  private func dismissSession(_ id: UUID) {
+  func dismissSession(_ id: UUID) {
     guard session?.id == id else { return }
     startTask?.cancel()
     startTask = nil
@@ -118,7 +74,7 @@ struct AttentionLinkRouting: ViewModifier {
 
   /// A newer link replaces the current one; the old navigator's late
   /// results are dropped with it.
-  private func open(
+  func open(
     _ start: @escaping @MainActor (AttentionNavigator) async -> Void
   ) {
     startTask?.cancel()
@@ -136,6 +92,61 @@ struct AttentionLinkRouting: ViewModifier {
   }
 }
 
+struct AttentionLinkRouting: ViewModifier {
+  let model: RoamingAppModel
+  @State
+  private var router: AttentionRouter
+
+  init(model: RoamingAppModel) {
+    self.model = model
+    _router = State(initialValue: AttentionRouter(model: model))
+  }
+
+  func body(content: Content) -> some View {
+    content.onOpenURL { url in router.open { await $0.open(url) } }
+      .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
+        guard let url = activity.webpageURL else { return }
+        router.open { await $0.open(url) }
+      }
+      .onContinueUserActivity(AttentionHandoffRequest.activityType) {
+        activity in
+        // A watch handoff carries only a locator; it is resolved through
+        // this device's hosts like any link and never grants a lease.
+        guard
+          let request = AttentionHandoffRequest(userInfo: activity.userInfo),
+          let destination = try? request.destination()
+        else { return }
+        router.open(destination)
+      }
+      // Inbox entries open through the same navigator, in this scene.
+      .environment(router)
+      // iPadOS/visionOS/Catalyst: an attention link goes to an existing
+      // window (this one, when it is frontmost) instead of a new scene;
+      // every scene shares the one app model and its single terminal.
+      .preferringAttentionEvents()
+      .sheet(item: presentedSession) { session in
+        AttentionDestinationView(navigator: session.navigator) {
+          router.dismissSession(session.id)
+        }
+        .macSheetFrame(width: 440, height: 320).presentationBackground(.clear)
+        .connectionPrompts(model).onDisappear { session.navigator.cancel() }
+      }
+      .onDisappear {
+        if let session = router.session { router.dismissSession(session.id) }
+      }
+  }
+
+  /// Captures the session shown at render time, so a late dismissal of a
+  /// replaced sheet cannot dismiss its successor.
+  private var presentedSession: Binding<AttentionLinkSession?> {
+    let id = router.session?.id
+    return Binding(
+      get: { router.session },
+      set: { if $0 == nil, let id { router.dismissSession(id) } }
+    )
+  }
+}
+
 /// Renders every navigator state. Program text is untrusted and shown
 /// verbatim as plain text, never as markup or a link.
 struct AttentionDestinationView: View {
@@ -150,10 +161,11 @@ struct AttentionDestinationView: View {
           maxHeight: .infinity,
           alignment: .topLeading
         )
-        .glassSurface().glassButtonStyle().navigationTitle("Attention")
+        .glassSurface().glassButtonStyle()
+        .navigationTitle(.localized("Attention"))
         .toolbar {
           ToolbarItem(placement: .cancellationAction) {
-            Button("Close") {
+            Button(.localized("Close")) {
               navigator.cancel()
               dismiss()
             }
@@ -168,21 +180,26 @@ struct AttentionDestinationView: View {
     case .idle: ProgressView()
     case .rejected:
       message(
-        "This link can't be opened",
-        "It is not a valid Swiftty attention link. Nothing was contacted.",
+        .localized("This link can't be opened"),
+        Text(
+          "It is not a valid Swiftty attention link. Nothing was contacted.",
+          bundle: #bundle
+        ),
         symbol: "link.badge.plus"
       )
     case let .needsHostSelection(hosts):
       VStack(alignment: .leading, spacing: 12) {
-        Text("Choose a host").font(.headline)
+        Text("Choose a host", bundle: #bundle).font(.headline)
         if hosts.isEmpty {
           Text(
-            "Add the Mac this link came from to your hosts first. Links never add hosts."
+            "Add the Mac this link came from to your hosts first. Links never add hosts.",
+            bundle: #bundle
           )
           .foregroundStyle(.secondary)
         } else {
           Text(
-            "This link names a host this device doesn't know. Pick one of your own hosts."
+            "This link names a host this device doesn't know. Pick one of your own hosts.",
+            bundle: #bundle
           )
           .foregroundStyle(.secondary)
           ForEach(hosts) { host in
@@ -190,24 +207,34 @@ struct AttentionDestinationView: View {
           }
         }
       }
-    case let .connecting(host): ProgressView("Connecting to \(host.name)…")
+    case let .connecting(host):
+      ProgressView { Text("Connecting to \(host.name)…", bundle: #bundle) }
     case let .unavailable(reason):
       VStack(alignment: .leading, spacing: 12) {
-        message("Unavailable", reason, symbol: "wifi.exclamationmark")
-        Button("Try Again") { Task { await navigator.retry() } }
+        message(
+          .localized("Unavailable"),
+          Text(verbatim: reason),
+          symbol: "wifi.exclamationmark"
+        )
+        Button(.localized("Try Again")) { Task { await navigator.retry() } }
       }
     case let .ready(preview):
       VStack(alignment: .leading, spacing: 12) {
         item(preview)
-        Button("Open in Pane") { Task { await navigator.openInPane() } }
-          .glassButtonStyle(prominent: true)
+        Button(.localized("Open in Pane")) {
+          Task { await navigator.openInPane() }
+        }
+        .glassButtonStyle(prominent: true)
       }
       .task { await navigator.didView() }
     case let .stale(preview):
       VStack(alignment: .leading, spacing: 12) {
         message(
-          "No longer current",
-          "This request was resolved, reviewed or replaced. A newer request is not shown in its place.",
+          .localized("No longer current"),
+          Text(
+            "This request was resolved, reviewed or replaced. A newer request is not shown in its place.",
+            bundle: #bundle
+          ),
           symbol: "clock.arrow.circlepath"
         )
         item(preview)
@@ -215,51 +242,65 @@ struct AttentionDestinationView: View {
       .task { await navigator.didView() }
     case let .missing(reason):
       message(
-        "Item not found",
-        reason == .serviceRestarted
-          ? "The host's service restarted since this link was made."
-          : "The request, pane or terminal this link named is gone.",
+        .localized("Item not found"),
+        Text(
+          reason == .serviceRestarted
+            ? "The host's service restarted since this link was made."
+            : "The request, pane or terminal this link named is gone.",
+          bundle: #bundle
+        ),
         symbol: "questionmark.square.dashed"
       )
     case let .paneExited(preview):
       VStack(alignment: .leading, spacing: 12) {
         message(
-          "The pane exited",
-          "Its final output may still be retained.",
+          .localized("The pane exited"),
+          Text("Its final output may still be retained.", bundle: #bundle),
           symbol: "stop.circle"
         )
         item(preview)
-        Button("Show Final Output") { Task { await navigator.openInPane() } }
+        Button(.localized("Show Final Output")) {
+          Task { await navigator.openInPane() }
+        }
       }
       .task { await navigator.didView() }
     case let .confirmTakeover(offer):
       VStack(alignment: .leading, spacing: 12) {
         message(
           offer.controllerChanged
-            ? "Another client took control first"
-            : "Another client controls this workspace",
-          "Taking over disconnects it. Its shells keep running.",
+            ? .localized("Another client took control first")
+            : .localized("Another client controls this workspace"),
+          Text(
+            "Taking over disconnects it. Its shells keep running.",
+            bundle: #bundle
+          ),
           symbol: "person.2.badge.gearshape"
         )
-        Button("Take Over", role: .destructive) {
+        Button(.localized("Take Over"), role: .destructive) {
           Task { await navigator.confirmTakeover() }
         }
-        Button("Not Now") { navigator.declineTakeover() }
+        Button(.localized("Not Now")) { navigator.declineTakeover() }
       }
-    case .opening: ProgressView("Opening…")
+    case .opening: ProgressView(.localized("Opening…"))
     case .opened:
-      message("Opened", "The pane is active.", symbol: "checkmark.circle")
+      message(
+        .localized("Opened"),
+        Text("The pane is active.", bundle: #bundle),
+        symbol: "checkmark.circle"
+      )
     }
   }
 
+  /// `detail` is app copy, or `Text(verbatim:)` for text the host
+  /// reported.
   private func message(
-    _ title: String,
-    _ detail: String,
+    _ title: LocalizedStringResource,
+    _ detail: Text,
     symbol: String
   ) -> some View {
     VStack(alignment: .leading, spacing: 6) {
       Label(title, systemImage: symbol).font(.headline)
-      Text(verbatim: detail).foregroundStyle(.secondary)
+      detail.foregroundStyle(.secondary)
     }
   }
 
@@ -277,11 +318,13 @@ struct AttentionDestinationView: View {
     .accessibilityElement(children: .combine)
   }
 
-  private func category(_ category: AttentionCategory) -> String {
+  private func category(
+    _ category: AttentionCategory
+  ) -> LocalizedStringResource {
     switch category {
-    case .needsYou: "Needs you"
-    case .failure: "Failed"
-    case .result: "Result"
+    case .needsYou: .localized("Needs you")
+    case .failure: .localized("Failed")
+    case .result: .localized("Result")
     }
   }
 }

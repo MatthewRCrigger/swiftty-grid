@@ -81,7 +81,7 @@ public struct Compositor {
         let note = " [exited \(exit)] "
         screen.write(
           note,
-          x: rect.x + max(0, rect.width - note.count),
+          x: rect.x + max(0, rect.width - TerminalText.width(note)),
           y: rect.y,
           style: OuterStyle(foreground: .palette(0), background: .palette(3))
         )
@@ -121,7 +121,13 @@ public struct Compositor {
         let kind = g.kind(at: i)
         if kind == .continuation { continue }
         let si = g.style(at: i)
-        var style = styleCache[si] ?? OuterStyle(frame.styles[si])
+        var style =
+          styleCache[si]
+          ?? OuterStyle(
+            frame.styles[si],
+            palette: frame.palette,
+            underlineColors: frame.underlineColors
+          )
         styleCache[si] = style
         if reverse { style = style.toggling(OuterStyle.inverse) }
         if let overlay,
@@ -262,8 +268,13 @@ public struct Compositor {
     into screen: inout ScreenBuffer
   ) -> String {
     guard !text.isEmpty, room >= Self.minimumNote else { return "" }
-    let note = DisplayText.head(text, width: room)
-    screen.write(note, x: columns - note.count, y: y, style: style)
+    let note = TerminalText.head(text, width: room)
+    screen.write(
+      note,
+      x: columns - TerminalText.width(note),
+      y: y,
+      style: style
+    )
     return note
   }
 
@@ -280,13 +291,14 @@ public struct Compositor {
       guard status.promptCursor else {
         // A message or question keeps its start, and its suffix (answer
         // keys) whole; a note shows in what is left when that is readable.
-        let suffix = DisplayText.tail(status.promptSuffix, width: columns)
+        let suffix = TerminalText.tail(status.promptSuffix, width: columns)
         let shown =
-          DisplayText.head(prompt, width: columns - suffix.count) + suffix
+          TerminalText.head(prompt, width: columns - TerminalText.width(suffix))
+          + suffix
         screen.write(shown, x: 0, y: y, style: style)
         drawNote(
           status.right,
-          room: columns - shown.count - 1,
+          room: columns - TerminalText.width(shown) - 1,
           y: y,
           style: base,
           into: &screen
@@ -299,21 +311,21 @@ public struct Compositor {
       let line = columns - 1
       let note = drawNote(
         status.right,
-        room: line - min(prompt.count, line / 2) - 1,
+        room: line - min(TerminalText.width(prompt), line / 2) - 1,
         y: y,
         style: base,
         into: &screen
       )
-      let shown = DisplayText.tail(
+      let shown = TerminalText.tail(
         prompt,
-        width: max(0, line - (note.isEmpty ? 0 : note.count + 1))
+        width: max(0, line - (note.isEmpty ? 0 : TerminalText.width(note) + 1))
       )
       screen.write(shown, x: 0, y: y, style: style)
-      screen.cursor = (min(columns - 1, shown.count), y, 2)
+      screen.cursor = (min(columns - 1, TerminalText.width(shown)), y, 2)
       return
     }
     let right = status.right
-    let rightWidth = min(columns, right.count)
+    let rightWidth = min(columns, TerminalText.width(right))
     var x = 0
     screen.write(
       status.left,
@@ -322,7 +334,7 @@ public struct Compositor {
       style: base,
       limit: max(0, columns - rightWidth - 1)
     )
-    x = min(columns, status.left.count)
+    x = min(columns, TerminalText.width(status.left))
     for item in status.items where x < columns - rightWidth - 1 {
       let style =
         item.active
@@ -338,7 +350,7 @@ public struct Compositor {
         style: style,
         limit: columns - rightWidth - 1 - x
       )
-      x += item.text.count
+      x += TerminalText.width(item.text)
     }
     screen.write(right, x: columns - rightWidth, y: y, style: base)
   }

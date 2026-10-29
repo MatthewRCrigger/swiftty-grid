@@ -33,6 +33,9 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   /// Height of the view covered by the docked keyboard and its
   /// accessory bar, in points.
   private var keyboardInset: CGFloat = 0
+  /// How far the whole terminal is lifted above a docked keyboard, in
+  /// points. The grid keeps its size; its top scrolls out of view.
+  private(set) var keyboardLift: CGFloat = 0
   /// Set while the scene is in the background: no frames are drawn.
   private(set) var isRenderingPaused = false
   private var isSceneActive = true
@@ -141,6 +144,8 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   var pointerShapeName = ""
   #if !os(tvOS)
   var pointerInteraction: UIPointerInteraction?
+  /// Present while a program is registered for kitty drag-and-drop.
+  var dropInteraction: UIDropInteraction?
   #endif
 
   private var blink = BlinkState()
@@ -242,6 +247,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
     }
 
     installGestures()
+    installKittyClipboard()
     Self.surfaces.add(self)
     accessibilityLabel = "Terminal"
     accessibilityTraits = [.causesPageTurn, .allowsDirectInteraction]
@@ -305,6 +311,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
       _ = text
       #endif
     case .exited: onExit?()
+    case .dragAndDrop(.registration): dragAndDropRegistrationChanged()
     case let .pointerShape(name):
       pointerShapeName = name
       #if !os(tvOS)
@@ -404,7 +411,10 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   override public func layoutSubviews() {
     super.layoutSubviews()
     if isSearchVisible {
-      searchBar.position(in: safeAreaLayoutGuide.layoutFrame)
+      // Keep the search bar on screen while the content is lifted.
+      searchBar.position(
+        in: safeAreaLayoutGuide.layoutFrame.offsetBy(dx: 0, dy: keyboardLift)
+      )
     }
     updateGrid()
     updateFrameDriving()
@@ -559,8 +569,10 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   }
 
   #if !os(visionOS) && !os(tvOS)
-  /// Follows the docked keyboard: rows it covers leave the grid. A
-  /// floating or undocked keyboard covers nothing.
+  /// Follows the docked keyboard without resizing the grid: the view is
+  /// lifted just enough to keep the cursor row visible, scrolling the top
+  /// of the terminal out of view. A floating or undocked keyboard covers
+  /// nothing.
   @objc
   private func keyboardFrameChanged(_ notification: Notification) {
     // Keyboard notifications are global, including those for
@@ -575,18 +587,83 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
       let frame =
         (notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey]
         as? NSValue)?
-        .cgRectValue, let screen = window?.windowScene?.screen
+        .cgRectValue, let screen = window?.windowScene?.screen, let superview
     {
-      let local = convert(frame, from: screen.coordinateSpace)
-      if local.maxY >= bounds.maxY - 1, local.intersects(bounds) {
-        inset = max(0, bounds.maxY - local.minY)
+      // Measure against the unlifted position: the lift is a transform.
+      let keyboard = superview.convert(frame, from: screen.coordinateSpace)
+      let resting = CGRect(
+        x: center.x - bounds.width / 2,
+        y: center.y - bounds.height / 2,
+        width: bounds.width,
+        height: bounds.height
+      )
+      if keyboard.maxY >= resting.maxY - 1, keyboard.intersects(resting) {
+        inset = max(0, resting.maxY - keyboard.minY)
       }
     }
     guard inset != keyboardInset else { return }
     keyboardInset = inset
-    updateGrid()
+    let info = notification.userInfo
+    let duration =
+      (info?[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?
+      .doubleValue ?? 0
+    let curve =
+      (info?[UIResponder.keyboardAnimationCurveUserInfoKey] as? NSNumber)?
+      .uintValue ?? UInt(UIView.AnimationCurve.easeInOut.rawValue)
+    updateKeyboardLift(
+      duration: duration,
+      options: UIView.AnimationOptions(rawValue: curve << 16)
+    )
   }
   #endif
+
+  /// Lift that keeps the cursor row (and the bottom padding) above the
+  /// keyboard, at most the covered height.
+  nonisolated static func keyboardLift(
+    covered: CGFloat,
+    height: CGFloat,
+    cursorRow: Int?,
+    geometry: GridGeometry
+  ) -> CGFloat {
+    guard covered > 0 else { return 0 }
+    guard let cursorRow else { return covered }
+    let bottom =
+      geometry.rect(column: 0, row: cursorRow).maxY + geometry.padding.y
+      / max(1, geometry.scale)
+    return min(covered, max(0, (bottom - (height - covered)).rounded(.up)))
+  }
+
+  /// Applies the lift for the current keyboard and cursor; animates with
+  /// the keyboard when it moves, otherwise follows the cursor directly.
+  func updateKeyboardLift(
+    duration: TimeInterval = 0,
+    options: UIView.AnimationOptions = []
+  ) {
+    let lift = Self.keyboardLift(
+      covered: keyboardInset,
+      height: bounds.height,
+      cursorRow: lastCursor?.y,
+      geometry: geometry
+    )
+    guard lift != keyboardLift else { return }
+    keyboardLift = lift
+    let apply = { [self] in
+      transform =
+        lift == 0 ? .identity : CGAffineTransform(translationX: 0, y: -lift)
+      setNeedsLayout()
+      layoutIfNeeded()
+    }
+    if duration > 0 {
+      UIView.animate(
+        withDuration: duration,
+        delay: 0,
+        options: options.union(.beginFromCurrentState),
+        animations: apply
+      )
+    } else {
+      apply()
+    }
+  }
 
   /// The configured size, or 13 pt scaled for Dynamic Type when the
   /// configuration leaves `font-size` at its default.
@@ -628,9 +705,10 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
 
   private func updateGrid() {
     let scale = contentScaleFactor
+    // The keyboard lifts the view instead of shrinking the grid.
     let pixels = CGSize(
       width: bounds.width * scale,
-      height: max(0, bounds.height - keyboardInset) * scale
+      height: bounds.height * scale
     )
     guard pixels.width > 0, pixels.height > 0 else { return }
     let size = renderer.gridSize(for: pixels)
@@ -701,6 +779,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
     hoverViewportOffset = snapshot.viewportOffset
     hoverGeometry = geometry
     lastCursor = snapshot.cursor
+    if keyboardInset > 0 { updateKeyboardLift() }
     if hasSelection, snapshot.selection == nil {
       hasSelection = false
       selectionOrigin = nil
@@ -941,6 +1020,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   // MARK: Capabilities and privacy
 
   private func capabilitiesChanged() {
+    installKittyClipboard()
     let available = effectiveCapabilities
     lastModes = available.effectiveModes(programModes)
     if !available.textInput {

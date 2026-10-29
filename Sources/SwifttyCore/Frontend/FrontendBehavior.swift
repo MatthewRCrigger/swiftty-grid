@@ -277,6 +277,14 @@ public enum ClickToMove {
   public static func keys(_ moves: Int) -> [KeyEvent] {
     Array(repeating: KeyEvent(moves < 0 ? .left : .right), count: abs(moves))
   }
+
+  /// Input sending a prompt click, as `promptClickAction(at:)` reports.
+  public static func inputs(_ action: PromptClickAction) -> [TerminalInput] {
+    switch action {
+    case let .moves(moves): keys(moves).map { .key($0) }
+    case let .report(bytes): [.bytes(bytes)]
+    }
+  }
 }
 
 // MARK: - Selection

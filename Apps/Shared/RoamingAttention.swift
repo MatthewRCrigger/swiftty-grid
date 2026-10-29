@@ -22,19 +22,35 @@ protocol RoamingAttentionMetadataService: AttentionService {
 struct RoamingAttentionConnector: AttentionServiceConnector {
   let model: RoamingAppModel
   var interactive = true
+  /// Report SSH failures by stage (host key, sign-in, reachability)
+  /// instead of collapsing them, for screens that explain one host.
+  var detailedErrors = false
+  /// A chooser retains the host it showed instead of resolving a new selection.
+  var selection: HostMutationContext?
 
+  @MainActor
   func connect(
     to host: NavigationHost
   ) async throws(AttentionServiceError) -> any AttentionService {
-    let profile = await MainActor.run { model.hosts.first { $0.id == host.id } }
-    guard let profile else { throw .notFound }
+    let profile: HostProfile
+    if let selection {
+      guard selection.id == host.id, model.hostMutationIsCurrent(selection),
+        let selected = selection.original
+      else { throw .other(RoamingAppModel.hostChangedMessage) }
+      profile = selected
+    } else {
+      guard let current = model.hosts.first(where: { $0.id == host.id }) else {
+        throw .notFound
+      }
+      profile = current
+    }
     let connection: SSHConnection
     do {
       connection = try await model.ssh.connect(
         profile,
         interactive: interactive
       )
-    } catch { throw Self.map(error) }
+    } catch { throw detailedErrors ? Self.describe(error) : Self.map(error) }
     return RoamingAttentionService(
       model: model,
       host: profile,
@@ -42,11 +58,21 @@ struct RoamingAttentionConnector: AttentionServiceConnector {
     )
   }
 
+  /// The SSH stage and its nonsecret explanation.
+  static func describe(_ error: SSHAccessError) -> AttentionServiceError {
+    let message = String(
+      localized: "\(error.title). \(error.detail)",
+      bundle: #bundle
+    )
+    return error == .unreachable ? .offline(message) : .other(message)
+  }
+
   static func map(_ error: SSHAccessError) -> AttentionServiceError {
     switch error {
     case .cancelled: .other("Sign-in was cancelled.")
-    case .hostKeyChanged, .hostKeyRejected, .trustStoreUnavailable,
-      .keyUnavailable, .authenticationFailed:
+    case .hostKeyChanged, .hostKeyRejected, .hostKeyMismatch,
+      .trustStoreUnavailable, .keyUnavailable, .keyNeedsRepair,
+      .unsupportedAuthMethod, .authenticationFailed:
       .unauthorized
     default: .offline("The Mac could not be reached.")
     }
@@ -236,10 +262,20 @@ final class RoamingInboxModel {
   nonisolated private static let maxEntriesPerHost = 10_000
   nonisolated private static let maxPagesPerSection = 100
   nonisolated struct Entry: Identifiable, Hashable, Sendable {
-    var host: NavigationHost
-    var item: AttentionItem
+    let host: NavigationHost
+    let item: AttentionItem
+    /// Sanitized once here rather than on every inbox redraw.
+    let title: String?
+    let appName: String?
     var id: String {
       "\(host.id)/\(item.source.serviceEpoch)/\(item.occurrence)"
+    }
+
+    init(host: NavigationHost, item: AttentionItem) {
+      self.host = host
+      self.item = item
+      title = AttentionInboxText.plain(item.status.title ?? item.status.message)
+      appName = AttentionInboxText.plain(item.status.app)
     }
   }
 
@@ -249,7 +285,16 @@ final class RoamingInboxModel {
     case failed(String)
   }
 
-  private(set) var entries: [Entry] = []
+  private(set) var entries: [Entry] = [] {
+    didSet {
+      needsYouEntries = entries.filter { $0.item.category != .result }
+      resultEntries = entries.filter { $0.item.category == .result }
+    }
+  }
+  /// `entries` split by section, cached so the inbox does not filter up
+  /// to 10,000 entries per host on every redraw.
+  private(set) var needsYouEntries: [Entry] = []
+  private(set) var resultEntries: [Entry] = []
   private(set) var hostStates: [UUID: HostState] = [:]
   private(set) var refreshedAt: Date?
   @ObservationIgnored

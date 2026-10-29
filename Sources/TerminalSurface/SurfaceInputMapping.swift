@@ -47,6 +47,13 @@ extension SemanticKeyName {
     case let .function(n):
       guard (1 ... 12).contains(n) else { return nil }
       self = .function(n)
+    case let .keypad(key):
+      // `RoamingClient` sends the main-keyboard key to hosts without
+      // `keypadKeys`.
+      guard let keypad = SemanticKeypadKey(rawValue: key.rawValue) else {
+        return nil
+      }
+      self = .keypad(keypad)
     }
   }
 }

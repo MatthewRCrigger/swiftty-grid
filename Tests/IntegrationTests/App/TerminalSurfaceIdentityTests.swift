@@ -8,6 +8,23 @@ import SwifttyMac
 import Synchronization
 import Testing
 
+/// Gives each test host its own fixed display session.
+private struct TwoSessionFactory: TerminalSurfaceFactory {
+  let firstHostID: HostProfile.ID
+  let first: TerminalSession
+  let second: TerminalSession
+
+  @MainActor
+  func makeSurface(for model: TerminalScreenModel) -> AnyView {
+    AnyView(
+      TerminalDisplayView(
+        session: model.host.id == firstHostID ? first : second,
+        capabilities: model.capabilities
+      )
+    )
+  }
+}
+
 @MainActor
 private struct TerminalIdentityRoot: View {
   @Bindable
@@ -66,8 +83,8 @@ extension MainActorIntegrationTests {
       let defaults = try #require(UserDefaults(suiteName: suite))
       defer { defaults.removePersistentDomain(forName: suite) }
       let app = RoamingAppModel(
-        profile: .profile(for: .mac),
-        store: HostProfileStore(
+        profile: .profile(for: .catalyst),
+        store: ConnectionStore(
           fileURL: directory.appendingPathComponent("hosts.json")
         ),
         resumeStore: SessionResumeStore(defaults: defaults)
@@ -91,14 +108,11 @@ extension MainActorIntegrationTests {
       let inputs = Mutex<[Int]>([0, 0])
       first.semanticInputHandler = { _ in inputs.withLock { $0[0] += 1 } }
       second.semanticInputHandler = { _ in inputs.withLock { $0[1] += 1 } }
-      let factory = TerminalSurfaceFactory { model in
-        AnyView(
-          TerminalDisplayView(
-            session: model.host.id == firstHost.id ? first : second,
-            capabilities: model.capabilities
-          )
-        )
-      }
+      let factory = TwoSessionFactory(
+        firstHostID: firstHost.id,
+        first: first,
+        second: second
+      )
       let window = NSWindow(
         contentRect: NSRect(x: 0, y: 0, width: 720, height: 480),
         styleMask: [.titled, .closable],
@@ -166,8 +180,8 @@ extension MainActorIntegrationTests {
       defer { defaults.removePersistentDomain(forName: suite) }
       let fixture = try await TransferFixture.make()
       let app = RoamingAppModel(
-        profile: .profile(for: .mac),
-        store: HostProfileStore(
+        profile: .profile(for: .catalyst),
+        store: ConnectionStore(
           fileURL: fixture.local.appendingPathComponent("hosts.json")
         ),
         resumeStore: SessionResumeStore(defaults: defaults)
@@ -182,7 +196,10 @@ extension MainActorIntegrationTests {
       defer { close(window) }
       let root = NSHostingView(
         rootView: RoamingRootView(model: app)
-          .environment(\.terminalSurfaceFactory, .live(app))
+          .environment(
+            \.terminalSurfaceFactory,
+            LiveTerminalSurfaceFactory(app: app)
+          )
       )
       window.contentView = root
       window.makeKeyAndOrderFront(nil)
@@ -196,7 +213,14 @@ extension MainActorIntegrationTests {
             username: "test",
             auth: .password
           )
-          app.open(host, kind: kind)
+          if kind == .roaming {
+            // A roaming screen signs in only for an explicit workspace
+            // choice (spec.connection-setup.md D1). Trust is rejected
+            // below, before any create request could be sent.
+            app.openWorkspace(host, intent: .create)
+          } else {
+            app.open(host, kind: kind)
+          }
           let model = try #require(app.activeSession)
           try #require(try await until { model.controller != nil })
           let controller = try #require(model.controller)

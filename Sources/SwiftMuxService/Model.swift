@@ -16,6 +16,9 @@ public struct MuxServiceConfiguration: Sendable {
   /// keeps the service running (tests, foreground use). Invalid delays
   /// also keep it running rather than triggering an immediate exit.
   public var idleExitDelay: TimeInterval?
+  /// Compress idle pane history where supported. Local policy only: pane
+  /// budgets, `MuxLimits` and SMX messages are unchanged.
+  public var scrollbackCompression = true
   /// Runs on the pane queue before each launch (tests hold a launch open).
   package var beforeLaunch: (@Sendable () -> Void)?
 

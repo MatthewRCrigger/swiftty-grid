@@ -127,7 +127,22 @@ public enum FrameExporter {
         scrollbackRows: screen.scrollbackCount
       ),
       search: search,
-      title: title
+      title: title,
+      dropTarget: screen.dropTypes.map { types in
+        FrameDropTarget(
+          types: Array(
+            types.filter { $0.utf8.count <= FrameDropTarget.maxTypeBytes }
+              .prefix(FrameDropTarget.maxTypes)
+          ),
+          accepted: screen.dropAccepted.map {
+            switch $0 {
+            case .none: .none
+            case .copy: .copy
+            case .move: .move
+            }
+          }
+        )
+      }
     )
   }
 
@@ -148,6 +163,9 @@ public enum FrameExporter {
     }
     if screen.modes.contains(.keypadApplication) {
       modes.insert(.keypadApplication)
+    }
+    if screen.modes.contains(.kittyPasteEvents) {
+      modes.insert(.kittyPasteEvents)
     }
     return modes
   }

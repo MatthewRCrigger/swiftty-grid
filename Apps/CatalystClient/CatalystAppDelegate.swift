@@ -17,7 +17,10 @@ struct CatalystClientApp: App {
   var body: some Scene {
     WindowGroup {
       RoamingRootView(model: delegate.model)
-        .environment(\.terminalSurfaceFactory, .live(delegate.model))
+        .environment(
+          \.terminalSurfaceFactory,
+          LiveTerminalSurfaceFactory(app: delegate.model)
+        )
         .frame(minWidth: 640, minHeight: 420)
     }
     // Links reuse an open window rather than spawning one per link.
@@ -28,11 +31,11 @@ struct CatalystClientApp: App {
 final class CatalystAppDelegate: UIResponder, UIApplicationDelegate {
   let model = RoamingAppModel(profile: .profile(for: .catalyst))
 
-  /// Best-effort detach on quit; the helper retains the session even if
-  /// it never arrives (spec §9). Focus changes never detach.
+  /// Quitting detaches (spec §9): UIKit cannot defer termination, so this
+  /// waits, bounded, for the detach to be sent. The helper retains the
+  /// session even if it never arrives. Focus changes never detach.
   func applicationWillTerminate(_ application: UIApplication) {
-    let model = model
-    Task { await model.detachForTermination() }
+    model.detachBeforeExit()
   }
 
   /// Desktop menus: drop the text-formatting menu a terminal client does

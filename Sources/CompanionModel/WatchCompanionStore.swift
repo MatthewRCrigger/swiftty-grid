@@ -7,7 +7,7 @@ import Foundation
 /// offers no operation that reaches a host: the only outbound values are
 /// `CompanionRequest`s (refresh/preview), which carry no input, command,
 /// credential, or attachment capability.
-public struct WatchCompanionStore: Sendable {
+public struct WatchCompanionStore: Equatable, Sendable {
   /// What the watch UI should render. Always carries the capture time and
   /// an explicit freshness; nothing here can read as "live".
   public struct Presentation: Hashable, Sendable {

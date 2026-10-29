@@ -225,7 +225,7 @@ extension MainActorIntegrationTests {
     func app(at directory: URL, hosts: [HostProfile]) throws -> RoamingAppModel
     {
       let app = RoamingAppModel(
-        store: HostProfileStore(
+        store: ConnectionStore(
           fileURL: directory.appendingPathComponent("hosts.json")
         )
       )
@@ -237,7 +237,7 @@ extension MainActorIntegrationTests {
         nickname: name,
         host: name + ".local",
         username: "test",
-        auth: password ? .password : .keychainKey(label: "test")
+        auth: password ? .password : .key(identityID: UUID())
       )
     }
     func item(epoch: SwiftMuxProtocol.ServerInstanceID) -> AttentionItem {

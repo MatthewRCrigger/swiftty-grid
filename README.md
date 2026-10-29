@@ -26,6 +26,13 @@ mise run install [--roaming]           # see SwiftMux below
 mise run uninstall [--purge] [-y]
 ```
 
+The native host runs tests serially because suites share AppKit state and use
+blocking dispatch handoffs. Each manifest test bundle must exist and report a
+complete run. A missing or failing bundle fails the command; later bundles still
+run so their diagnostics are available. Completion is audited separately for
+each bundle. Allocation budgets run only with optimized code;
+`Scripts/test-native.sh -c release` checks them alongside the rest of the suite.
+
 `mise.toml` sets `SDKROOT` for swift.org toolchains. Build the UIKit frontend
 with Xcode; the package's AppKit executable scheme is macOS-only:
 
@@ -75,8 +82,11 @@ a roaming host). It never parses program output or encodes input:
 screen atomically, keeping the frame's cell widths, graphemes and wraps without
 reflow, and marks it fully damaged. `send` forwards committed text, key presses
 and pastes to `semanticInputHandler` (never `onWrite`), `resize` proposes the
-view's grid to `gridProposalHandler`, and history is disabled. Local selection
-and copy work on the displayed frame.
+view's grid to `gridProposalHandler`, and its own history is disabled:
+`scrollViewport(by:)` goes to `viewportScrollHandler`, which a roaming client
+turns into an RST/1 `Viewport` request so the host presents that client's own
+history window (hosts advertising `historyViewport`). Local selection and copy
+work on the displayed frame.
 
 Both frontends expose a settable `capabilities: SurfaceCapabilities` (default
 `.full`; set `.roaming` for remote presentation). Program-initiated clipboard writes (OSC
@@ -180,6 +190,11 @@ app in place. Filesystems that refuse the atomic operation stop installation.
 Registration and optional roaming setup run after publication; they are separate
 steps. Interrupted copy/verification workers are killed and collected, and
 temporary-directory cleanup failures report the retained directory.
+Before replacement, the installer checks the destination bundle's running
+application through `swiftty --running-app APP_PATH`. A running copy there is
+left alone; otherwise the installer opens the selected installation as a new
+instance, even when another copy with the same name or bundle identifier is
+running elsewhere.
 
 `uninstall.sh` requires Python 3 to limit each shutdown command to ten seconds.
 Failed or timed-out shutdown checks preserve installation files and state.
@@ -249,8 +264,7 @@ https://<configured domain>/a/<locator>
   #    application/json at /.well-known/apple-app-site-association.
   #    It claims only /a/<locator> (one component, no query or fragment).
   Scripts/make-aasa.sh -o apple-app-site-association TEAMID1234 \
-    com.chr33s.swiftty dev.swiftty.roaming.mobile dev.swiftty.roaming.mac \
-    dev.swiftty.roaming.catalyst dev.swiftty.roaming.vision
+    com.chr33s.swiftty dev.chr33s.swiftty
   Scripts/make-aasa.sh --check apple-app-site-association   # re-validate rule order
 
   # 2. Native macOS app: Info.plist SwifttyAssociatedDomains plus the
@@ -261,7 +275,7 @@ https://<configured domain>/a/<locator>
 
   # 3. Roaming clients: XcodeGen's preGenCommand (Scripts/configure-links.sh)
   #    writes Apps/Config/Generated/ with the domain list and per-target
-  #    entitlements for MobileClient, MacClient, CatalystClient and
+  #    entitlements for MobileClient, CatalystClient and
   #    VisionClient. tvOS stays swiftty:// only.
   SWIFTTY_LINK_DOMAINS=links.example.com Scripts/build-platforms.sh
   ```
@@ -340,10 +354,12 @@ Appendix B of the spec records the design sources.
 | `SessionCore` | IDs, limits, input ledger (client queue, host admission), lifecycle, backoff, transfer manifests |
 | `ScreenProtocol` | RST/1 messages, framing, RFC 1950 snapshots, validation, snapshot scheduler, bootstrap envelope and attention metadata, `RSTConnection` |
 | `SSHClient` | SwiftNIO SSH: host trust, password/Ed25519, exec, shell, SFTP v3 subset, resumable verified transfers |
+| `SSHIdentity` | SSH identities (spec.ssh-identity.md): UUID metadata, Keychain storage policies, read-only resolution, bounded OpenSSH Ed25519 import, including passphrase-protected keys; client-only |
 | `AppleTransport` | Network framework QUIC (ALPN `rst/1`, TLS 1.3, no 0-RTT), SPKI and exact-certificate pinning, host identity |
 | `TerminalHost` | RST/1 host over the SwiftMux service (owns no PTYs): `RoamingHost` QUIC listener and grants, in-process SMX client, screen exporter, session registry, bootstrap/attention service, control socket, roaming configuration |
 | `TerminalSurface` | Client: `RoamingClient`, frontend backends (roaming, ordinary SSH, local PTY), SSH and QUIC bridges |
 | `CompanionModel` | Bounded watch/iPhone status DTOs; no Swiftty, SSH or QUIC |
+| `HostConnection` | Pairing-code descriptor and `_swiftty._tcp` discovery contract (spec.connection-setup.md); Foundation only |
 | `RoamingApp` (`Apps/Shared`) | Shared app model and SwiftUI for the direct clients |
 | `swifttyd` (`Apps/swifttyd`) | No-PTY SSH helper: `bootstrap --stdio`, `status` |
 
@@ -370,7 +386,90 @@ are SwiftMux workspace IDs, the grant's server instance is the service
 epoch, and each attachment takes the workspace's interactive lease: a
 workspace the Mac app controls is refused (`writerBusy`) unless the client
 resumes with `takeover`. Grant expiry never ends a shell the remote client
-did not create. Firewall changes are not made automatically.
+did not create.
+
+To allow incoming connections to the bundled `swiftmux-agent` through the
+macOS firewall, run `Scripts/install.sh --roaming --configure-firewall`.
+This uses `sudo` to add and unblock the installed agent, verifies its exception,
+and reapplies it on repeat installs. The exception covers the executable,
+rather than a single UDP port. Setup reports whether the firewall is disabled
+or **Block all incoming connections** overrides the exception; global firewall
+settings stay unchanged. Other firewalls, routers and managed network policies
+may still need to allow the configured roaming UDP port. A configured exception
+does not verify reachability from another device. Without `--configure-firewall`,
+setup leaves firewall policy unchanged.
+
+### Xcode Cloud, TestFlight and releases
+
+The roaming clients are one universal-purchase app, `dev.chr33s.swiftty`:
+`MobileClient` (iOS/iPadOS, embedding `WatchCompanion` as
+`dev.chr33s.swiftty.watchkitapp`), `CatalystClient` (macOS), `VisionClient`
+and `TVClient` are platforms of one App Store Connect app, so testers see a
+single TestFlight entry. Swiftty.app is the Mac terminal and host; Mac users
+reach remote sessions through the Catalyst build.
+
+`Apps/ci_scripts/ci_post_clone.sh` drives Xcode Cloud: it installs XcodeGen,
+generates `Apps/Swiftty.xcodeproj` and copies `Package.resolved` into
+it (Xcode Cloud never resolves packages itself). Create one Xcode Cloud
+product for the app, pointed at `Apps/Swiftty.xcodeproj`, with
+`SWIFTTY_TEAM_ID` (and optionally `SWIFTTY_LINK_DOMAINS`) in the workflow
+environment, and one workflow with an archive action per platform, each
+with a TestFlight post-action:
+
+| Scheme | Archive platform |
+|---|---|
+| `MobileClient` | iOS |
+| `CatalystClient` | macOS |
+| `VisionClient` | visionOS |
+| `TVClient` | tvOS |
+
+tvOS and visionOS need layered icons (`Apps/TVClient/Assets.xcassets` with
+the Top Shelf images, `Apps/VisionClient/Assets.xcassets`); regenerate them
+from `icon.svg` with `xcrun swift Scripts/gen-platform-icons.swift`.
+
+Swiftty.app is unsandboxed (it owns local PTYs) and is distributed with
+Developer ID. `.github/workflows/release-mac.yml` runs on the Namespace
+`namespace-profile-mac` runner for a pushed `v<version>` tag (or manually, as a
+`mac-v<version>-<build>` prerelease): `Scripts/package-swiftmux.sh` builds and
+signs it, then `Scripts/release-mac-github.sh` notarizes it (`Scripts/notarize.sh`,
+shared with the package and install scripts) and uploads a zip and SHA-256 to
+the release, or to an existing draft for the tag. The Namespace `mac` profile must
+provide Apple Silicon, macOS 27, Xcode 27 and Swift 6.4. The workflow imports the
+Developer ID certificate and private key into a temporary keychain from the
+base64 `MACOS_CERTIFICATE_P12` secret and its `MACOS_CERTIFICATE_PASSWORD` secret,
+then removes the keychain after the release, including on failure. It also needs
+the repository variable `DEVELOPER_ID_IDENTITY` and an App Store Connect API key as the secrets
+`NOTARY_KEY_ID`, `NOTARY_ISSUER_ID` and `NOTARY_KEY` (the `.p8` contents).
+
+### Connecting a device
+
+[spec.connection-setup.md](spec.connection-setup.md) covers client setup. To
+set up a device:
+
+1. On the Mac, open **Terminal Service › Connect a Device…**. The panel shows
+   the SSH host, port and account; the configured roaming endpoint; local
+   checks of SSH and `swifttyd`; and the SSH host-key fingerprints. Turn on
+   **Show Pairing Code** for a QR code, or **Make Discoverable While This
+   Panel Is Open** to advertise `_swiftty._tcp` on the local network. Closing
+   the panel stops advertising. The panel never turns on Remote Login or
+   changes the firewall or roaming configuration.
+2. On the iPhone or iPad, open **Settings › Connect to Mac** and choose **Nearby Macs**,
+   **Scan Mac Code**, **Paste Mac Code** or **Enter Address Manually**. The
+   app asks for Local Network access when it browses or first reaches a LAN
+   address, and asks for camera access only when you scan. A code's SSH key
+   fingerprints must match before any password is sent, and an unknown key
+   still needs an explicit Trust.
+3. After sign-in, choose a workspace, or choose **New Workspace**. Opening a
+   saved host always shows this list; nothing is created automatically.
+   Taking control of a workspace that another client holds needs your
+   confirmation.
+
+SSH and roaming use separate addresses. The device first reaches the Mac
+over SSH, then reaches the roaming endpoint that the Mac's configuration
+advertises over UDP. A `<LocalHostName>.local` endpoint works only on the
+local network or a VPN that carries it. If SSH works but that endpoint does
+not, the app shows "SSH connected; roaming endpoint unavailable" with the
+address it tried.
 
 Clients bootstrap with `ssh <mac> /usr/local/libexec/swifttyd bootstrap --stdio`
 (a no-PTY exec with a length-prefixed JSON request), receive a session grant
@@ -397,10 +496,34 @@ Scripts/test-app-ui.sh '<xcodebuild destination>' [xcodebuild args]      # XCUIT
 Scripts/test-keychain-signed.sh '<destination>' [team-id]                # signed, app-hosted Keychain test
 ```
 
+`test-roaming-simulator.sh` accepts `--configuration release` to build both
+the native host products and simulator test bundle in Release; it defaults to
+Debug. The fixture records the selected configuration alongside its results.
+
 `test-real-ssh.sh` needs `container`. `swifttyd` is macOS-only, so the Linux
 VM's `/usr/local/libexec/swifttyd` relays `bootstrap --stdio` to an agent on
 this Mac. macOS Local Network privacy can deny test runners a route to the VM
 subnet, so the script reaches sshd through `container exec`.
+Set `RST_REAL_SSH_CONFIGURATION=release` to build and run the host, launcher,
+bootstrap helper and test bundle in Release; the default is `debug`.
+The wrapper compiles tests before starting the fixture and runs them without
+rebuilding while the host is live.
+
+The fixture keeps a private process owner for each host/bridge/relay, the UI-test
+build (`xcodebuild.log`) and optional Bonjour advertiser (`advertiser.log`). `stop`
+authenticates those owners and waits for child exit, escalating after six seconds
+while allowing the proxies to reap their own children. PID files alone never
+authorize signals. Missing owners, legacy PID-only records and failed cleanup
+retain their markers and return an error. A `start.lock` prevents concurrent
+startup/stop; if startup was forcibly killed, verify it has ended before removing
+that lock and retrying cleanup.
+The UI wrapper polls the collected build status so cancellation can stop an
+active build before retiring the rest of the fixture. A build that ignores TERM
+is killed and reaped after the same six-second grace period.
+Container deletion and listing each have a ten-second deadline and capped output.
+The container marker clears after successful deletion, or after a successful,
+validated listing confirms the recorded VM is already absent; failed commands
+and malformed listings alone never establish absence.
 
 Roaming verification record (2026-10-10, Xcode 27.0, OS 27 SDKs):
 
@@ -427,6 +550,56 @@ Watch runs.
 on the phone keeps one roaming session open while you toggle Wi-Fi, and the
 retained shell on the Mac logs one line per switch.
 
+### SSH keys and iCloud sync
+
+[spec.ssh-identity.md](spec.ssh-identity.md) makes an SSH key a reusable
+identity. **Settings › SSH Keys** (or **New Key** in the host editor)
+generates an Ed25519 key or imports an OpenSSH Ed25519 private key from a
+file or an explicit paste; a passphrase-protected key asks for its passphrase
+once, which is not saved. Hosts select a key by UUID, so renaming never breaks them. Add the shown public key
+to `~/.ssh/authorized_keys` on the Mac yourself. Signing in only reads the
+selected key: a missing, locked, deleted or mismatched key fails closed, never
+generates a replacement and never falls back to a password.
+
+Keys are device-only by default (`WhenUnlockedThisDeviceOnly`, never
+synchronized). A key created or imported as **iCloud Keychain** is
+synchronizable (`WhenUnlocked`); the policy is fixed per key, with explicit
+**Create iCloud Copy** and **Withdraw from iCloud** actions that make a new key.
+Items use service `dev.chr33s.swiftty.ssh-identity.v1` and the access group
+`$(AppIdentifierPrefix)dev.chr33s.swiftty`.
+
+**Settings › iCloud Sync** separately opts in to syncing host profiles and
+public key metadata, and trusted host keys, through the private CloudKit
+database (zone `SwifttyConnectionsV1`). Both are off by default and only appear
+when the clients are generated with `SWIFTTY_CLOUDKIT_CONTAINER` set to a
+provisioned container (Scripts/configure-links.sh). Sync runs in the
+foreground only, never carries private keys or passwords, and keeps another
+iCloud account's data hidden after an account switch. tvOS keeps local key
+sign-in and generation, without import or sync.
+
+iCloud key operations use the configured account provider even when metadata
+sync is off. Interrupted operations retain their original account; enabling
+metadata sync does not move another account's pending work. Older interrupted
+creations without account information require explicit Restore in SSH Keys.
+Older removals appear under **Key Removals Needing Review**. Review the
+fingerprint before authorizing removal from the current iCloud account;
+failed removals remain queued for retry. Returning to the foreground retries
+interrupted key operations even when metadata sync is off.
+Completed iCloud keys also stay with their original account. Older descriptions
+without account information appear under **Keys Needing Account Review**;
+restoring one verifies its fingerprint in the current account without enabling
+metadata sync.
+Builds without an account provider still support device-only keys.
+
+`hosts.json` uses a version-4 snapshot of all non-secret connection state.
+It preserves separate account caches when record names collide and upgrades
+version-2 and version-3 snapshots, retaining records and queued edits while
+requiring review for older iCloud keys with unknown account ownership.
+Version-1 key labels migrate to device-only identities with the same key and
+fingerprint. Migration keeps the original file as `hosts.v1.json` and removes
+each legacy Keychain item only after its replacement is verified. Earlier builds reject the version-4 file when
+loading it.
+
 ## API and storage contracts
 
 The session, snapshot, input, configuration, and frontend APIs are the embedding
@@ -441,6 +614,30 @@ before mutating its owner. Grid writes require exclusive access;
 `withMutableCells(row:_:)` updates the row extent even when its closure throws.
 Indices and allocation sizes are checked before accessing memory. Nonpositive
 screen dimensions are clamped to one.
+
+History storage is reclaimable and, on macOS and iOS/iPadOS, compressed when
+idle. History
+chunks use dedicated page-aligned mappings divided into compression units of at
+most 256 KiB; after 250 ms without output, input, viewport or resize activity,
+the owning session or SwiftMux pane encodes at most one unit per step on its own
+queue (LZ4 through Apple's Compression framework, verified by CRC-32C). The
+viewport, recent captures, the next eviction rows and both live screens stay
+resident. Warm row access is O(1) with no Swiftty heap allocation; a cold
+borrowed read restores its units in place, costing O(bytes of those units)
+plus page commitment, and never invalidates another borrowed row. Search,
+selection copy, ANSI dumps, link detection, OSC 8 reclamation, invariant checks
+and reflow read cold history through at most two units of scratch without
+restoring it. Clearing history drops compressed units without decoding them and
+returns fully free units' pages to the system. Retention limits count
+uncompressed history cells, so compression never changes which rows are kept.
+Compression runs no timers when idle and never redraws, publishes, or changes
+addressing or search generations. A compressed unit that fails its integrity
+check traps (fail-fast). macOS and iOS/iPadOS use this backend; Catalyst,
+visionOS and tvOS keep uncompressed heap chunks.
+`TerminalState.scrollbackStatistics` reports logical, resident, compressed,
+metadata, workspace, protected, eligible and reclaimed bytes from metadata
+alone; `scrollbackCompression` reports the requested and effective policy with
+the fallback reason.
 
 Snapshot spans borrow the snapshot. Retaining a snapshot preserves its cells
 while later frames reuse other pool entries. Grapheme ids belong to the snapshot
@@ -458,9 +655,10 @@ operation; run them in Release without internal checks.
 Swift formatting follows the pinned Swift Collections configuration: two-space
 indentation, 80-column wrapping, and unindented conditional-compilation bodies.
 `mise run format-check` also validates documentation comments. Generated Unicode
-tables retain their generator's layout. CI requires a self-hosted Apple Silicon
-runner labeled `swiftty`, with Swift 6.4, Xcode 27, all supported platform SDKs,
-Python 3, and the test tools from `mise.toml` on `PATH`.
+tables retain their generator's layout. CI and release builds use the Namespace
+`namespace-profile-mac` runner with Apple Silicon, macOS 27, Swift 6.4 and Xcode 27.
+The shared macOS setup action verifies the toolchain and installs ripgrep and
+tmux for native tests.
 
 ## Configuration
 
@@ -470,7 +668,7 @@ and ignored. macOS reads `$XDG_CONFIG_HOME/swiftty/config` (default
 `~/.config/swiftty/config`); Settings opens it and Shift-Cmd-, reloads it.
 iOS reads `Documents/config`.
 
-Terminal windows use Liquid Glass by default, with `background-opacity = 0.8`
+Terminal windows use Liquid Glass by default, with `background-opacity = 0.5`
 and `background-blur = true`. Set `background-opacity = 1` for an opaque
 terminal or `background-blur = false` for translucency without glass.
 
@@ -490,15 +688,26 @@ minimum-contrast = 3
 cursor-style = bar
 cursor-style-blink = false
 cursor-click-to-move = true
+rectangle-checksum-report = false
 copy-on-select = true
 link-url = true
 mouse-hide-while-typing = true
 window-padding-x = 6
-scrollback-limit = 20000000
+scrollback-limit-bytes = 20000000
+scrollback-limit-lines = 100000
+scrollback-compression = true
 command = /opt/homebrew/bin/fish
 keybind = super+shift+k=clear_screen
 keybind = ctrl+shift+arrow_up=jump_to_prompt:-1
 ```
+
+`scrollback-limit-bytes` (alias `scrollback-limit`; the last assignment wins)
+budgets uncompressed history cells per terminal (default 10,000,000);
+`scrollback-limit-lines` caps physical history rows (default 100,000). Zero
+disables history; negative, overflowing and `unlimited` values are rejected.
+`scrollback-compression` (default `true`) compresses idle history where
+supported; turning it off stops maintenance without decoding existing history.
+Limits apply when a terminal is created.
 
 Style-specific font families use `-bold`, `-italic` and `-bold-italic` suffixes.
 `font-style` (and the same suffixes) selects a named face such as `Retina`;
@@ -508,7 +717,9 @@ shared Ghostty config loads, but Swiftty has a single icon.
 Cell adjustments accept points or percentages. Foreground, cursor and selection
 colors can be configured separately. Themes are searched in
 `~/.config/swiftty/themes`, `~/.config/ghostty/themes`, then the built-in
-`Swiftty Dark` and `Swiftty Light` themes.
+`Swiftty Dark` and `Swiftty Light` themes (Blackboard dark and light). Without
+`theme`, the palette follows the appearance as
+`light:Swiftty Light,dark:Swiftty Dark`.
 
 Includes load in declaration order and override earlier settings; nested includes
 join the end of the queue. Each file loads once. `config-file =` clears pending
@@ -668,9 +879,12 @@ eight idle seconds and two background seconds with incoming output.
 
 ## Verification status
 
-The full macOS Debug/Release baseline passed 1,156 tests. Added keypad-mode coverage
-and 86 AppKit checks pass in both configurations. The hosted simulator
-passed 171 mobile tests. The current physical iPad build passed 169 correctness
+These results describe earlier tested builds. Current validation gaps are tracked
+in [todo.md](todo.md); historical device results do not verify the current tree.
+
+The earlier macOS Debug/Release baseline passed 1,156 tests. Added keypad-mode coverage
+and 86 AppKit checks passed in both configurations. The hosted simulator
+passed 171 mobile tests. The physical iPad build tested then passed 169 correctness
 tests and two separate frame-time tests. Release builds passed for visionOS and
 Mac Catalyst.
 
@@ -688,5 +902,5 @@ both devices. Scripted and hands-on USB shell checks with `vim`, `less`, `tmux`
 and `top` passed on the physical iPad. The user reported typing and scrolling
 equally responsive alongside Ghostty in the two-drawable Mac build.
 Battery consumption has not been measured.
-[todo.tests.md](todo.tests.md) lists deferred checks that need protocols or
-APIs Swiftty does not implement yet.
+[The consolidated backlog](todo.md#deferred-terminal-feature-checks) lists deferred
+checks that need protocols or APIs Swiftty does not implement yet.

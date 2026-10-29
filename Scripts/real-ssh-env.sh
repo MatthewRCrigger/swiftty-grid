@@ -4,6 +4,7 @@
 #
 #   Scripts/real-ssh-env.sh start [state-dir]   # prints the env file path
 #   Scripts/real-ssh-env.sh stop  <state-dir>
+# Set RST_REAL_SSH_CONFIGURATION=release for optimized host products (default: debug).
 #
 # `start` brings up, and leaves running in the background:
 #  - a real SwiftMux service with roaming (`swiftmux-agent --roaming-config`) on this Mac (QUIC on 127.0.0.1:<quic port>);
@@ -22,7 +23,8 @@
 #   RST_REAL_SSH_PASSWORD RST_REAL_SSH_HOSTKEY RST_REAL_SSH_FINGERPRINT
 #   RST_REAL_SSH_KEY_HEX RST_REAL_SSH_QUIC_PORT RST_REAL_SSH_ENV_DIR
 # and prints its path as the only line on stdout (progress goes to stderr).
-# `stop` kills the background processes and removes the VM.
+# `stop` asks each process owner to terminate/reap its child, then removes the VM.
+# Legacy PID-only records are retained: a saved PID cannot establish ownership.
 set -eu
 usage() { echo "usage: $0 start [state-dir] | stop <state-dir>" >&2; exit 2; }
 [ "$#" -ge 1 ] || usage
@@ -32,51 +34,39 @@ stop() {
   dir=$1
   [ -d "$dir" ] || return 0
   cleanup_status=0
-  for f in relay bridge host; do
-    if [ -e "$dir/$f.pid" ] || [ -L "$dir/$f.pid" ]; then
-      if ! pid=$(cat "$dir/$f.pid"); then
-        echo "cannot read $dir/$f.pid" >&2
+  for f in xcodebuild advertiser relay bridge host; do
+    if [ -e "$dir/$f.pid" ] || [ -L "$dir/$f.pid" ] ||
+       [ -e "$dir/$f.owner" ] || [ -L "$dir/$f.owner" ]; then
+      if [ ! -e "$dir/$f.owner" ] && [ ! -L "$dir/$f.owner" ]; then
+        echo "no process owner for $dir/$f.pid; legacy PID marker retained" >&2
         cleanup_status=1
-        continue
-      fi
-      case "$pid" in
-        *[!0-9]*|0*|'') echo "invalid PID in $dir/$f.pid" >&2; cleanup_status=1; continue ;;
-      esac
-      if ! [ "$pid" -gt 1 ] 2>/dev/null || ! [ "$pid" -le 2147483647 ] 2>/dev/null; then
-        echo "invalid PID in $dir/$f.pid" >&2
+      elif ! python3 -I "$repository_root/Scripts/real-ssh-process.py" stop "$dir" "$f"; then
         cleanup_status=1
-        continue
       fi
-      if kill -0 "$pid" 2>/dev/null && ! kill "$pid" 2>/dev/null; then
-        echo "cannot stop PID $pid" >&2
-        cleanup_status=1
-        continue
-      fi
-      rm -f "$dir/$f.pid" || cleanup_status=1
     fi
   done
   if [ -e "$dir/container.name" ] || [ -L "$dir/container.name" ]; then
-    container_name=$(cat "$dir/container.name") || return 1
-    case "$container_name" in
-      *[!a-zA-Z0-9-]*|'') echo "invalid container name in $dir/container.name" >&2; return 1 ;;
-    esac
-    case "$container_name" in
-      swiftty-rst-ssh-*) ;;
-      *) echo "unrecognized fixture container in $dir/container.name" >&2; return 1 ;;
-    esac
-    if ! container rm -f "$container_name" >/dev/null 2>&1; then
-      echo "cannot remove fixture container $container_name" >&2
-      return 1
-    fi
-    rm -f "$dir/container.name" || return 1
+    python3 -I "$repository_root/Scripts/real-ssh-container.py" "$dir" || return 1
   fi
   return "$cleanup_status"
 }
 
 case $1 in
-  stop) [ "$#" -eq 2 ] || usage; stop "$2"; exit $? ;;
+  stop)
+    [ "$#" -eq 2 ] || usage
+    if [ -e "$2/start.lock" ] || [ -L "$2/start.lock" ]; then
+      echo "fixture startup still recorded in $2; cannot stop concurrently" >&2
+      exit 1
+    fi
+    stop "$2"; exit $? ;;
   start) [ "$#" -le 2 ] || usage ;;
   *) usage ;;
+esac
+
+build_configuration=${RST_REAL_SSH_CONFIGURATION-debug}
+case "$build_configuration" in
+  debug|release) ;;
+  *) echo "RST_REAL_SSH_CONFIGURATION must be debug or release" >&2; exit 2 ;;
 esac
 
 command -v container >/dev/null || { echo "apple/container required" >&2; exit 1; }
@@ -84,7 +74,16 @@ umask 077
 workspace=${2:-$(mktemp -d /tmp/rstr.XXXXXX)}
 mkdir -p "$workspace"
 workspace=$(CDPATH= cd "$workspace" && pwd)
-for marker in host.pid bridge.pid relay.pid container.name; do
+# Serialize resource creation. A second start must never roll back the first
+# invocation's resources; only our own EXIT handler bypasses this startup lock.
+mkdir "$workspace/start.lock" 2>/dev/null || {
+  echo "fixture startup already recorded in $workspace" >&2
+  exit 1
+}
+trap 'rmdir "$workspace/start.lock"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+for marker in host.pid bridge.pid relay.pid advertiser.pid xcodebuild.pid host.owner bridge.owner relay.owner advertiser.owner xcodebuild.owner container.name; do
   [ ! -e "$workspace/$marker" ] && [ ! -L "$workspace/$marker" ] || {
     echo "fixture resources already recorded in $workspace; stop them before starting" >&2
     exit 1
@@ -105,6 +104,7 @@ cleanup_start() {
   if [ "$setup_complete" -eq 0 ]; then
     stop "$workspace" || echo "fixture cleanup incomplete: $workspace" >&2
   fi
+  rmdir "$workspace/start.lock" || echo "fixture startup lock retained: $workspace" >&2
   exit "$setup_status"
 }
 trap cleanup_start EXIT
@@ -123,9 +123,9 @@ container build --progress plain -t swiftty-rst-ssh:test \
   "$repository_root/Tests/RealSSH" >"$workspace/build.log" 2>&1 \
   || fail "container build failed; see $workspace/build.log"
 
-(cd "$repository_root" && mise exec -- swift build --product swiftmux-agent && mise exec -- swift build --product swmux-launcher && mise exec -- swift build --product swifttyd) >"$workspace/swift-build.log" 2>&1 \
+(cd "$repository_root" && mise exec -- swift build -c "$build_configuration" --product swiftmux-agent && mise exec -- swift build -c "$build_configuration" --product swmux-launcher && mise exec -- swift build -c "$build_configuration" --product swifttyd) >"$workspace/swift-build.log" 2>&1 \
   || fail "swifttyd build failed; see $workspace/swift-build.log"
-bin_dir="$(cd "$repository_root" && mise exec -- swift build --show-bin-path)"
+bin_dir="$(cd "$repository_root" && mise exec -- swift build -c "$build_configuration" --show-bin-path)"
 host_bin="$bin_dir/swiftmux-agent"
 # RST_PUBLIC_HOST=<this Mac's LAN address> serves physical devices: swifttyd
 # and the SSH relay listen on all interfaces and grants advertise that
@@ -141,9 +141,9 @@ import json, sys
 bind, host, port, state = sys.argv[1:]
 json.dump(dict(bindAddress=bind, advertisedHost=host, port=int(port), stateDirectory=state), sys.stdout)
 PY
-"$host_bin" --mach-service "com.chr33s.swiftty.swiftmux.test.$$" --launcher "$bin_dir/swmux-launcher" --roaming-config "$workspace/config.json" </dev/null >/dev/null 2>"$workspace/host.log" &
-host_pid=$!
-echo "$host_pid" >"$workspace/host.pid"
+host_pid=$(python3 -I "$repository_root/Scripts/real-ssh-process.py" start "$workspace" host \
+  "$host_bin" --mach-service "com.chr33s.swiftty.swiftmux.test.$$" --launcher "$bin_dir/swmux-launcher" --roaming-config "$workspace/config.json") \
+  || fail "cannot start owned host; see $workspace/host.log"
 python3 -I "$repository_root/Scripts/real-ssh-readiness.py" host "$host_pid" \
   "$bin_dir/swifttyd" "$workspace/config.json" >"$workspace/host-readiness.log" 2>&1 \
   || fail "host did not start; see $workspace/host-readiness.log"
@@ -184,11 +184,11 @@ container run -d --name "$name" \
   -e RST_BRIDGE="$gateway:$bridge_port" swiftty-rst-ssh:test >/dev/null \
   || fail "container run failed"
 
-python3 -I "$repository_root/Scripts/real-ssh-proxy.py" bridge \
+bridge_pid=$(python3 -I "$repository_root/Scripts/real-ssh-process.py" start "$workspace" bridge \
+  python3 -I "$repository_root/Scripts/real-ssh-proxy.py" bridge \
   "$gateway" "$bridge_port" "$workspace/state/control.sock" \
-  "$workspace/bridge.ready" "$fixture_id" >"$workspace/bridge.log" 2>&1 &
-bridge_pid=$!
-echo "$bridge_pid" >"$workspace/bridge.pid"
+  "$workspace/bridge.ready" "$fixture_id") \
+  || fail "cannot start owned bridge; see $workspace/bridge.log"
 python3 -I "$repository_root/Scripts/real-ssh-readiness.py" listener "$bridge_pid" \
   "$workspace/bridge.ready" "$fixture_id" >"$workspace/bridge-readiness.log" 2>&1 \
   || fail "bridge did not start; see $workspace/bridge-readiness.log"
@@ -203,27 +203,29 @@ key_details=$(ssh-keygen -lf "$workspace/hostkey.pub")
 fingerprint=$(printf '%s\n' "$key_details" | awk '{print $2}')
 [ -n "$fingerprint" ] || fail "SSH host key has no fingerprint"
 
-python3 -I "$repository_root/Scripts/real-ssh-proxy.py" relay \
-  "$relay_bind" "$ssh_port" "$name" "$workspace/relay.ready" "$fixture_id" \
-  >"$workspace/relay.log" 2>&1 &
-relay_pid=$!
-echo "$relay_pid" >"$workspace/relay.pid"
+relay_pid=$(python3 -I "$repository_root/Scripts/real-ssh-process.py" start "$workspace" relay \
+  python3 -I "$repository_root/Scripts/real-ssh-proxy.py" relay \
+  "$relay_bind" "$ssh_port" "$name" "$workspace/relay.ready" "$fixture_id") \
+  || fail "cannot start owned relay; see $workspace/relay.log"
 python3 -I "$repository_root/Scripts/real-ssh-readiness.py" listener "$relay_pid" \
   "$workspace/relay.ready" "$fixture_id" >"$workspace/relay-readiness.log" 2>&1 \
   || fail "relay did not start; see $workspace/relay-readiness.log"
-python3 -I "$repository_root/Scripts/real-ssh-readiness.py" alive \
-  "$host_pid" "$bridge_pid" "$relay_pid" || fail "fixture process exited during setup"
+for role in host bridge relay; do
+  python3 -I "$repository_root/Scripts/real-ssh-process.py" alive "$workspace" "$role" \
+    || fail "fixture process exited during setup"
+done
 echo "OpenSSH at $address:22 via 127.0.0.1:$ssh_port; bridge $gateway:$bridge_port; swifttyd QUIC $advertised:$quic_port" >&2
 
 python3 -I - "$advertised" "$ssh_port" "$password" "$hostkey" "$fingerprint" \
-  "$seed" "$quic_port" "$workspace" <<'PY' >"$workspace/env"
+  "$seed" "$quic_port" "$workspace" "$build_configuration" <<'PY' >"$workspace/env"
 import shlex, sys
-keys = ["HOST", "PORT", "PASSWORD", "HOSTKEY", "FINGERPRINT", "KEY_HEX", "QUIC_PORT", "ENV_DIR"]
+keys = ["HOST", "PORT", "PASSWORD", "HOSTKEY", "FINGERPRINT", "KEY_HEX", "QUIC_PORT", "ENV_DIR", "CONFIGURATION"]
 print("export RST_REAL_SSH_USER=rst")
 for key, value in zip(keys, sys.argv[1:]):
     print(f"export RST_REAL_SSH_{key}={shlex.quote(value)}")
 PY
 chmod 600 "$workspace/env"
-echo "$workspace/env"
+rmdir "$workspace/start.lock"
 setup_complete=1
 trap - EXIT INT TERM
+echo "$workspace/env"

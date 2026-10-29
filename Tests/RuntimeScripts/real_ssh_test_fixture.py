@@ -45,7 +45,12 @@ def idle(role):
                   if role in os.environ.get("FIXTURE_IGNORE_TERM", "").split(",") else stop)
     while True: time.sleep(0.05)
 if name == "container":
-    if args[0] == "build": fail("container-build", 61)
+    if args[0] == "build":
+        if os.environ.get("FIXTURE_BUILD_GATE"):
+            gate = Path(os.environ["FIXTURE_BUILD_GATE"])
+            gate.with_suffix(".waiting").touch()
+            while not gate.exists(): time.sleep(0.01)
+        fail("container-build", 61)
     elif args[:2] == ["network", "list"]:
         fail("network", 70)
         if "--format" in args:
@@ -60,8 +65,17 @@ if name == "container":
         (directory / "container.created").touch()
         fail("container-run", 71)
     elif args[0] == "rm":
+        if os.environ.get("FIXTURE_CONTAINER_ABSENT"):
+            sys.exit(75)
         fail("container-remove", 74)
         (directory / "container.removed").touch()
+    elif args[0] == "list":
+        fail("container-list", 78)
+        if "FIXTURE_CONTAINER_LIST" in os.environ:
+            print(os.environ["FIXTURE_CONTAINER_LIST"])
+        else:
+            print(json.dumps([] if os.environ.get("FIXTURE_CONTAINER_ABSENT") else
+                             [{"id": (state / "container.name").read_text().strip()}]))
     elif args[0] == "inspect":
         print(json.dumps([{"status": {"networks": [{"ipv4Address": "127.0.0.2/24"}]}}]))
     elif args[0] == "exec" and "cut" in args:
@@ -122,6 +136,9 @@ class RealSSHFixture:
         shutil.copyfile(ROOT / "Scripts/real-ssh-readiness.py", scripts / "real-ssh-readiness.py")
         shutil.copyfile(ROOT / "Scripts/real-ssh-proxy.py", scripts / "real-ssh-proxy.py")
         shutil.copyfile(ROOT / "Scripts/real-ssh-config.py", scripts / "real-ssh-config.py")
+        shutil.copyfile(ROOT / "Scripts/real-ssh-process.py", scripts / "real-ssh-process.py")
+        shutil.copyfile(ROOT / "Scripts/real-ssh-container.py", scripts / "real-ssh-container.py")
+        shutil.copyfile(ROOT / "Scripts/real_ssh_commands.py", scripts / "real_ssh_commands.py")
         self.state = self.directory / "state"
         self.bin = self.directory / "bin"
         self.bin.mkdir()
@@ -141,6 +158,7 @@ class RealSSHFixture:
         self.environment.pop("RST_PUBLIC_HOST", None)
         self.environment.pop("RST_QUIC_PORT", None)
         self.environment.pop("RST_SSH_PORT", None)
+        self.environment.pop("RST_REAL_SSH_CONFIGURATION", None)
         for name in list(self.environment):
             if name.startswith("FIXTURE_") and name != "FIXTURE_DIRECTORY":
                 self.environment.pop(name)

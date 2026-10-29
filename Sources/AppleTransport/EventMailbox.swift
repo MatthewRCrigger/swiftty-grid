@@ -7,8 +7,9 @@ import Synchronization
 /// a handler call finishes before the next starts. Control bytes carry a
 /// completion that the transport uses to issue its next read, so a slow
 /// `onControl` stops reading (backpressure) instead of queueing. Complete
-/// snapshots are bounded separately: when more than `snapshotLimit` are
-/// waiting, the oldest is dropped (the client shows only the newest).
+/// snapshots retain their QUIC stream credit until delivery completes, so
+/// the transport bounds their count. Preserve every admitted payload: stream
+/// arrival order does not establish which encoded screen revision is newest.
 final class EventMailbox: Sendable {
   enum Event: Sendable {
     case control([UInt8], done: @Sendable () -> Void)
@@ -25,11 +26,13 @@ final class EventMailbox: Sendable {
   }
 
   private let state = Mutex(State())
-  let snapshotLimit: Int
-
-  init(snapshotLimit: Int) { self.snapshotLimit = max(1, snapshotLimit) }
-
   var hasHandler: Bool { state.withLock { $0.handler != nil } }
+
+  var queuedSnapshotsForTesting: Int {
+    state.withLock {
+      $0.events.count { if case .snapshot = $0 { true } else { false } }
+    }
+  }
 
   /// Installs the handler and starts delivery. Only the first call counts.
   /// Returns false on a repeated call.
@@ -48,28 +51,13 @@ final class EventMailbox: Sendable {
   /// Queues an event. Events after `.closed` are dropped (their completion
   /// still runs so no reader waits forever).
   func post(_ event: Event) {
-    let dropped = state.withLock { s -> [Event] in
-      if s.closePosted { return [event] }
-      var dropped: [Event] = []
-      switch event {
-      case .closed: s.closePosted = true
-      case .snapshot:
-        let queued = s.events.count(where: {
-          if case .snapshot = $0 { true } else { false }
-        })
-        if queued >= snapshotLimit,
-          let oldest = s.events.firstIndex(where: {
-            if case .snapshot = $0 { true } else { false }
-          })
-        {
-          dropped.append(s.events.remove(at: oldest))
-        }
-      case .control: break
-      }
+    let dropped = state.withLock { s -> Bool in
+      if s.closePosted { return true }
+      if case .closed = event { s.closePosted = true }
       s.events.append(event)
-      return dropped
+      return false
     }
-    for event in dropped { Self.complete(event) }
+    if dropped { Self.complete(event) }
     pump()
   }
 

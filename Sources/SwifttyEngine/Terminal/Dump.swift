@@ -8,22 +8,19 @@ extension TerminalState {
       : dump(grid, cursorRow: cursor.y)
   }
 
+  /// Streams history through scoped reads: no pointer outlives its row
+  /// and dumped history stays cold.
   private func dump(_ screen: borrowing Grid, cursorRow: Int?) -> [UInt8] {
-    var lines: [(UnsafeBufferPointer<Cell>, Bool)] = []
-    for i in 0 ..< screen.historyCount { lines.append(screen.historyLine(i)) }
     var last = screen.rows - 1
     while last >= 0, screen._unsafeCells(row: last).allSatisfy(\.isBlank) {
       last -= 1
     }
     if let cursorRow { last = max(last, cursorRow) }
-    if last >= 0 {
-      for y in 0 ... last {
-        lines.append((screen._unsafeCells(row: y), screen.isWrapped(y)))
-      }
-    }
+    let lineCount = screen.historyCount + last + 1
     var out: [UInt8] = []
     var pen = CellAttributes.default
-    for (index, (cells, wrapped)) in lines.enumerated() {
+    func emit(_ index: Int, _ cells: UnsafeBufferPointer<Cell>, _ wrapped: Bool)
+    {
       var end = cells.count
       if !wrapped { while end > 0, cells[end - 1].isBlank { end -= 1 } }
       for x in 0 ..< end {
@@ -52,12 +49,24 @@ extension TerminalState {
           out.append(0x20)
         }
       }
-      if !wrapped, index < lines.count - 1 {
+      if !wrapped, index < lineCount - 1 {
         if pen != .default {
           out.append(contentsOf: "\u{1B}[0m".utf8)
           pen = .default
         }
         out.append(contentsOf: "\r\n".utf8)
+      }
+    }
+    for i in 0 ..< screen.historyCount {
+      screen.withHistoryLine(i) { cells, wrapped in emit(i, cells, wrapped) }
+    }
+    if last >= 0 {
+      for y in 0 ... last {
+        emit(
+          screen.historyCount + y,
+          screen._unsafeCells(row: y),
+          screen.isWrapped(y)
+        )
       }
     }
     if pen != .default { out.append(contentsOf: "\u{1B}[0m".utf8) }

@@ -4,6 +4,15 @@
 # Scripts/real-ssh-env.sh; this runs the SwiftPM RealOpenSSHTests against it.
 set -eu
 repository_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
+build_configuration=${RST_REAL_SSH_CONFIGURATION-debug}
+case "$build_configuration" in
+  debug|release) ;;
+  *) echo "RST_REAL_SSH_CONFIGURATION must be debug or release" >&2; exit 2 ;;
+esac
+cd "$repository_root"
+# Compile before the fixture launches an agent from these products. Building
+# tests afterward can relink that executable while it is running.
+mise exec -- swift build -c "$build_configuration" --build-tests -Xswiftc -enable-testing
 env_file=$("$repository_root/Scripts/real-ssh-env.sh" start)
 workspace=$(dirname "$env_file")
 cleanup_fixture() {
@@ -20,12 +29,16 @@ trap cleanup_fixture EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 . "$env_file"
+if [ "${RST_REAL_SSH_CONFIGURATION:-debug}" != "$build_configuration" ]; then
+  echo "fixture configuration differs from the prebuilt tests" >&2
+  exit 1
+fi
 
 cd "$repository_root"
 status=0
 rm -f "$workspace/test-events.jsonl"
 RST_REAL_SSH_POSIX=${RST_REAL_SSH_POSIX:-} \
-  mise exec -- swift test --filter RealOpenSSHTests \
+  mise exec -- swift test -c "$build_configuration" --skip-build --filter RealOpenSSHTests \
   --event-stream-version 0 --event-stream-output-path "$workspace/test-events.jsonl" \
   >"$workspace/test.log" 2>&1 || status=$?
 grep -E "✔ Test|✘|recorded|Test run with" "$workspace/test.log" || true

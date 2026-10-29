@@ -27,7 +27,10 @@ extension MuxPaneView {
 
   /// A non-consuming binding's key, as the terminal would get it unbound.
   private func sendUnbound(_ event: NSEvent) {
-    if let key = Self.semanticKey(for: event) {
+    if let key = Self.semanticKey(
+      for: event,
+      keypadKeys: features.contains(.keypadKeys)
+    ) {
       clearSelection()
       controller?.send(.key(key.0, key.1), to: pane)
     } else if let text = event.characters, !text.isEmpty {

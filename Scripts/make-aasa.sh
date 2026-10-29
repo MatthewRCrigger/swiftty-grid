@@ -9,8 +9,8 @@
 #   -o path    write to path instead of stdout.
 #   team-id    the 10-character Apple Developer Team ID.
 #   bundle-id  each app accepting the links, e.g. com.chr33s.swiftty
-#              (native macOS) and dev.swiftty.roaming.mobile,
-#              .mac, .catalyst, .vision (roaming clients).
+#              (native macOS) and dev.chr33s.swiftty (the roaming
+#              clients' shared universal-purchase ID).
 #   --check    validate an existing file (JSON syntax with python3 and
 #              plutil, the applinks structure, and, when given, that it
 #              names exactly those app IDs).

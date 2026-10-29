@@ -92,7 +92,10 @@ extension MuxWorkspaceController {
 
   static func connect(
     createConnection: @MainActor () async throws -> MuxConnection = {
-      try await MuxConnection.connect(frontend: .native)
+      try await MuxConnection.connect(
+        frontend: .native,
+        capabilities: MuxWorkspaceController.clientCapabilities
+      )
     }
   ) async throws -> MuxConnection {
     try Task.checkCancellation()

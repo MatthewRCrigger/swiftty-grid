@@ -40,6 +40,7 @@ extension TerminalUIView {
     if flags.contains(.control) { mods.insert(.control) }
     if flags.contains(.alternate) { mods.insert(.alt) }
     if flags.contains(.command) { mods.insert(.command) }
+    if flags.contains(.alphaShift) { mods.insert(.capsLock) }
     return mods
   }
 
@@ -306,7 +307,7 @@ extension TerminalUIView {
     case .pageUp: UIKeyCommand.inputPageUp
     case .pageDown: UIKeyCommand.inputPageDown
     case .delete: UIKeyCommand.inputDelete
-    case .insert: nil
+    case .insert, .keypad: nil
     case let .function(n):
       [
         UIKeyCommand.f1, UIKeyCommand.f2, UIKeyCommand.f3, UIKeyCommand.f4,
@@ -445,9 +446,14 @@ extension TerminalUIView {
     #if os(tvOS)
     return false
     #else
-    guard effectiveCapabilities.allows(.pasteFromClipboard),
-      let text = pasteboard.string
-    else { return false }
+    guard effectiveCapabilities.allows(.pasteFromClipboard) else {
+      return false
+    }
+    if sendKittyPasteEvent() {
+      clearSelection()
+      return true
+    }
+    guard let text = pasteboard.string else { return false }
     clearSelection()
     send([.paste(text)])
     return true

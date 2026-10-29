@@ -548,12 +548,20 @@ struct FrameFairnessTests {
     limits.pendingFrameBudget = 1
     limits.frameIntervalNanoseconds = 0
     let h = try Harness(limits: limits)
+    // Keep both leases producing small updates that internal validation can
+    // process between frames. Each consumer must still acknowledge to free
+    // the shared budget for its peer.
+    var launch = shellLaunch()
+    launch.command = [
+      "/bin/sh", "-c",
+      "i=0; while :; do i=$((i+1)); echo $i; /bin/sleep 0.01; done",
+    ]
     var shown: [(MuxConnection, PaneID, WorkspaceID)] = []
     for name in ["one", "two"] {
       let c = try await h.connect()
       guard
         case let .created(ws) = try await c.execute(
-          .newWorkspace(NewWorkspaceRequest(name: name, launch: busyLaunch()))
+          .newWorkspace(NewWorkspaceRequest(name: name, launch: launch))
         )
       else { throw MuxError(.invalidRequest, "unexpected reply") }
       try await c.attachAndShow(.id(ws.id))
@@ -569,6 +577,10 @@ struct FrameFairnessTests {
           while let event = try await c.nextEvent() {
             if case let .frame(f) = event, f.identity.pane == pane {
               counts.withLock { $0[i] += 1 }
+              // Let another update queue while both producers keep writing.
+              // Taking the queued frame on the next iteration releases its
+              // budget, with both leases competing for the next admission.
+              try await Task.sleep(for: .milliseconds(20))
             }
           }
         }

@@ -12,6 +12,34 @@ extension MainActorIntegrationTests {
     enum Rejection: CaseIterable, Sendable { case channel, pty, shell }
 
     @Test
+    func terminationClosesTheShellWhileTheMainQueueWaits() async throws {
+      try await withController { server, app, controller in
+        try await signIn(controller, app: app)
+        try #require(try await eventually { controller.phase == .running })
+        app.open(controller.model.host, kind: .ordinarySSH)
+        let screen = try #require(app.activeSession)
+        screen.controller = controller
+        let connection = try #require(controller.connection)
+        await withCheckedContinuation { continuation in
+          DispatchQueue.main.async {
+            let start = ContinuousClock.now
+            app.detachBeforeExit()
+            #expect(start.duration(to: .now) < .seconds(1))
+            // Closed before the quit callback returns, not merely begun.
+            #expect(!connection.isActive)
+            #expect(screen.controller == nil)
+            continuation.resume()
+          }
+        }
+        #expect(
+          try await eventually {
+            server.state.connections.withLock { $0.channels.isEmpty }
+          }
+        )
+      }
+    }
+
+    @Test
     func repeatedCloseWaitsForTheSameCleanup() async throws {
       try await withController { server, app, controller in
         try await signIn(controller, app: app)
@@ -57,10 +85,17 @@ extension MainActorIntegrationTests {
     @Test
     func directViewRefusalShowsNoticeWithoutEndingShell() async throws {
       try await withController { server, app, controller in
+        // The view reports focus as it appears; that is not a refusal.
+        controller.session.send(.focus(true))
+        await withCheckedContinuation { continuation in
+          DispatchQueue.main.async { continuation.resume() }
+        }
+        #expect(controller.inputNotice == nil)
         controller.session.send(.text("early"))
         #expect(
           try await eventually {
-            controller.inputNotice?.contains("not ready") == true
+            controller.inputNotice.map { String(localized: $0) }?
+              .contains("not ready") == true
           }
         )
         controller.dismissInputNotice()
@@ -72,7 +107,8 @@ extension MainActorIntegrationTests {
         )
         #expect(
           try await eventually {
-            controller.inputNotice?.contains("limits") == true
+            controller.inputNotice.map { String(localized: $0) }?
+              .contains("limits") == true
           }
         )
         #expect(controller.phase == .running)
@@ -215,7 +251,8 @@ extension MainActorIntegrationTests {
         )
         if case let .failed(problem) = controller.phase {
           #expect(
-            problem.title == (status ? "Shell exited" : "SSH connection lost")
+            String(localized: problem.title)
+              == (status ? "Shell exited" : "SSH connection lost")
           )
         } else {
           Issue.record("A finished shell must retain its failure explanation")
@@ -267,7 +304,7 @@ extension MainActorIntegrationTests {
       do {
         let defaults = try #require(UserDefaults(suiteName: suite))
         let app = RoamingAppModel(
-          store: HostProfileStore(
+          store: ConnectionStore(
             fileURL: directory.appendingPathComponent("hosts.json")
           ),
           resumeStore: SessionResumeStore(defaults: defaults),

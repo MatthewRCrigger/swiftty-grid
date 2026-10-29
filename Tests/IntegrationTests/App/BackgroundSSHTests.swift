@@ -29,7 +29,7 @@ extension MainActorIntegrationTests {
         host: "127.0.0.1",
         port: server.port,
         username: TestSSHServer.username,
-        auth: password ? .password : .keychainKey(label: "test")
+        auth: password ? .password : .key(identityID: UUID())
       )
       await #expect(
         throws: password ? SSHAccessError.cancelled : .hostKeyRejected

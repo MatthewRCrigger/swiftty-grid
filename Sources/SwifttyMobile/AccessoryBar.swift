@@ -19,22 +19,18 @@ final class TerminalAccessoryBar: UIInputView, UIInputViewAudioFeedback {
     allowsSelfSizing = true
     translatesAutoresizingMaskIntoConstraints = false
 
-    #if os(visionOS)
+    // No glass container: one draws every nested element's glass itself,
+    // outside any clipping, so scrolled keys showed under and beside Hide
+    // Keyboard. Each `.glass()` button draws its own, which the scroll
+    // view clips.
     let content = self
-    #else
-    let container = UIVisualEffectView(effect: UIGlassContainerEffect())
-    container.frame = bounds
-    container.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    addSubview(container)
-    let content = container.contentView
-    #endif
 
     let stack = UIStackView()
     stack.axis = .horizontal
     stack.spacing = 6
     stack.translatesAutoresizingMaskIntoConstraints = false
     for key in AccessoryKey.standard {
-      let button = makeButton(key.title)
+      let button = makeButton(key)
       if key.modifier == nil {
         // Keys fire on touch down and repeat while held.
         button.addTarget(self, action: #selector(keyDown(_:)), for: .touchDown)
@@ -58,6 +54,12 @@ final class TerminalAccessoryBar: UIInputView, UIInputViewAudioFeedback {
     scroll.translatesAutoresizingMaskIntoConstraints = false
     scroll.addSubview(stack)
 
+    let keys = UIView()
+    let keysContent = keys
+    keys.clipsToBounds = true
+    keys.translatesAutoresizingMaskIntoConstraints = false
+    keysContent.addSubview(scroll)
+
     #if os(visionOS)
     var dismiss = UIButton.Configuration.plain()
     #else
@@ -71,15 +73,21 @@ final class TerminalAccessoryBar: UIInputView, UIInputViewAudioFeedback {
     dismissButton.accessibilityLabel = "Hide keyboard"
     dismissButton.translatesAutoresizingMaskIntoConstraints = false
 
-    content.addSubview(scroll)
+    content.addSubview(keys)
     content.addSubview(dismissButton)
     NSLayoutConstraint.activate([
       heightAnchor.constraint(equalToConstant: 44),
-      scroll.leadingAnchor.constraint(
-        equalTo: safeAreaLayoutGuide.leadingAnchor
-      ), scroll.topAnchor.constraint(equalTo: topAnchor),
-      scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
-      scroll.trailingAnchor.constraint(equalTo: dismissButton.leadingAnchor),
+      keys.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor),
+      keys.topAnchor.constraint(equalTo: topAnchor),
+      keys.bottomAnchor.constraint(equalTo: bottomAnchor),
+      // A clear gap so the last key never touches Hide Keyboard.
+      keys.trailingAnchor.constraint(
+        equalTo: dismissButton.leadingAnchor,
+        constant: -8
+      ), scroll.leadingAnchor.constraint(equalTo: keysContent.leadingAnchor),
+      scroll.trailingAnchor.constraint(equalTo: keysContent.trailingAnchor),
+      scroll.topAnchor.constraint(equalTo: keysContent.topAnchor),
+      scroll.bottomAnchor.constraint(equalTo: keysContent.bottomAnchor),
       dismissButton.trailingAnchor.constraint(
         equalTo: safeAreaLayoutGuide.trailingAnchor,
         constant: -4
@@ -143,9 +151,17 @@ final class TerminalAccessoryBar: UIInputView, UIInputViewAudioFeedback {
     }
   }
 
-  private func makeButton(_ title: String) -> UIButton {
+  private func makeButton(_ key: AccessoryKey) -> UIButton {
     var config = Self.keyConfiguration
-    config.title = title
+    if let symbol = key.symbolName {
+      config.image = UIImage(systemName: symbol)
+      config.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(
+        pointSize: 15,
+        weight: .medium
+      )
+    } else {
+      config.title = key.title
+    }
     config.baseForegroundColor = .label
     config.contentInsets = NSDirectionalEdgeInsets(
       top: 4,
@@ -160,7 +176,7 @@ final class TerminalAccessoryBar: UIInputView, UIInputViewAudioFeedback {
         return attributes
       }
     let button = UIButton(configuration: config)
-    button.accessibilityLabel = title
+    button.accessibilityLabel = key.accessibilityName
     button.widthAnchor.constraint(greaterThanOrEqualToConstant: 36).isActive =
       true
     return button

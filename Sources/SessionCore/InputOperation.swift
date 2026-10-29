@@ -5,8 +5,10 @@ public enum SemanticKeyName: Hashable, Sendable {
   case up, down, left, right
   case home, end, pageUp, pageDown, insert, delete
   case function(Int)
+  /// Sent only to hosts whose `Attached` lists `keypadKeys`.
+  case keypad(SemanticKeypadKey)
 
-  /// Wire spelling: `enter`, `f5`, or `char:<scalar>`.
+  /// Wire spelling: `enter`, `f5`, `kp:<key>`, or `char:<scalar>`.
   public var wireName: String {
     switch self {
     case let .character(scalar): "char:" + String(Character(scalar))
@@ -25,10 +27,17 @@ public enum SemanticKeyName: Hashable, Sendable {
     case .insert: "insert"
     case .delete: "delete"
     case let .function(n): "f\(n)"
+    case let .keypad(key): "kp:" + key.rawValue
     }
   }
 
   public init?(wireName: String) {
+    if wireName.hasPrefix("kp:") {
+      guard let key = SemanticKeypadKey(rawValue: String(wireName.dropFirst(3)))
+      else { return nil }
+      self = .keypad(key)
+      return
+    }
     if wireName.hasPrefix("char:") {
       let rest = wireName.dropFirst(5).unicodeScalars
       guard rest.count == 1, let scalar = rest.first else { return nil }
@@ -58,6 +67,14 @@ public enum SemanticKeyName: Hashable, Sendable {
       self = .function(n)
     }
   }
+}
+
+/// Numeric keypad keys, named as on the wire after `kp:`.
+public enum SemanticKeypadKey: String, CaseIterable, Hashable, Sendable {
+  case zero, one, two, three, four, five, six, seven, eight, nine
+  case decimal, divide, multiply, subtract, add, enter, equal, separator
+  case left, right, up, down, pageUp, pageDown, home, end, insert, delete
+  case begin
 }
 
 public struct SemanticModifiers: OptionSet, Hashable, Sendable, Codable {

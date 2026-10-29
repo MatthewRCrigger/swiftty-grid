@@ -54,7 +54,8 @@ public enum SSHPublicKeyFormat {
     return "SHA256:" + trimmed
   }
 
-  static func keyBlob(openSSHPublicKey line: String) -> [UInt8]? {
+  /// The decoded key blob of a `"<type> <base64>"` line.
+  public static func keyBlob(openSSHPublicKey line: String) -> [UInt8]? {
     let parts = line.split(separator: " ", omittingEmptySubsequences: true)
     guard parts.count >= 2, let data = Data(base64Encoded: String(parts[1]))
     else { return nil }
@@ -66,7 +67,7 @@ public enum SSHPublicKeyFormat {
   }
 
   /// Key algorithm name, such as `ssh-ed25519`.
-  static func keyType(openSSHPublicKey line: String) -> String {
+  public static func keyType(openSSHPublicKey line: String) -> String {
     String(line.split(separator: " ").first ?? "")
   }
 }
@@ -176,6 +177,11 @@ public actor FileHostTrustStore: HostTrustStore {
       try save(keys)
       return openSSHPublicKey
     }
+  }
+
+  /// Every trusted key, for opt-in trust sync.
+  public func entries() throws -> [HostIdentity: String] {
+    try Self.fileAccess.withLock { try load() }
   }
 
   public func removeTrustedKey(for host: HostIdentity) throws {
@@ -323,6 +329,8 @@ final class HostKeyVerifier: NIOSSHClientServerAuthenticationDelegate, Sendable
   let host: HostIdentity
   let store: any HostTrustStore
   let decider: any HostTrustDecider
+  /// Pairing-code fingerprints the presented key must match, if any.
+  let expected: Set<String>?
   /// The first trust failure, reported by `connect` instead of the
   /// generic NIO error.
   let failure = Mutex<SSHClientError?>(nil)
@@ -345,11 +353,13 @@ final class HostKeyVerifier: NIOSSHClientServerAuthenticationDelegate, Sendable
   init(
     host: HostIdentity,
     store: any HostTrustStore,
-    decider: any HostTrustDecider
+    decider: any HostTrustDecider,
+    expected: Set<String>? = nil
   ) {
     self.host = host
     self.store = store
     self.decider = decider
+    self.expected = expected
   }
 
   func validateHostKey(
@@ -437,6 +447,11 @@ final class HostKeyVerifier: NIOSSHClientServerAuthenticationDelegate, Sendable
   private func evaluate(_ line: String) async throws -> SSHClientError? {
     try Task.checkCancellation()
     let presented = SSHPublicKeyFormat.fingerprint(openSSHPublicKey: line) ?? ""
+    // A pairing expectation is enforced first, for known and unknown keys
+    // alike: neither the store nor the decider can accept another key.
+    if let expected, !expected.contains(presented) {
+      return .hostKeyMismatch(host: host, presented: presented)
+    }
     let trusted = try await store.trustedKey(for: host)
     try Task.checkCancellation()
     if let trusted {

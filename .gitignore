@@ -1,5 +1,8 @@
-.build/
+.build*/
 .claude/worktrees/
+.env*
+!.env.example
+.keys/
 .swiftpm/
 *.xcodeproj
 DerivedData/

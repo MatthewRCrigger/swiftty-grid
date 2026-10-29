@@ -260,6 +260,38 @@ struct RoamingEndToEndTests {
   }
 
   @Test
+  func `unreachable advertised host falls back to the SSH host`() async throws {
+    let harness = try await Harness()
+    let bootstrapper = EnvelopeBootstrapper(service: harness.service)
+    guard
+      case var .granted(grant) = try await bootstrapper.bootstrap(
+        BootstrapRequest(
+          operation: .create,
+          initialGrid: GridSize(columns: 80, rows: 24)
+        )
+      )
+    else {
+      Issue.record("expected a grant")
+      await harness.shutdown()
+      return
+    }
+    // A LAN address the client cannot route to (TEST-NET-1), as when the
+    // Mac advertises its Wi-Fi address and the phone is on cellular.
+    grant.endpoint.host = "192.0.2.1"
+    let connection = try await QUICGrantConnector(
+      connector: QUICRSTConnector(handshakeTimeout: .seconds(3)),
+      fallbackHost: "127.0.0.1",
+      fallbackDelay: .milliseconds(50)
+    )
+    .connect(to: grant)
+    connection.close()
+    try await waitFor("server saw the fallback connection") {
+      harness.serverConnections.list.withLock { $0.count } == 1
+    }
+    await harness.shutdown()
+  }
+
+  @Test
   func `changed QUIC pin fails closed before the token is sent`() async throws {
     let harness = try await Harness()
     let bootstrapper = EnvelopeBootstrapper(service: harness.service)

@@ -29,6 +29,10 @@ package struct OwnedScreen: Sendable, Equatable {
   package var searchMatches: [HighlightSpan]
   package var selectedSearchMatch: Int?
   package var searchMatchCount: Int
+  /// Types a kitty drag-and-drop client accepts (nil: none registered)
+  /// and its answer for the current drag.
+  package var dropTypes: [String]?
+  package var dropAccepted: KittyDragAndDrop.Operation?
 
   package init(
     columns: Int,
@@ -50,6 +54,8 @@ package struct OwnedScreen: Sendable, Equatable {
     searchMatches: [HighlightSpan] = [],
     selectedSearchMatch: Int? = nil,
     searchMatchCount: Int = 0,
+    dropTypes: [String]? = nil,
+    dropAccepted: KittyDragAndDrop.Operation? = nil,
   ) {
     self.columns = columns
     self.rows = rows
@@ -70,6 +76,8 @@ package struct OwnedScreen: Sendable, Equatable {
     self.searchMatches = searchMatches
     self.selectedSearchMatch = selectedSearchMatch
     self.searchMatchCount = searchMatchCount
+    self.dropTypes = dropTypes
+    self.dropAccepted = dropAccepted
   }
 
   /// Text of row `y` with trailing blanks trimmed.
@@ -165,6 +173,8 @@ extension TerminalState {
       searchMatches: matches,
       selectedSearchMatch: selected,
       searchMatchCount: searchMatches.count,
+      dropTypes: dragAndDrop?.registeredMimes,
+      dropAccepted: dragAndDrop?.clientAccepted,
     )
   }
 }

@@ -161,6 +161,9 @@ public struct KeyTrigger: Hashable, Sendable {
   public var modifiers: KeyModifiers
 
   public init(_ key: Key, modifiers: KeyModifiers = []) {
+    // Binding names have no keypad keys: they match the keys they type.
+    var key = key
+    if case let .keypad(k) = key, let main = k.mainKey { key = main }
     if case let .character(c) = key,
       let lower = String(c).lowercased().unicodeScalars.first,
       String(c).lowercased().unicodeScalars.count == 1
@@ -169,7 +172,8 @@ public struct KeyTrigger: Hashable, Sendable {
     } else {
       self.key = key
     }
-    self.modifiers = modifiers
+    // Lock states never select a binding.
+    self.modifiers = modifiers.subtracting(KeyModifiers.locks)
   }
 
   /// Parses Ghostty's `mods+key`, e.g. `super+shift+arrow_up`, `ctrl+a`.

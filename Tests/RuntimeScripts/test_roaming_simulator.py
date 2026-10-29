@@ -36,10 +36,12 @@ if name == "mise":
     if os.environ.get("FIXTURE_BUILD_MODE") == "hang":
         while True: time.sleep(0.05)
     if "--show-bin-path" in sys.argv:
-        print(directory / "bin")
+        configuration = sys.argv[sys.argv.index("-c") + 1] if "-c" in sys.argv else "debug"
+        print(directory / "bin" / configuration)
     else:
         sys.exit(int(os.environ.get("FIXTURE_BUILD_CODE", "0")))
 elif name == "swiftmux-agent":
+    (directory / "host.executable").write_text(sys.argv[0])
     (directory / "host.pid").write_text(str(os.getpid()))
     if os.environ.get("FIXTURE_HOST_MODE") == "dead":
         sys.exit(37)
@@ -88,7 +90,7 @@ class SimulatorDriverTests(unittest.TestCase):
         self.root = self.directory / "repo with 'quotes'"
         scripts = self.root / "Scripts"
         scripts.mkdir(parents=True)
-        for name in ["roaming-simulator.py", "test-roaming-simulator.sh"]:
+        for name in ["roaming-simulator.py", "test-roaming-simulator.sh", "real_ssh_commands.py"]:
             shutil.copyfile(ROOT / "Scripts" / name, scripts / name)
         self.bin = self.directory / "bin"
         self.bin.mkdir()
@@ -100,6 +102,11 @@ class SimulatorDriverTests(unittest.TestCase):
             tool.write_text(body.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1))
             tool.chmod(0o755)
         (self.bin / "python3").symlink_to(sys.executable)
+        for configuration in ["debug", "release"]:
+            selected = self.bin / configuration
+            selected.mkdir()
+            for product in ["swiftmux-agent", "swmux-launcher", "swifttyd"]:
+                (selected / product).symlink_to(self.bin / product)
         self.environment = {**os.environ, "FIXTURE_DIRECTORY": str(self.directory),
                             "PATH": str(self.bin) + os.pathsep + os.environ["PATH"]}
         self.workspaces = set()
@@ -342,6 +349,38 @@ class SimulatorDriverTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertEqual(self.calls(), [])
 
+    def test_configuration_selects_matching_host_products_and_simulator(self):
+        for option, configuration in [((), "debug"), (("--configuration", "debug"), "debug"),
+                                      (("--configuration", "release"), "release")]:
+            with self.subTest(configuration=configuration, option=option):
+                (self.directory / "calls.jsonl").unlink(missing_ok=True)
+                result = self.run_driver(("tvOS", *option))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if result.returncode:
+                    continue
+                calls = [json.loads(line) for line in
+                         (self.directory / "calls.jsonl").read_text().splitlines()]
+                swift = [args for name, args in calls if name == "mise"]
+                prefix = ["exec", "--", "swift", "build", "-c", configuration]
+                self.assertEqual(swift, [prefix + ["--product", p] for p in
+                                        ["swiftmux-agent", "swmux-launcher", "swifttyd"]]
+                                 + [prefix + ["--show-bin-path"]])
+                self.assertEqual(Path((self.directory / "host.executable").read_text()),
+                                 self.bin / configuration / "swiftmux-agent")
+                xcode = next(args for name, args in calls if name == "xcodebuild")
+                self.assertIn("-configuration", xcode)
+                if "-configuration" in xcode:
+                    self.assertEqual(xcode[xcode.index("-configuration") + 1],
+                                     configuration.capitalize())
+                self.assert_stopped()
+
+    def test_invalid_configuration_starts_no_tools(self):
+        for value in ["Release", "profile", ""]:
+            with self.subTest(value=value):
+                result = self.run_driver(("--configuration", value))
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(self.calls(), [])
+
     def test_dead_host_prevents_xcode_and_is_reaped(self):
         result = self.run_driver(FIXTURE_HOST_MODE="dead")
         self.assertEqual(result.returncode, 1)
@@ -426,6 +465,46 @@ class SimulatorDriverTests(unittest.TestCase):
                 host.kill()
                 host.wait(timeout=5)
             host.stdout.close()
+
+    def test_interrupt_after_host_spawn_reaps_child_before_propagating(self):
+        spawn = subprocess.Popen
+        for signum in [signal.SIGINT, signal.SIGTERM]:
+            with self.subTest(signal=signum):
+                children = []
+
+                def interrupt(signum, frame):
+                    raise DRIVER.Interrupted(signum)
+
+                def spawn_and_interrupt(*args, **kwargs):
+                    child = spawn(*args, **kwargs)
+                    # Keep a separate handle for cleanup of the broken baseline.
+                    children.append(child)
+                    os.kill(os.getpid(), signum)
+                    return child
+
+                previous = signal.signal(signum, interrupt)
+                try:
+                    with (self.directory / "spawn.log").open("w") as log:
+                        with mock.patch.object(DRIVER.subprocess, "Popen", spawn_and_interrupt):
+                            with self.assertRaises(DRIVER.Interrupted) as caught:
+                                with DRIVER.managed_host(["/bin/sleep", "30"], log):
+                                    self.fail("interrupted startup entered its body")
+                    self.assertEqual(caught.exception.signum, signum)
+                    self.assertEqual(len(children), 1)
+                    self.assertIsNotNone(children[0].returncode,
+                                         "interrupted host startup did not reap its child")
+                finally:
+                    signal.signal(signum, previous)
+                    for child in children:
+                        if child.poll() is None:
+                            child.kill()
+                        child.wait(timeout=3)
+
+    def test_host_spawn_failure_preserves_original_error(self):
+        with (self.directory / "spawn.log").open("w") as log:
+            with self.assertRaises(FileNotFoundError):
+                with DRIVER.managed_host([str(self.directory / "missing-host")], log):
+                    self.fail("failed startup entered its body")
 
     def test_interrupt_closes_running_xcode_and_host(self):
         with self.running_driver(FIXTURE_XCODE_MODE="hang") as process:

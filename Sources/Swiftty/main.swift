@@ -7,6 +7,26 @@ import SwiftMuxProtocol
 // `swiftty --swiftmux-agent register|unregister|status` manages the bundled
 // SwiftMux LaunchAgent without opening windows (packaging checks, scripts).
 let arguments = CommandLine.arguments
+// Query before replacing the bundle: another copy or a command-line process
+// with the same executable name must not suppress opening this installation.
+if arguments.dropFirst().first == "--running-app" {
+  guard arguments.count == 3 else {
+    FileHandle.standardError.write(
+      Data("usage: swiftty --running-app APP_PATH\n".utf8)
+    )
+    exit(64)
+  }
+  let requested = URL(fileURLWithPath: arguments[2]).standardizedFileURL
+    .resolvingSymlinksInPath().path
+  let running = NSWorkspace.shared.runningApplications.contains { application in
+    application.processIdentifier != ProcessInfo.processInfo.processIdentifier
+      && !application.isTerminated
+      && application.bundleURL?.standardizedFileURL.resolvingSymlinksInPath()
+        .path == requested
+  }
+  print(running ? "running" : "stopped")
+  exit(0)
+}
 if let i = arguments.firstIndex(of: "--swiftmux-agent") {
   let service = SMAppService.agent(plistName: SMX.agentPlistName)
   func describe(_ status: SMAppService.Status) -> String {

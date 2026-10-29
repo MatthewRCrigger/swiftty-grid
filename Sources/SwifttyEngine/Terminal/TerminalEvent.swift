@@ -25,4 +25,7 @@ public enum TerminalEvent: Sendable, Equatable {
   /// OSC 133 ; D: a command finished with this exit status (the latest,
   /// once per batch).
   case commandFinished(exitCode: Int?)
+  /// OSC 72: the drag-and-drop client changed what it accepts or
+  /// answered a drag (`TerminalState.dragAndDrop`).
+  case dragAndDrop(KittyDragAndDrop.Event)
 }

@@ -9,23 +9,21 @@ import SwifttyCore
 import Synchronization
 import TerminalSurface
 
-#if os(macOS) && !targetEnvironment(macCatalyst)
-import AppKit
-import SwifttyMac
-#endif
-
 // The live terminal surfaces behind `TerminalScreen` (replacing the
 // former placeholder): one MainActor controller per opened
 // `TerminalScreenModel`, owning the display session and its backend.
 
-extension TerminalSurfaceFactory {
-  /// Real surfaces for `app`'s sessions: a roaming presentation fed by
-  /// `RoamingClient`, an ordinary SSH shell, or (native macOS) a local PTY.
-  public static func live(_ app: RoamingAppModel) -> TerminalSurfaceFactory {
-    TerminalSurfaceFactory { [weak app] model in
-      guard let app else { return AnyView(EmptyView()) }
-      return AnyView(LiveTerminalSurface(model: model, app: app))
-    }
+/// Real surfaces for `app`'s sessions: a roaming presentation fed by
+/// `RoamingClient`, or an ordinary SSH shell.
+public struct LiveTerminalSurfaceFactory: TerminalSurfaceFactory {
+  private weak let app: RoamingAppModel?
+
+  public init(app: RoamingAppModel) { self.app = app }
+
+  @MainActor
+  public func makeSurface(for model: TerminalScreenModel) -> AnyView {
+    guard let app else { return AnyView(EmptyView()) }
+    return AnyView(LiveTerminalSurface(model: model, app: app))
   }
 }
 
@@ -40,18 +38,85 @@ enum SurfaceAction: Hashable, Sendable {
 }
 
 /// A nonsecret explanation of why no working terminal is shown.
-struct SurfaceProblem: Hashable, Sendable {
-  var title: String
+struct SurfaceProblem: Equatable, Sendable {
+  var title: LocalizedStringResource
+  /// Already localized. A `String` rather than a resource so values it
+  /// interpolates (key lines, addresses) are never read as Markdown.
   var detail: String
   var actions: [SurfaceAction]
 }
 
-enum SurfacePhase: Hashable, Sendable {
+enum SurfacePhase: Equatable, Sendable {
   /// Sign-in or setup in progress, with a short description.
-  case preparing(String)
+  case preparing(LocalizedStringResource)
   /// The backend owns the state; the status bar mirrors it.
   case running
   case failed(SurfaceProblem)
+}
+
+/// SSH succeeded and granted an attachment, but the grant's roaming
+/// endpoint could not be reached. Names the endpoint SSH returned and
+/// never blames authentication, guesses at firewalls or permissions, or
+/// substitutes another address.
+struct EndpointStageNotice: Hashable, Sendable {
+  static let title: LocalizedStringResource = .localized(
+    "SSH connected; roaming endpoint unavailable"
+  )
+  let endpoint: String
+  let timedOut: Bool
+  /// What the network or TLS stack reported, verbatim.
+  let reason: String?
+
+  init?(
+    state: ClientConnectionState,
+    failure: RoamingFailure?,
+    endpoint: BootstrapEndpoint?,
+    reason: String? = nil
+  ) {
+    guard let endpoint, state == .attaching || state == .reconnecting else {
+      return nil
+    }
+    switch failure {
+    case .endpointUnreachable: timedOut = false
+    case .attachTimedOut: timedOut = true
+    default: return nil
+    }
+    let host =
+      endpoint.host.contains(":") ? "[\(endpoint.host)]" : endpoint.host
+    self.endpoint = "\(host):\(endpoint.port) (UDP)"
+    self.reason = timedOut ? nil : reason.flatMap { $0.isEmpty ? nil : $0 }
+  }
+
+  /// Localized plain text: the endpoint and reason are never read as
+  /// Markdown.
+  var detail: String {
+    let advice = String(
+      localized: """
+        Sign-in succeeded; this address is the one the Mac's roaming \
+        configuration advertises. A local-network name or address may not be \
+        reachable over the route used for SSH, such as cellular or a VPN. \
+        The session is kept on the Mac.
+        """,
+      bundle: #bundle
+    )
+    let stage =
+      timedOut
+      ? String(
+        localized:
+          "The Mac's roaming endpoint at \(endpoint) did not answer in time. \(advice)",
+        bundle: #bundle
+      )
+      : String(
+        localized:
+          "The Mac's roaming endpoint at \(endpoint) could not be reached. \(advice)",
+        bundle: #bundle
+      )
+    guard let reason else { return stage }
+    return String(
+      localized: "\(stage) Reported error: \(reason).",
+      bundle: #bundle
+    )
+  }
 }
 
 /// Holds the current client for nonisolated input submission.
@@ -75,18 +140,23 @@ final class ClientSlot: Sendable {
 @Observable
 final class RoamingTerminalController: TerminalSurfaceController {
   enum StartChoice {
-    /// Resume the remembered session if any, else create one.
-    case automatic
-    /// Forget any remembered session and create a new one.
+    /// The workspace the user chose (`WorkspaceIntent`); a retry reuses
+    /// it, resuming a workspace once one was granted. Without a choice,
+    /// only a remembered workspace is resumed: nothing is created.
+    case selected
+    /// An explicit Start New Session: forget the remembered session and
+    /// create one.
     case newSession
   }
 
   let model: TerminalScreenModel
   let display: TerminalSession
-  private(set) var phase: SurfacePhase = .preparing("Signing in")
+  private(set) var phase: SurfacePhase = .preparing(.localized("Signing in"))
 
   @ObservationIgnored
   private weak var app: RoamingAppModel?
+  @ObservationIgnored
+  private(set) var selection: HostConnectionSelection
   @ObservationIgnored
   private let slot: ClientSlot
   @ObservationIgnored
@@ -102,18 +172,28 @@ final class RoamingTerminalController: TerminalSurfaceController {
   private let lifecycleQueue = ClientLifecycleQueue()
   @ObservationIgnored
   private var closed = false
+  /// The detach or terminate begun by `beginClose(_:)`.
+  @ObservationIgnored
+  private var closing: Task<Void, Never>?
   @ObservationIgnored
   private var started = false
   @ObservationIgnored
   private var monitor: NWPathMonitor?
   @ObservationIgnored
   private var pathSeen = false
+  #if os(macOS) || targetEnvironment(macCatalyst)
   @ObservationIgnored
-  private var observers: [any NSObjectProtocol] = []
+  private var powerMonitor: SystemPowerMonitor?
+  #endif
+  /// The workspace this screen attaches to, once chosen.
+  @ObservationIgnored
+  private(set) var intent: WorkspaceIntent?
 
   init(model: TerminalScreenModel, app: RoamingAppModel) {
     self.model = model
     self.app = app
+    selection = model.selection ?? app.connectionSelection(for: model.host)
+    model.selection = selection
     let display = TerminalSession(
       presentationColumns: 80,
       rows: 24,
@@ -136,6 +216,14 @@ final class RoamingTerminalController: TerminalSurfaceController {
         MainActor.assumeIsolated { self?.propose(columns: columns, rows: rows) }
       }
     }
+    // Scrolling moves this client's own history window on the host.
+    display.viewportScrollHandler = { [weak self] lines in
+      DispatchQueue.main.async {
+        MainActor.assumeIsolated {
+          _ = self?.serial { await $0.scrollViewport(by: lines) }
+        }
+      }
+    }
     model.previewLines = { [display] in display.withState { $0.screenLines } }
     observeSystem()
   }
@@ -148,7 +236,7 @@ final class RoamingTerminalController: TerminalSurfaceController {
   }
 
   /// Starts (or retries) sign-in and attachment. No-op while running.
-  func start(_ choice: StartChoice = .automatic) {
+  func start(_ choice: StartChoice = .selected) {
     guard !closed, runTask == nil else { return }
     started = true
     runTask = Task {
@@ -159,8 +247,32 @@ final class RoamingTerminalController: TerminalSurfaceController {
 
   private func run(_ choice: StartChoice) async {
     guard let app else { return }
-    let host = model.host
-    phase = .preparing("Signing in")
+    do {
+      selection = try await app.ssh.prepare(selection)
+      model.selection = selection
+    } catch {
+      guard !closed else { return }
+      phase = .failed(Self.problem(for: error))
+      return
+    }
+    guard !closed, !Task.isCancelled else { return }
+    let host = selection.host
+    if choice == .newSession {
+      app.forgetSession(for: selection)
+      _ = model.takeWorkspaceIntent()
+      intent = .create
+    } else if let chosen = model.takeWorkspaceIntent() {
+      intent = chosen
+    } else if intent == nil,
+      let remembered = app.resumableSessionID(for: selection)
+    {
+      intent = .resume(remembered, nil)
+    }
+    guard let intent else {
+      phase = .failed(Self.noWorkspaceChosen)
+      return
+    }
+    phase = .preparing(.localized("Signing in"))
     if let old = client {
       client = nil
       slot.set(nil)
@@ -168,14 +280,14 @@ final class RoamingTerminalController: TerminalSurfaceController {
       await old.close(.detach)
     }
     guard !closed, !Task.isCancelled else { return }
-    let credential: SSHCredential
+    let endpoint: SSHEndpoint
     do {
       // Interactive trust and credential check; the client's own SSH
       // bootstraps then run without prompts.
-      let probe = try await app.ssh.connect(host)
+      let probe = try await app.ssh.connectPrepared(selection)
       await probe.close()
       guard !closed, !Task.isCancelled else { return }
-      credential = try await app.ssh.credential(for: host)
+      endpoint = try await app.ssh.bootstrapEndpoint(for: selection)
     } catch {
       guard !closed else { return }
       phase = .failed(Self.problem(for: error))
@@ -184,10 +296,8 @@ final class RoamingTerminalController: TerminalSurfaceController {
     guard !closed, !Task.isCancelled else { return }
 
     let client = RoamingClient(
-      bootstrapper: SSHBootstrapper(
-        endpoint: app.ssh.endpoint(for: host, credential: credential)
-      ),
-      connector: QUICGrantConnector(),
+      bootstrapper: SSHBootstrapper(endpoint: endpoint),
+      connector: QUICGrantConnector(fallbackHost: endpoint.configuration.host),
       sink: display,
       configuration: RoamingClientConfiguration(initialGrid: grid)
     )
@@ -203,27 +313,29 @@ final class RoamingTerminalController: TerminalSurfaceController {
 
     guard !closed, !Task.isCancelled else { return }
 
-    if choice == .newSession { app.forgetSession(for: host) }
-    let resume = app.resumableSessionID(for: host)
-    let reveal = app.takeReveal(for: host)
-    phase = .preparing(resume == nil ? "Starting session" : "Resuming session")
+    let target: RoamingTarget =
+      switch intent {
+      case .create: .create(grid)
+      case let .resume(id, reveal?): .reveal(id, reveal)
+      case let .resume(id, nil): .resume(id)
+      }
+    let resuming = intent != .create
+    // A reveal's pane focus and takeover apply to this attempt only.
+    if case let .resume(id, _?) = intent { self.intent = .resume(id, nil) }
+    phase = .preparing(
+      resuming ? .localized("Resuming session") : .localized("Starting session")
+    )
     do {
-      let target: RoamingTarget =
-        switch (resume, reveal) {
-        case let (id?, reveal?): .reveal(id, reveal)
-        case let (id?, nil): .resume(id)
-        case (nil, _): .create(grid)
-        }
       try await client.start(target)
       guard !closed else { return }
       if case .preparing = phase { phase = .running }
     } catch {
       guard !closed, self.client === client else { return }
       if error == .sessionLost || error == .sessionExited {
-        app.forgetSession(for: host)
+        app.forgetSession(for: selection)
       }
       if error == .authenticationFailed { app.forgetPassword(for: host) }
-      phase = .failed(Self.problem(for: error, resuming: resume != nil))
+      phase = .failed(Self.problem(for: error, resuming: resuming))
     }
   }
 
@@ -233,14 +345,18 @@ final class RoamingTerminalController: TerminalSurfaceController {
     guard let app else { return }
     switch status.state {
     case .sessionLost:
-      app.forgetSession(for: model.host)
+      app.forgetSession(for: selection)
       phase = .failed(Self.problem(for: .sessionLost, resuming: false))
     case .sessionExited:
-      app.forgetSession(for: model.host)
+      app.forgetSession(for: selection)
       phase = .failed(Self.exited(status.exitStatus))
     case .userClosed: break
     default:
-      if let id = status.sessionID { app.rememberSession(id, for: model.host) }
+      if let id = status.sessionID {
+        app.rememberSession(id, for: selection)
+        // A retry reattaches the granted workspace; it never creates again.
+        if intent == .create { intent = .resume(id, nil) }
+      }
       if status.state == .active, phase != .running { phase = .running }
     }
   }
@@ -252,18 +368,31 @@ final class RoamingTerminalController: TerminalSurfaceController {
     switch model.connectionState {
     case .attaching, .reconnecting:
       return model.reconnectAttempt >= 2 || model.lastFailure == .attachTimedOut
+        || model.lastFailure == .endpointUnreachable
     default: return false
     }
+  }
+
+  /// Which stage failed when SSH authorized an attachment but its QUIC
+  /// endpoint did not answer (spec.connection-setup.md D6).
+  var endpointNotice: EndpointStageNotice? {
+    guard phase == .running else { return nil }
+    return EndpointStageNotice(
+      state: model.connectionState,
+      failure: model.lastFailure,
+      endpoint: model.roamingEndpoint,
+      reason: model.lastFailureDetail
+    )
   }
 
   // MARK: Lifecycle
 
   /// Mobile, spatial and TV scenes detach in the background and
-  /// reattach in the foreground. A Mac (native or Catalyst) window
-  /// losing focus is not a suspension (spec §9).
+  /// reattach in the foreground. A Mac window losing focus is not a
+  /// suspension; sleep is (spec §9, `SystemPowerMonitor`).
   func scenePhaseChanged(_ phase: ScenePhase) {
     switch model.profile.kind {
-    case .mac, .catalyst: return
+    case .catalyst: return
     case .mobile, .vision, .tv: break
     }
     switch phase {
@@ -285,11 +414,12 @@ final class RoamingTerminalController: TerminalSurfaceController {
     serial { await $0.proposeGrid(columns: next.columns, rows: next.rows) }
   }
 
+  @discardableResult
   private func serial(
     _ operation: @escaping @Sendable (RoamingClient) async -> Void
-  ) {
-    guard !closed else { return }
-    lifecycleQueue.enqueue(operation)
+  ) -> Task<Void, Never>? {
+    guard !closed else { return nil }
+    return lifecycleQueue.enqueue(operation)
   }
 
   private func observeSystem() {
@@ -301,26 +431,11 @@ final class RoamingTerminalController: TerminalSurfaceController {
     }
     monitor.start(queue: DispatchQueue(label: "dev.swiftty.roaming.path"))
     self.monitor = monitor
-    #if os(macOS) && !targetEnvironment(macCatalyst)
-    // Native macOS: sleep detaches, wake reattaches; focus does not.
-    let center = NSWorkspace.shared.notificationCenter
-    observers.append(
-      center.addObserver(
-        forName: NSWorkspace.willSleepNotification,
-        object: nil,
-        queue: .main
-      ) { [weak self] _ in
-        MainActor.assumeIsolated { self?.serial { await $0.enterBackground() } }
-      }
-    )
-    observers.append(
-      center.addObserver(
-        forName: NSWorkspace.didWakeNotification,
-        object: nil,
-        queue: .main
-      ) { [weak self] _ in
-        MainActor.assumeIsolated { self?.serial { await $0.wake() } }
-      }
+    #if os(macOS) || targetEnvironment(macCatalyst)
+    // A Mac: sleep detaches, wake reattaches; focus does not.
+    powerMonitor = SystemPowerMonitor(
+      onSleep: { [weak self] in self?.serial { await $0.enterBackground() } },
+      onWake: { [weak self] in self?.serial { await $0.wake() } }
     )
     #endif
   }
@@ -334,35 +449,54 @@ final class RoamingTerminalController: TerminalSurfaceController {
     serial { await $0.pathChanged() }
   }
 
-  func close(_ mode: RoamingCloseMode) async {
-    guard !closed else { return }
+  func beginClose(_ mode: RoamingCloseMode) -> Task<Void, Never> {
+    if let closing { return closing }
     closed = true
     runTask?.cancel()
     let pendingLifecycle = lifecycleQueue.use(nil)
     slot.set(nil)
     pump.close()
     monitor?.cancel()
-    #if os(macOS) && !targetEnvironment(macCatalyst)
-    for observer in observers {
-      NSWorkspace.shared.notificationCenter.removeObserver(observer)
-    }
+    #if os(macOS) || targetEnvironment(macCatalyst)
+    powerMonitor?.invalidate()
+    powerMonitor = nil
     #endif
-    observers = []
     display.semanticInputHandler = nil
     display.gridProposalHandler = nil
-    if let client {
+    display.viewportScrollHandler = nil
+    let client = client
+    // An already-dispatched detach finishes first. Neither it nor the
+    // close needs the main actor.
+    let closing = Task.detached(priority: .high) {
+      guard let client else { return }
       await pendingLifecycle?.value
       await client.close(mode)
       await client.setStatusHandler(nil)
     }
+    self.closing = closing
+    return closing
   }
 
   // MARK: Messages
 
+  /// No workspace was chosen and none is remembered: nothing is created
+  /// without an explicit request.
+  static let noWorkspaceChosen = SurfaceProblem(
+    title: .localized("Choose a workspace"),
+    detail: String(
+      localized: """
+        Open this Mac from the host list to pick one of its workspaces, or start \
+        a new one here.
+        """,
+      bundle: #bundle
+    ),
+    actions: [.startNewSession]
+  )
+
   static func problem(for error: SSHAccessError) -> SurfaceProblem {
     let actions: [SurfaceAction] =
       switch error {
-      case .hostKeyChanged, .trustStoreUnavailable: []
+      case .hostKeyChanged, .hostKeyMismatch, .trustStoreUnavailable: []
       default: [.retry]
       }
     return SurfaceProblem(
@@ -379,56 +513,99 @@ final class RoamingTerminalController: TerminalSurfaceController {
     switch error {
     case .sessionLost:
       SurfaceProblem(
-        title: resuming ? "Previous session no longer exists" : "Session lost",
-        detail:
-          "The Mac no longer has this session: it expired, was terminated, or the "
-          + "helper restarted. Nothing was replayed into another shell.",
+        title: resuming
+          ? .localized("Previous session no longer exists")
+          : .localized("Session lost"),
+        detail: String(
+          localized: """
+            The Mac no longer has this session: it expired, was terminated, or the \
+            helper restarted. Nothing was replayed into another shell.
+            """,
+          bundle: #bundle
+        ),
         actions: [.startNewSession]
       )
     case .sessionExited: exited(nil)
     case .unreachable:
       SurfaceProblem(
-        title: "Mac unreachable over SSH",
-        detail:
-          "The session is kept on the Mac. Try again when the network is back.",
+        title: .localized("Mac unreachable over SSH"),
+        detail: String(
+          localized:
+            "The session is kept on the Mac. Try again when the network is back.",
+          bundle: #bundle
+        ),
         actions: [.retry]
       )
     case .hostKeyRejected:
       SurfaceProblem(
-        title: "Host key not trusted",
-        detail: "The connection was closed before any credentials were sent.",
+        title: .localized("Host key not trusted"),
+        detail: String(
+          localized:
+            "The connection was closed before any credentials were sent.",
+          bundle: #bundle
+        ),
         actions: [.retry]
       )
     case .authenticationFailed:
       SurfaceProblem(
-        title: "Authentication failed",
-        detail: "The server rejected the credentials.",
+        title: .localized("Authentication failed"),
+        detail: String(
+          localized: "The server rejected the credentials.",
+          bundle: #bundle
+        ),
+        actions: [.retry]
+      )
+    case .credentialUnavailable:
+      SurfaceProblem(
+        title: .localized("Key unavailable"),
+        detail: String(
+          localized: """
+            The selected SSH key could not be read: it was deleted, is not on this \
+            device, or the device is locked. The session is kept on the Mac; no \
+            credentials were sent.
+            """,
+          bundle: #bundle
+        ),
         actions: [.retry]
       )
     case .protocolViolation:
       SurfaceProblem(
-        title: "Roaming helper unavailable",
-        detail:
-          "swifttyd did not answer at \(defaultHelperPath). Install it on the Mac, "
-          + "or use an ordinary SSH shell.",
+        title: .localized("Roaming helper unavailable"),
+        detail: String(
+          localized: """
+            swifttyd did not answer at \(defaultHelperPath). Install it on the Mac, \
+            or use an ordinary SSH shell.
+            """,
+          bundle: #bundle
+        ),
         actions: [.retry, .openOrdinarySSH]
       )
     case let .rejected(code):
       SurfaceProblem(
-        title: "Roaming session refused",
-        detail: "The Mac refused the request (\(code)).",
+        title: .localized("Roaming session refused"),
+        detail: String(
+          localized:
+            "The Mac refused the request (\(String(describing: code))).",
+          bundle: #bundle
+        ),
         actions: [.retry, .openOrdinarySSH]
       )
     case .cancelled:
       SurfaceProblem(
-        title: "Session cancelled",
-        detail: "The connection attempt was cancelled.",
+        title: .localized("Session cancelled"),
+        detail: String(
+          localized: "The connection attempt was cancelled.",
+          bundle: #bundle
+        ),
         actions: [.retry]
       )
     case .invalidState:
       SurfaceProblem(
-        title: "Session busy",
-        detail: "Another attempt is still in progress.",
+        title: .localized("Session busy"),
+        detail: String(
+          localized: "Another attempt is still in progress.",
+          bundle: #bundle
+        ),
         actions: [.retry]
       )
     }
@@ -436,9 +613,17 @@ final class RoamingTerminalController: TerminalSurfaceController {
 
   static func exited(_ status: Int32?) -> SurfaceProblem {
     SurfaceProblem(
-      title: "Session exited",
-      detail: status.map { "The shell exited with status \($0)." }
-        ?? "The shell on the Mac has exited.",
+      title: .localized("Session exited"),
+      detail: status.map {
+        String(
+          localized: "The shell exited with status \($0).",
+          bundle: #bundle
+        )
+      }
+        ?? String(
+          localized: "The shell on the Mac has exited.",
+          bundle: #bundle
+        ),
       actions: [.startNewSession]
     )
   }
@@ -454,8 +639,8 @@ final class RoamingTerminalController: TerminalSurfaceController {
 final class SSHShellController: TerminalSurfaceController {
   let model: TerminalScreenModel
   let session: TerminalSession
-  private(set) var phase: SurfacePhase = .preparing("Signing in")
-  private(set) var inputNotice: String?
+  private(set) var phase: SurfacePhase = .preparing(.localized("Signing in"))
+  private(set) var inputNotice: LocalizedStringResource?
 
   @ObservationIgnored
   private var refusalRelay: InputRefusalRelay?
@@ -463,9 +648,11 @@ final class SSHShellController: TerminalSurfaceController {
   @ObservationIgnored
   private let access: SSHAccess
   @ObservationIgnored
+  private(set) var selection: HostConnectionSelection
+  @ObservationIgnored
   private var backend: SSHStreamBackend?
   @ObservationIgnored
-  private var connection: SSHConnection?
+  private(set) var connection: SSHConnection?
   @ObservationIgnored
   private var runTask: Task<Void, Never>?
   @ObservationIgnored
@@ -482,6 +669,8 @@ final class SSHShellController: TerminalSurfaceController {
   ) {
     self.model = model
     self.access = access ?? app.ssh
+    selection = model.selection ?? app.connectionSelection(for: model.host)
+    model.selection = selection
     let session = TerminalSession(
       columns: 80,
       rows: 24,
@@ -492,17 +681,26 @@ final class SSHShellController: TerminalSurfaceController {
       guard let self, !closed else { return }
       switch refusal {
       case .backpressure:
-        inputNotice =
+        inputNotice = .localized(
           "Input was not sent because the SSH connection is busy. Try again."
+        )
       case .invalid:
-        inputNotice =
+        inputNotice = .localized(
           "Input was not sent because it exceeds the supported input limits."
+        )
       case .closed, .notActive:
-        inputNotice = "Input was not sent because the SSH shell is not ready."
+        inputNotice = .localized(
+          "Input was not sent because the SSH shell is not ready."
+        )
       }
     }
     refusalRelay = relay
-    session.inputHandler = { _ in relay.report(.notActive(.idle)) }
+    session.inputHandler = { input in
+      // The view reports focus as soon as it appears, often before the
+      // shell opens; that is not the user's input, so it raises no notice.
+      if case .focus = input { return }
+      relay.report(.notActive(.idle))
+    }
     model.previewLines = { [session] in session.withState { $0.screenLines } }
   }
 
@@ -517,16 +715,18 @@ final class SSHShellController: TerminalSurfaceController {
   }
 
   private func run() async {
-    phase = .preparing("Signing in")
+    phase = .preparing(.localized("Signing in"))
     model.observe(.connecting)
     do {
-      let connection = try await access.connect(model.host)
+      selection = try await access.prepare(selection)
+      model.selection = selection
+      let connection = try await access.connectPrepared(selection)
       guard !closed else {
         await connection.close()
         return
       }
       self.connection = connection
-      phase = .preparing("Opening shell")
+      phase = .preparing(.localized("Opening shell"))
       let (columns, rows) = session.withState { ($0.columns, $0.rows) }
       let channel = try await SSHShellByteChannel.open(
         on: connection,
@@ -570,8 +770,11 @@ final class SSHShellController: TerminalSurfaceController {
       } else {
         phase = .failed(
           SurfaceProblem(
-            title: "Shell unavailable",
-            detail: "The Mac refused to open a shell on this connection.",
+            title: .localized("Shell unavailable"),
+            detail: String(
+              localized: "The Mac refused to open a shell on this connection.",
+              bundle: #bundle
+            ),
             actions: [.retry]
           )
         )
@@ -587,19 +790,27 @@ final class SSHShellController: TerminalSurfaceController {
     case .lost:
       phase = .failed(
         SurfaceProblem(
-          title: "SSH connection lost",
-          detail:
-            "This ordinary SSH shell ended with its connection and cannot be resumed. "
-            + "A roaming session on the Mac is not affected.",
+          title: .localized("SSH connection lost"),
+          detail: String(
+            localized: """
+              This ordinary SSH shell ended with its connection and cannot be resumed. \
+              A roaming session on the Mac is not affected.
+              """,
+            bundle: #bundle
+          ),
           actions: [.retry]
         )
       )
     case let .exited(status):
       phase = .failed(
         SurfaceProblem(
-          title: "Shell exited",
-          detail: status.map { "The shell exited with status \($0)." }
-            ?? "The shell exited.",
+          title: .localized("Shell exited"),
+          detail: status.map {
+            String(
+              localized: "The shell exited with status \($0).",
+              bundle: #bundle
+            )
+          } ?? String(localized: "The shell exited.", bundle: #bundle),
           actions: [.retry]
         )
       )
@@ -607,121 +818,34 @@ final class SSHShellController: TerminalSurfaceController {
     }
   }
 
-  func close(_ mode: RoamingCloseMode) async {
-    guard !closed else {
-      await cleanupTask?.value
-      return
-    }
+  func beginClose(_ mode: RoamingCloseMode) -> Task<Void, Never> {
     closed = true
     runTask?.cancel()
-    releaseResources()
-    await cleanupTask?.value
+    return releaseResources()
   }
 
-  private func releaseResources() {
-    guard cleanupTask == nil else { return }
+  /// Also waits for setup still unwinding on the main actor.
+  func close(_ mode: RoamingCloseMode) async {
+    await beginClose(mode).value
+    await runTask?.value
+  }
+
+  @discardableResult
+  private func releaseResources() -> Task<Void, Never> {
+    if let cleanupTask { return cleanupTask }
     refusalRelay?.close()
     refusalRelay = nil
     let backend = backend
     let connection = connection
-    let setupTask = runTask
     self.backend = nil
     self.connection = nil
-    cleanupTask = Task {
+    let cleanup = Task.detached(priority: .high) {
       await backend?.close()
       await connection?.close()
-      await setupTask?.value
     }
+    cleanupTask = cleanup
+    return cleanup
   }
 
   func dismissInputNotice() { inputNotice = nil }
 }
-
-// MARK: - Local shell (native macOS only)
-
-#if os(macOS) && !targetEnvironment(macCatalyst)
-/// The app-local PTY (spec §A.3.A). Its lifetime is the app's.
-@MainActor
-@Observable
-final class LocalShellController: TerminalSurfaceController {
-  let model: TerminalScreenModel
-  let backend: LocalPTYBackend
-  private(set) var phase: SurfacePhase = .preparing("Starting shell")
-  private(set) var inputNotice: String?
-  @ObservationIgnored
-  private var refusalRelay: InputRefusalRelay?
-  @ObservationIgnored
-  private var started = false
-
-  init(model: TerminalScreenModel) {
-    self.model = model
-    let session = TerminalSession(
-      configuration: Configuration().sessionConfiguration()
-    )
-    backend = LocalPTYBackend(session: session)
-    let relay = InputRefusalRelay { [weak self] refusal in
-      guard let self else { return }
-      switch refusal {
-      case .backpressure:
-        inputNotice =
-          "Input was not sent because the local shell is busy. Try again."
-      case .invalid:
-        inputNotice =
-          "Input was not sent because it exceeds the supported input limits."
-      case .closed, .notActive:
-        inputNotice = "Input was not sent because the local shell is not ready."
-      }
-    }
-    refusalRelay = relay
-    backend.onInputRefusal = { reason in relay.report(reason) }
-    model.previewLines = { [session] in session.withState { $0.screenLines } }
-  }
-
-  /// Starts the shell once `view` hosts the session, keeping the
-  /// view's own event handling behind the backend's exit tracking.
-  func attach(_ view: TerminalView) {
-    guard !started else { return }
-    started = true
-    backend.onEvent = backend.session.onEvent
-    backend.onLifecycleChange = { [weak self] lifecycle in
-      DispatchQueue.main.async {
-        MainActor.assumeIsolated { self?.apply(lifecycle) }
-      }
-    }
-    do {
-      try backend.start(Configuration().sessionConfiguration())
-      phase = .running
-    } catch {
-      phase = .failed(
-        SurfaceProblem(
-          title: "Shell could not start",
-          detail: "The local shell failed to launch.",
-          actions: []
-        )
-      )
-    }
-  }
-
-  private func apply(_ lifecycle: SurfaceLifecycle) {
-    model.observe(lifecycle)
-    if case let .exited(status) = lifecycle {
-      phase = .failed(
-        SurfaceProblem(
-          title: "Shell exited",
-          detail: status.map { "The shell exited with status \($0)." }
-            ?? "The shell exited.",
-          actions: []
-        )
-      )
-    }
-  }
-
-  func close(_ mode: RoamingCloseMode) async {
-    refusalRelay?.close()
-    refusalRelay = nil
-    await backend.close()
-  }
-
-  func dismissInputNotice() { inputNotice = nil }
-}
-#endif

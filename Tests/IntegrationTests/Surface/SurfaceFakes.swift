@@ -111,6 +111,10 @@ actor FakeHost {
   private(set) var detachCount = 0
   private(set) var terminateCount = 0
   private(set) var screenAckCount = 0
+  /// `Viewport` movements received, in order.
+  private(set) var viewports: [Int64] = []
+  /// Features advertised in `Attached`.
+  var features: RSTFeatures = []
 
   var links: [ObjectIdentifier: Link] = [:]
   var current: ObjectIdentifier?
@@ -126,6 +130,8 @@ actor FakeHost {
   init() throws { try ledger.authorize(writer) }
 
   deinit { for link in links.values { link.connection.close() } }
+
+  func set(features: RSTFeatures) { self.features = features }
 
   func set(
     withholdAcks: Bool? = nil,
@@ -347,7 +353,8 @@ actor FakeHost {
           writerID: attach.writerID,
           lastFullyAppliedInputSequence: ledger.lastApplied,
           partialInputSequence: ledger.partialSequence,
-          resizeRevision: resizeRevision
+          resizeRevision: resizeRevision,
+          features: features
         )
       )
       if withholdAttached {
@@ -377,6 +384,7 @@ actor FakeHost {
     case let .terminate(e):
       terminateCount += 1
       await send(.terminated(epoch: e), to: id)
+    case let .viewport(_, lines): viewports.append(lines)
     case .screenAck: screenAckCount += 1
     default: await send(.error(.init(.malformed)), to: id)
     }

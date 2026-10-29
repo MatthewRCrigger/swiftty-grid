@@ -13,6 +13,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private var config: Configuration
   let workspaces: WorkspaceCoordinator
   private let muxUpdate = MuxUpdateController()
+  /// Connect a Device… (one panel; it owns the Bonjour registration).
+  private var connectPanel: ConnectDevicePanelController?
   private lazy var attentionLinks = AttentionLinkRouter(
     ownsWorkspace: { [weak self] id in
       self?.workspaces.controller(holding: id) != nil
@@ -87,6 +89,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   func applicationShouldTerminate(
     _ sender: NSApplication
   ) -> NSApplication.TerminateReply {
+    // Quitting withdraws any discovery registration with the panel.
+    connectPanel?.model.close()
     Task {
       await workspaces.terminate()
       sender.reply(toApplicationShouldTerminate: true)
@@ -118,6 +122,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   @objc
   func muxCancelUpdate(_ sender: Any?) { muxUpdate.cancel() }
+
+  /// Connection details, pairing code and foreground discovery for
+  /// phones and tablets (spec.connection-setup.md D2).
+  @objc
+  func connectDevice(_ sender: Any?) {
+    let panel = connectPanel ?? ConnectDevicePanelController()
+    connectPanel = panel
+    panel.present()
+  }
 
   // MARK: Configuration
 
@@ -294,6 +307,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       keyEquivalent: ""
     )
     service.submenu = NSMenu(title: "Terminal Service")
+    service.submenu?
+      .addItem(item("Connect a Device…", #selector(connectDevice(_:))))
+    service.submenu?.addItem(.separator())
     for update in [
       item("Stage Update…", #selector(muxStageUpdate(_:))),
       item("Install Staged Update…", #selector(muxInstallUpdate(_:))),
@@ -455,7 +471,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       case .backspace: "\u{8}"
       case .delete: function(NSDeleteFunctionKey)
       case let .function(n): function(NSF1FunctionKey + n - 1)
-      case .insert: nil
+      case .insert, .keypad: nil
       }
     return key.map { ($0, mods) }
   }

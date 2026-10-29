@@ -49,6 +49,8 @@ public enum SurfaceInput: Hashable, Sendable {
     case .insert: .insert
     case .delete: .delete
     case let .function(n): .function(n)
+    case let .keypad(k):
+      KeypadKey(rawValue: k.rawValue).map(Key.keypad) ?? .enter
     }
   }
 

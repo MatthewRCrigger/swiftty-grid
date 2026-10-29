@@ -134,10 +134,18 @@ struct PaneLaunchFailureEvidenceTests {
   }
 
   private func launch(
-    _ launcher: PaneLauncher
+    _ fixture: PaneLauncher
   ) throws(MuxError) -> LaunchedProcess {
-    try launcher.launch(
-      LaunchSpec(command: ["/usr/bin/true"]),
+    // Execute the installed interpreter directly. Executing each freshly
+    // written script can spend the handshake budget on macOS launch checks.
+    // The fake launcher uses the directory argument slot for its script path.
+    var launcher = fixture
+    launcher.launcherPath = "/bin/sh"
+    return try launcher.launch(
+      LaunchSpec(
+        command: ["/usr/bin/true"],
+        workingDirectory: fixture.launcherPath
+      ),
       pane: PaneID(),
       workspace: WorkspaceID(),
       columns: 10,

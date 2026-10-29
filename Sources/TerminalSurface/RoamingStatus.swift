@@ -49,9 +49,12 @@ public struct RoamingClientConfiguration: Sendable {
   /// treated as failed.
   public var maxOutboundRecords: Int
 
+  /// `detachDeadline` unless configured otherwise.
+  public static let defaultDetachDeadline: Duration = .seconds(2)
+
   public init(
     initialGrid: GridSize = GridSize(columns: 80, rows: 24),
-    detachDeadline: Duration = .seconds(2),
+    detachDeadline: Duration = defaultDetachDeadline,
     attachTimeout: Duration = .seconds(15),
     heartbeatInterval: Duration = RSTLimits.heartbeatInterval,
     livenessTick: Duration = .milliseconds(250),
@@ -85,8 +88,13 @@ public enum RoamingTarget: Hashable, Sendable {
 /// Nonsecret reason for the latest failure, for display.
 public enum RoamingFailure: Hashable, Sendable {
   case unreachable
+  /// SSH authorized the attachment, but the grant's QUIC endpoint could
+  /// not be reached. Says nothing about why (firewall, route, policy).
+  case endpointUnreachable
   case hostKeyRejected
   case authenticationFailed
+  /// The client key could not be read; no credential was offered.
+  case credentialUnavailable
   case protocolViolation
   case attachRejected(RSTErrorCode)
   case bootstrapRejected(BootstrapErrorCode)
@@ -102,7 +110,8 @@ public enum RoamingFailure: Hashable, Sendable {
 }
 
 /// Observable client status for the UI and the watch companion bridge.
-/// Contains no tokens, certificates, endpoints or terminal input.
+/// Contains no tokens, certificates or terminal input; the only endpoint
+/// is the grant's nonsecret roaming host and port, for diagnostics.
 public struct RoamingStatus: Hashable, Sendable {
   public var state: ClientConnectionState
   public var sessionID: SessionID?
@@ -116,8 +125,16 @@ public struct RoamingStatus: Hashable, Sendable {
   public var title: String
   public var exitStatus: Int32?
   public var lastFailure: RoamingFailure?
+  /// The transport's own reason for `lastFailure` when the roaming
+  /// endpoint could not be reached (for example "No route to host" or a
+  /// certificate mismatch). One bounded line, for diagnostics; it never
+  /// carries tokens or certificates.
+  public var lastFailureDetail: String?
   /// Consecutive reconnect attempts since the last success.
   public var reconnectAttempt: Int
+  /// The QUIC endpoint the current grant names, once SSH has authorized
+  /// one. Display only; never replaced by the SSH or discovered host.
+  public var roamingEndpoint: BootstrapEndpoint?
 
   public init(
     state: ClientConnectionState = .idle,
@@ -129,7 +146,9 @@ public struct RoamingStatus: Hashable, Sendable {
     title: String = "",
     exitStatus: Int32? = nil,
     lastFailure: RoamingFailure? = nil,
-    reconnectAttempt: Int = 0
+    lastFailureDetail: String? = nil,
+    reconnectAttempt: Int = 0,
+    roamingEndpoint: BootstrapEndpoint? = nil
   ) {
     self.state = state
     self.sessionID = sessionID
@@ -140,7 +159,9 @@ public struct RoamingStatus: Hashable, Sendable {
     self.title = title
     self.exitStatus = exitStatus
     self.lastFailure = lastFailure
+    self.lastFailureDetail = lastFailureDetail
     self.reconnectAttempt = reconnectAttempt
+    self.roamingEndpoint = roamingEndpoint
   }
 }
 
@@ -152,6 +173,8 @@ public enum RoamingClientError: Error, Hashable, Sendable {
   case unreachable
   case hostKeyRejected
   case authenticationFailed
+  /// The client key could not be read; no credential was offered.
+  case credentialUnavailable
   case protocolViolation
   case rejected(BootstrapErrorCode)
   /// The requested session no longer exists.
