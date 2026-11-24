@@ -5,6 +5,7 @@ import Synchronization
 import SwifttyCore
 import Testing
 
+@testable import RoamingKit
 @testable import TerminalSurface
 
 /// Client-side history windows (`historyViewport`).
@@ -15,7 +16,10 @@ struct RoamingViewportTests {
   {
     for advertised in [false, true] {
       let f = try RoamingFixture()
-      await f.host.set(features: advertised ? [.historyViewport] : [])
+      await f.host.set(
+        features: advertised
+          ? RSTFeatures.required.union(.historyViewport) : .required
+      )
       try #require(try await f.startActive())
       #expect(await f.client.supportsHistoryViewport == advertised)
       await f.client.scrollViewport(by: 12)

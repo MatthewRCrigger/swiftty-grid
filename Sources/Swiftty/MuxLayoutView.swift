@@ -7,13 +7,18 @@ import SwiftMuxProtocol
 @MainActor
 final class MuxLayoutView: NSView {
   /// The gap between pane cards, which is also the draggable divider.
-  static let divider = 10
+  static let divider = 5
   /// Space around the cards of a split tab.
-  static let margin = 10
+  static let margin = 5
 
   /// The area panes are laid out in, in layout coordinates (y down).
-  static func area(_ bounds: NSRect, split: Bool) -> LayoutRect {
-    // A lone pane keeps the frame a split pane has, so it gets the margin too.
+  static func area(
+    _ bounds: NSRect,
+    split: Bool,
+    margin: Int = margin
+  ) -> LayoutRect {
+    // GRID: a lone pane keeps the frame a split pane has, so it gets the
+    // margin too.
     let inset = margin
     return LayoutRect(
       x: inset,
@@ -23,9 +28,31 @@ final class MuxLayoutView: NSView {
     )
   }
   weak var controller: MuxWorkspaceController?
+  /// The panes show in a rounded card, which already sets them apart
+  /// (tabs on the left): a split tab's cards need no margin of their own.
+  var isCard = false {
+    didSet {
+      guard isCard != oldValue else { return }
+      layer?.cornerCurve = .continuous
+      layer?.cornerRadius = isCard ? MuxPaneContainer.cornerRadius : 0
+      layer?.masksToBounds = isCard
+      needsLayout = true
+    }
+  }
+  var splitMargin: Int { isCard ? 0 : Self.margin }
   private(set) var dividers: [LayoutDivider] = []
   private var dragging: LayoutDivider?
   private var dividerElements: [MuxDividerElement] = []
+
+  override init(frame: NSRect) {
+    super.init(frame: frame)
+    // Layer-backed from the start: turning it on while shown would redraw
+    // the whole subtree.
+    wantsLayer = true
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) { fatalError() }
 
   override var isFlipped: Bool { false }
 

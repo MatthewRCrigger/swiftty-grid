@@ -36,6 +36,8 @@ public struct MuxError: Error, Codable, Sendable, Equatable,
     case staleRevision
     /// Input skipped a sequence number; resend from `nextExpected`.
     case inputGap
+    /// A selected screen row changed since the client saw it.
+    case selectionChanged
   }
 
   public var code: Code
@@ -81,9 +83,24 @@ public struct ClientCapabilities: OptionSet, Codable, Sendable, Equatable {
   /// The client answers `clipboardRead` and `clipboardWrite` events.
   /// Only frontends with a pasteboard ask for it (not in `supported`).
   public static let clipboardRequests = ClientCapabilities(rawValue: 1 << 3)
+  /// The client decodes `SMXB/1` frame records (spec.multiplexer.md §4).
+  public static let binaryFrames = ClientCapabilities(rawValue: 1 << 4)
+  /// The client applies frame deltas and sends `requestFullFrame`.
+  public static let frameDeltas = ClientCapabilities(rawValue: 1 << 5)
+
+  public static let inboxAcknowledgementTokens = ClientCapabilities(
+    rawValue: 1 << 6
+  )
+  /// The client takes `MuxEvent.program`: the program each pane runs, for
+  /// its icon (not in `supported`; only frontends that show it ask).
+  public static let paneProgram = ClientCapabilities(rawValue: 1 << 7)
+  /// The client takes `MuxEvent.location`: each pane's OSC 7 directory and
+  /// remote host (GRID fork; a high bit, clear of upstream's).
+  public static let paneLocation = ClientCapabilities(rawValue: 1 << 24)
 
   public static let supported: ClientCapabilities = [
-    .attachReadiness, .observers, .viewerViewport,
+    .attachReadiness, .observers, .viewerViewport, .binaryFrames, .frameDeltas,
+    .inboxAcknowledgementTokens,
   ]
 }
 
@@ -100,23 +117,28 @@ public struct Hello: Codable, Sendable {
   public var terminalProfile: String?
   /// Empty when the peer omitted the field (single controller only).
   public var capabilities: ClientCapabilities
+  /// Accepted only from the currently authenticated gateway by a scoped worker.
+  public var forwardedTransport: LeaseHolder.Transport?
 
   public init(
     frontend: FrontendKind,
     terminalProfile: String? = nil,
     protocolVersion: Int = SMX.protocolVersion,
     build: String = SMX.build,
-    capabilities: ClientCapabilities = .supported
+    capabilities: ClientCapabilities = .supported,
+    forwardedTransport: LeaseHolder.Transport? = nil
   ) {
     self.protocolVersion = protocolVersion
     self.build = build
     self.frontend = frontend
     self.terminalProfile = terminalProfile
     self.capabilities = capabilities
+    self.forwardedTransport = forwardedTransport
   }
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion, build, frontend, terminalProfile, capabilities
+    case forwardedTransport
   }
 
   public init(from decoder: any Decoder) throws {
@@ -127,6 +149,10 @@ public struct Hello: Codable, Sendable {
     terminalProfile = try container.decodeIfPresent(
       String.self,
       forKey: .terminalProfile
+    )
+    forwardedTransport = try container.decodeIfPresent(
+      LeaseHolder.Transport.self,
+      forKey: .forwardedTransport
     )
     capabilities =
       try container.decodeIfPresent(
@@ -140,6 +166,10 @@ public struct Hello: Codable, Sendable {
     try container.encode(protocolVersion, forKey: .protocolVersion)
     try container.encode(build, forKey: .build)
     try container.encode(frontend, forKey: .frontend)
+    try container.encodeIfPresent(
+      forwardedTransport,
+      forKey: .forwardedTransport
+    )
     try container.encodeIfPresent(terminalProfile, forKey: .terminalProfile)
     if !capabilities.isEmpty {
       try container.encode(capabilities, forKey: .capabilities)
@@ -170,9 +200,31 @@ public struct ServiceFeatures: OptionSet, Codable, Sendable, Equatable {
   /// `PaneFrame.dropTarget` and `MuxInput.drag`.
   public static let dropTargets = ServiceFeatures(rawValue: 1 << 6)
 
+  public static let javaScript = ServiceFeatures(rawValue: 1 << 7)
+  /// `SMXB/1` frames to clients with `ClientCapabilities.binaryFrames`.
+  public static let binaryFrames = ServiceFeatures(rawValue: 1 << 8)
+  /// Frame deltas to clients with `ClientCapabilities.frameDeltas`, and
+  /// `ClientMessage.requestFullFrame`.
+  public static let frameDeltas = ServiceFeatures(rawValue: 1 << 9)
+  /// Row versions in frames and `MuxCommand.copySelection`.
+  public static let liveSelection = ServiceFeatures(rawValue: 1 << 10)
+  /// Authenticated gateway metadata subscription on a workspace-scoped worker.
+  public static let workspaceGraph = ServiceFeatures(rawValue: 1 << 11)
+
+  public static let inboxAcknowledgementTokens = ServiceFeatures(
+    rawValue: 1 << 12
+  )
+  /// `savedLayoutState`, `newWorkspaceFromTemplate` and End dispositions
+  /// on a workspace-scoped worker (spec.durability.md §12.2).
+  public static let savedLayoutMetadata = ServiceFeatures(rawValue: 1 << 13)
+  /// `endWorkspaceIfUnused` and `roamingSessionChanged`, for a roaming
+  /// host outside the service (a durable gateway).
+  public static let roamingControl = ServiceFeatures(rawValue: 1 << 14)
+
   public static let supported: ServiceFeatures = [
     .mouseReporting, .historyJumps, .terminalControl, .shellIntegration,
-    .keypadKeys, .kittyClipboard, .dropTargets,
+    .keypadKeys, .kittyClipboard, .dropTargets, .javaScript, .binaryFrames,
+    .frameDeltas, .liveSelection, .inboxAcknowledgementTokens, .roamingControl,
   ]
 }
 
@@ -185,6 +237,8 @@ public struct Welcome: Codable, Sendable {
   public var innerTerm: String
   /// Empty when the service omitted the field (an older build).
   public var features: ServiceFeatures
+  /// Echoes the accepted gateway declaration; absence means no forwarding support.
+  public var forwardedTransport: LeaseHolder.Transport?
 
   public init(
     protocolVersion: Int,
@@ -193,7 +247,8 @@ public struct Welcome: Codable, Sendable {
     acceptedProfile: String?,
     limits: MuxLimits,
     innerTerm: String,
-    features: ServiceFeatures = []
+    features: ServiceFeatures = [],
+    forwardedTransport: LeaseHolder.Transport? = nil
   ) {
     self.protocolVersion = protocolVersion
     self.build = build
@@ -202,11 +257,12 @@ public struct Welcome: Codable, Sendable {
     self.limits = limits
     self.innerTerm = innerTerm
     self.features = features
+    self.forwardedTransport = forwardedTransport
   }
 
   private enum CodingKeys: String, CodingKey {
     case protocolVersion, build, server, acceptedProfile, limits, innerTerm
-    case features
+    case features, forwardedTransport
   }
 
   public init(from decoder: any Decoder) throws {
@@ -220,6 +276,10 @@ public struct Welcome: Codable, Sendable {
     )
     limits = try container.decode(MuxLimits.self, forKey: .limits)
     innerTerm = try container.decode(String.self, forKey: .innerTerm)
+    forwardedTransport = try container.decodeIfPresent(
+      LeaseHolder.Transport.self,
+      forKey: .forwardedTransport
+    )
     features =
       try container.decodeIfPresent(ServiceFeatures.self, forKey: .features)
       ?? []
@@ -233,6 +293,10 @@ public struct Welcome: Codable, Sendable {
     try container.encodeIfPresent(acceptedProfile, forKey: .acceptedProfile)
     try container.encode(limits, forKey: .limits)
     try container.encode(innerTerm, forKey: .innerTerm)
+    try container.encodeIfPresent(
+      forwardedTransport,
+      forKey: .forwardedTransport
+    )
     if !features.isEmpty { try container.encode(features, forKey: .features) }
   }
 }
@@ -250,8 +314,9 @@ public struct PaneSummary: Codable, Sendable, Equatable {
   public var workingDirectory: String?
   /// OSC 7 host when it names another machine; nil or empty when local.
   public var workingHost: String?
-  /// The program holding the terminal's foreground, nil at the shell.
-  public var foreground: String?
+  /// The program the pane runs in its foreground, as `MuxEvent.program`
+  /// reports it; nil when unknown (or from an older service).
+  public var program: String?
 
   public init(
     id: PaneID,
@@ -262,7 +327,7 @@ public struct PaneSummary: Codable, Sendable, Equatable {
     exitStatus: Int32? = nil,
     workingDirectory: String? = nil,
     workingHost: String? = nil,
-    foreground: String? = nil
+    program: String? = nil
   ) {
     self.id = id
     self.columns = columns
@@ -272,7 +337,7 @@ public struct PaneSummary: Codable, Sendable, Equatable {
     self.exitStatus = exitStatus
     self.workingDirectory = workingDirectory
     self.workingHost = workingHost
-    self.foreground = foreground
+    self.program = program
   }
 }
 
@@ -381,11 +446,20 @@ public struct LeaseHolder: Codable, Sendable, Hashable {
   public var transport: Transport
   public var frontend: FrontendKind
   public var since: Date
+  /// When the holder last wrote input (nil before any, or from older
+  /// services): an idle holder may be taken over without asking.
+  public var lastInput: Date?
 
-  public init(transport: Transport, frontend: FrontendKind, since: Date) {
+  public init(
+    transport: Transport,
+    frontend: FrontendKind,
+    since: Date,
+    lastInput: Date? = nil
+  ) {
     self.transport = transport
     self.frontend = frontend
     self.since = since
+    self.lastInput = lastInput
   }
 }
 
@@ -608,8 +682,23 @@ public enum MuxCommand: Codable, Sendable, Equatable {
   case status
   case listWorkspaces
   case newWorkspace(NewWorkspaceRequest)
-  case endWorkspace(WorkspaceSelector)
+  /// A reopened saved layout with fresh processes (`savedLayoutMetadata`).
+  /// Replies `createdFromTemplate`.
+  case newWorkspaceFromTemplate(WorkspaceTemplate)
+  /// Nil disposition is `ended`. Only the issuer knows why it ends.
+  case endWorkspace(
+    WorkspaceSelector,
+    disposition: SavedLayoutDisposition? = nil
+  )
   case renameWorkspace(WorkspaceSelector, name: String)
+  /// Ends a workspace a roaming host created, but only while it is still
+  /// unused: every pane exited (`onlyIfExited`), or no local frontend ever
+  /// attached. Checked in service order; `notFound` when it was kept.
+  /// Local control clients only (`roamingControl`).
+  case endWorkspaceIfUnused(WorkspaceID, onlyIfExited: Bool)
+  /// A device's roaming session changed state, for automation scripts.
+  /// Local control clients only (`roamingControl`).
+  case roamingSessionChanged(id: String, workspace: WorkspaceID, state: String)
   /// Releases the current interactive lease, whoever holds it.
   case detachActive
   /// Quiesce, then end every workspace and report the empty barrier.
@@ -629,13 +718,32 @@ public enum MuxCommand: Codable, Sendable, Equatable {
   /// `expectedLease` must name the lease generation the user saw, so a
   /// stale prompt cannot displace a newer holder.
   case takeover(WorkspaceSelector, expectedLease: UInt64)
+  /// Gateway relay only (spec.durability.md §6): after a planned
+  /// replacement, continue the controller lease the checkpoint carried.
+  /// `nextInput` is the relay's watermark: every sequence after the
+  /// checkpoint's was refused by the frozen worker, so it is never reused.
+  case resumeAttachment(AttachmentID, nextInput: UInt64)
   case detach
   case switchWorkspace(WorkspaceSelector)
 
   // Metadata observation (no lease, never resizes panes).
   /// Workspace list and lease changes as `workspaces` events.
   case observeWorkspaces(Bool)
+  /// Internal gateway discovery; never acquires an attachment or writer lease.
+  /// True returns the current graph and rearms one graph-event credit.
+  case observeWorkspaceGraph(Bool)
+  /// Internal gateway saving (`savedLayoutMetadata`): the graph with pane
+  /// launches, local directories and the causes since the last read.
+  case savedLayoutState
+  /// Internal gateway saving (C1): one page of a pane's newest main-screen
+  /// rows. Offset 0 takes a new snapshot unless unchanged since the
+  /// revision; later offsets read that snapshot. Replies `savedOutputPage`.
+  case exportSavedOutput(pane: PaneID, ifChangedSince: UInt64?, offset: Int)
   case subscribeInbox(Bool)
+  /// Local native automation UI; events only follow an explicit subscription.
+  case subscribeAutomation(Bool)
+  case automationKey(pane: PaneID, shortcut: String)
+  case automationFocus(PaneID)
   case inbox(InboxQuery)
   case locateAttention(AttentionReference)
   /// Marks exactly this occurrence seen; never resolves it.
@@ -655,6 +763,8 @@ public enum MuxCommand: Codable, Sendable, Equatable {
   case focusPane(PaneID)
   case toggleZoom(TabID)
   case setSplitRatio(tab: TabID, path: [Bool], ratio: Double)
+  /// Workspace › Don't Save Output (`savedLayoutMetadata`).
+  case setOutputOptOut(Bool)
   case endPane(PaneID)
   case setGeometry(GeometryBatch)
   /// Visible panes whose frames this attachment wants.
@@ -683,6 +793,9 @@ public enum MuxCommand: Codable, Sendable, Equatable {
   /// output), from OSC 133 marks. Scrolls it into view; replies
   /// `commandOutput`.
   case commandOutput(pane: PaneID, at: HistoryAddress?)
+  /// With `liveSelection`: the text of a selection, from the authoritative
+  /// grid (spec.multiplexer.md §4, "Live selection across pages").
+  case copySelection(CopySelectionRequest)
 
   // Kitty clipboard (lease required; `kittyClipboard`).
   case clipboardReadResult(pane: PaneID, token: UInt64, MuxClipboardReadResult)
@@ -701,8 +814,21 @@ public enum MuxCommand: Codable, Sendable, Equatable {
       .endAllWorkspaces, .quiesce, .endPane, .endTab, .setGeometry,
       .setSubscriptions, .setViewport, .scroll, .searchStep, .endSearch,
       .clearScreen, .resetTerminal, .link, .commandOutput, .setTheme,
-      .observeWorkspaces, .subscribeInbox, .inbox, .locateAttention, .markSeen,
-      .snooze, .markReviewed, .clipboardReadResult, .clipboardWriteResult:
+      .observeWorkspaces, .observeWorkspaceGraph, .savedLayoutState,
+      .exportSavedOutput, .subscribeAutomation, .subscribeInbox, .inbox,
+      .locateAttention, .markSeen, .snooze, .markReviewed, .clipboardReadResult,
+      .clipboardWriteResult, .copySelection:
+      true
+    default: false
+    }
+  }
+
+  /// Admitted while a planned replacement is frozen: reads that change no
+  /// engine or graph state (spec.durability.md §7.2).
+  public var allowedWhileMigrating: Bool {
+    switch self {
+    case .status, .listWorkspaces, .observeWorkspaces, .observeWorkspaceGraph,
+      .savedLayoutState, .exportSavedOutput, .inbox, .detach:
       true
     default: false
     }
@@ -711,24 +837,70 @@ public enum MuxCommand: Codable, Sendable, Equatable {
   /// Read-only viewer commands. Everything else is refused to an observer.
   public var allowedForObserver: Bool {
     switch self {
-    case .status, .listWorkspaces, .detach, .observeWorkspaces, .subscribeInbox,
-      .inbox, .locateAttention, .setSubscriptions, .setViewport, .scroll,
-      .search, .searchStep, .endSearch:
+    case .status, .listWorkspaces, .detach, .observeWorkspaces,
+      .observeWorkspaceGraph, .subscribeAutomation, .subscribeInbox, .inbox,
+      .locateAttention, .setSubscriptions, .setViewport, .scroll, .search,
+      .searchStep, .endSearch, .copySelection:
       true
     default: false
     }
   }
 
-  /// Whether this command needs the interactive lease.
   public var requiresLease: Bool {
     switch self {
     case .status, .listWorkspaces, .newWorkspace, .endWorkspace,
       .renameWorkspace, .detachActive, .endAllWorkspaces, .quiesce, .attach,
-      .setTheme, .takeover, .observeWorkspaces, .subscribeInbox, .inbox,
-      .locateAttention, .markSeen, .snooze, .markReviewed:
+      .setTheme, .takeover, .observeWorkspaces, .observeWorkspaceGraph,
+      .savedLayoutState, .exportSavedOutput, .newWorkspaceFromTemplate,
+      .subscribeAutomation, .subscribeInbox, .inbox, .locateAttention,
+      .markSeen, .snooze, .markReviewed, .resumeAttachment,
+      .endWorkspaceIfUnused, .roamingSessionChanged:
       false
     default: true
     }
+  }
+}
+
+/// One end of a selection: a cell at an absolute history address.
+public struct SelectionPoint: Codable, Sendable, Hashable {
+  public var address: HistoryAddress
+  public var column: Int
+
+  public init(address: HistoryAddress, column: Int) {
+    self.address = address
+    self.column = column
+  }
+}
+
+/// A client-local selection to copy from the service's grid. Screen rows
+/// carry the versions the client saw; history rows cannot change within
+/// a generation and need none.
+public struct CopySelectionRequest: Codable, Sendable, Equatable {
+  public enum Unit: String, Codable, Sendable { case character, word, line }
+
+  /// Copied text above this fails with `resourceLimit`; never truncated.
+  public static let maxTextBytes = 8 << 20
+  /// Screen rows a request may list.
+  public static let maxScreenRows = 1024
+
+  public var pane: PaneID
+  public var start: SelectionPoint
+  public var end: SelectionPoint
+  public var unit: Unit
+  public var screenRowVersions: [RowIdentity]
+
+  public init(
+    pane: PaneID,
+    start: SelectionPoint,
+    end: SelectionPoint,
+    unit: Unit,
+    screenRowVersions: [RowIdentity]
+  ) {
+    self.pane = pane
+    self.start = start
+    self.end = end
+    self.unit = unit
+    self.screenRowVersions = screenRowVersions
   }
 }
 
@@ -761,7 +933,12 @@ public enum MuxReply: Codable, Sendable, Equatable {
   case ok
   case status(ServiceStatus)
   case workspaces([WorkspaceSummary])
+  /// Complete scoped graph; nil means no published workspace.
+  case workspaceGraph(WorkspaceSnapshot?)
   case created(WorkspaceSnapshot)
+  case createdFromTemplate(WorkspaceSnapshot, WorkspaceTemplateOutcome)
+  case savedLayoutState(SavedLayoutState)
+  case savedOutputPage(SavedOutputPage)
   case attached(attachment: AttachmentID, workspace: WorkspaceSnapshot)
   case layout(WorkspaceSnapshot)
   case pane(PaneID)
@@ -770,6 +947,7 @@ public enum MuxReply: Codable, Sendable, Equatable {
   case attention(AttentionLocation)
   case link(MuxLink?)
   case commandOutput(CommandOutput?)
+  case copied(String)
 }
 
 /// A link found by `MuxCommand.link`.
@@ -831,7 +1009,6 @@ public enum MuxKey: Codable, Sendable, Hashable {
   case keypad(MuxKeypadKey)
 }
 
-/// Numeric keypad keys.
 public enum MuxKeypadKey: String, Codable, CaseIterable, Sendable, Hashable {
   case zero, one, two, three, four, five, six, seven, eight, nine
   case decimal, divide, multiply, subtract, add, enter, equal, separator
@@ -939,21 +1116,38 @@ public enum ClientMessage: Codable, Sendable {
   /// any other attachment releases nothing.
   case frameAck(pane: PaneID, revision: UInt64, attachment: AttachmentID)
   /// The consumer took one `inbox` event (inbox flow control).
-  case inboxAck(revision: UInt64)
+  case inboxAck(revision: UInt64, token: UUID? = nil)
+  /// With `ServiceFeatures.frameDeltas`: a delta could not be applied, so
+  /// the next frame of the pane must be complete.
+  /// It also releases the credit of `revision`, the refused delta, in
+  /// place of a `frameAck`: an acknowledgement would adopt the refused
+  /// frame as the base before this request arrived.
+  case requestFullFrame(
+    pane: PaneID,
+    revision: UInt64,
+    attachment: AttachmentID
+  )
 }
 
 public enum MuxEvent: Codable, Sendable {
+  /// JSON-encoded automation presentation value, never executable code.
+  case automation(Data)
   case frame(PaneFrame)
+  /// A frame against an installed base (JSON clients with `frameDeltas`).
+  /// Consumers of `MuxConnection` only ever see `frame`.
+  case frameDelta(FrameDelta)
   case layout(WorkspaceSnapshot)
   /// `truncated`: an explicit end had to force-kill the processes, so
   /// final output may be incomplete.
   case paneExited(PaneID, status: Int32, truncated: Bool)
   case title(PaneID, String)
-  /// A pane's OSC 7 location changed; `host` is empty for this machine.
+  /// A pane's OSC 7 location changed; `host` is nil for this machine.
+  /// Only to clients with `paneLocation`.
   case location(PaneID, directory: String?, host: String?)
+  /// The pane's foreground program changed: a bare name (`ProgramName`),
+  /// empty when unknown. Only to clients with `paneProgram`.
+  case program(PaneID, String)
   case bell(PaneID)
-  /// The program in a pane's foreground changed; nil when the shell has it.
-  case foreground(PaneID, String?)
   /// An unsubscribed pane in another tab of the attached workspace
   /// changed. Sent once until it is subscribed again.
   case activity(PaneID)
@@ -967,6 +1161,8 @@ public enum MuxEvent: Codable, Sendable {
   case frameUnavailable(PaneID, MuxError)
   /// Observers only (`observeWorkspaces`).
   case workspaces([WorkspaceSummary])
+  /// Complete scoped graph; nil means no published workspace.
+  case workspaceGraph(WorkspaceSnapshot?)
   /// Subscribers only (`subscribeInbox`), after reduction.
   case inbox(InboxUpdate)
   /// The controller only, with `ClientCapabilities.clipboardRequests`.

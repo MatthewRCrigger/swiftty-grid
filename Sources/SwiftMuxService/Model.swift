@@ -1,9 +1,16 @@
+import SwiftMuxGuardian
 import Dispatch
 import Foundation
 import SwiftMuxProtocol
+import SwiftMuxXPC
 import SwifttyEngine
+import SwifttyJS
 
 public struct MuxServiceConfiguration: Sendable {
+  /// The shared automation VM. The host installs callbacks before creating the service.
+  public var javaScriptRuntime: JavaScriptRuntime?
+  /// Production config, evaluated once before the first pane starts.
+  public var javaScriptDirectory: URL?
   /// Private fixture observation; production callers leave this nil.
   var observePaneIO: (@Sendable (PaneID, PaneIOObservation) -> Void)?
   public var launcherPath: String
@@ -21,6 +28,21 @@ public struct MuxServiceConfiguration: Sendable {
   public var scrollbackCompression = true
   /// Runs on the pane queue before each launch (tests hold a launch open).
   package var beforeLaunch: (@Sendable () -> Void)?
+  /// Internal process adapter selected by the workspace host. Nil keeps the
+  /// current local guardian owner; it is not a frontend-selected option.
+  var paneProcessFactory:
+    (
+      @Sendable (PaneID, WorkspaceID, DispatchQueue, MuxLimits) throws ->
+        any PaneProcess
+    )?
+
+  /// Guardian worker mode: one lifetime workspace identity, provisioned by
+  /// its supervisor. Ordinary local services continue allocating identities.
+  var workerWorkspace: WorkspaceID?
+  /// A planned replacement's candidate continues its predecessor's service
+  /// instance (spec.durability.md §6).
+  var instance: ServerInstanceID?
+  var requiresGatewayBinding = false
 
   public init(launcherPath: String) { self.launcherPath = launcherPath }
 }
@@ -56,6 +78,8 @@ struct Workspace {
   /// Environment snapshot taken at creation; new panes reuse it.
   var launch: LaunchSpec
   var layoutRevision: UInt64 = 1
+  /// Workspace › Don't Save Output (spec.durability.md §12.2.2).
+  var outputOptOut = false
 
   func tabIndex(containing pane: PaneID) -> Int? {
     tabs.firstIndex { $0.layout.contains(pane) }
@@ -70,9 +94,16 @@ struct PaneRecord {
   var columns: Int
   var rows: Int
   var title = ""
+  /// The foreground program (`PaneEvent.program`); empty when unknown.
+  var program = ""
   var workingDirectory: String?
+  /// OSC 7 host when it names another machine; nil when local.
   var workingHost: String?
-  var foreground: String?
+  /// How the pane started, for saved layouts.
+  var launch: SavedPaneLaunch = .loginShell
+  /// The last directory on this Mac; splits and saved layouts use only this.
+  var localDirectory: String?
+  var directoryFallback = false
   var exitStatus: Int32?
   /// Removed from the layout; kept only until its process is reaped.
   var detachedFromLayout = false
@@ -87,7 +118,7 @@ struct PaneRecord {
       exitStatus: exitStatus,
       workingDirectory: workingDirectory,
       workingHost: workingHost,
-      foreground: foreground
+      program: program.isEmpty ? nil : program
     )
   }
 }
@@ -105,10 +136,26 @@ final class Client {
   var hello: Hello?
   /// Receives `workspaces` events (metadata only, no lease).
   var observesWorkspaces = false
+  var observesWorkspaceGraph = false
+  var workspaceGraphOutstanding = false
   /// Receives `inbox` events.
   var subscribesInbox = false
   /// Bridged from the roaming transport rather than local XPC.
   var remote = false
+  /// Accepted on an in-process forwarding listener: its hello may declare
+  /// the transport an in-process frontend authenticated, as a bound
+  /// gateway's may.
+  var acceptsForwarding = false
+
+  /// Negotiated frame encoding: binary and deltas only when the hello
+  /// asked for them (the service supports both).
+  var frameEncoding: PaneRuntime.FrameEncoding {
+    let capabilities = hello?.capabilities ?? []
+    return PaneRuntime.FrameEncoding(
+      binary: capabilities.contains(.binaryFrames),
+      deltas: capabilities.contains(.frameDeltas)
+    )
+  }
 
   init(channel: SMXChannel) {
     id = UUID()
@@ -141,6 +188,8 @@ struct SentFrame {
   /// The viewport revision it shows: a viewer's window, or the
   /// controller's scroll position and search.
   var viewport: UInt64
+  /// The base for later deltas once the client acknowledges this frame.
+  var baseline: FrameBaseline? = nil
 }
 
 struct QueuedFrame {
@@ -166,12 +215,19 @@ struct FrameSlot {
   /// never queued deeper than one.
   var queued: QueuedFrame?
   var lastSent: UInt64 = 0
+  /// The controller viewport revision of the newest frame sent. A newer
+  /// one (a scroll) is captured without waiting out the frame interval;
+  /// the single frame in flight still paces it to the client.
+  var lastViewport: UInt64 = 0
   var lastCapture: UInt64 = 0
+  /// The newest frame the client acknowledged: the base of the next delta.
+  /// Nil forces a complete frame.
+  var baseline: FrameBaseline?
 
-  /// Records `frame` as sent now.
   mutating func sent(_ frame: SentFrame) {
     inflight = frame
     lastSent = DispatchTime.now().uptimeNanoseconds
+    lastViewport = frame.viewport
   }
 }
 
@@ -272,7 +328,6 @@ struct ViewerViewport: Sendable {
 }
 
 extension ViewerViewport {
-  /// This window as a request for `pane`.
   func request(_ pane: PaneID) -> ViewportRequest {
     ViewportRequest(
       pane: pane,
@@ -285,7 +340,7 @@ extension ViewerViewport {
   }
 }
 
-struct ActivePaste {
+struct ActivePaste: Codable {
   var pane: PaneID
   var bytes = 0
 }
@@ -293,8 +348,8 @@ struct ActivePaste {
 /// One interactive lease on one workspace (spec.inbox.md §2). A client
 /// holds at most one; a workspace has at most one holder.
 struct Lease {
-  let client: UUID
-  let attachment = AttachmentID()
+  var client: UUID
+  var attachment = AttachmentID()
   var workspace: WorkspaceID
   /// The workspace's lease generation when this lease was granted.
   var generation: UInt64

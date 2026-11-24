@@ -23,7 +23,6 @@ public struct ScrollbackCompressionPolicy: Sendable, Equatable {
   public var fallbackReason: String?
 }
 
-/// Outcome of one maintenance step.
 public enum ScrollbackMaintenanceResult: Sendable, Equatable {
   /// More eligible units may remain: run another step after a short delay.
   case pending
@@ -121,7 +120,6 @@ extension Grid {
   /// Identifies the current row pool; reset and resize replace it.
   var storageGeneration: UInt64 { storage.generation }
 
-  /// Whether this grid's history can be compressed.
   var isCompressible: Bool { storage.store.isMapped }
 
   var scrollbackFallbackReason: String? {
@@ -433,14 +431,15 @@ public protocol ScrollbackMaintenanceClock: AnyObject, Sendable {
   /// Monotonic nanoseconds.
   var now: UInt64 { get }
   /// Calls `handler` once at or after `deadline`, replacing any deadline
-  /// armed earlier.
+  /// armed earlier; never synchronously (the coordinator arms and disarms
+  /// under its lock, which the handler takes).
   func arm(_ deadline: UInt64, _ handler: @escaping @Sendable () -> Void)
   func disarm()
 }
 
 /// A dispatch-timer clock on a private queue.
 public final class DispatchScrollbackMaintenanceClock:
-  ScrollbackMaintenanceClock, @unchecked Sendable
+  ScrollbackMaintenanceClock, Sendable
 {
   private let queue = DispatchQueue(label: "swiftty.scrollback-maintenance")
   private let timer = Mutex<DispatchSourceTimer?>(nil)
@@ -515,7 +514,6 @@ public final class ScrollbackMaintenanceCoordinator: Sendable {
   /// Minimum delay before another pending step.
   public let stepDelay: UInt64
 
-  /// Scheduling counters.
   public struct Counters: Sendable, Equatable {
     public var steps = 0
     public var wakeups = 0
@@ -609,7 +607,6 @@ public final class ScrollbackMaintenanceCoordinator: Sendable {
     state.withLock { $0.entries.values.count { $0.owner != nil } }
   }
 
-  /// Whether a wakeup is currently armed.
   public var isTimerArmed: Bool { state.withLock { $0.armedAt != nil } }
 
   public func register(_ owner: any ScrollbackMaintenanceOwner) -> Registration
@@ -624,15 +621,14 @@ public final class ScrollbackMaintenanceCoordinator: Sendable {
   }
 
   func unregister(_ id: UInt64) {
-    let disarm = state.withLock { s -> Bool in
+    state.withLock { s in
       s.entries[id] = nil
       s.order.removeAll { $0 == id }
       guard s.armedAt != nil, !s.entries.values.contains(where: \.pending)
-      else { return false }
+      else { return }
       s.armedAt = nil
-      return true
+      clock.disarm()
     }
-    if disarm { clock.disarm() }
   }
 
   func noteActivity(_ id: UInt64, generation: UInt64, postpone: Bool) {
@@ -652,7 +648,6 @@ public final class ScrollbackMaintenanceCoordinator: Sendable {
     pump()
   }
 
-  /// Timer callback.
   private func fire() {
     state.withLock {
       $0.armedAt = nil
@@ -668,9 +663,10 @@ public final class ScrollbackMaintenanceCoordinator: Sendable {
     enum Action {
       case none
       case run(any ScrollbackMaintenanceOwner, UInt64, UInt64)
-      case arm(UInt64)
-      case disarm
     }
+    // The timer is armed or disarmed under the lock that decided it: done
+    // after releasing it, a disarm decided first could cancel a deadline
+    // another thread armed since, leaving `armedAt` set with no timer.
     let action = state.withLock { s -> Action in
       guard s.inFlight == nil else { return .none }
       // Drop owners that were torn down without cancelling.
@@ -694,18 +690,17 @@ public final class ScrollbackMaintenanceCoordinator: Sendable {
       guard let earliest else {
         if s.armedAt != nil {
           s.armedAt = nil
-          return .disarm
+          clock.disarm()
         }
         return .none
       }
       if let armed = s.armedAt, armed <= earliest { return .none }
       s.armedAt = earliest
-      return .arm(earliest)
+      clock.arm(earliest) { [weak self] in self?.fire() }
+      return .none
     }
     switch action {
     case .none: break
-    case .disarm: clock.disarm()
-    case let .arm(deadline): clock.arm(deadline) { [weak self] in self?.fire() }
     case let .run(owner, id, generation):
       owner.performScrollbackMaintenance(generation: generation) {
         [weak self] report in self?.complete(id, report)
@@ -751,13 +746,19 @@ public final class ScrollbackMaintenanceCoordinator: Sendable {
 
 /// Owner adapter: runs maintenance for one terminal state on its serial
 /// queue. `step` runs on that queue and returns nil after teardown.
+///
+/// Sendable: the non-Sendable `step`/`release` closures run only on the
+/// owner's `queue`; `registration` is behind a `Mutex`, so `cancel()` is
+/// safe from any thread (an owner's `deinit` runs wherever its last
+/// reference is dropped). Queued work holds the client weakly.
 public final class ScrollbackMaintenanceClient: ScrollbackMaintenanceOwner,
   @unchecked Sendable
 {
   private let queue: DispatchQueue
   private let step: (UInt64) -> ScrollbackMaintenanceResult?
   private let release: () -> Void
-  private var registration: ScrollbackMaintenanceCoordinator.Registration?
+  private let registration:
+    Mutex<ScrollbackMaintenanceCoordinator.Registration?>
 
   /// - Parameters:
   ///   - queue: The owner's serial queue, which owns the terminal state.
@@ -773,23 +774,26 @@ public final class ScrollbackMaintenanceClient: ScrollbackMaintenanceOwner,
     self.queue = queue
     self.step = step
     self.release = release
-    registration = coordinator.register(self)
+    registration = Mutex(nil)
+    let registered = coordinator.register(self)
+    registration.withLock { $0 = registered }
   }
 
   /// Call on the owner's queue after each batch of relevant activity.
   public func noteActivity(generation: UInt64) {
-    registration?.noteActivity(generation: generation)
+    registration.withLock { $0 }?.noteActivity(generation: generation)
   }
 
   /// Call on the owner's queue when a read promoted cold history.
   public func requestMaintenance(generation: UInt64) {
-    registration?.requestMaintenance(generation: generation)
+    registration.withLock { $0 }?.requestMaintenance(generation: generation)
   }
 
   /// Ends scheduling; queued steps become no-ops.
   public func cancel() {
-    registration?.cancel()
-    registration = nil
+    // Taken under the lock, cancelled outside it: the coordinator has its
+    // own lock.
+    registration.withLock { $0.take() }?.cancel()
   }
 
   public func performScrollbackMaintenance(

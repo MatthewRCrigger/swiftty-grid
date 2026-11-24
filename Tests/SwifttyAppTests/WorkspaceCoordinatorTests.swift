@@ -1,8 +1,11 @@
+import CoreTestSupport
 import AppKit
 import Foundation
 import SwiftMuxClient
 import SwiftMuxProtocol
+import SwiftMuxXPC
 @testable import Swiftty
+import SwifttyConfig
 import SwifttyCore
 import Testing
 import TestSupport
@@ -10,12 +13,29 @@ import TestSupport
 /// Configuration to launch spec, matching the direct-window rules.
 @Suite
 struct WorkspaceLaunchTests {
-  func config(_ text: String) -> Configuration { Configuration.parse(text) }
+  @Test
+  func profileEnvironmentOverridesFrontendAndLaunchIsSnapshot() {
+    var config = Configuration()
+    config.preferredShell = .bash
+    config.shellProfiles["bash"] = ShellLaunchProfile(
+      arguments: ["--login"],
+      environment: ["A": "profile"]
+    )
+    let before = WorkspaceLaunch.spec(
+      config,
+      environment: ["A": "frontend", "B": "kept"]
+    )
+    config.preferredShell = .zsh
+    let after = WorkspaceLaunch.spec(config)
+    #expect(before.command == ["/bin/bash", "--login"])
+    #expect(before.environment == ["A": "profile", "B": "kept"])
+    #expect(after.command == ["/bin/zsh"])
+  }
 
   @Test
   func `no command runs the login shell from the frontend's directory`() {
     let spec = WorkspaceLaunch.spec(
-      config("working-directory = inherit"),
+      Configuration.configured([("working-directory", "inherit")]),
       environment: ["A": "1"],
       currentDirectory: "/var/frontend"
     )
@@ -27,12 +47,12 @@ struct WorkspaceLaunchTests {
   @Test
   func `explicit and home directories are kept`() {
     let home = WorkspaceLaunch.spec(
-      config("working-directory = home"),
+      Configuration.configured([("working-directory", "home")]),
       currentDirectory: "/var/frontend"
     )
     #expect(home.workingDirectory == NSHomeDirectory())
     let explicit = WorkspaceLaunch.spec(
-      config("working-directory = /tmp"),
+      Configuration.configured([("working-directory", "/tmp")]),
       currentDirectory: "/var/frontend"
     )
     #expect(explicit.workingDirectory == "/tmp")
@@ -40,9 +60,13 @@ struct WorkspaceLaunchTests {
 
   @Test
   func `configured commands keep shell and direct syntax`() {
-    let direct = WorkspaceLaunch.spec(config("command = direct:/bin/echo a b"))
+    let direct = WorkspaceLaunch.spec(
+      Configuration.configured([("command", "direct:/bin/echo a b")])
+    )
     #expect(direct.command == ["/bin/echo", "a", "b"])
-    let shell = WorkspaceLaunch.spec(config("command = vim ~/notes"))
+    let shell = WorkspaceLaunch.spec(
+      Configuration.configured([("command", "vim ~/notes")])
+    )
     #expect(
       shell.command == [
         "/bin/bash", "--noprofile", "--norc", "-c", "exec -l vim ~/notes",
@@ -75,6 +99,145 @@ struct WorkspaceLaunchActionTests {
 
   let a = WorkspaceID()
   let b = WorkspaceID()
+
+  @Test(arguments: [
+    GatewayWorkspaceRecord.State.starting, .discovering, .empty,
+    .unavailable(MuxError(.connectionLost)),
+  ])
+  func retainedGatewayEntriesNeverTriggerAutomaticCreation(
+    state: GatewayWorkspaceRecord.State
+  ) {
+    let retained = GatewayWorkspaceRecord(
+      workspace: a,
+      state: state,
+      summary: nil
+    )
+    let listing = WorkspaceListing(
+      server: nil,
+      workspaces: [],
+      gatewayRecords: [retained]
+    )
+    #expect(WorkspaceCoordinator.launchAction(listing, last: a) == .choose)
+    let healthy = GatewayWorkspaceRecord(
+      workspace: b,
+      state: .available,
+      summary: summary(b)
+    )
+    let mixed = WorkspaceListing(
+      server: nil,
+      workspaces: [summary(b)],
+      gatewayRecords: [retained, healthy]
+    )
+    #expect(WorkspaceCoordinator.launchAction(mixed, last: a) == .choose)
+    #expect(WorkspaceCoordinator.launchAction(mixed, last: nil) == .choose)
+    #expect(WorkspaceCoordinator.launchAction(mixed, last: b) == .open(b))
+  }
+
+  @Test(arguments: [SavedReopenAtLaunch.ask, .automatic, .never])
+  func savedLayoutsAreOfferedOnlyWithoutLiveWorkspaces(
+    policy reopen: SavedReopenAtLaunch
+  ) {
+    var policy = SavedLayoutPolicy.defaults
+    policy.reopenAtLaunch = reopen
+    let saved = SavedWorkspaceListing(
+      id: a,
+      state: .saved,
+      name: "kept",
+      savedAt: Date(),
+      build: nil,
+      tabCount: 1,
+      paneCount: 2,
+      commands: [.init(slot: 1, command: ["top"])],
+      hasOutput: false
+    )
+    let newer = SavedWorkspaceListing(
+      id: b,
+      state: .newer,
+      name: "newer",
+      savedAt: nil,
+      build: nil,
+      tabCount: 0,
+      paneCount: 0,
+      commands: [],
+      hasOutput: false
+    )
+    let list = SavedWorkspaceList(
+      store: .available,
+      policy: policy,
+      workspaces: [saved, newer]
+    )
+    let empty = WorkspaceListing(
+      server: nil,
+      workspaces: [],
+      gatewayRecords: [],
+      saved: list
+    )
+    let expected: WorkspaceCoordinator.LaunchAction =
+      switch reopen {
+      case .ask: .choose
+      case .automatic: .reopen([a])
+      case .never: .create
+      }
+    #expect(WorkspaceCoordinator.launchAction(empty, last: nil) == expected)
+    #expect(empty.reopenable.map(\.id) == [a])
+    // A live workspace keeps the usual launch behaviour.
+    let live = WorkspaceListing(
+      server: nil,
+      workspaces: [summary(b)],
+      gatewayRecords: [
+        GatewayWorkspaceRecord(
+          workspace: b,
+          state: .available,
+          summary: summary(b)
+        )
+      ],
+      saved: list
+    )
+    #expect(WorkspaceCoordinator.launchAction(live, last: b) == .open(b))
+  }
+
+  @Test
+  func gatewayStartupCreatesOnlyForAnEmptyInventory() {
+    let empty = WorkspaceListing(
+      server: nil,
+      workspaces: [],
+      gatewayRecords: []
+    )
+    #expect(WorkspaceCoordinator.launchAction(empty, last: a) == .create)
+    let attached = GatewayWorkspaceRecord(
+      workspace: a,
+      state: .available,
+      summary: summary(a, attached: true)
+    )
+    let busy = WorkspaceListing(
+      server: nil,
+      workspaces: [summary(a, attached: true)],
+      gatewayRecords: [attached]
+    )
+    #expect(WorkspaceCoordinator.launchAction(busy, last: a) == .choose)
+    let ready = WorkspaceListing(
+      server: nil,
+      workspaces: [summary(a)],
+      gatewayRecords: [
+        GatewayWorkspaceRecord(
+          workspace: a,
+          state: .available,
+          summary: summary(a)
+        )
+      ]
+    )
+    #expect(WorkspaceCoordinator.launchAction(ready, last: nil) == .open(a))
+    let missingSummary = WorkspaceListing(
+      server: nil,
+      workspaces: [],
+      gatewayRecords: [
+        GatewayWorkspaceRecord(workspace: a, state: .available, summary: nil)
+      ]
+    )
+    #expect(
+      WorkspaceCoordinator.launchAction(missingSummary, last: nil) == .choose
+    )
+  }
 
   @Test
   func `the last workspace reopens when free`() {

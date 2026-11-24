@@ -71,13 +71,32 @@ private struct MuxCommandPayload {
     case let .newWorkspace(request):
       try text(request.name)
       try launch(request.launch)
-    case let .endWorkspace(value), let .switchWorkspace(value),
+    case let .newWorkspaceFromTemplate(template):
+      try text(template.name)
+      try launch(template.launch)
+      for pane in template.panes { try launch(pane) }
+      try add(
+        count: template.tabs.count,
+        stride: MemoryLayout<WorkspaceTemplateTab>.stride,
+      )
+      for tab in template.tabs {
+        try text(tab.name)
+        try add(
+          count: tab.layout.slots.count * 2,
+          stride: MemoryLayout<WorkspaceTemplateNode>.stride,
+        )
+      }
+    case let .endWorkspace(value, _), let .switchWorkspace(value),
       let .takeover(value, _):
       try selector(value)
     case let .attach(request): try selector(request.selector)
     case let .renameWorkspace(value, name):
       try selector(value)
       try text(name)
+    case .endWorkspaceIfUnused: break
+    case let .roamingSessionChanged(id, _, state):
+      try text(id)
+      try text(state)
     case let .setTheme(theme):
       try add(
         count: theme.palette.colors.count,
@@ -102,16 +121,25 @@ private struct MuxCommandPayload {
     case let .setSubscriptions(panes):
       try add(count: panes.count, stride: MemoryLayout<PaneID>.stride)
     case .setViewport: try add(MemoryLayout<ViewportRequest>.stride)
+    case let .automationKey(_, shortcut): try text(shortcut)
+    case .subscribeAutomation, .automationFocus: break
     case let .search(_, query): try text(query)
+    case let .copySelection(request):
+      try add(
+        count: request.screenRowVersions.count,
+        stride: MemoryLayout<RowIdentity>.stride,
+      )
     case let .clipboardReadResult(_, _, .success(available, contents, _)):
       try add(count: available.count, stride: MemoryLayout<String>.stride)
       for mime in available { try text(mime) }
       try clipboard(contents)
     case .clipboardReadResult, .clipboardWriteResult: break
     case .status, .listWorkspaces, .detachActive, .endAllWorkspaces, .quiesce,
-      .detach, .observeWorkspaces, .subscribeInbox, .selectTab, .endTab,
-      .focusPane, .toggleZoom, .endPane, .scroll, .searchStep, .endSearch,
-      .clearScreen, .resetTerminal, .link, .commandOutput:
+      .resumeAttachment, .detach, .observeWorkspaces, .observeWorkspaceGraph,
+      .savedLayoutState, .exportSavedOutput, .setOutputOptOut, .subscribeInbox,
+      .selectTab, .endTab, .focusPane, .toggleZoom, .endPane, .scroll,
+      .searchStep, .endSearch, .clearScreen, .resetTerminal, .link,
+      .commandOutput:
       break
     }
   }
@@ -121,4 +149,11 @@ extension MuxCommandAdmission {
   static func bytes(_ command: MuxCommand) throws(MuxError) -> Int {
     try MuxCommandPayload.bytes(command, limit: maxBytes)
   }
+}
+
+extension MuxConnection {
+  /// Shared preflight accounting for gateway work retained before connection.
+  package nonisolated static func commandPayloadBytes(
+    _ command: MuxCommand
+  ) throws(MuxError) -> Int { try MuxCommandAdmission.bytes(command) }
 }

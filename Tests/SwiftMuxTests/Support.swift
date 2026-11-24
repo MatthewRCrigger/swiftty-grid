@@ -1,6 +1,7 @@
 import Foundation
 import SwiftMuxClient
 import SwiftMuxProtocol
+import SwiftMuxXPC
 import SwiftMuxService
 import Testing
 import TestSupport
@@ -47,7 +48,6 @@ func shellLaunch(_ extra: [String: String] = [:]) -> LaunchSpec {
 }
 
 extension MuxConnection {
-  /// Waits for a frame of `pane` satisfying `predicate`.
   func frame(
     of pane: PaneID,
     timeout: Duration = .seconds(10),

@@ -18,7 +18,9 @@ resize, Unicode/graphemes, snapshots, fonts, rendering and frontend features.
 The embedder owns external transports, connections, authentication and window/tab/
 split management; the Swiftty app's own SwiftMux workspace window is specified
 below. Linux, Windows, GTK, OpenGL, WebAssembly, plugin APIs and a
-stable core C ABI are excluded; Shell supplies its own libghostty embedder API.
+stable core C ABI are excluded from the terminal core and frontends (`Package.swift`
+reduces itself on Linux to the `swsh` shell and confined-execution targets in
+[spec.shell.md](spec.shell.md)); Shell supplies its own libghostty embedder API.
 Sixel is excluded. Kitty graphics is future work; until separately specified,
 ignore APC strings safely. Future graphics support should use bounded image
 storage and cover transmission, placement, deletion, z-order and placeholders.
@@ -37,11 +39,42 @@ TerminalSession — one serial queue owns parser and terminal state
   └─ immutable RenderSnapshot → MetalRenderer + CoreTextFontManager
 ```
 
-Keep targets coarse: `SwifttyCore`, `Swiftty`, `SwifttyMobile`. Within the core,
-use `Session`, `Process`, `Terminal`, `Input`, `Unicode`, `Font`, `Renderer` and
-`Config` directories. Frontends share everything below view hosting. Isolate
-platform code with conditional compilation; avoid a portability layer or
-internal C-shaped APIs.
+The diagram describes direct byte-stream sessions. `SwifttyEngine` is headless;
+`SwifttyCore` adds session/rendering functionality, and `SwifttyMac` and
+`SwifttyMobile` host native views. `SwiftMuxService` depends on the headless
+engine, not AppKit or Metal. Keep targets coarse and isolate platform code with
+conditional compilation; avoid a portability layer or internal C-shaped APIs.
+
+Terminal capabilities compose: engine and ordered runtime, persistent workspace
+service, local/roaming attachments, then product workflows. Shared presentation
+sits alongside those owners; this is not an inheritance hierarchy or a requirement
+that every target import the next layer. The renderer does not own workspace
+policy, and ordinary SSH/SFTP does not require roaming.
+
+| Path | Parser and presentation | Lifetime |
+|---|---|---|
+| Direct local / embedding | Local runtime; retained renderer snapshots | Direct session / embedding API |
+| Ordinary SSH | Client-side parser; locally parsed byte stream | Ends with SSH connection |
+| Native SwiftMux | Agent-side runtime; validated owned pane frames | Outlives app window |
+| Roaming workspace | Same agent-side runtime; validated RST snapshots | Outlives network attachment within service retention guarantees |
+| Confined execution ([spec.shell.md §11](spec.shell.md#11-confined-execution-an-execution-context-with-swsh-as-its-runner)) | Confined pane PTY or headless `swsh` runner inside a per-context Linux VM | Bounded by execution-service lease and grant |
+
+`swiftmux-agent` remains the single persistent workspace/PTY authority. Local
+SMX and roaming RST address the same workspaces and leases. Confined execution
+is a proposed design, not an implemented path: `SwifttyExec` holds the protocol
+and admission only, `SwshAgent` is its sole importer, and no process hosts the
+service ([spec.shell.md §11.6](spec.shell.md)). As designed, the app, the
+multiplexer service and the JavaScript runtime will be clients of that service
+and gain no path around it: a confined pane attaches a PTY to one execution
+context, an agent identity never receives host-pane writes, the JavaScript
+bridge or SSH as a path to the host, and an unreachable execution service
+reports `service_unavailable` instead of falling back to host execution
+([spec.shell.md §11.5](spec.shell.md#115-swiftty)). Applications own
+windows, navigation, trust prompts and credentials; attachments own protocol
+identity, recovery and delivery; surfaces own visible interaction. A workspace,
+tab, view, connection and PTY have distinct lifetimes. Hide, detach and end are
+separate operations. Neither an attachment nor a mux view creates another emulator.
+Do not force direct rendering through network encoding or full-grid export/import.
 
 `TerminalSession` provides `start(_:)`, `receive(_:)`, `onWrite`,
 `resize(columns:rows:)`, `send(_:)`, `snapshot()` and `stop()`.
@@ -54,6 +87,90 @@ I/O enters the existing session queue; UI runs on the main actor. Renderer acces
 stays on the main thread/render callback.
 Use immutable snapshots and coarse synchronization; avoid actors or locks in
 parser/grid loops and cross-thread terminal-state mutation.
+
+### Shared native presentation and interaction
+
+`TerminalView` and `MuxPaneView` compose package-internal helpers in `SwifttyMac`:
+
+| Helper | Shared behavior |
+|---|---|
+| `TerminalComposition` | IME state, Unicode range clamping, cancellation, preedit and candidate geometry |
+| `TerminalDisplay` | Renderer configuration, MTK setup, visibility, coalesced retries, submission, blink and animation scheduling |
+| `TerminalKeyboard` | Binding consumption, key equivalents and IME dispatch |
+| `TerminalPointer` | Gesture routing, click units, cell geometry and fractional scrolling |
+| `TerminalAccessibility` | Unicode text/ranges, hit testing and rectangles; cache keyed by retained source identity and sequence |
+
+Small adapters retain direct state/history access and mux live-selection semantics
+(frozen-frame selection against a service without `liveSelection`).
+They obtain complete immutable presentations without unbounded queues, coalesce
+redraw notifications, submit ordered bounded semantic input, propose geometry
+without declaring authority acceptance, expose supported capabilities, and route
+history/search/links/actions to their owner. Preserve dead keys, modifiers,
+special keys, negotiated keyboard modes and exactly-once IME commits. Unsupported
+capabilities are disabled honestly. Invalid scroll deltas preserve accumulated
+fractions and report loops remain bounded.
+
+Public `TerminalView` remains a final `MTKView` with its nonoptional `session` and
+existing initializers; do not add a dummy session to mux or a public plugin API.
+The public `MetalRenderer.tryDraw(_:in:)` signature is also preserved. Native
+presentation callbacks use a package-internal overload guarded to native macOS.
+
+Only accepted renderer submission advances the snapshot/mode baseline for
+hit-testing, links, selection, IME, cursor placement and accessibility. Busy,
+unavailable or hidden rendering keeps the prior baseline. Direct pointer lookups
+are fenced to that presentation. Selection-only overlay mutations may retain a
+source/revision ticket; any other published change retires it. Edge dragging
+selects the displayed edge before requesting a scroll, so new output cannot
+silently become selectable. No full-grid copy is required for this fencing.
+View replacement cancels composition and releases subscriptions/resources without
+ending a service-owned process. Mux-specific requirements are in
+[spec.multiplexer.md §7](spec.multiplexer.md#7-later-frontend-native-swiftty-with-metal).
+
+Standalone native UI input reserves a 64 KiB budget before encoding or semantic
+callbacks are queued; credit includes blocked PTY bytes and is released on drain
+or teardown. Immediate refusal beeps, and paste/drop actions report failure.
+Explicit LocalPTY/SSH backends keep their own admission policy. Public
+`TerminalSession.send` retains its unbounded embedding contract. The reservation
+calculation is shared as `TerminalInput.encodedByteReservation`. Semantic callbacks
+are captured at submission, preventing queued input from following a replacement
+attachment; see [roaming attachment ownership](spec.roaming.md#production-attachment-ownership).
+
+### Runtime extraction and deferred boundaries
+
+Share one proven behavior at a time, preferably starting with a failing or
+characterization test. Candidate mechanics include parser/state sequencing,
+ordered replies and provenance, input encoding, publication, scrollback upkeep,
+capture/events and PTY I/O where semantics match. An extraction must remove more
+duplicate behavior than wrappers, preserve single-owner ordering, bounded
+backpressure and cleanup, and stay within existing performance gates. Avoid
+`isMux`/`isRemote`/`ownsWorkspace` switches throughout common hot paths or
+cross-executor indirection without a deletion benefit.
+
+`TerminalSession` remains the embedding facade. `PaneRuntime` retains workspace
+identity, persistent launch/ownership, writer leases, bounded paste, observer
+viewports, service exit/drain rules, frame identity/SMX encoding and attention.
+They already share parser/state and scrollback maintenance; the input-reservation
+extraction is used by actual callers. Their different reply, callback and lifetime
+policies do not justify wholesale runtime consolidation.
+
+Owned-capture replacement, SSH bootstrap relocation and module renaming remain
+optional, not prerequisites:
+
+- Borrowed queue-ordered `MuxService.inspect` is valid. Replace it only for an
+  observed consistency, coupling or testability limitation, with bounded coherent
+  capture, stable revisions and explicit viewport semantics. Keep RST clipping,
+  palette/grapheme limits and encoding in its adapter; avoid gratuitous copies.
+- Move `runBootstrap` into `SSHBootstrapper` only if that removes generic SSH-layer
+  RST policy without duplicating timeout, path-validation or error handling.
+- Foundation SMX contracts (`SwiftMuxProtocol`) are split from the XPC channel
+  and launchd job description (`SwiftMuxXPC`), because the roaming clients on
+  iOS, tvOS and visionOS link the contracts for attention metadata. Do not
+  create separately versioned packages for diagram symmetry.
+- Preserve target/product names and the dependency graph unless a concrete change
+  needs a new boundary. No universal backend ABI, wire DTO, extra parser/renderer/
+  SSH stack, service or PTY owner is required. SFTP and watch companion data stay
+  outside the terminal display pipeline. Lease/input-ledger protocols and survival
+  after logout, reboot or agent crash remain unchanged.
 
 ### SwiftPM C security settings
 
@@ -116,7 +233,7 @@ custom Metal post-processing shaders.
 | 1: macOS      | Shell PTY, typing/IME, colors, cursor, reflow, history, alternate screen, mouse, selection/copy, search, clipboard, common prompts and TUIs                                                                                                                                                            |
 | 2: iOS/iPadOS | Metal `UIView`, `UITextInput` for keyboard/dictation/IME, hardware key press/release, Esc/Ctrl/Alt/Tab/arrows/symbol accessory bar, touch selection/handles/edit menu, momentum scrolling, touch/pointer mouse reporting, multitasking resize/keyboard avoidance, lifecycle pausing, local demo source |
 | 3: protocols  | Semantic prompt marks/jumps/output selection/redraw/click-to-move, underline colors/styles, blinking text, title/SGR stacks, pointer shapes, color-scheme and resize reports, alternate-key encoding and hyperlinks                                                                                    |
-| 4: embedding  | Ghostty-style supported configuration/themes, keybinding actions, font/render options, find controls and VoiceOver on both frontends                                                                                                                                                                   |
+| 4: embedding  | JSONC configuration/themes, keybinding actions, font/render options, find controls and VoiceOver on both frontends                                                                                                                                                                   |
 
 Milestones require behavioral tests and the performance gates below. Network
 clients and frontend window management remain embedder responsibilities.
@@ -140,8 +257,7 @@ OSC 52 accepts padded/unpadded Base64 and an empty clipboard clear; invalid
 characters, whitespace or malformed explicit padding reject the entire write.
 Clipboard reads are refused. Paste replaces editing, signal and escape controls
 with spaces. Unbracketed LF/CRLF becomes one CR; bracketed paste preserves line
-endings and frames empty input. Unsupported upstream protocols/API cases are
-tracked in [the deferred terminal checks](todo.md#deferred-terminal-feature-checks).
+endings and frames empty input.
 
 Committed typing/IME text without a physical key uses key code zero when Kitty
 flag 8 is set; flag 16 adds its Unicode scalars as associated text. Other flags
@@ -151,12 +267,140 @@ PTY and SSH admission reserve the largest possible encoding before queueing,
 because keyboard modes can change before encoding. This may refuse a large
 commit even when its current UTF-8 encoding would fit the pending-byte limit.
 
+## Configuration
+
+### JSONC format and discovery
+
+Terminal settings use JSONC: JSON with `//` and `/* ... */` comments and
+trailing commas in objects and arrays. The shared `SwifttyConfig` library MUST
+use only the Swift standard library and Foundation, including `JSONDecoder`
+and `JSONEncoder`; no external parser dependency is required.
+
+Resolve configuration in this order:
+
+1. Explicit `--config <path>`. A missing argument or missing explicit file is
+   an error, not permission to select a fallback.
+2. `${XDG_CONFIG_HOME:-~/.config}/swiftty/config.jsonc`.
+3. `~/.swiftty.jsonc`, then `~/.config/swiftty/config.json`.
+
+Ghostty-style `key = value` files and includes are not supported. Discovery
+ignores extensionless legacy files. Explicit files are always parsed as JSONC.
+With no file, use internal JSONC defaults. Edit Configuration File can create a
+commented template on demand at the selected/default JSONC path; startup need
+not write a file. Reload and Settings edits MUST retain the selected path,
+including an explicit CLI override. Native settings and persistence behavior
+are specified in [the Apple platform spec](spec.apple.md#a01--native-settings-cfg-01).
+
+### Parsing and diagnostics
+
+The processing pipeline is UTF-8 source → byte-preserving sanitizer → syntax
+validation/source index → Foundation decoding → typed validation. Reads MUST
+require regular UTF-8 files and enforce the shared 1 MiB input limit.
+
+The sanitizer MUST replace each comment byte and permitted trailing comma with
+ASCII space, retaining CR and LF at their original offsets. It MUST operate
+outside quoted strings and respect escaped quotes and backslashes. URLs and
+comment-like text inside strings remain untouched. Scan UTF-8 bytes rather than
+Swift `Character` values so non-ASCII comments do not shift source positions.
+Reject unterminated comments, malformed JSON and duplicate keys; sanitization
+must not turn invalid comma placement into valid JSON.
+
+Syntax errors, unknown keys, missing required values, type mismatches and range
+errors MUST report the original file, one-based line and one-based UTF-8 byte
+column (tabs count as one), plus the coding path when available. Preserve a
+source index for mapping decoding paths to locations; Foundation decoding
+contexts alone do not guarantee exact source positions.
+
+The same syntax parser serves [JavaScript JSONC data](spec.javascript.md#jsonc-data-for-automation).
+Terminal configuration validation applies only when loading terminal settings.
+
+### Typed model and editor schema
+
+`SwifttyConfig` and its font, window, terminal and keybinding models are mutable
+`Codable` values. Omitted sections and settings use defaults:
+
+| Section | Settings and defaults |
+| --- | --- |
+| `font` | `family: "Menlo"`, `size: 13`, `line_height: 1.2` |
+| `window` | `opacity: 0.95`, `blur: true`, `padding: 8`, `tabs: "top"`; optional `width` and `height` in content points |
+| `terminal` | `shell: null` (default login shell), `scrollback_limit: 10000` history rows |
+| `keybindings` | Empty array; each entry requires `trigger` and `action` strings |
+
+`window.tabs` places workspace tabs in the toolbar (`"top"`, the default) or in
+a sidebar beside the panes (`"left"`), whose toolbar button hides and shows it;
+Settings › Appearance › Tabs and View › Tabs edit it.
+
+A shell setting is an executable path, not a shell command. The existing
+scrollback byte budget also bounds history. Optional `theme`, `copy_on_select`,
+`mouse_hide_while_typing`, `cursor_style` and `cursor_style_blink` fields support
+native Settings edits. Use snake_case JSON keys and map `$schema` to the model's
+schema field.
+
+The repository's [schema.json](schema.json) MUST describe supported fields,
+defaults, types and ranges for editor completion and agree with runtime
+validation. Unknown keys are rejected. The optional `$schema` value is the
+plain URL `https://raw.githubusercontent.com/chr33s/swiftty/main/schema.json`,
+not a Markdown link; it resolves once published to the main branch.
+
+Example user configuration:
+
+```jsonc
+{
+  "$schema": "https://raw.githubusercontent.com/chr33s/swiftty/main/schema.json",
+  // Font configuration
+  "font": { "family": "SF Mono", "size": 14, "line_height": 1.15, },
+  /* Window styling and compositor blur */
+  "window": { "opacity": 0.92, "blur": true, "padding": 12, },
+  "terminal": { "shell": "/bin/zsh", "scrollback_limit": 50000, },
+  "keybindings": [
+    { "trigger": "cmd+k", "action": "clear_screen" },
+    { "trigger": "cmd+t", "action": "new_tab" },
+  ],
+}
+```
+
+Theme files also use JSONC. Supported color keys are `foreground`, `background`,
+`cursor`, `cursor_text`, `selection_foreground` and `selection_background`;
+`palette` maps indexed-color numbers (0–255) to color strings. Look up names in
+Swiftty's theme directory, then the built-in light/dark themes; do not search
+Ghostty's directory. A name containing a slash selects an explicit path. Theme
+files must be regular UTF-8 files of at most 64 KiB. Reject invalid theme
+documents as a whole and continue to the next named-theme fallback.
+
+### Serialization and required coverage
+
+Runtime settings mutations MUST round-trip through the typed model.
+`ConfigLoader.save` validates before atomically writing with
+`JSONEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]`. Saving replaces
+JSONC comments and formatting with canonical JSON; it does not promise textual
+round-trip preservation. Resolve a symlink's target when saving so linked
+dotfiles keep their links.
+
+Required verification covers:
+
+- URLs, escaped quotes, backslashes and comment markers inside strings.
+- Multiline and non-ASCII comments with identical UTF-8 byte offsets and line
+  endings after sanitization; valid trailing commas in both arrays and objects.
+- Unterminated comments, malformed commas, duplicate and unknown keys, missing
+  required values, invalid types/ranges and oversized or non-UTF-8 input.
+- Exact original-source diagnostics, including a type mismatch below a 20-line
+  comment block, nested coding paths, CRLF and non-ASCII input.
+- Discovery precedence, missing explicit paths, defaults and template creation.
+- Mutating settings, saving canonical sorted JSON and reloading equivalent
+  values, including validation failure and preservation of symlink targets.
+- Native Settings and JavaScript consumers using the shared parser/model
+  contracts, with their platform-specific acceptance criteria in their specs.
+
 ## OSC 7501 program status
 
 The core owns protocol validation, state, lifecycle and support replies.
 Embedders own badges, notifications, acknowledgment, permission UX, aggregation
 and pane-specific transport routing. Keep status distinct from OSC 9;4 progress;
-never persist it into a newly created process or interpret it as approval.
+never persist it into a newly created process or interpret it as approval. Output
+and terminal control sequences from an execution context are untrusted data and
+cannot draw approval state, open URLs, set the clipboard or trigger UI actions;
+scope, backend, expiry and cleanup state come from service state in UI that
+terminal output cannot imitate ([spec.shell.md §11.3](spec.shell.md#113-the-service), [§11.5](spec.shell.md#115-swiftty)).
 
 ### Framing and fields
 
@@ -447,9 +691,10 @@ The pipeline:
   - App shortcuts (new tab, split, focus, zoom, resize, end pane or tab,
     find) are never forwarded as terminal input.
   - Ctrl-C, arrows, paste and IME commits go to the pane.
-- **Selection and search:** selection freezes the displayed viewport for
-  copy. Find runs the service's bounded history search. Selection across
-  fetched pages is deferred.
+- **Selection and search:** selection stays live while output arrives and
+  can span history pages; copy outside the displayed frame is a bounded
+  service request ([spec.multiplexer.md §4](spec.multiplexer.md#live-selection-across-pages)).
+  Find runs the service's bounded history search.
 - **Accessibility:** pane names, status, dividers, tab titles and displayed
   text are exposed through AppKit accessibility. Mutable server state is
   never read synchronously on the main actor.
@@ -556,7 +801,7 @@ Status and measurements for these are recorded in spec.multiplexer.md §11.
 | UIKit energy behavior                             | no rendering while idle or backgrounded |
 
 Parser throughput must reach ≥95% of upstream Ghostty for every comparison input,
-or ≥90% for wide-character-heavy inputs (`Scripts/compare-ghostty.sh`). Maintain
+or ≥90% for wide-character-heavy inputs (`Scripts/compare-ghostty.py`). Maintain
 100 MB ASCII/UTF-8, compiler-log, source-file, full-redraw, scroll, resize-stress,
 OSC-heavy and CSI-heavy benchmarks. Measure throughput, CPU time, allocations,
 peak RSS, frame time and p95 input-to-render latency on Apple Silicon Release
@@ -594,3 +839,127 @@ Parity is complete only when:
 
 Automated and offscreen results alone do not establish the interactive acceptance
 requirements.
+
+### Shared-surface regression gates
+
+Behavior fixes must be inherited by both direct and mux adapters, with no second
+frontend emulator and no unused parallel production attachment. Preserve existing
+security, protocol, resource and lifecycle guarantees. Required checks include:
+
+- A direct local terminal and a native mux pane render the same deterministic terminal content, widths, attributes, cursor and wraps.
+- IME composition and commit, dead keys, modifiers, special keys and paste deliver intended input exactly once.
+- A mux pane accepts frames only for the current server/attachment/pane/geometry and rejects stale frames.
+- Renderer unavailable/busy/hidden does not advance the interaction baseline prematurely.
+- A live selection follows ongoing output, clears on in-place edits under it, and accurately copies wrapped/wide text across history pages; the frozen-frame fallback survives ongoing output.
+- Switching tabs or destroying a pane view does not terminate any process.
+- Closing an app window, app Quit and local/remote detach retain the same service-owned shell and workspace until an explicit end or applicable service failure.
+- One writer is authoritative across local and remote transports; takeover fences old queued input.
+- Lost/uncertain input is not replayed into a new shell; ordinary SSH fallback is visibly separate.
+- Hidden/detached panes continue parsing output, draining replies and maintaining bounded history.
+- Final output, process exit and attention status are delivered in established order.
+- Search, prompt navigation, mouse reporting, clipboard security policy, accessibility, theme, focus and font zoom retain their existing supported behavior.
+- Backpressure and slow receivers cannot grow input, frame or UI queues without bound.
+
+
+Compare before/after on the same hardware, OS, build mode (including testability)
+and workload: parser throughput/allocations; direct typing/rendering; mux input,
+frame and presentation stages; visible/hidden/detached CPU, memory and allocations;
+submission/frame pacing under load; and affected mobile lifecycle/energy behavior.
+A reproducible regression outside existing gates calls for revisiting the
+abstraction before optimizing around it.
+
+### Shared-surface implementation and validation — 2026-11-01
+
+Baseline: `78ee561d977bf4c1c25976126c07f8480370ec65`. Shared native behavior and
+production roaming attachment are implemented, without new targets/dependency
+edges or public embedding breaks. Independent implementations decreased; total
+source lines increased because accessibility parity and regression checks add
+behavior. Conditional runtime and optional cleanup scope remains deferred above.
+
+Final verification passed 2,931 Debug and 2,930 Release tests across ten native
+bundles. Release tests used `--build-tests -Xswiftc -enable-testing`, then
+`Scripts/test-native.sh -c release --skip-build`. Logs are
+`/private/tmp/swiftty-layered-audit-final-{debug,release-tests}.log`.
+Strict formatting passed for 33 changed Swift files and `git diff --check` passed.
+Physical-device and shipping iOS results are in [spec.apple.md A08](spec.apple.md#a08--memory-and-performance-txt-04-perf-01-appendix-a);
+roaming ownership coverage is in [spec.roaming.md](spec.roaming.md#production-attachment-ownership).
+These are refactor validation results, not a claim that every product acceptance
+gate or the upstream Ghostty comparison has newly been rerun.
+
+`BridgeTests.exportImportParity` covers content, widths, attributes, cursor, wraps
+and graphemes. `MuxNativeTests` covers real Metal submission, IME, frozen selection,
+slow GPU, missing drawable and shell-preserving detach. Native view/capability/
+visibility tests and service/integration suites cover admission, lease fencing,
+reconnect, uncertain input, lifecycle queues, reply backpressure and natural exit.
+Final focused interaction/admission and client-lifetime runs passed 92 and 10 tests,
+respectively. The earlier broad filtered `swiftty-presented-selection-green.log`
+did not complete integration tests and is not counted as a full pass.
+
+| Regression | Evidence logs under `/private/tmp/` |
+|---|---|
+| Direct pointer targets unseen output | `swiftty-display-state-red.log`, `swiftty-display-state-green.log` |
+| Mux pending command-output freezes too early | `swiftty-pending-selection-red2.log`, `swiftty-baseline-fence-regressions.log` |
+| Queued semantic input follows replacement | `swiftty-queued-attachment-red.log`, `swiftty-view-admission-binding-green.log` |
+| Drag selects overwritten, undisplayed cells | `swiftty-unpresented-drag-regression-red.log`, `swiftty-final-interaction-focused.log` |
+| Closed client retained through display callback | `swiftty-roaming-retention-red.log`, `swiftty-roaming-retention-green.log` |
+
+
+#### Production parser and direct rendering
+
+Hardware: Mac17,7, 18 cores, 128 GiB; macOS 27.2 (26B123), Swift 6.4.2.
+Baseline sources are archived at `/private/tmp/swiftty-layered-baseline`.
+Both versions use plain `swift build -c release`. A compiler import check confirmed
+that **both** final modules reject `@testable import`; unlike the early exploratory
+runs, these measurements use matching production testability settings.
+The final driver log is `/private/tmp/swiftty-final-performance.log`.
+
+| Metric (same workload) | Baseline | Current |
+|---|---:|---:|
+| ASCII parser, MB/s | 1135.5 | 1139.3 |
+| UTF-8 parser, MB/s | 306.2 | 305.3 |
+| Wide UTF-8 parser, MB/s | 1178.4 | 1178.8 |
+| Compiler-log parser, MB/s | 797.1 | 794.4 |
+| CSI-heavy parser, MB/s | 233.7 | 226.9 |
+| Scroll parser, MB/s | 336.3 | 327.6 |
+| Text-phase peak RSS, MiB | 138.8 | 138.7 |
+| Direct PTY-to-snapshot p95, ms | 0.059 | 0.060 |
+| Redraw parse+snapshot p95, ms | 0.051 | 0.051 |
+| Redraw GPU p95, ms | 1.470 | 1.478 |
+| Scroll-frame p95, ms | 0.333 | 0.334 |
+| Resize p95, ms | 3.23 | 3.23 |
+
+Workload: `swiftty-bench --mb 100 --repeat 3`, run serially with no concurrent
+desktop build/test workload. Logs:
+`/private/tmp/swiftty-final-{baseline,current}-core-bench.log`.
+Allocation counts match for every corpus: zero for common loops, nine for source
+and 28,800 for OSC-heavy input. Final matching-build measurements supersede the
+earlier testability-mismatched exploratory runs.
+
+#### Native presentation
+
+Three valid native presentation pairs measured p95 latency in milliseconds:
+
+| Pair | Baseline | Current |
+|---|---:|---:|
+| 1 | 23.931 | 23.951 |
+| 2 (current first) | 24.053 | 24.186 |
+| 3 | 24.437 | 23.914 |
+
+Median paired change was +0.019 ms. Every accepted run had zero idle draws and
+zero hidden drawable acquisitions. Accepted logs are `swiftty-final-baseline-native-1.log`,
+`swiftty-final-current-native-1-retry.log`, `swiftty-final-{baseline,current}-native-2.log`
+and `swiftty-final-{baseline,current}-native-3-isolated.log` under `/private/tmp`.
+The third pair was repeated in isolation to exclude overlap with another benchmark.
+Both versions had an initial occluded-window attempt; those attempts are excluded.
+Native probes associate the expected PTY echo with the draw's entry state and use
+actual drawable presentation timestamps. Each run has 20 warmups and 100 samples,
+then checks two seconds each of idle and hidden activity. Occluded attempts contribute no latency samples.
+
+These measure synthetic key-to-drawable presentation, not physical keyboard or
+photon latency. Mux/resource and isolated-frame measurements are recorded in
+[spec.multiplexer.md §11](spec.multiplexer.md#shared-surface-measurements--2026-11-01).
+Temporary probe sources/builders are `/private/tmp/swiftty-frame-probe.swift`,
+`build-swiftty-frame-probes.py`, `swiftty-native-presentation-probe.swift` and
+`build-swiftty-native-probes.py`; executables/resources are under
+`/private/tmp/swiftty-frame-probes/{baseline,current}`. These local artifacts are
+provenance, not repository-managed test fixtures.

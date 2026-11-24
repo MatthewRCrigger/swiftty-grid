@@ -1,6 +1,7 @@
 import Dispatch
 import Foundation
 import SwiftMuxProtocol
+import SwiftMuxXPC
 
 extension MuxService {
   // MARK: Viewers
@@ -31,6 +32,7 @@ extension MuxService {
     viewers[ws.id] = list
     clientViewers[client.id] = ws.id
     idleWork?.cancel()
+    scheduleAutomationTopology()
     var snap = snapshot(ws)
     snap.attachmentRole = .observer
     return .attached(attachment: viewer.attachment, workspace: snap)
@@ -50,6 +52,7 @@ extension MuxService {
     if viewers[wsID]?.isEmpty == true { viewers[wsID] = nil }
     tearDown(viewer)
     if notify { send(.event(.detached(reason: reason)), to: client) }
+    scheduleAutomationTopology()
   }
 
   func releaseViewers(in wsID: WorkspaceID, reason: String) {
@@ -57,12 +60,14 @@ extension MuxService {
       tearDown(viewer)
       send(.event(.detached(reason: reason)), to: viewer.client)
     }
+    scheduleAutomationTopology()
   }
 
   /// Releases what a viewer already removed from `viewers` held: its frame
   /// budget, and its waiting window commands fail.
   func tearDown(_ viewer: Viewer) {
     for slot in viewer.frames.values { releaseBudget(slot) }
+    forgetRowVersions(viewer.workspace, of: viewer.attachment)
     clientViewers.removeValue(forKey: viewer.client)
     failWindowCommands(
       viewer.windowCommands.values.flatMap(\.waiting),
@@ -366,6 +371,13 @@ extension MuxService {
           reply: reply,
         )
       }
+    case let .copySelection(request):
+      copySelection(
+        request,
+        attachment: viewers[wsID]?.first { $0.client == client }?.attachment,
+        workspace: wsID,
+        reply: reply
+      )
     default: reply(.success(.ok))
     }
   }
@@ -545,7 +557,6 @@ extension MuxService {
     viewers[wsID]?.first { $0.client == client }
   }
 
-  /// Writes `viewer` back over its stored copy.
   func store(_ viewer: Viewer) {
     withViewer(viewer.client, in: viewer.workspace) { $0 = viewer }
   }
@@ -856,6 +867,8 @@ extension MuxService {
         attachment: attachment,
         layoutRevision: layoutRevision,
         viewport: capture,
+        encoding: clients[client]?.frameEncoding ?? PaneRuntime.FrameEncoding(),
+        baseline: slot.baseline,
       ) { [weak self] result in
         self?
           .onQueue {
@@ -959,6 +972,7 @@ extension MuxService {
         let inflight = slot.inflight, inflight.revision == revision
       else { return nil }
       viewer.frames[pane]?.inflight = nil
+      viewer.frames[pane]?.baseline = inflight.baseline
       if let queued = slot.queued {
         viewer.frames[pane]?.queued = nil
         viewer.frames[pane]?.sent(queued.frame)

@@ -1,3 +1,4 @@
+import CoreTestSupport
 import AppKit
 import Metal
 @testable import Swiftty
@@ -11,14 +12,31 @@ import TestSupport
 /// configuration reload, in the macOS view.
 @MainActor
 @Suite(.serialized)
-struct ViewBehaviorTests {
+final class ViewBehaviorTests {
+  private var displayWindows: [NSWindow] = []
+
+  isolated deinit { for window in displayWindows { window.close() } }
   nonisolated static let hasMetal = MTLCreateSystemDefaultDevice() != nil
+
+  init() { DisplayAccommodations.override = DisplayAccommodations() }
 
   func makeView(
     configuration: Configuration = Configuration()
   ) throws -> TerminalView {
     _ = NSApplication.shared
-    return try TerminalView(configuration: configuration)
+    let view = try TerminalView(configuration: configuration)
+    // Interaction tests need an admitted display baseline. Offscreen draw calls
+    // intentionally no longer publish received snapshots as visible content.
+    let window = InteractionTestWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 640, height: 480),
+      styleMask: [.borderless],
+      backing: .buffered,
+      defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.contentView = view
+    displayWindows.append(window)
+    return view
   }
 
   @Test(
@@ -47,7 +65,7 @@ struct ViewBehaviorTests {
       view.fontSize == CGFloat(expected)
         && view.renderer.font.descriptor.size == CGFloat(expected)
     )
-    view.apply(Configuration.parse("font-size=20"))
+    view.apply(Configuration.configured([("font-size", "20")]))
     #expect(view.fontSize == 20 && view.renderer.font.descriptor.size == 20)
     view.apply(configuration)
     #expect(
@@ -88,7 +106,7 @@ struct ViewBehaviorTests {
   {
     _ = NSApplication.shared
     let controller = try TerminalWindowController(
-      configuration: Configuration.parse("command=/bin/sleep 30")
+      configuration: Configuration.configured([("command", "/bin/sleep 30")])
     )
     let window = try #require(controller.window)
     let view = controller.terminal
@@ -122,7 +140,9 @@ struct ViewBehaviorTests {
     throws
   {
     _ = NSApplication.shared
-    let config = Configuration.parse("command=/bin/sleep 30\nbackground-opacity=0.8")
+    let config = Configuration.configured([
+      ("command", "/bin/sleep 30"), ("background-opacity", "0.8"),
+    ])
     let controller = try TerminalWindowController(configuration: config)
     let window = try #require(controller.window)
     defer { window.close() }
@@ -204,8 +224,9 @@ struct ViewBehaviorTests {
   @Test(.enabled(if: hasMetal))
   func `detached blinking text stays visible through restart`() throws {
     let view = try makeView(
-      configuration: Configuration.parse("command=/bin/sleep 30")
+      configuration: Configuration.configured([("command", "/bin/sleep 30")])
     )
+    view.removeFromSuperview()
     defer { view.stop() }
     let descriptor = MTLTextureDescriptor.texture2DDescriptor(
       pixelFormat: .bgra8Unorm,
@@ -242,8 +263,9 @@ struct ViewBehaviorTests {
   func `detached animated shader frames stay suspended through restart`() throws
   {
     let view = try makeView(
-      configuration: Configuration.parse("command=/bin/sleep 30")
+      configuration: Configuration.configured([("command", "/bin/sleep 30")])
     )
+    view.removeFromSuperview()
     defer { view.stop() }
     try view.renderer.setPostProcessShader(
       """
@@ -268,7 +290,7 @@ struct ViewBehaviorTests {
     throws
   {
     let view = try makeView(
-      configuration: Configuration.parse("scrollback-limit=0")
+      configuration: Configuration.configured([("scrollback-limit", "0")])
     )
     view.session.resize(columns: 20, rows: 3)
     let prompt = "\u{1B}]133;A\u{7}$ \u{1B}]133;B\u{7}"
@@ -315,7 +337,7 @@ struct ViewBehaviorTests {
     ) throws
   {
     let view = try makeView(
-      configuration: Configuration.parse("scrollback-limit=0")
+      configuration: Configuration.configured([("scrollback-limit", "0")])
     )
     view.session.resize(columns: 20, rows: change == "evict" ? 5 : 8)
     let prompt = "\u{1B}]133;A\u{7}$ \u{1B}]133;B\u{7}"
@@ -433,7 +455,7 @@ struct ViewBehaviorTests {
     ) throws
   {
     let view = try makeView(
-      configuration: Configuration.parse("font-size=\(size)")
+      configuration: Configuration.configured([("font-size", "\(size)")])
     )
     view.perform(.increaseFontSize(1))
     #expect(view.fontSize == CGFloat(min(size + 1, 200)))
@@ -448,15 +470,21 @@ struct ViewBehaviorTests {
       _ zoomed: Bool
     ) throws
   {
-    let view = try makeView(configuration: Configuration.parse("font-size=14"))
+    let view = try makeView(
+      configuration: Configuration.configured([("font-size", "14")])
+    )
     if zoomed { view.perform(.increaseFontSize(5)) }
-    view.apply(Configuration.parse("font-size=20\nfont-feature=-liga"))
+    view.apply(
+      Configuration.configured([("font-size", "20"), ("font-feature", "-liga")])
+    )
     #expect(view.fontSize == (zoomed ? 19 : 20))
     #expect(view.renderer.font.descriptor.size == view.fontSize)
     #expect(view.renderer.font.descriptor.features == ["-liga"])
     view.perform(.resetFontSize)
     #expect(view.fontSize == 20)
-    view.apply(Configuration.parse("font-size=22\nfont-feature=-liga"))
+    view.apply(
+      Configuration.configured([("font-size", "22"), ("font-feature", "-liga")])
+    )
     #expect(view.fontSize == 22)
     #expect(view.renderer.font.descriptor.size == 22)
   }
@@ -504,4 +532,13 @@ struct ViewBehaviorTests {
     )
   }
 
+}
+
+@MainActor
+final class InteractionTestWindow: NSWindow {
+  // Interaction tests convert pixel coordinates at 2x. CI runners can have a
+  // 1x display, so pin the scale instead of inheriting the host's screen.
+  override var backingScaleFactor: CGFloat { 2 }
+  override var isVisible: Bool { true }
+  override var occlusionState: NSWindow.OcclusionState { [.visible] }
 }

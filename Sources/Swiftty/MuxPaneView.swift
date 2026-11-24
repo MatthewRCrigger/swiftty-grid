@@ -6,7 +6,7 @@ import SwifttyCore
 import SwifttyMac
 
 /// A decoded, validated frame with its app-owned renderer snapshot.
-struct MuxPresentation: @unchecked Sendable {
+struct MuxPresentation: Sendable {
   let frame: PaneFrame
   let snapshot: RenderSnapshot
 }
@@ -14,7 +14,7 @@ struct MuxPresentation: @unchecked Sendable {
 /// Selection on one frozen frame, in viewport cells. New output never
 /// changes it; the frame it was made on stays retained until it ends.
 struct FrozenSelection: Equatable {
-  enum Unit { case cell, word, line }
+  typealias Unit = TerminalPointer.SelectionUnit
   var anchor: (row: Int, column: Int)
   var head: (row: Int, column: Int)
   var unit: Unit
@@ -26,8 +26,12 @@ struct FrozenSelection: Equatable {
   /// Ordered, unit-expanded bounds clamped to the frame.
   func span(in frame: PaneFrame) -> HighlightSpan {
     let cols = frame.grid.columns
+    // An end above the frame starts at its first cell, one below ends at
+    // its last, whatever column the pointer was in.
     func clamp(_ p: (row: Int, column: Int)) -> (row: Int, column: Int) {
-      (min(max(p.row, 0), frame.grid.rows - 1), min(max(p.column, 0), cols - 1))
+      if p.row < 0 { return (0, 0) }
+      if p.row >= frame.grid.rows { return (frame.grid.rows - 1, cols - 1) }
+      return (p.row, min(max(p.column, 0), cols - 1))
     }
     let a = clamp(anchor)
     let b = clamp(head)
@@ -111,20 +115,38 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
   /// selection, IME placement and accessibility.
   private(set) var presented: MuxPresentation?
   /// Set while a selection freezes the presentation used for interaction.
+  /// With live selection it is instead the presentation the selection's
+  /// viewport coordinates refer to, and newer frames keep drawing.
   var frozen: MuxPresentation?
+  /// The live selection in the service's addresses (the shared
+  /// `PresentationSelection`), and the viewport selection it was last
+  /// placed as: a different `selection` means the user changed it.
+  var live: PresentationSelection?
+  var placedSelection: FrozenSelection?
+  /// Identifies the copy whose reply may still write the pasteboard.
+  var copyToken: UInt64 = 0
+  /// A drag past an edge asked to scroll; the next frame admits another.
+  var autoscrollPending = false
   var selection: FrozenSelection? {
     didSet {
       if selection != outputSelection?.selection { outputSelection = nil }
     }
   }
   var selectionDragged = false
-  private var retryScheduled = false
+  private lazy var display = TerminalDisplay(
+    view: self,
+    renderer: renderer,
+    suspendsWhenOccluded: false,
+    submissionPolicy: .availableGPUOnly
+  )
   private var localSequence: UInt64 = 0
-  var scrollAccumulator: CGFloat = 0
-  var horizontalScrollAccumulator: CGFloat = 0
+  let pointer = TerminalPointer()
   var pendingAnchor: ((row: Int, column: Int), MuxPresentation)?
   /// A left-button gesture reported to the program, not selecting.
-  var reportsLeftGesture = false
+  var reportsLeftGesture: Bool {
+    get { pointer.reportsLeftGesture }
+    set { pointer.reportsLeftGesture = newValue }
+  }
   /// The last reported pointer cell and button, so motion is sent only
   /// when it moves to another cell.
   var lastReported: (row: Int, column: Int, button: MuxMouse.Button)?
@@ -141,9 +163,11 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
   /// The link last found under the pointer, and the cell queried for it.
   var hoveredLink: MuxLink?
   var linkQuery: (row: Int, column: Int)?
-  var markedText = ""
-  private var markedSelection = NSRange(location: NSNotFound, length: 0)
-  private var interpretingEvent: NSEvent?
+  let composition = TerminalComposition()
+  var markedText: String { composition.text }
+  var accessibilityCache = AccessibilityTextCache()
+  let keyboard = TerminalKeyboard()
+  private var interpretingEvent: NSEvent? { keyboard.interpretingEvent }
   var isActivePane = false {
     didSet { if oldValue != isActivePane { needsDisplay = true } }
   }
@@ -151,24 +175,11 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
   init(pane: PaneID, configuration: Configuration) throws {
     self.pane = pane
     config = configuration
-    guard let device = MTLCreateSystemDefaultDevice() else {
-      throw RendererError.setup("no Metal device")
-    }
-    renderer = try MetalRenderer(
-      device: device,
-      fontManager: CoreTextFontManager(),
-      font: configuration.fontDescriptor(scale: 2)
-    )
-    super.init(frame: .zero, device: device)
-    (layer as? CAMetalLayer)?.maximumDrawableCount = 2
-    colorPixelFormat = .bgra8Unorm
-    framebufferOnly = true
-    isPaused = true
-    enableSetNeedsDisplay = true
-    autoResizeDrawable = true
+    renderer = try TerminalDisplay.makeRenderer(configuration: configuration)
+    super.init(frame: .zero, device: renderer.device)
+    TerminalDisplay.prepare(self)
     delegate = self
-    renderer.options = configuration.renderOptions(scale: 2)
-    layer?.isOpaque = configuration.backgroundOpacity >= 1
+    display.apply(configuration: configuration, scale: 2)
     loadShader()
     setAccessibilityRole(.textArea)
     setAccessibilityLabel("Terminal pane")
@@ -183,8 +194,14 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
   // it the active pane.
   override var canBecomeKeyView: Bool { false }
 
+  override func viewWillMove(toWindow newWindow: NSWindow?) {
+    if window !== newWindow { cancelComposition() }
+    super.viewWillMove(toWindow: newWindow)
+  }
+
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
+    display.observeVisibility()
     applyScale()
     // The focused pane draws from its window's key state.
     let center = NotificationCenter.default
@@ -196,6 +213,20 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
         center.addObserver(
           self,
           selector: #selector(windowKeyChanged),
+          name: name,
+          object: window
+        )
+      }
+    }
+    for name in [
+      NSWindow.didChangeOcclusionStateNotification,
+      NSWindow.didChangeScreenNotification,
+    ] {
+      center.removeObserver(self, name: name, object: nil)
+      if let window {
+        center.addObserver(
+          self,
+          selector: #selector(windowVisibilityChanged),
           name: name,
           object: window
         )
@@ -213,16 +244,35 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
     applyScale()
   }
 
+  /// The pane sits in a card that paints the terminal's background: the
+  /// default background clears to transparent so a translucent one is not
+  /// laid twice. Coloured cells still draw.
+  var inCard = false {
+    didSet {
+      guard inCard != oldValue else { return }
+      applyScale()
+      needsDisplay = true
+    }
+  }
+
+  /// The default background the last drawn frame cleared to: the
+  /// program's (OSC 11) or the theme's, the foreground under reverse
+  /// video. A card paints it around and beneath its transparent terminal.
+  private(set) var drawnBackground: UInt32? {
+    didSet { if drawnBackground != oldValue { onBackgroundChange?() } }
+  }
+  var onBackgroundChange: (() -> Void)?
+
   private func applyScale() {
     let scale = window?.backingScaleFactor ?? 2
     let font = config.fontDescriptor(scale: scale)
     if renderer.font.descriptor != font { renderer.setFont(font) }
-    var options = config.renderOptions(scale: scale)
-    options.preedit = renderer.options.preedit
-    options.preeditSelection = renderer.options.preeditSelection
-    options.underlinedSpan = renderer.options.underlinedSpan
-    renderer.options = options
-    layer?.isOpaque = config.backgroundOpacity >= 1
+    display.apply(configuration: config, scale: scale)
+    if inCard {
+      renderer.options.backgroundOpacity = 0
+      // Transparent pixels on an opaque layer composite black.
+      layer?.isOpaque = false
+    }
     updateFrameDriving()
     controller?.geometryChanged()
   }
@@ -238,30 +288,42 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
 
   /// `custom-shader`, as the direct view loads it.
   private func loadShader() {
-    do {
-      try renderer.setPostProcessShader(
-        config.customShader.map {
-          try String(contentsOfFile: $0, encoding: .utf8)
-        }
-      )
-    } catch {
-      FileHandle.standardError.write(
-        Data("swiftty: custom-shader: \(error)\n".utf8)
-      )
-      try? renderer.setPostProcessShader(nil)
-    }
+    display.loadShader(config.customShader)
     updateFrameDriving()
   }
 
   /// A shader that animates needs frames without new output.
-  private func updateFrameDriving() {
-    let rate = window?.screen?.maximumFramesPerSecond ?? 60
-    if preferredFramesPerSecond != rate { preferredFramesPerSecond = rate }
-    let animating = renderer.isAnimating && window != nil
-    if animating == isPaused {
-      isPaused = !animating
-      enableSetNeedsDisplay = !animating
+  private func updateFrameDriving() { display.updateFrameDriving() }
+
+  override var needsDisplay: Bool {
+    get { super.needsDisplay }
+    set {
+      if !newValue || display.shouldInvalidate() {
+        super.needsDisplay = newValue
+      }
     }
+  }
+
+  override func viewDidMoveToSuperview() {
+    super.viewDidMoveToSuperview()
+    display.observeVisibility()
+    windowVisibilityChanged()
+  }
+
+  override func viewDidHide() {
+    super.viewDidHide()
+    updateFrameDriving()
+  }
+
+  override func viewDidUnhide() {
+    super.viewDidUnhide()
+    windowVisibilityChanged()
+  }
+
+  @objc
+  private func windowVisibilityChanged() {
+    updateFrameDriving()
+    needsDisplay = true
   }
 
   override func setFrameSize(_ newSize: NSSize) {
@@ -280,20 +342,20 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
 
   // MARK: Presentation
 
-  /// Imports off the main actor; returns nil for frames that fail
-  /// validation (they never partially update a presentation).
+  /// Imports off the main actor. `frame` came from `MuxConnection`, which
+  /// delivers only frames that passed `FrameValidator` under `limits`.
   nonisolated static func importFrame(
     _ frame: PaneFrame,
     limits: MuxLimits
-  ) -> MuxPresentation? {
-    guard
-      let snapshot = try? FrameImporter.snapshot(
-        from: frame,
+  ) -> MuxPresentation {
+    MuxPresentation(
+      frame: frame,
+      snapshot: FrameImporter.snapshot(
+        fromValidated: frame,
         sequence: 1,
         limits: limits
       )
-    else { return nil }
-    return MuxPresentation(frame: frame, snapshot: snapshot)
+    )
   }
 
   /// Stores the newest frame for this binding; drawing admits it later.
@@ -310,12 +372,8 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
       return
     }
     pending = presentation
-    if frozen == nil { needsDisplay = true }
-    selectPendingOutput(in: presentation)
-    let target =
-      features.contains(.dropTargets)
-      ? presentation.frame.dropTarget?.types : nil
-    if target != dropTypes { dropTargetChanged(target) }
+    if frozen == nil || liveSelecting { needsDisplay = true }
+
   }
 
   /// Rebind/reattach/server change: drop every cached presentation.
@@ -326,11 +384,11 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
     selection = nil
     pendingAnchor = nil
     selectionDragged = false
-    scrollAccumulator = 0
-    horizontalScrollAccumulator = 0
+    pointer.reset()
     reportsLeftGesture = false
     lastReported = nil
     pendingOutput = nil
+    if dropTypes != nil { dropTargetChanged(nil) }
     hoveredLink = nil
     linkQuery = nil
     renderer.options.underlinedSpan = nil
@@ -341,12 +399,45 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
   func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
   func draw(in view: MTKView) {
-    renderer.options.isFocused =
-      isActivePane && window?.isKeyWindow == true
-      && window?.firstResponder === self
     let candidate: MuxPresentation?
     var drawn: RenderSnapshot?
-    if let frozen {
+    let isLive = liveSelecting
+    // A live selection placed on the frame to draw: its viewport
+    // selection (nil when wholly off the frame) and its addresses.
+    var placed: (selection: FrozenSelection?, carried: PresentationSelection)?
+    if isLive, let base = frozen {
+      let target = pending ?? presented ?? base
+      if var carried = carriedSelection(on: base),
+        let keys = target.frame.rowKeys
+      {
+        let unit = selection?.unit ?? Self.unit(carried.unit)
+        switch carried.place(in: keys, columns: target.frame.grid.columns) {
+        case .ended: break
+        case .hidden: placed = (nil, carried)
+        case let .shown(anchor, head):
+          placed = (
+            FrozenSelection(
+              anchor: (anchor.row, anchor.column),
+              head: (head.row, head.column),
+              unit: unit
+            ), carried
+          )
+        }
+      }
+      if let placed {
+        candidate = target
+        localSequence &+= 1
+        drawn = try? FrameImporter.snapshot(
+          from: target.frame,
+          selection: placed.selection?.span(in: target.frame),
+          sequence: localSequence
+        )
+      } else {
+        clearSelection()
+        candidate = pending ?? presented
+        drawn = candidate?.snapshot
+      }
+    } else if let frozen {
       candidate = frozen
       localSequence &+= 1
       let span = selection.map { $0.span(in: frozen.frame) }
@@ -361,14 +452,30 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
       drawn = candidate?.snapshot
     }
     guard let candidate, let drawn else { return }
-    // Offscreen views still vend drawables; content drawn there is never
-    // seen and must not become the interaction baseline.
-    let result: MetalRenderer.SubmitResult =
-      window == nil || isHiddenOrHasHiddenAncestor
-      ? .noDrawable : renderer.tryDraw(drawn, in: self)
+    let result = display.submit(
+      drawn,
+      focused: isActivePane && window?.isKeyWindow == true
+        && window?.firstResponder === self,
+      cursorBlink: config.cursorStyleBlink
+    )
     switch result {
     case .submitted:
-      if frozen == nil {
+      drawnBackground =
+        drawn.modes.contains(.reverseVideo)
+        ? drawn.palette.foreground : drawn.palette.background
+      if isLive, frozen != nil, let placed {
+        // The selection's coordinates now refer to what was drawn.
+        let output = outputSelection
+        self.live = placed.carried
+        selection = placed.selection
+        placedSelection = placed.selection
+        if let output, let moved = placed.selection {
+          outputSelection = (moved, output.text)
+        }
+        frozen = candidate
+        autoscrollPending = false
+      }
+      if frozen == nil || isLive {
         let tracking = presented?.frame.modes.contains(.mouseTracking)
         presented = candidate
         if tracking != candidate.frame.modes.contains(.mouseTracking) {
@@ -378,17 +485,14 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
         {
           pending = nil
         }
+        selectPendingOutput(in: candidate)
+        let target =
+          features.contains(.dropTargets)
+          ? candidate.frame.dropTarget?.types : nil
+        if target != dropTypes { dropTargetChanged(target) }
         NSAccessibility.post(element: self, notification: .valueChanged)
       }
-    case .busy, .noDrawable, .resourceUnavailable:
-      // Keep the newest pending frame; redraw when capacity returns.
-      guard !retryScheduled, window != nil else { return }
-      retryScheduled = true
-      DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(8)) {
-        [weak self] in
-        self?.retryScheduled = false
-        self?.needsDisplay = true
-      }
+    case .busy, .noDrawable, .resourceUnavailable: break
     }
   }
 
@@ -406,31 +510,45 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
   }
 
   override func keyDown(with event: NSEvent) {
-    if config.mouseHideWhileTyping { NSCursor.setHiddenUntilMouseMoves(true) }
-    if !hasMarkedText(), let binding = binding(for: event) {
-      let performed = perform(binding.action)
-      if binding.consumesInput, !binding.requiresPerformable || performed {
-        return
-      }
+    // A window that lost control takes it back on typing (Command
+    // shortcuts such as Copy still work read-only); the key is replayed
+    // in the window that gets it.
+    if let controller, !controller.holdsLease,
+      !event.modifierFlags.contains(.command)
+    {
+      let pane = pane
+      controller.requestControl { $0.views[pane]?.keyDown(with: event) }
+      return
+    }
+    if !hasMarkedText(),
+      controller?.handleAutomationKey(event, pane: pane) == true
+    {
+      return
+    }
+    display.resetBlink()
+    if keyboard.consumesKeyDown(
+      hideMouse: config.mouseHideWhileTyping,
+      composing: hasMarkedText(),
+      binding: binding(for: event),
+      perform: { perform($0.action) }
+    ) {
+      return
     }
     if event.modifierFlags.contains(.command) {
       super.keyDown(with: event)
       return
     }
-    // While composing, every key belongs to the input method.
-    if !hasMarkedText(),
-      let key = Self.semanticKey(
-        for: event,
-        keypadKeys: features.contains(.keypadKeys)
-      )
-    {
+    keyboard.interpret(event, in: self, composing: hasMarkedText()) {
+      guard
+        let key = Self.semanticKey(
+          for: event,
+          keypadKeys: features.contains(.keypadKeys)
+        )
+      else { return false }
       clearSelection()
       controller?.send(.key(key.0, key.1), to: pane)
-      return
+      return true
     }
-    interpretingEvent = event
-    interpretKeyEvents([event])
-    interpretingEvent = nil
   }
 
   /// Special keys and control combinations; nil for text, which goes
@@ -489,23 +607,103 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
   }
 
   /// The selected text; a command-output selection copies all of it.
+  /// Nil for a live selection reaching beyond the drawn rows: that text
+  /// comes from the service (`copy(_:)`).
   var selectedText: String? {
     guard let selection, let frame = frozen?.frame else { return nil }
     if let output = outputSelection, output.selection == selection {
       return output.text
+    }
+    if liveSelecting, let keys = frame.rowKeys,
+      carriedSelection(on: frozen!)?.isShown(in: keys) == false
+    {
+      return nil
     }
     return selection.text(in: frame)
   }
 
   @objc
   func copy(_ sender: Any?) {
-    guard let text = selectedText, !text.isEmpty else { return }
-    NSPasteboard.general.clearContents()
-    NSPasteboard.general.setString(text, forType: .string)
+    if let text = selectedText {
+      guard !text.isEmpty else { return }
+      NSPasteboard.general.clearContents()
+      NSPasteboard.general.setString(text, forType: .string)
+      return
+    }
+    guard liveSelecting, let base = frozen,
+      let selected = carriedSelection(on: base)
+    else { return }
+    copyToken &+= 1
+    let token = copyToken
+    controller?
+      .copySelection(CopySelectionRequest(selected, pane: pane)) {
+        [weak self] result in
+        // Only the selection this copy was made for writes the pasteboard.
+        // It is compared in the service's addresses, which do not move as
+        // output scrolls it.
+        guard let self, copyToken == token, let base = frozen,
+          carriedSelection(on: base) == selected
+        else { return }
+        switch result {
+        case let .success(text):
+          guard !text.isEmpty else { return }
+          NSPasteboard.general.clearContents()
+          NSPasteboard.general.setString(text, forType: .string)
+        case .failure:
+          clearSelection()
+          NSSound.beep()
+        }
+      }
+  }
+
+  // MARK: Live selection
+
+  /// The selection follows newer frames instead of freezing one: the
+  /// service offers live selection and frames carry row versions.
+  var liveSelecting: Bool {
+    features.contains(.liveSelection) && frozen?.frame.rowVersions != nil
+  }
+
+  /// The live selection in the service's addresses, as currently shown
+  /// on `base`: the one last placed while the user has not changed it,
+  /// otherwise the shown selection with each unmoved end kept.
+  func carriedSelection(on base: MuxPresentation) -> PresentationSelection? {
+    if let live, selection == placedSelection { return live }
+    guard let selection, let keys = base.frame.rowKeys else { return nil }
+    return PresentationSelection.carrying(
+      anchor: selection.anchor,
+      head: selection.head,
+      placed: placedSelection.map { ($0.anchor, $0.head) },
+      previous: live,
+      keys: keys,
+      rectangle: false,
+      unit: Self.unit(selection.unit)
+    )
+  }
+
+  static func unit(_ unit: FrozenSelection.Unit) -> PresentationSelection.Unit {
+    switch unit {
+    case .cell: .character
+    case .word: .word
+    case .line: .line
+    }
+  }
+
+  static func unit(_ unit: PresentationSelection.Unit) -> FrozenSelection.Unit {
+    switch unit {
+    case .character: .cell
+    case .word: .word
+    case .line: .line
+    }
   }
 
   @objc
   func paste(_ sender: Any?) {
+    if let controller, !controller.holdsLease {
+      let pane = pane
+      controller.requestControl { $0.views[pane]?.paste(nil) }
+      return
+    }
     // A program asking for kitty paste events reads what it wants itself.
     if features.contains(.kittyClipboard), modes.contains(.kittyPasteEvents) {
       clearSelection()
@@ -564,43 +762,16 @@ final class MuxPaneView: MTKView, MTKViewDelegate {
     }
   }
 
-  // MARK: Accessibility
-
-  override func accessibilityValue() -> Any? {
-    (frozen ?? presented).map { $0.frame.lines.joined(separator: "\n") }
-  }
-
-  override func accessibilitySelectedText() -> String? { selectedText }
-
   // MARK: Composition
 
   /// Discards (never commits) an unfinished composition so it cannot
   /// reach another shell.
   func cancelComposition() {
-    guard !markedText.isEmpty else { return }
-    markedText = ""
-    renderer.options.preedit = []
-    renderer.options.preeditSelection = nil
-    inputContext?.discardMarkedText()
-    needsDisplay = true
+    composition.discard(renderer: renderer, view: self)
   }
 
   fileprivate func setPreedit(_ text: String, selection: NSRange) {
-    let length = text.utf16.count
-    markedText = text
-    markedSelection =
-      length == 0
-      ? NSRange(location: NSNotFound, length: 0)
-      : NSRange(
-        location: min(length, max(0, selection.location)),
-        length: min(
-          length - min(length, max(0, selection.location)),
-          max(0, selection.length)
-        )
-      )
-    renderer.options.preedit = Array(text.unicodeScalars)
-    renderer.options.preeditSelection = text.isEmpty ? nil : markedSelection
-    needsDisplay = true
+    composition.set(text, selection: selection, renderer: renderer, view: self)
   }
 }
 
@@ -646,17 +817,9 @@ extension MuxPaneView: @MainActor NSTextInputClient {
     )
   }
 
-  func hasMarkedText() -> Bool { !markedText.isEmpty }
-
-  func markedRange() -> NSRange {
-    hasMarkedText()
-      ? NSRange(location: 0, length: markedText.utf16.count)
-      : NSRange(location: NSNotFound, length: 0)
-  }
-
-  func selectedRange() -> NSRange {
-    hasMarkedText() ? markedSelection : NSRange(location: NSNotFound, length: 0)
-  }
+  func hasMarkedText() -> Bool { !composition.text.isEmpty }
+  func markedRange() -> NSRange { composition.markedRange }
+  func selectedRange() -> NSRange { composition.selection }
 
   func validAttributesForMarkedText() -> [NSAttributedString.Key] { [] }
 
@@ -672,20 +835,13 @@ extension MuxPaneView: @MainActor NSTextInputClient {
     forCharacterRange range: NSRange,
     actualRange: NSRangePointer?
   ) -> NSRect {
-    guard let window, let cursor = presented?.frame.cursor else { return .zero }
-    let scale = window.backingScaleFactor
-    let x =
-      (renderer.options.paddingX + CGFloat(cursor.x) * renderer.cellSize.width)
-      / scale
-    let y =
-      (renderer.options.paddingY + CGFloat(cursor.y + 1)
-        * renderer.cellSize.height) / scale
-    let local = NSRect(
-      x: x,
-      y: bounds.height - y,
-      width: renderer.cellSize.width / scale,
-      height: renderer.cellSize.height / scale
+    let cursor = (frozen ?? presented)?.snapshot.cursor
+    return composition.firstRect(
+      for: range,
+      actualRange: actualRange,
+      cursor: (cursor?.x ?? 0, cursor?.y ?? 0),
+      renderer: renderer,
+      view: self
     )
-    return window.convertToScreen(convert(local, to: nil))
   }
 }

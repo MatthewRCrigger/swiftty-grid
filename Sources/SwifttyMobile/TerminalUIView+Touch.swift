@@ -9,7 +9,8 @@ import UIKit
 ///   click when the application tracks the mouse;
 /// - long press, then drag: select words; the edit menu follows;
 /// - one-finger pan, trackpad or wheel: scroll with momentum (wheel
-///   events or arrow keys when the application asks for them);
+///   events or arrow keys when the application asks for them); a mostly
+///   sideways drag pages between panes instead when `onPaneDrag` is set;
 /// - pointer drag: select cells, or report a drag;
 /// - pointer hover: motion reports (mode 1003), link underline, the
 ///   OSC 22 pointer shape; secondary click: menu;
@@ -94,6 +95,12 @@ extension TerminalUIView {
 
   var tracking: Bool { !lastModes.isDisjoint(with: Modes.mouseTracking) }
 
+  /// How scrolling reaches the terminal now. Wheel reports may reach a
+  /// program whose other mouse input stays local (a roaming host).
+  var scrollRouting: ScrollRouting {
+    ScrollRouting(modes: effectiveCapabilities.scrollModes(programModes))
+  }
+
   /// Grid cell under `point`, clamped to the grid.
   func cell(at point: CGPoint) -> (column: Int, row: Int) {
     let c = geometry.cell(at: point)
@@ -107,6 +114,17 @@ extension TerminalUIView {
     modifiers: KeyModifiers = []
   ) {
     guard tracking else { return }
+    reportMouse(action, button, at: point, modifiers: modifiers)
+  }
+
+  /// Sends a mouse report without checking `tracking`; the host drops it
+  /// unless the program tracks the mouse.
+  private func reportMouse(
+    _ action: MouseEvent.Action,
+    _ button: MouseEvent.Button,
+    at point: CGPoint,
+    modifiers: KeyModifiers
+  ) {
     let c = cell(at: point)
     let pixel = geometry.pixel(at: point)
     session.send(
@@ -258,7 +276,7 @@ extension TerminalUIView {
     let c = cell(at: point)
     let detect = configuration.linkURL
     let hovered = session.withState {
-      state -> (id: UInt8, span: HighlightSpan)? in
+      state -> (id: UInt32, span: HighlightSpan)? in
       let p = state.viewportPoint(row: c.row, column: c.column)
       guard let link = state.link(at: p, detectURLs: detect),
         LinkPolicy.openableURL(link.url) != nil
@@ -276,7 +294,7 @@ extension TerminalUIView {
 
   /// Underlines the link under the pointer: OSC 8 links by id (every
   /// cell of the link), detected URLs by their span.
-  private func setHoveredLink(_ link: (id: UInt8, span: HighlightSpan)?) {
+  private func setHoveredLink(_ link: (id: UInt32, span: HighlightSpan)?) {
     let id = link?.id ?? 0
     let span = link.flatMap { $0.id == 0 ? $0.span : nil }
     let isOver = link != nil
@@ -402,7 +420,7 @@ extension TerminalUIView {
         case .word: state.wordRange(at: p)
         case .line: state.lineRange(at: p)
         }
-      state.setSelection(
+      state.beginSelection(
         unit == .cell
           ? nil
           : Selection(anchor: span.start, head: span.end, rectangle: rectangle)
@@ -419,6 +437,29 @@ extension TerminalUIView {
   ) {
     guard let origin = selectionOrigin else { return }
     let c = geometry.cell(at: point)
+    // A remote (presentation) selection follows the host's rows across
+    // frames, so it extends by host address rather than from an origin
+    // that each installed frame invalidates.
+    if session.isPresentation,
+      session.withState({ $0.hasLivePresentationSelection })
+    {
+      let extended = session.mutate { state in
+        state.extendPresentationSelection(
+          toViewportRow: c.row,
+          column: c.column,
+          rectangle: rectangle
+        )
+      }
+      hasSelection = extended
+      if !extended {
+        selectionOrigin = nil
+      } else if scrollEdges {
+        let rows = session.withState { $0.rows }
+        let lines = SelectionMath.edgeScroll(row: c.row, rows: rows)
+        if lines != 0 { session.scrollViewport(by: lines) }
+      }
+      return
+    }
     let unit = selectionUnit
     let requiresSelection = hasSelection
     let scrollback = effectiveCapabilities.scrollback
@@ -528,18 +569,39 @@ extension TerminalUIView {
       stopMomentum()
       scrollAccumulator.reset()
       horizontalScrollAccumulator.reset()
+      panTravel = .zero
+      // Trackpad and wheel scrolls arrive with no touches: they never page.
+      panPages = onPaneDrag != nil && pan.numberOfTouches > 0 ? nil : false
       editMenu.dismissMenu()
     case .changed, .ended: break
     case .cancelled, .failed:
       stopMomentum()
       scrollAccumulator.reset()
       horizontalScrollAccumulator.reset()
+      if panPages == true { onPaneDrag?(.cancelled) }
+      panPages = false
       return
     default: return
     }
     // Translation can change on the first and final callbacks too.
-    let distance = pan.translation(in: self)
+    var distance = pan.translation(in: self)
     pan.setTranslation(.zero, in: self)
+    panTravel.x += distance.x
+    panTravel.y += distance.y
+    if panPages == nil {
+      panPages = PaneDrag.pages(panTravel)
+      if panPages == nil, pan.state != .ended { return }
+      // Decided (or lifted undecided): scroll by the travel held back.
+      if panPages != true { distance = panTravel }
+    }
+    if panPages == true {
+      onPaneDrag?(
+        pan.state == .ended
+          ? .ended(panTravel.x, velocity: pan.velocity(in: self).x)
+          : .changed(panTravel.x)
+      )
+      return
+    }
     scroll(
       lines: distance.y / geometry.lineHeight,
       columns: distance.x / (geometry.cellSize.width / geometry.scale),
@@ -567,12 +629,23 @@ extension TerminalUIView {
     at point: CGPoint,
     modifiers: KeyModifiers = []
   ) {
+    let routing = scrollRouting
+    var lines = lines
+    if routing == .viewport, liveKeyboardLift > 0, geometry.lineHeight > 0 {
+      let rest = keyboardReveal.consume(
+        lines * geometry.lineHeight,
+        lift: liveKeyboardLift,
+        atLive: lastViewportOffset == 0
+      )
+      lines = rest / geometry.lineHeight
+      updateKeyboardLift()
+    }
     let n = scrollAccumulator.add(lines)
-    switch ScrollRouting(modes: lastModes) {
+    switch routing {
     case .wheel:
       let horizontal = horizontalScrollAccumulator.add(columns)
       for _ in 0 ..< abs(n) {
-        sendMouse(
+        reportMouse(
           .press,
           n > 0 ? .wheelUp : .wheelDown,
           at: point,
@@ -580,7 +653,7 @@ extension TerminalUIView {
         )
       }
       for _ in 0 ..< abs(horizontal) {
-        sendMouse(
+        reportMouse(
           .press,
           horizontal > 0 ? .wheelLeft : .wheelRight,
           at: point,
@@ -613,7 +686,7 @@ extension TerminalUIView {
     momentumTimestamp = nil
     momentum = ScrollMomentum(velocity: velocity)
     horizontalMomentum = ScrollMomentum(
-      velocity: tracking ? horizontalVelocity : 0
+      velocity: scrollRouting == .wheel ? horizontalVelocity : 0
     )
     guard momentum.isActive || horizontalMomentum.isActive, !isRenderingPaused
     else { return }

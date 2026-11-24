@@ -19,15 +19,15 @@ public struct TerminalState: ~Copyable {
   /// Position of the live primary cursor while its grid is inactive;
   /// independent of the application's DECSC saved cursor.
   var inactivePrimaryCursor = Cursor()
-  private var savedPrimaryModes: Modes = .initial
-  private var savedAlternateModes: Modes = .initial
+  var savedPrimaryModes: Modes = .initial
+  var savedAlternateModes: Modes = .initial
 
-  public private(set) var scrollTop = 0
-  public private(set) var scrollBottom: Int
+  public internal(set) var scrollTop = 0
+  public internal(set) var scrollBottom: Int
   /// DECSLRM left/right margins (only settable with DECLRMM).
-  public private(set) var scrollLeft = 0
-  public private(set) var scrollRight: Int
-  private var tabStops: [Bool]
+  public internal(set) var scrollLeft = 0
+  public internal(set) var scrollRight: Int
+  var tabStops: [Bool]
 
   /// How plain erases treat protected cells: only ISO protection (SPA)
   /// shields them; DEC protection (DECSCA) applies to DECSED/DECSEL.
@@ -37,7 +37,7 @@ public struct TerminalState: ~Copyable {
   public internal(set) var modes: Modes = .initial
   /// Identifies each new synchronized frame, even when a single parser
   /// batch ends one frame and begins the next.
-  package private(set) var synchronizedOutputGeneration: UInt64 = 0
+  package internal(set) var synchronizedOutputGeneration: UInt64 = 0
   public internal(set) var cursorStyle = CursorStyle.block
   public internal(set) var palette: Palette
   var defaultPalette: Palette
@@ -47,9 +47,7 @@ public struct TerminalState: ~Copyable {
   var titleChanged = false
   var directoryBytes: [UInt8] = []
   var directoryChanged = false
-  /// Host of the last OSC 7 URL; empty for none or this machine.
-  var directoryHost = ""
-  private var spareGraphemes = GraphemeTable()
+  var spareGraphemes = GraphemeTable()
 
   public var title: String { String(decoding: titleBytes, as: UTF8.self) }
 
@@ -108,23 +106,21 @@ public struct TerminalState: ~Copyable {
   public var events: [TerminalEvent] = []
 
   /// Kitty keyboard protocol flags stack (`CSI > flags u`); the top applies.
-  public private(set) var keyboardFlagStack: [UInt8] = []
-  private var inactiveKeyboardFlagStack: [UInt8] = []
+  public internal(set) var keyboardFlagStack: [UInt8] = []
+  var inactiveKeyboardFlagStack: [UInt8] = []
   public var keyboardFlags: UInt8 { keyboardFlagStack.last ?? 0 }
 
-  /// OSC 8 targets by id (1...255); ids are reused round-robin.
-  var hyperlinks: [[UInt8]] = []
-  var hyperlinkHashes: [UInt64] = []
-  var hyperlinkIndex: [UInt64: UInt8] = Dictionary(minimumCapacity: 512)
-  var freeHyperlinkSlots: [Int] = []
-  /// Per slot: last absolute row its cells can occupy (.max: unknown).
-  var hyperlinkLastRow: [Int] = []
-  var hyperlinkScanCooldown = 0
-  /// First history row at which a fully occupied link table may free an id.
-  var hyperlinkReclaimAfter: Int?
+  /// OSC 8 links by id (1...`CellAttributes.maxLink`).
+  var hyperlinks = HyperlinkTable()
 
   /// Current selection, in absolute rows (see `Selection.swift`).
   public internal(set) var selection: Selection?
+  /// Presentation mode: the installed frame's host row keys, the live
+  /// selection in host addresses, and the engine selection it was last
+  /// placed as (a different selection means the user changed it).
+  var presentationKeys: [[UInt64]]?
+  var presentationSelection: PresentationSelection?
+  var presentedSelection: Selection?
   /// Changes when resizing, clearing, resetting or switching screens
   /// invalidates retained cell coordinates. Ordinary output and viewport
   /// scrolling preserve it; callers must also check row availability.
@@ -185,6 +181,14 @@ public struct TerminalState: ~Copyable {
   public internal(set) var lastExitCode: Int?
   /// A command finished since the last `takeEvents()`.
   var commandFinished = false
+  /// Optional shell automation observer, invoked for every OSC 133 D marker.
+  /// The command is reconstructed from the marked input cells at OSC 133 C.
+  /// Empty when the shell did not provide an input boundary.
+  public var onShellCommandFinished: (@Sendable (String, Int?) -> Void)?
+  /// Optional observer of OSC 133 C: the command line about to run, as
+  /// `onShellCommandFinished` later reports it.
+  public var onShellCommandStarted: (@Sendable (String) -> Void)?
+  var shellCommand = ""
   var titleStack: [[UInt8]] = []
   var penStack: [CellAttributes] = []
   /// Appearance the host reports for color-scheme queries (mode 2031).
@@ -245,6 +249,12 @@ public struct TerminalState: ~Copyable {
     directoryBytes.reserveCapacity(256)
   }
 
+  /// Host of the latest OSC 7 URL: nil or empty for none. A remote host
+  /// names a directory on another machine.
+  public var workingDirectoryHost: String? {
+    URL(string: String(decoding: directoryBytes, as: UTF8.self))?.host
+  }
+
   /// Pending events, with title and directory changes coalesced to the
   /// latest value.
   public mutating func takeEvents() -> [TerminalEvent] {
@@ -259,11 +269,6 @@ public struct TerminalState: ~Copyable {
       url.isFileURL
     {
       out.append(.workingDirectory(url.path))
-      let host = url.host ?? ""
-      if host != directoryHost {
-        directoryHost = host
-        out.append(.workingHost(host))
-      }
     }
     if commandFinished { out.append(.commandFinished(exitCode: lastExitCode)) }
     titleChanged = false
@@ -293,6 +298,7 @@ public struct TerminalState: ~Copyable {
   // MARK: C0 controls
 
   mutating func execute(_ byte: UInt8) {
+    graphemes.releaseTail()
     switch byte {
     case 0x07: events.append(.bell)
     case 0x08: cursorLeft(1)  // BS
@@ -314,6 +320,39 @@ public struct TerminalState: ~Copyable {
   }
 
   /// IND: move down, scrolling the region at its bottom margin.
+  /// LF for the parser's CR LF fast path: a recycled row is blanked lazily,
+  /// so the next line writes most cells once. Selections read cells while
+  /// scrolling, so they opt out.
+  mutating func lineFeedDeferringClears() {
+    guard selection == nil else { return execute(0x0A) }
+    grid.storage.deferClears = true
+    execute(0x0A)
+    grid.storage.deferClears = false
+  }
+
+  /// Required before anything but the ASCII and CR LF fast paths touches cells.
+  @inline(__always)
+  mutating func resolveDeferredClears() { grid.resolveStaleRows() }
+
+  /// REP: printable ASCII takes the same bulk path as parsed text.
+  private mutating func repeatLastPrinted(_ count: Int) {
+    let c = lastPrinted
+    guard (0x20 ... 0x7E).contains(c) else {
+      for _ in 0 ..< count { print(c) }
+      return
+    }
+    withUnsafeTemporaryAllocation(of: UInt8.self, capacity: min(count, 256)) {
+      buffer in
+      buffer.initialize(repeating: UInt8(c))
+      var left = count
+      while left > 0 {
+        let n = min(left, buffer.count)
+        printASCII(UnsafeBufferPointer(rebasing: buffer[..<n]))
+        left -= n
+      }
+    }
+  }
+
   mutating func index() {
     cursor.pendingWrap = false
     if cursor.y < scrollTop || cursor.y > scrollBottom {
@@ -740,7 +779,6 @@ public struct TerminalState: ~Copyable {
     return Cell(glyph: 0, attributes: attributes, width: 1)
   }
 
-  /// Copies the margin columns of row `src` onto row `dst`.
   private func copyMarginCells(from src: Int, to dst: Int) {
     let n = scrollRight - scrollLeft + 1
     (grid._unsafeRow(dst) + scrollLeft)
@@ -849,22 +887,29 @@ public struct TerminalState: ~Copyable {
 
   // MARK: CSI
 
-  mutating func csiDispatch(_ csi: borrowing CSISequence) {
-    let marker = csi.marker
-    let inter = csi.intermediate
+  mutating func csiDispatch(_ csi: UnsafePointer<CSISequence>) {
+    graphemes.releaseTail()
+    let marker = csi.pointee.marker
+    let inter = csi.pointee.intermediate
     if marker == 0, inter == 0 {
       dispatchPlainCSI(csi)
       return
     }
-    switch (marker, inter, csi.final) {
+    switch (marker, inter, csi.pointee.final) {
     case (0x3F, 0, 0x68):
-      for i in 0 ..< csi.count { setDECMode(csi.value(i), true) }  // ? h
+      for i in 0 ..< csi.pointee.count {
+        setDECMode(csi.pointee.value(i), true)
+      }  // ? h
     case (0x3F, 0, 0x6C):
-      for i in 0 ..< csi.count { setDECMode(csi.value(i), false) }  // ? l
-    case (0x3F, 0, 0x4A): eraseDisplay(csi.value(0), selective: true)  // DECSED
-    case (0x3F, 0, 0x4B): eraseLine(csi.value(0), selective: true)  // DECSEL
+      for i in 0 ..< csi.pointee.count {
+        setDECMode(csi.pointee.value(i), false)
+      }  // ? l
+    case (0x3F, 0, 0x4A):  // DECSED
+      eraseDisplay(csi.pointee.value(0), selective: true)
+    case (0x3F, 0, 0x4B):  // DECSEL
+      eraseLine(csi.pointee.value(0), selective: true)
     case (0, 0x22, 0x71):  // DECSCA " q
-      switch csi.value(0) {
+      switch csi.pointee.value(0) {
       case 0, 2: cursor.isProtected = false
       case 1:
         cursor.isProtected = true
@@ -872,7 +917,7 @@ public struct TerminalState: ~Copyable {
       default: break
       }
     case (0x3F, 0, 0x6E):  // ? n
-      switch csi.value(0) {
+      switch csi.pointee.value(0) {
       case 6: reply("\u{1B}[?\(reportedRow);\(reportedColumn)R")
       case 996: reportColorScheme()
       default: break
@@ -880,24 +925,26 @@ public struct TerminalState: ~Copyable {
     case (0, 0x23, 0x7B), (0, 0x23, 0x70): pushPen()  // XTPUSHSGR # { and # p
     case (0, 0x23, 0x7D), (0, 0x23, 0x71): popPen()  // XTPOPSGR # } and # q
     case (0x3F, 0x24, 0x70):  // DECRQM ? $ p
-      let n = csi.value(0)
+      let n = csi.pointee.value(0)
       // Paste events are unusable unless their follow-up read is served.
       let state =
         n == 5522 && kittyClipboardReader == nil
         ? 0 : Modes.dec(n).map { modes.contains($0) ? 1 : 2 } ?? 0
       reply("\u{1B}[?\(n);\(state)$y")
     case (0, 0x24, 0x70):  // ANSI DECRQM
-      let n = csi.value(0)
+      let n = csi.pointee.value(0)
       let state = Modes.ansi(n).map { modes.contains($0) ? 1 : 2 } ?? 0
       reply("\u{1B}[\(n);\(state)$y")
     case (0x3E, 0, 0x63): reply("\u{1B}[>1;10;0c")  // DA2
     case (0x3E, 0, 0x6D):  // XTMODKEYS > m
       // Only `modifyOtherKeys` state 2 changes encoding. Every valid
       // request leaves it, as in Ghostty.
-      let resource = csi.value(0)
-      let value = csi.value(1)
-      guard csi.count <= 2, [0, 1, 2, 4].contains(resource) else { return }
-      if csi.count == 2, resource == 4, value == 2 {
+      let resource = csi.pointee.value(0)
+      let value = csi.pointee.value(1)
+      guard csi.pointee.count <= 2, [0, 1, 2, 4].contains(resource) else {
+        return
+      }
+      if csi.pointee.count == 2, resource == 4, value == 2 {
         modes.insert(.modifyOtherKeys)
       } else {
         modes.remove(.modifyOtherKeys)
@@ -909,8 +956,8 @@ public struct TerminalState: ~Copyable {
       else { return }
       reply("\u{1B}P>|\(terminalVersion)\u{1B}\\")
     case (0, 0x20, 0x71):  // DECSCUSR
-      let p = csi.value(0)
-      guard csi.count <= 1, (0 ... 6).contains(p) else { return }
+      let p = csi.pointee.value(0)
+      guard csi.pointee.count <= 1, (0 ... 6).contains(p) else { return }
       cursorStyle = p <= 2 ? .block : p <= 4 ? .underline : .bar
       if p == 0 || p % 2 == 1 {
         modes.insert(.cursorBlink)
@@ -929,16 +976,16 @@ public struct TerminalState: ~Copyable {
     case (0x3F, 0, 0x75): reply("\u{1B}[?\(keyboardFlags)u")
     case (0x3E, 0, 0x75):  // push
       if keyboardFlagStack.count >= 16 { keyboardFlagStack.removeFirst() }
-      keyboardFlagStack.append(UInt8(clamping: csi.value(0)) & 0x1F)
+      keyboardFlagStack.append(UInt8(clamping: csi.pointee.value(0)) & 0x1F)
     case (0x3C, 0, 0x75):  // pop
       keyboardFlagStack.removeLast(
-        min(max(csi.value(0), 1), keyboardFlagStack.count)
+        min(max(csi.pointee.value(0), 1), keyboardFlagStack.count)
       )
     case (0x3D, 0, 0x75):  // set
-      let flags = UInt8(clamping: csi.value(0)) & 0x1F
+      let flags = UInt8(clamping: csi.pointee.value(0)) & 0x1F
       let current = keyboardFlags
       let updated: UInt8 =
-        switch csi.param(1, default: 1) {
+        switch csi.pointee.param(1, default: 1) {
         case 2: current | flags
         case 3: current & ~flags
         default: flags
@@ -952,9 +999,9 @@ public struct TerminalState: ~Copyable {
     }
   }
 
-  private mutating func dispatchPlainCSI(_ csi: borrowing CSISequence) {
-    let n = csi.param(0, default: 1)
-    switch csi.final {
+  private mutating func dispatchPlainCSI(_ csi: UnsafePointer<CSISequence>) {
+    let n = csi.pointee.param(0, default: 1)
+    switch csi.pointee.final {
     case 0x40: insertBlanks(n)  // ICH @
     case 0x41: cursorUp(n)  // CUU A
     case 0x42: cursorDown(n)  // CUD B
@@ -971,11 +1018,11 @@ public struct TerminalState: ~Copyable {
     case 0x47, 0x60: setCursorColumn(n)  // CHA G, HPA `
     case 0x48, 0x66:
       // CUP H, HVP f
-      setCursorPosition(row: n, column: csi.param(1, default: 1))
+      setCursorPosition(row: n, column: csi.pointee.param(1, default: 1))
     case 0x49: tabForward(n)  // CHT I
-    case 0x4A: eraseDisplay(csi.value(0))  // ED J
+    case 0x4A: eraseDisplay(csi.pointee.value(0))  // ED J
     // EL K
-    case 0x4B: eraseLine(csi.value(0))
+    case 0x4B: eraseLine(csi.pointee.value(0))
     case 0x4C: insertLines(n)  // IL L
     case 0x4D: deleteLines(n)  // DL M
     case 0x50: deleteChars(n)  // DCH P
@@ -984,43 +1031,49 @@ public struct TerminalState: ~Copyable {
     case 0x58: eraseChars(n)  // ECH X
     case 0x5A: tabBackward(n)  // CBT Z
     case 0x62:  // REP b
-      if lastPrinted != 0 {
-        let c = lastPrinted
-        for _ in 0 ..< min(n, 65535) { print(c) }
-      }
-    case 0x63: if csi.value(0) == 0 { reply("\u{1B}[?62;22c") }  // DA1
+      if lastPrinted != 0 { repeatLastPrinted(min(n, 65535)) }
+    case 0x63: if csi.pointee.value(0) == 0 { reply("\u{1B}[?62;22c") }  // DA1
     case 0x64: setCursorRow(n)  // VPA d
     case 0x67:  // TBC g
-      switch csi.value(0) {
+      switch csi.pointee.value(0) {
       case 0: tabStops[cursor.x] = false
       case 3: for i in tabStops.indices { tabStops[i] = false }
       default: break
       }
     // SM h
-    case 0x68: for i in 0 ..< csi.count { setANSIMode(csi.value(i), true) }
+    case 0x68:
+      for i in 0 ..< csi.pointee.count {
+        setANSIMode(csi.pointee.value(i), true)
+      }
     // RM l
-    case 0x6C: for i in 0 ..< csi.count { setANSIMode(csi.value(i), false) }
+    case 0x6C:
+      for i in 0 ..< csi.pointee.count {
+        setANSIMode(csi.pointee.value(i), false)
+      }
     case 0x6D: selectGraphicRendition(csi)  // SGR m
     // DSR n
     case 0x6E:
-      switch csi.value(0) {
+      switch csi.pointee.value(0) {
       case 5: reply("\u{1B}[0n")
       case 6: reply("\u{1B}[\(reportedRow);\(reportedColumn)R")
       default: break
       }
     case 0x72:  // DECSTBM r
-      let top = max(1, csi.value(0))
-      let bottom = min(rows, csi.value(1) == 0 ? rows : csi.value(1))
+      let top = max(1, csi.pointee.value(0))
+      let bottom = min(
+        rows,
+        csi.pointee.value(1) == 0 ? rows : csi.pointee.value(1)
+      )
       if top < bottom {
         scrollTop = top - 1
         scrollBottom = bottom - 1
         setCursorPosition(row: 1, column: 1)
       }
     case 0x73:  // DECSLRM s, or SCOSC without parameters unless DECLRMM
-      if csi.count == 0, !modes.contains(.leftRightMargin) {
+      if csi.pointee.count == 0, !modes.contains(.leftRightMargin) {
         saveCursor()
       } else {
-        setLeftRightMargins(csi.value(0), csi.value(1))
+        setLeftRightMargins(csi.pointee.value(0), csi.pointee.value(1))
       }
     case 0x74: windowOperation(csi)  // XTWINOPS t
     case 0x75: restoreCursor()  // SCORC u
@@ -1069,8 +1122,8 @@ public struct TerminalState: ~Copyable {
     modes.contains(.origin) ? cursor.y - scrollTop + 1 : cursor.y + 1
   }
 
-  private mutating func windowOperation(_ csi: borrowing CSISequence) {
-    switch csi.value(0) {
+  private mutating func windowOperation(_ csi: UnsafePointer<CSISequence>) {
+    switch csi.pointee.value(0) {
     case 14:
       reply("\u{1B}[4;\(textAreaPixelSize.height);\(textAreaPixelSize.width)t")
     case 16: reply("\u{1B}[6;\(cellPixelSize.height);\(cellPixelSize.width)t")
@@ -1175,6 +1228,7 @@ public struct TerminalState: ~Copyable {
     invalidateSelection()
     swap(&grid, &inactiveGrid)
     swap(&keyboardFlagStack, &inactiveKeyboardFlagStack)
+    pinPenLink()
     modes.insert(.alternateScreen)
     viewportOffset = 0
     damage.setFull()
@@ -1186,6 +1240,7 @@ public struct TerminalState: ~Copyable {
     invalidateSelection()
     swap(&grid, &inactiveGrid)
     swap(&keyboardFlagStack, &inactiveKeyboardFlagStack)
+    pinPenLink()
     modes.remove(.alternateScreen)
     damage.setFull()
   }
@@ -1257,13 +1312,7 @@ public struct TerminalState: ~Copyable {
     invalidateSelection()
     resetShellState()
     if programStatus.reset() { programStatusChanged = true }
-    hyperlinks = []
-    hyperlinkHashes = []
-    hyperlinkIndex.removeAll(keepingCapacity: true)
-    freeHyperlinkSlots = []
-    hyperlinkLastRow = []
-    hyperlinkScanCooldown = 0
-    hyperlinkReclaimAfter = nil
+    hyperlinks = HyperlinkTable()
     keyboardFlagStack = []
     inactiveKeyboardFlagStack = []
     if isAlternateScreen { leaveAlternateScreen() }
@@ -1301,6 +1350,7 @@ public struct TerminalState: ~Copyable {
   // MARK: ESC
 
   mutating func escDispatch(intermediate: UInt8, final: UInt8) {
+    graphemes.releaseTail()
     switch (intermediate, final) {
     case (0, 0x37): saveCursor()  // DECSC 7
     case (0, 0x38): restoreCursor()  // DECRC 8
@@ -1368,6 +1418,7 @@ public struct TerminalState: ~Copyable {
   // MARK: Resize
 
   public mutating func resize(columns newColumns: Int, rows newRows: Int) {
+    graphemes.releaseTail()
     let newColumns = max(1, newColumns)
     let newRows = max(1, newRows)
     if modes.contains(.synchronizedOutput) {
@@ -1456,6 +1507,7 @@ public struct TerminalState: ~Copyable {
     var fresh = GraphemeTable()
     swap(&fresh, &spareGraphemes)  // reuse the previous table's capacity
     fresh.removeAll()
+    graphemes.prepareForAdoption()
     for y in 0 ..< grid.rows {
       let row = grid._unsafeRow(y)
       for x in 0 ..< grid.columns where row[x].isGrapheme {
@@ -1489,6 +1541,7 @@ public struct TerminalState: ~Copyable {
     )
     swap(&graphemes, &fresh)
     swap(&fresh, &spareGraphemes)
+    graphemes.releaseTail()
   }
 
   // MARK: Tables

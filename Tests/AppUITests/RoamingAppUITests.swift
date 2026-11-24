@@ -116,7 +116,7 @@ final class RoamingAppUITests: XCTestCase {
 
     // Detach keeps the shell on the host; reopening resumes it.
     openSessionMenuItem(id: "session.detach", title: "Detach")
-    let resumable = anyText("Detached session — open to resume")
+    let resumable = anyText("Detached workspace — open to resume")
     XCTAssertTrue(
       resumable.waitForExistence(timeout: 10),
       "no resumable session listed"
@@ -127,7 +127,7 @@ final class RoamingAppUITests: XCTestCase {
     typeLine("echo again-$UI_MARK")
     waitForScreen(containing: "again-kept-7")
 
-    press(element("terminal.close"))
+    closeTerminal()
     XCTAssertTrue(element("hosts.add").waitForExistence(timeout: 10))
   }
 
@@ -179,7 +179,7 @@ final class RoamingAppUITests: XCTestCase {
     waitForConnected()
     typeLine("echo root-$((6*7))")
     waitForScreen(containing: "root-42")
-    press(element("terminal.close"))
+    closeTerminal(ordinarySSH: true)
     XCTAssertTrue(element("hosts.add").waitForExistence(timeout: 10))
   }
 
@@ -211,7 +211,7 @@ final class RoamingAppUITests: XCTestCase {
     waitForConnected()
     typeLine("echo password-$((6*7))")
     waitForScreen(containing: "password-42")
-    press(element("terminal.close"))
+    closeTerminal(ordinarySSH: true)
     XCTAssertTrue(element("hosts.add").waitForExistence(timeout: 10))
   }
 
@@ -225,7 +225,17 @@ final class RoamingAppUITests: XCTestCase {
     replaceText(in: element("host.address"), with: server.host)
     replaceText(in: element("host.port"), with: server.port)
     replaceText(in: element("host.username"), with: server.user)
-    press(element("host.save"))
+    let save = element("host.save")
+    #if os(iOS) && !targetEnvironment(macCatalyst)
+    // On a device the form sheet moves while the keyboard animates, and a
+    // tap that arrives mid-move misses Save. Let it settle first.
+    dismissKeyboard()
+    #endif
+    press(save)
+    // A missed tap leaves the form open; a saved host closes it.
+    if !hostRow(nickname).waitForExistence(timeout: 5), save.exists {
+      press(save)
+    }
     XCTAssertTrue(
       hostRow(nickname).waitForExistence(timeout: 10),
       "host not saved"
@@ -331,6 +341,20 @@ final class RoamingAppUITests: XCTestCase {
     }
   }
 
+  /// Leaves the terminal: Close on the Mac, the menu's Detach (or, for an
+  /// ordinary SSH shell, Disconnect) on iPhone and iPad.
+  private func closeTerminal(ordinarySSH: Bool = false) {
+    #if os(macOS) || targetEnvironment(macCatalyst)
+    press(element("terminal.close"))
+    #else
+    if ordinarySSH {
+      openSessionMenuItem(id: "session.disconnect", title: "Disconnect")
+    } else {
+      openSessionMenuItem(id: "session.detach", title: "Detach")
+    }
+    #endif
+  }
+
   private func openSessionMenuItem(id: String, title: String) {
     let menu = element("session.menu")
     XCTAssertTrue(menu.waitForExistence(timeout: 10))
@@ -385,6 +409,20 @@ final class RoamingAppUITests: XCTestCase {
 
   /// A click on macOS (synthesized taps do not focus fields there), a tap
   /// elsewhere.
+  #if os(iOS) && !targetEnvironment(macCatalyst)
+  /// Hides the on-screen keyboard (iPad has a key for it) and waits for it
+  /// to leave. A phone keyboard, or one off screen (a simulator with a
+  /// hardware keyboard reports it below the display), is left alone.
+  private func dismissKeyboard() {
+    let keyboard = app.keyboards.firstMatch
+    guard keyboard.exists else { return }
+    let hide = keyboard.buttons["Hide keyboard"]
+    guard hide.exists, hide.isHittable else { return }
+    hide.tap()
+    _ = keyboard.waitForNonExistence(timeout: 3)
+  }
+  #endif
+
   private func press(_ element: XCUIElement) {
     #if os(macOS) || targetEnvironment(macCatalyst)
     // Rows can report not hittable while a sheet finishes closing.
@@ -410,7 +448,7 @@ final class RoamingAppUITests: XCTestCase {
       "hosts.add": ["Add Host"], "host.save": ["Save"],
       "terminal.close": ["Close"],
       // Catalyst shows a toolbar menu as "More".
-      "session.menu": ["Session", "More"], "sftp.done": ["Done"],
+      "session.menu": ["Workspace", "Session", "More"], "sftp.done": ["Done"],
     ]
     if let names = labels[id] {
       return app.descendants(matching: .any)
@@ -505,7 +543,6 @@ final class RoamingAppUITests: XCTestCase {
 }
 
 extension XCUIElement {
-  /// Whether this element currently receives typed text.
   fileprivate var hasFocusForTyping: Bool {
     (value(forKey: "hasKeyboardFocus") as? Bool) ?? false
   }

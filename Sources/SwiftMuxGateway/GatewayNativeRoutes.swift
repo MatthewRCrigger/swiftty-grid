@@ -1,0 +1,207 @@
+import SwiftMuxGuardian
+import SwiftMuxProtocol
+import SwiftMuxXPC
+
+/// Bounded owner of native routes. The directory is monitored by its caller.
+/// Selections reuse listeners; each accepted connection still validates authority.
+package actor GatewayNativeRoutes {
+  private struct Route {
+    var authority: GuardianAuthority
+    let listener: GatewayNativeEndpoint
+    /// Released by a planned replacement: kept while the candidate is
+    /// still publishing, rather than pruned as replaced.
+    var migratedAt: ContinuousClock.Instant? = nil
+    /// A transaction is running; inventory may show either owner.
+    var migrating = false
+  }
+
+  private let supervisor: GatewaySupervisor
+  private let directory: GatewayWorkspaceDirectory
+  private let peerRequirement: String?
+  private let capacity: Int
+  private let admission: GatewayNativeAdmission
+  private var routes: [WorkspaceID: Route] = [:]
+  private var busy = false
+  /// Selections queued behind an in-flight reconcile or selection.
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+  private var closed = false
+
+  package init(
+    supervisor: GatewaySupervisor,
+    directory: GatewayWorkspaceDirectory,
+    peerRequirement: String?,
+    capacity: Int = 32,
+    connectionLimit: Int = 64
+  ) throws {
+    guard capacity > 0, capacity <= 4096 else {
+      throw MuxError(.invalidRequest, "invalid native route capacity")
+    }
+    self.supervisor = supervisor
+    self.directory = directory
+    self.peerRequirement = peerRequirement
+    self.capacity = capacity
+    admission = try GatewayNativeAdmission(limit: connectionLimit)
+  }
+
+  package var routeCount: Int { routes.count }
+  package var connectionCount: Int { admission.count }
+
+  package func endpoint(
+    for selector: WorkspaceSelector,
+    expectedAuthority: GuardianAuthority? = nil
+  ) async throws -> SMXEndpoint {
+    // A selection waits out a background reconcile rather than failing.
+    try await acquire()
+    defer { release() }
+    try await prune()
+    let authority = try await directory.nativeAuthority(for: selector)
+    try checkOpen()
+    guard expectedAuthority == nil || expectedAuthority == authority else {
+      throw MuxError(.staleAttachment, "selected workspace authority changed")
+    }
+    if let route = routes[authority.workspace] {
+      guard route.authority == authority else {
+        throw MuxError(
+          .staleAttachment,
+          "workspace authority changed during selection"
+        )
+      }
+      return route.listener.endpoint
+    }
+    guard routes.count < capacity else {
+      throw MuxError(.resourceLimit, "native route capacity exhausted")
+    }
+    let listener = try GatewayNativeEndpoint(
+      supervisor: supervisor,
+      authority: authority,
+      peerRequirement: peerRequirement,
+      capacity: 256,
+      admission: admission
+    )
+    routes[authority.workspace] = Route(
+      authority: authority,
+      listener: listener
+    )
+    return listener.endpoint
+  }
+
+  /// Hold the route through a planned replacement's transaction.
+  package func beginMigration(_ workspace: WorkspaceID) {
+    routes[workspace]?.migrating = true
+  }
+
+  /// The transaction finished without release: ordinary pruning resumes.
+  package func endMigration(_ workspace: WorkspaceID) {
+    routes[workspace]?.migrating = false
+  }
+
+  /// A planned replacement released `workspace` from `old` to `next`: the
+  /// listener and its relays continue rather than closing (§6).
+  package func migrated(
+    _ workspace: WorkspaceID,
+    from old: GuardianAuthority,
+    to next: GuardianAuthority
+  ) {
+    guard !closed, var route = routes[workspace], route.authority == old else {
+      return
+    }
+    route.authority = next
+    route.migratedAt = .now
+    route.migrating = false
+    routes[workspace] = route
+    route.listener.rebind(to: next)
+  }
+
+  /// An aborted replacement resumed the same worker under `next`.
+  package func reauthorized(
+    _ workspace: WorkspaceID,
+    from old: GuardianAuthority,
+    to next: GuardianAuthority
+  ) {
+    guard !closed, var route = routes[workspace], route.authority == old else {
+      return
+    }
+    route.authority = next
+    route.migrating = false
+    routes[workspace] = route
+    route.listener.reauthorize(to: next)
+  }
+
+  /// Call after inventory changes, or before selection (done automatically).
+  /// Retirement disconnects frontend transports, never guardian-owned processes.
+  package func reconcile() async throws {
+    try begin()
+    defer { release() }
+    try await prune()
+  }
+
+  package func close() async {
+    closed = true
+    wakeWaiters()
+    // Keep entries until cancelled so a concurrent close also drains them.
+    for route in Array(routes.values) { await route.listener.close() }
+    routes.removeAll()
+  }
+
+  private func begin() throws {
+    try checkOpen()
+    guard !busy else {
+      throw MuxError(.quiescing, "native routes are reconciling")
+    }
+    busy = true
+  }
+
+  private func acquire() async throws {
+    try checkOpen()
+    while busy {
+      await withCheckedContinuation { waiters.append($0) }
+      try checkOpen()
+    }
+    busy = true
+  }
+
+  private func release() {
+    busy = false
+    wakeWaiters()
+  }
+
+  /// Woken waiters re-check `busy`, so waking all of them is safe.
+  private func wakeWaiters() {
+    let pending = waiters
+    waiters.removeAll()
+    for waiter in pending { waiter.resume() }
+  }
+
+  private func checkOpen() throws {
+    try Task.checkCancellation()
+    guard !closed else {
+      throw MuxError(.connectionLost, "native routes closed")
+    }
+  }
+
+  private func prune() async throws {
+    let records = await directory.records
+    try checkOpen()
+    let available = records.filter {
+      if case .available = $0.state { true } else { false }
+    }
+    for (id, route) in Array(routes) {
+      guard
+        !available.contains(where: { $0.inventory.authority == route.authority }
+        )
+      else { continue }
+      if route.migrating { continue }
+      if let migrated = route.migratedAt,
+        ContinuousClock.now - migrated < .seconds(10),
+        records.contains(where: {
+          $0.inventory.authority.workspace == route.authority.workspace
+        })
+      {
+        continue  // The candidate is still publishing.
+      }
+      await route.listener.close()
+      routes.removeValue(forKey: id)
+      try checkOpen()
+    }
+  }
+}

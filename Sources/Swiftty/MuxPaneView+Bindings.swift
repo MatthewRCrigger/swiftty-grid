@@ -16,13 +16,18 @@ extension MuxPaneView {
 
   /// Key bindings run before the menu's key equivalents.
   override func performKeyEquivalent(with event: NSEvent) -> Bool {
-    guard window?.firstResponder === self, !hasMarkedText(),
-      let binding = binding(for: event)
-    else { return super.performKeyEquivalent(with: event) }
-    let performed = perform(binding.action)
-    if binding.requiresPerformable, !performed { return false }
-    if !binding.consumesInput { sendUnbound(event) }
-    return true
+    if window?.firstResponder === self, !hasMarkedText(),
+      controller?.handleAutomationKey(event, pane: pane) == true
+    {
+      return true
+    }
+    return keyboard.keyEquivalent(
+      in: self,
+      composing: hasMarkedText(),
+      binding: binding(for: event),
+      perform: { perform($0.action) },
+      sendUnbound: { sendUnbound(event) }
+    ) ?? super.performKeyEquivalent(with: event)
   }
 
   /// A non-consuming binding's key, as the terminal would get it unbound.
@@ -43,6 +48,7 @@ extension MuxPaneView {
   func perform(_ action: KeyAction) -> Bool {
     guard let controller else { return false }
     switch action {
+    case .newTab: controller.newTab()
     case .copyToClipboard:
       guard selection != nil else { return false }
       copy(nil)

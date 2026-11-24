@@ -17,6 +17,32 @@ let loopbackIdentity: HostIdentity = {
   } catch { fatalError("identity generation failed: \(error)") }
 }()
 
+/// Runs `body`; if it throws, records both ends' diagnostics (errors,
+/// stream credit, flow control, admission/retirement state, lifecycle log)
+/// and elapsed time beside any `TimedOut` deadline. CI release builds have
+/// seen loopback connections close mid-transfer; this shows which side
+/// ended it, why, and in what order.
+func withConnectionDiagnostics<T>(
+  _ label: String = "body",
+  client: QUICRSTConnection,
+  server: QUICRSTConnection?,
+  _ body: () async throws -> T
+) async throws -> T {
+  let started = ContinuousClock.now
+  do { return try await body() } catch {
+    Issue.record(
+      Comment(
+        rawValue: """
+          \(label) failed after \(ContinuousClock.now - started): \(error)
+          client: \(client.snapshotDiagnosticsForTesting)
+          server: \(server?.snapshotDiagnosticsForTesting ?? "not accepted")
+          """
+      )
+    )
+    throw error
+  }
+}
+
 /// Collects everything a connection delivers.
 final class Inbox: Sendable {
   private struct State {
@@ -74,7 +100,10 @@ final class Accepted: Sendable {
   var count: Int { state.withLock { $0.count } }
 }
 
-struct TimedOut: Error { var line: Int }
+struct TimedOut: Error {
+  var line: Int
+  var timeout: Duration?
+}
 
 /// Polls `condition` until it holds or the deadline passes.
 func transportEventually(
@@ -84,7 +113,9 @@ func transportEventually(
 ) async throws {
   let deadline = ContinuousClock.now + timeout
   while !condition() {
-    guard ContinuousClock.now < deadline else { throw TimedOut(line: line) }
+    guard ContinuousClock.now < deadline else {
+      throw TimedOut(line: line, timeout: timeout)
+    }
     try await Task.sleep(for: .milliseconds(10))
   }
 }
@@ -110,10 +141,10 @@ func connector(
   QUICRSTConnector(alpn: alpn, handshakeTimeout: timeout)
 }
 
-/// A syntactically valid plain-encoding snapshot payload of `bodyLength`
+/// A syntactically valid uncompressed screen payload of `bodyLength`
 /// bytes; the transport never decodes it.
 func snapshotPayload(bodyLength: Int, fill: UInt8) -> [UInt8] {
-  var out: [UInt8] = [SnapshotFrame.Encoding.plain.rawValue]
+  var out: [UInt8] = [SnapshotFrame.Encoding.smxb.rawValue]
   for _ in 0 ..< 2 {
     let n = UInt32(bodyLength)
     out += [
@@ -124,4 +155,18 @@ func snapshotPayload(bodyLength: Int, fill: UInt8) -> [UInt8] {
   out += [UInt8](repeating: fill, count: bodyLength)
   return out
 }
+
+/// Network framework behavior these tests assert first ships in macOS 27.2:
+/// a stream reset leaves the connection open, and a migrated client's traffic
+/// reaches the same connection. Earlier releases skip the tests unless
+/// `SWIFTTY_REQUIRE_OS_GATED=1` is set, which runs them regardless so a CI job
+/// that must execute them fails instead of skipping.
+let runsNetworkFramework272Tests: Bool = {
+  if ProcessInfo.processInfo.environment["SWIFTTY_REQUIRE_OS_GATED"] == "1" {
+    return true
+  }
+  return ProcessInfo.processInfo.isOperatingSystemAtLeast(
+    OperatingSystemVersion(majorVersion: 27, minorVersion: 2, patchVersion: 0)
+  )
+}()
 #endif

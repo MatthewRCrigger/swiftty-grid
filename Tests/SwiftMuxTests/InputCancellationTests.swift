@@ -2,6 +2,7 @@ import Dispatch
 import Foundation
 import SwiftMuxClient
 import SwiftMuxProtocol
+import SwiftMuxXPC
 import Synchronization
 import Testing
 
@@ -72,6 +73,10 @@ struct InputCancellationTests {
         ($0 as? MuxError)?.code == .notAttached
       }
       #expect(peer.records.withLock { $0.count } == original.count)
+      // The late acknowledgments carry only sequence numbers, which restart
+      // with the new attachment. Drain them with an ordered round trip so a
+      // stale ack cannot complete the next send before the peer records it.
+      #expect(try await connection.execute(.listWorkspaces) == .ok)
       try await connection.send(.text("Z"), to: pane)
       #expect(
         peer.records.withLock { $0.last?.attachment }
@@ -208,7 +213,7 @@ struct InputCancellationTests {
         retired,
         "ACK processing must enforce the oldest absolute deadline and fail the channel"
       )
-      // Collect deliberately delayed baseline waiters without leaving timers or tasks alive.
+      // Collect delayed baseline waiters without leaving timers or tasks alive.
       if !retired { await connection.close() }
       await #expect { try await first.value } throws: {
         ($0 as? MuxError)

@@ -2,11 +2,13 @@
 import Darwin
 import Foundation
 import SwiftMuxClient
+import SwiftMuxGuardian
 import SwiftMuxProtocol
+import SwiftMuxXPC
 import SwiftMuxTerminal
 
 let usage = """
-  usage: swmux [command] [options]
+  usage: swmux [--gateway-service NAME] [command] [options]
 
     (no command)                 attach to the newest workspace, or create one
     new [-s NAME] [-c DIR] [-d] [-- COMMAND...]
@@ -17,11 +19,20 @@ let usage = """
     end -t NAME                  end a workspace and its processes
     end-all                      end every workspace
     status                       show service status
+    restore [-t NAME|ID] [-d] [--run-saved-commands]
+                                 reopen a saved layout with fresh shells
+    saved [list]                 list saved layouts
+    saved policy [--layout on|off] [--output on|off]
+                 [--reopen ask|automatic|never] [--retention DAYS]
+    saved delete -t ID | --all   delete saved layouts
     agent install|uninstall|status
                                  manage a development LaunchAgent (the app
                                  bundle registers its own with SMAppService)
 
   options: --allow-host  run outside the supported Swiftty host profile
+           --gateway-service NAME  use an explicitly installed durable gateway
+             (before command; supports new, attach, list, status, targeted end,
+             restore and saved)
 
   """
 
@@ -46,8 +57,26 @@ if let i = arguments.firstIndex(of: "--") {
   trailing = Array(arguments[(i + 1)...])
   arguments = Array(arguments[..<i])
 }
-var allowHost = arguments.first == "--allow-host"
-if allowHost { arguments.removeFirst() }
+var allowHost = false
+var gatewayService: String?
+while let option = arguments.first,
+  ["--allow-host", "--gateway-service"].contains(option)
+{
+  arguments.removeFirst()
+  if option == "--allow-host" {
+    allowHost = true;
+    continue
+  }
+  guard gatewayService == nil, let service = arguments.first, !service.isEmpty,
+    service.utf8.count <= 255,
+    service.utf8.allSatisfy({
+      (48 ... 57).contains($0) || (65 ... 90).contains($0)
+        || (97 ... 122).contains($0) || $0 == 45 || $0 == 46 || $0 == 95
+    })
+  else { fail("--gateway-service requires one service name", code: 64) }
+  gatewayService = service
+  arguments.removeFirst()
+}
 let command =
   arguments.first.map {
     ["-h", "--help", "--version"].contains($0) || !$0.hasPrefix("-") ? $0 : ""
@@ -173,19 +202,18 @@ func environmentSnapshot() -> [String: String] {
   return env
 }
 
-func newWorkspace(
-  _ connection: MuxConnection,
+func workspaceRequest(
   name: String?,
   directory: String?,
   command: [String]?
-) async -> WorkspaceSnapshot {
+) -> NewWorkspaceRequest {
   let settings: Settings
   do { settings = try Settings.load() } catch { fail("settings: \(error)") }
   var ws = winsize()
   let size =
     ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0
     ? (Int(ws.ws_col), max(1, Int(ws.ws_row) - 1)) : (80, 23)
-  let request = NewWorkspaceRequest(
+  return NewWorkspaceRequest(
     name: name,
     columns: size.0,
     rows: size.1,
@@ -195,6 +223,19 @@ func newWorkspace(
       environment: environmentSnapshot()
     ),
     remainOnExit: settings.remainOnExit
+  )
+}
+
+func newWorkspace(
+  _ connection: MuxConnection,
+  name: String?,
+  directory: String?,
+  command: [String]?
+) async -> WorkspaceSnapshot {
+  let request = workspaceRequest(
+    name: name,
+    directory: directory,
+    command: command
   )
   do {
     guard
@@ -289,6 +330,11 @@ func agentCommand(_ sub: String) -> Never {
 // MARK: Dispatch
 
 signal(SIGPIPE, SIG_IGN)
+if let gatewayService,
+  !["help", "-h", "--help", "--version", "version"].contains(command)
+{
+  await gatewayCommand(service: gatewayService)
+}
 switch command {
 case "help", "-h", "--help":
   validateArguments()
@@ -331,6 +377,11 @@ case "end", "kill":
   do { _ = try await c.execute(.endWorkspace(.name(name))) } catch {
     fail("\(error)")
   }
+case "restore", "saved":
+  fail(
+    "\(command) requires --gateway-service NAME: saved layouts belong to the durable gateway",
+    code: 64
+  )
 case "end-all":
   validateArguments()
   let c = await connect(.control)

@@ -28,7 +28,8 @@ extension MainActorIntegrationTests.IdentityAccountBoundaryTests {
     @objc
     func tracking(_ notification: Notification) {
       guard let menu = notification.object as? NSMenu else { return }
-      item = menu.items.first { $0.title.contains("Files") }
+      // A section header ("Files") has no action; the item does.
+      item = menu.items.first { $0.title.contains("Files") && $0.action != nil }
       DispatchQueue.main.async { menu.cancelTracking() }
     }
   }
@@ -52,8 +53,8 @@ extension MainActorIntegrationTests.IdentityAccountBoundaryTests {
     let original = try await model.identityStore.resolve(identity.id)
     let replacement = IdentitySecret(.init())
     let server = try await TestSSHServer.start(authorizedKeys: [
-      NIOSSHPrivateKey(ed25519Key: original.privateKey).publicKey,
-      NIOSSHPrivateKey(ed25519Key: replacement.privateKey).publicKey,
+      NIOSSHPrivateKey(ed25519Key: original.ed25519PrivateKey!).publicKey,
+      NIOSSHPrivateKey(ed25519Key: replacement.ed25519PrivateKey!).publicKey,
     ])
     server.state.faults.withLock { $0.rejectShell = action == "shellRetry" }
     if action == "roamingFallback" {
@@ -81,12 +82,8 @@ extension MainActorIntegrationTests.IdentityAccountBoundaryTests {
       defer: false
     )
     window.isReleasedWhenClosed = false
-    let enhanced = NSAccessibility.Attribute(
-      rawValue: "AXEnhancedUserInterface"
-    )
-    let previous = NSApp.accessibilityAttributeValue(enhanced) as? Bool ?? false
-    NSApp.accessibilitySetValue(true, forAttribute: enhanced)
-    defer { NSApp.accessibilitySetValue(previous, forAttribute: enhanced) }
+    let restoreEnhancedUI = enableEnhancedUserInterface()
+    defer { restoreEnhancedUI() }
     func close() async {
       let active = model.activeSession?.controller
       let first = screen.controller
@@ -195,7 +192,7 @@ extension MainActorIntegrationTests.IdentityAccountBoundaryTests {
               SSHIdentityMetadata(
                 id: identity.id,
                 name: "B",
-                publicKey: replacement.publicKey,
+                publicKeyLine: replacement.publicKeyLine,
                 storage: .deviceOnly,
                 revision: .init(counter: 100, deviceID: UUID())
               )

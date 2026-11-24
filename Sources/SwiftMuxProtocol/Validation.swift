@@ -81,11 +81,14 @@ public enum FrameValidator {
       throw MuxError(.invalidRequest, "cursor")
     }
     let h = frame.history
-    guard h.firstRow >= 0, h.availableRows >= g.rows, h.viewportOffset >= 0,
-      h.scrollbackRows >= 0, h.viewportOffset <= h.scrollbackRows
+    guard h.isBounded, h.availableRows >= g.rows,
+      h.viewportOffset <= h.scrollbackRows
     else { throw MuxError(.invalidRequest, "history window") }
     if let search = frame.search {
+      // `SMXB/1` encodes an absent index as -1, so a negative `selected`
+      // from JSON would not survive the binary form.
       guard search.matchCount >= 0, search.visible.count <= count,
+        search.selected.map({ $0 >= 0 && $0 < search.matchCount }) ?? true,
         search.selectedVisible.map({ $0 >= 0 && $0 < search.visible.count })
           ?? true
       else { throw MuxError(.invalidRequest, "search state") }
@@ -98,6 +101,9 @@ public enum FrameValidator {
     }
     guard frame.title.utf8.count <= 4096 else {
       throw MuxError(.invalidRequest, "title length")
+    }
+    if let versions = frame.rowVersions, versions.count != g.rows {
+      throw MuxError(.invalidRequest, "row versions")
     }
     if let target = frame.dropTarget {
       guard target.types.count <= FrameDropTarget.maxTypes,

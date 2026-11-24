@@ -11,20 +11,29 @@ public enum FrameImporter {
     limits: MuxLimits = .standard
   ) throws(MuxError) -> OwnedScreen {
     try FrameValidator.validate(frame, limits: limits)
+    return convert(frame)
+  }
+
+  /// Converts a frame that already passed `FrameValidator` (every frame
+  /// `MuxConnection` delivers): an invalid one can trap.
+  private static func convert(_ frame: PaneFrame) -> OwnedScreen {
     let g = frame.grid
     let count = g.columns * g.rows
     var cells: [Cell] = []
     cells.reserveCapacity(count)
-    for i in 0 ..< count {
-      let s = frame.styles[g.style(at: i)]
+    // Attributes per style entry, built once rather than per cell.
+    let table = frame.styles.map { s in
       var attributes = CellAttributes(
         foreground: TerminalColor(rawValue: s.foreground),
         background: TerminalColor(rawValue: s.background),
         flags: CellFlags(rawValue: s.flags).subtracting(.structural)
       )
       attributes.underlineColor = s.underlineColor
+      return attributes
+    }
+    for i in 0 ..< count {
       let glyph = g.glyph(at: i)
-      var cell = Cell(glyph: 0, attributes: attributes, width: 1)
+      var cell = Cell(glyph: 0, attributes: table[g.style(at: i)], width: 1)
       switch g.kind(at: i) {
       case .continuation:
         cell.width = 0
@@ -101,6 +110,22 @@ public enum FrameImporter {
         },
       selectedSearchMatch: search?.selectedVisible,
       searchMatchCount: search?.matchCount ?? 0
+    )
+  }
+
+  /// A renderer snapshot of a frame `MuxConnection` delivered, which it
+  /// has already validated against the server's limits.
+  package static func snapshot(
+    fromValidated frame: PaneFrame,
+    selection: HighlightSpan? = nil,
+    sequence: UInt64,
+    limits: MuxLimits = .standard
+  ) -> RenderSnapshot {
+    assert((try? FrameValidator.validate(frame, limits: limits)) != nil)
+    return RenderSnapshot(
+      owned: convert(frame),
+      selection: selection,
+      sequence: sequence
     )
   }
 

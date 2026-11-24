@@ -3,6 +3,14 @@ import PackageDescription
 
 let core: [SwiftSetting] = [.enableExperimentalFeature("Lifetimes")]
 
+// SHA-256 comes from CryptoKit on Apple platforms. The Linux build of swsh
+// (`swift build --product swsh`) takes it from swift-crypto instead.
+let linuxCrypto: Target.Dependency = .product(
+  name: "Crypto",
+  package: "swift-crypto",
+  condition: .when(platforms: [.linux])
+)
+
 let package = Package(
   name: "swiftty",
   // Source language of the String Catalogs in the UI targets.
@@ -16,6 +24,9 @@ let package = Package(
     .tvOS("27.0"), .watchOS("27.0"),
   ],
   products: [
+    .library(name: "Swsh", targets: ["Swsh"]),
+    .executable(name: "swsh", targets: ["SwshCLI"]),
+    .library(name: "SwifttyConfig", targets: ["SwifttyConfig"]),
     .library(name: "SwifttyEngine", targets: ["SwifttyEngine"]),
     .library(name: "SwifttyCore", targets: ["SwifttyCore"]),
     .library(name: "SwifttyMobile", targets: ["SwifttyMobile"]),
@@ -26,15 +37,24 @@ let package = Package(
     .library(name: "SSHIdentity", targets: ["SSHIdentity"]),
     .library(name: "AppleTransport", targets: ["AppleTransport"]),
     .library(name: "TerminalHost", targets: ["TerminalHost"]),
+    .library(name: "TTYKit", targets: ["TTYKit"]),
+    .library(name: "RoamingTerminal", targets: ["RoamingTerminal"]),
+    .library(name: "RoamingKit", targets: ["RoamingKit"]),
+    .library(name: "RoamingConnect", targets: ["RoamingConnect"]),
     .library(name: "TerminalSurface", targets: ["TerminalSurface"]),
     .library(name: "CompanionModel", targets: ["CompanionModel"]),
     .library(name: "RoamingApp", targets: ["RoamingApp"]),
+    .library(name: "RoamingStore", targets: ["RoamingStore"]),
     .library(name: "MuxNavigation", targets: ["MuxNavigation"]),
     .library(name: "HostConnection", targets: ["HostConnection"]),
     .executable(name: "swiftty", targets: ["Swiftty"]),
     .executable(name: "swiftty-bench", targets: ["SwifttyBench"]),
     .executable(name: "swmux", targets: ["SwiftMuxCLI"]),
+    .executable(name: "swroam", targets: ["SwRoamCLI"]),
     .executable(name: "swiftmux-agent", targets: ["SwiftMuxAgent"]),
+    .executable(name: "swiftmux-worker", targets: ["SwiftMuxWorker"]),
+    .executable(name: "swiftmux-guardian", targets: ["SwiftMuxGuardianDaemon"]),
+    .executable(name: "swiftmux-gateway", targets: ["SwiftMuxGatewayDaemon"]),
     .executable(name: "swmux-launcher", targets: ["SwiftMuxLauncher"]),
     .executable(name: "swiftmux-bench", targets: ["SwiftMuxBench"]),
     .executable(name: "swifttyd", targets: ["Swifttyd"]),
@@ -57,19 +77,50 @@ let package = Package(
     ),
   ],
   targets: [
+    .target(
+      name: "Swsh",
+      dependencies: ["CSwshSupport", linuxCrypto],
+      swiftSettings: [.enableUpcomingFeature("NonisolatedNonsendingByDefault")]
+    ),
+    .testTarget(
+      name: "SwshTests",
+      dependencies: ["Swsh", "SwifttyEngine"],
+      resources: [.copy("Fixtures")]
+    ), .target(name: "CSwshSupport"),
+    // The execution service's protocol, planner, and broker. No dependency
+    // beyond SHA-256 on Linux: request handling cannot reach the shell runtime
+    // or the app.
+    .target(name: "SwifttyExec", dependencies: [linuxCrypto]),
+    .testTarget(
+      name: "SwifttyExecTests",
+      dependencies: ["SwifttyExec", "SwshAgent"]
+    ),
+    // swsh's headless interface; it holds no grants and no backend.
+    .target(name: "SwshAgent", dependencies: ["SwifttyExec"]),
+    .executableTarget(name: "SwshCLI", dependencies: ["Swsh", "SwshAgent"]),
+    .target(name: "SwifttyConfig"),
+    .testTarget(name: "SwifttyConfigTests", dependencies: ["SwifttyConfig"]),
+    .target(
+      name: "SwifttyJS",
+      dependencies: ["SwifttyConfig"],
+      resources: [.copy("Resources")]
+    ), .testTarget(name: "SwifttyJSTests", dependencies: ["SwifttyJS"]),
     // Headless terminal engine: parser, state, history, input encoding
     // and PTY processes. No Metal, fonts or AppKit; the SwiftMux service
     // links only this.
     .target(
       name: "SwifttyEngine",
-      dependencies: ["CScrollbackChecksum"],
+      dependencies: ["Checksum", "TerminalProcess"],
       swiftSettings: core
-    ),
+    ), .target(name: "TerminalProcess"),
     // CRC-32C instructions for verifying compressed scrollback.
     .target(name: "CScrollbackChecksum"),
+    // CRC-32C with those instructions or a portable fallback: scrollback
+    // units and frame-delta row identities.
+    .target(name: "Checksum", dependencies: ["CScrollbackChecksum"]),
     .target(
       name: "SwifttyCore",
-      dependencies: ["SwifttyEngine"],
+      dependencies: ["SwifttyEngine", "SwifttyConfig"],
       resources: [.copy("Renderer/Shaders.metal")],
       swiftSettings: core,
     ),
@@ -81,19 +132,29 @@ let package = Package(
       name: "Swiftty",
       dependencies: [
         "SwifttyCore", "SwifttyMac", "SwiftMuxClient", "SwiftMuxBridge",
-        "MuxNavigation", "MuxNavigationSMX", "HostConnection",
+        "MuxNavigation", "MuxNavigationSMX", "HostConnection", "SwifttyJS",
+        "SwiftMuxGuardian",
       ],
-      resources: [.process("Localizable.xcstrings")]
+      // BrandIcons: developer-icons logos (MIT), Scripts/fetch-brand-icons.sh.
+      resources: [.process("Localizable.xcstrings"), .copy("BrandIcons")]
     ),
     // SwiftMux (spec.multiplexer.md): shared messages, engine bridge,
     // service, PTY launcher, client connection and frontends.
-    .target(name: "SwiftMuxProtocol"),
+    // Foundation only: every platform that shows attention links it.
+    .target(name: "SwiftMuxProtocol", dependencies: ["Checksum"]),
+    // The local XPC channel and launchd job description; macOS only.
+    .target(name: "SwiftMuxXPC", dependencies: ["SwiftMuxProtocol"]),
+    // Process/I/O ownership, deliberately independent of terminal emulation.
+    .target(
+      name: "SwiftMuxGuardian",
+      dependencies: ["TerminalProcess", "SwiftMuxProtocol", "SwiftMuxXPC"]
+    ),
     // OSC 7501 attention reducer (spec.inbox.md §3): pure, no I/O.
     .target(name: "MuxAttention", dependencies: ["SwiftMuxProtocol"]),
     // Frame export needs only the engine; import needs the renderer.
     .target(
       name: "SwiftMuxExport",
-      dependencies: ["SwifttyEngine", "SwiftMuxProtocol"]
+      dependencies: ["SwifttyEngine", "SwiftMuxProtocol", "ScreenProtocol"]
     ),
     .target(
       name: "SwiftMuxBridge",
@@ -103,17 +164,63 @@ let package = Package(
     .target(
       name: "SwiftMuxService",
       dependencies: [
-        "SwifttyEngine", "SwiftMuxProtocol", "SwiftMuxExport", "MuxAttention",
+        "SwifttyEngine", "SwiftMuxProtocol", "SwiftMuxXPC", "SwiftMuxExport",
+        "MuxAttention", "SwifttyJS", "SwiftMuxGuardian", "SwifttyConfig",
+        "HostConnection",
       ]
     ),
     // The one PTY owner: local XPC and, when configured, roaming RST/1.
     .executableTarget(
       name: "SwiftMuxAgent",
-      dependencies: ["SwiftMuxService", "TerminalHost"]
+      dependencies: ["SwiftMuxService", "SwiftMuxProtocol", "TerminalHost"]
+    ),
+    .executableTarget(
+      name: "SwiftMuxWorker",
+      dependencies: ["SwiftMuxService", "SwiftMuxGuardian", "SwiftMuxProtocol"]
+    ),
+    .executableTarget(
+      name: "SwiftMuxGuardianDaemon",
+      dependencies: ["SwiftMuxGuardian", "SwiftMuxProtocol"]
+    ),
+    .executableTarget(
+      name: "SwiftMuxGatewayDaemon",
+      dependencies: [
+        "SwiftMuxGateway", "SwiftMuxGuardian", "SwiftMuxProtocol",
+        "SwiftMuxGatewayRoaming", "TerminalHost",
+      ]
+    ),
+    // The durable gateway's roaming host (spec.durability.md §2): RST/1
+    // sessions on guardian-supervised workers.
+    .target(
+      name: "SwiftMuxGatewayRoaming",
+      dependencies: [
+        "TerminalHost", "SwiftMuxGateway", "SwiftMuxClient", "SwiftMuxProtocol",
+        "SessionCore", "ScreenProtocol",
+      ],
+      swiftSettings: core
     ),
     // Fresh-process terminal setup: login_tty, then exec the shell in place.
     .executableTarget(name: "SwiftMuxLauncher"),
-    .target(name: "SwiftMuxClient", dependencies: ["SwiftMuxProtocol"]),
+    // Isolated signed lifecycle, worker and build-registry qualification.
+    // Fixture jobs never replace the user's installed SwiftMux registration.
+    .executableTarget(
+      name: "GuardianLifecycleProbe",
+      dependencies: [
+        "SwiftMuxService", "SwiftMuxClient", "SwiftMuxProtocol", "SwiftMuxXPC",
+        "SwiftMuxGuardian", "SwiftMuxGateway",
+      ],
+      path: "Tests/GuardianLifecycleProbe"
+    ),
+    .target(
+      name: "SwiftMuxClient",
+      dependencies: ["SwiftMuxProtocol", "SwiftMuxXPC"]
+    ),
+    .target(
+      name: "SwiftMuxGateway",
+      dependencies: [
+        "SwiftMuxGuardian", "SwiftMuxClient", "SwiftMuxProtocol", "SwiftMuxXPC",
+      ]
+    ),
     // Deep links (spec.inbox.md §4): typed destinations, the
     // opaque locator, URL validation and the navigation state machine.
     // Foundation only, so the watch companion can link it.
@@ -135,13 +242,25 @@ let package = Package(
         "SwiftMuxBridge", "SwifttyCore",
       ]
     ),
+    // Outer-terminal I/O shared by the TTY frontends: raw mode, input
+    // decoding, display-width text and the cell diff renderer. Headless:
+    // SwiftMuxProtocol supplies only the key vocabulary and DisplayText.
+    .target(
+      name: "TTYKit",
+      dependencies: ["SwiftMuxProtocol", "SwifttyEngine"]
+    ),
     .target(
       name: "SwiftMuxTerminal",
-      dependencies: ["SwiftMuxClient", "SwiftMuxProtocol", "SwifttyEngine"]
+      dependencies: [
+        "TTYKit", "SwiftMuxClient", "SwiftMuxProtocol", "SwifttyEngine",
+      ]
     ),
     .executableTarget(
       name: "SwiftMuxCLI",
-      dependencies: ["SwiftMuxTerminal", "SwiftMuxClient", "SwiftMuxProtocol"]
+      dependencies: [
+        "SwiftMuxTerminal", "SwiftMuxClient", "SwiftMuxProtocol", "SwiftMuxXPC",
+        "SwiftMuxGuardian",
+      ]
     ),
     // UIKit views are conditional; shared frontend tests also run on macOS.
     .target(name: "SwifttyMobile", dependencies: ["SwifttyCore"]),
@@ -150,10 +269,18 @@ let package = Package(
       dependencies: ["SwifttyCore", "CAllocCounter"],
       swiftSettings: core,
     ),
+    // Links neither the engine nor the renderer, so every test target can
+    // use it without rebuilding them.
     .target(
       name: "TestSupport",
       dependencies: ["SessionCore"],
       path: "Tests/Support"
+    ),
+    // Fixtures that need `Configuration`, and so the renderer module.
+    .target(
+      name: "CoreTestSupport",
+      dependencies: ["SwifttyCore"],
+      path: "Tests/CoreSupport"
     ),
     .executableTarget(
       name: "StorageBoundsProbe",
@@ -216,16 +343,55 @@ let package = Package(
       name: "TerminalHost",
       dependencies: [
         "SessionCore", "ScreenProtocol", "AppleTransport", "SwifttyEngine",
-        "SwiftMuxProtocol", "SwiftMuxService",
+        "SwiftMuxProtocol", "SwiftMuxService", "SwiftMuxExport",
+        "SwiftMuxClient",
       ],
       swiftSettings: core
     ),
-    // Shared direct-client frame/input abstraction and backends.
+    // Roaming client core: RST/1 client state machine, semantic input,
+    // presentation frames and the transport seams. Headless: links the
+    // engine, never the renderer, NIO, Network or a UI framework.
+    .target(
+      name: "RoamingKit",
+      dependencies: [
+        "SessionCore", "ScreenProtocol", "SwifttyEngine", "SwiftMuxExport",
+      ],
+      swiftSettings: core
+    ),
+    // RoamingKit's seams bound to SSHClient (bootstrap, shell channel) and
+    // AppleTransport (pinned QUIC). No renderer or UI.
+    .target(
+      name: "RoamingConnect",
+      dependencies: [
+        "RoamingKit", "ScreenProtocol", "AppleTransport", "SSHClient",
+        .product(name: "NIOCore", package: "swift-nio"),
+      ]
+    ),
+    // TTY frontend for RoamingKit: frames through TTYKit's diff renderer,
+    // decoded outer input as semantic operations. No renderer or UI.
+    .target(
+      name: "RoamingTerminal",
+      dependencies: [
+        "RoamingKit", "TTYKit", "SessionCore", "ScreenProtocol",
+        "SwiftMuxProtocol", "SwifttyEngine",
+      ]
+    ),
+    // swroam: mosh-style roaming client for any terminal.
+    .executableTarget(
+      name: "SwRoamCLI",
+      dependencies: [
+        "RoamingTerminal", "RoamingConnect", "RoamingKit", "TTYKit",
+        "SessionCore", "ScreenProtocol", "SSHClient", "SSHIdentity",
+        "AppleTransport",
+      ]
+    ),
+    // GUI frontend glue: backends that render through a TerminalSession.
     .target(
       name: "TerminalSurface",
       dependencies: [
-        "SessionCore", "ScreenProtocol", "AppleTransport", "SSHClient",
-        "SwifttyCore", .product(name: "NIOCore", package: "swift-nio"),
+        "RoamingKit", "RoamingConnect", "SessionCore", "ScreenProtocol",
+        "SSHClient", "SwifttyCore",
+        .product(name: "NIOCore", package: "swift-nio"),
       ],
       swiftSettings: core
     ),
@@ -236,14 +402,24 @@ let package = Package(
     // (spec.connection-setup.md). Foundation only: no UI, credentials,
     // PTYs or network I/O.
     .target(name: "HostConnection"),
+    // Saved hosts, SSH identities, CloudKit metadata sync and transfer
+    // manifests for the direct clients. No UI, terminal or renderer code.
+    .target(
+      name: "RoamingStore",
+      dependencies: [
+        "SessionCore", "SSHClient", "SSHIdentity",
+        .product(name: "Crypto", package: "swift-crypto"),
+      ],
+      path: "Apps/Store"
+    ),
     // Shared app model and per-platform UI for the direct clients
     // (Apps/* app targets are thin XcodeGen wrappers around this).
     .target(
       name: "RoamingApp",
       dependencies: [
-        "SessionCore", "ScreenProtocol", "SSHClient", "TerminalSurface",
-        "CompanionModel", "SwifttyCore", "SwifttyMobile", "MuxNavigation",
-        "HostConnection", "SSHIdentity",
+        "RoamingStore", "SessionCore", "ScreenProtocol", "SSHClient",
+        "TerminalSurface", "CompanionModel", "SwifttyCore", "SwifttyMobile",
+        "MuxNavigation", "HostConnection", "SSHIdentity", "SwiftMuxProtocol",
         // AppKit surface for native macOS builds (the SwiftPM test host).
         .target(name: "SwifttyMac", condition: .when(platforms: [.macOS])),
         .product(name: "Crypto", package: "swift-crypto"),
@@ -260,25 +436,34 @@ let package = Package(
       swiftSettings: core
     ),
 
+    // Engine tests link neither the renderer nor fonts, so an engine change
+    // is tested without rebuilding them.
+    .testTarget(
+      name: "SwifttyEngineTests",
+      dependencies: ["SwifttyEngine", "TestSupport"],
+      swiftSettings: core
+    ),
     .testTarget(
       name: "SwifttyCoreTests",
       dependencies: [
-        "SwifttyCore", "SwifttyEngine", "CAllocCounter", "TestSupport",
-        "StorageBoundsProbe",
+        "CoreTestSupport", "SwifttyCore", "SwifttyEngine", "CAllocCounter",
+        "TestSupport", "StorageBoundsProbe", "Checksum",
       ],
       swiftSettings: core,
     ),
     .testTarget(
       name: "SwifttyMobileTests",
-      dependencies: ["SwifttyMobile", "SwifttyCore", "TestSupport"],
+      dependencies: [
+        "CoreTestSupport", "SwifttyMobile", "SwifttyCore", "TestSupport",
+      ],
       resources: [.copy("Fixtures")],
     ),
     .testTarget(
       name: "SwiftMuxTests",
       dependencies: [
-        "SwiftMuxProtocol", "SwiftMuxBridge", "SwiftMuxService",
-        "SwiftMuxClient", "SwiftMuxTerminal", "SwifttyCore", "MuxAttention",
-        "TestSupport",
+        "SwiftMuxProtocol", "SwiftMuxXPC", "SwiftMuxBridge", "SwiftMuxService",
+        "SwiftMuxClient", "SwiftMuxTerminal", "TTYKit", "SwifttyCore",
+        "MuxAttention", "TestSupport", "SwiftMuxGuardian", "SwiftMuxGateway",
       ]
     ),
     .testTarget(
@@ -302,14 +487,15 @@ let package = Package(
     ),
     .testTarget(
       name: "MuxAttentionTests",
-      dependencies: ["MuxAttention", "SwiftMuxProtocol"]
+      dependencies: ["MuxAttention", "SwiftMuxProtocol", "TestSupport"]
     ),
     .testTarget(
       name: "SwifttyAppTests",
       dependencies: [
-        "Swiftty", "SwifttyMac", "SwifttyCore", "TestSupport",
-        "SwiftMuxService", "SwiftMuxClient", "SwiftMuxProtocol",
-        "SwiftMuxExport", "MuxNavigation", "MuxNavigationSMX", "HostConnection",
+        "CoreTestSupport", "Swiftty", "SwifttyMac", "SwifttyCore",
+        "TestSupport", "SwiftMuxService", "SwiftMuxClient", "SwiftMuxProtocol",
+        "SwiftMuxXPC", "SwiftMuxExport", "MuxNavigation", "MuxNavigationSMX",
+        "HostConnection", "SwiftMuxGateway", "SwiftMuxGuardian",
       ]
     ),
     .testTarget(
@@ -321,10 +507,13 @@ let package = Package(
     .testTarget(
       name: "IntegrationTests",
       dependencies: [
-        "SessionCore", "ScreenProtocol", "SSHClient", "AppleTransport",
-        "TerminalHost", "TerminalSurface", "SwifttyCore", "TestSupport",
-        "RoamingApp", "SwiftMuxProtocol", "SwiftMuxService", "SwiftMuxClient",
-        "HostConnection", "MuxNavigation", "SSHIdentity",
+        "CoreTestSupport", "SessionCore", "ScreenProtocol", "SSHClient",
+        "AppleTransport", "TerminalHost", "RoamingKit", "RoamingConnect",
+        "TerminalSurface", "RoamingTerminal", "TTYKit", "SwifttyCore",
+        "TestSupport", "RoamingApp", "SwiftMuxProtocol", "SwiftMuxService",
+        "SwiftMuxClient", "HostConnection", "MuxNavigation", "SSHIdentity",
+        "SwiftMuxExport", "SwifttyEngine", "SwiftMuxGateway",
+        "SwiftMuxGatewayRoaming",
         .product(name: "NIOCore", package: "swift-nio"),
         .product(name: "NIOPosix", package: "swift-nio"),
         .product(name: "NIOSSH", package: "swift-nio-ssh"),
@@ -334,3 +523,50 @@ let package = Package(
     ),
   ],
 )
+
+// arm64e requires a consistent Objective-C class_ro_t signing ABI across
+// every linked object. Xcode builds third-party packages at their own older
+// deployment targets, where class_ro_t signing is off, even though our apps
+// require OS 27. Match that ABI for iOS until the dependencies adopt
+// it. This leaves return-address and other arm64e pointer authentication on.
+// MobileClient uses the same flag in Apps/project.yml. visionOS dependencies
+// already use signed metadata; watchOS has no third-party dependencies.
+// Both keep their default class_ro_t signing.
+for target in package.targets
+where target.type != .system && target.name != "CScrollbackChecksum"
+  && target.name != "CAllocCounter"
+{
+  target.swiftSettings =
+    (target.swiftSettings ?? []) + [
+      .unsafeFlags(
+        ["-Xfrontend", "-no-sign-class-ro"],
+        .when(platforms: [.iOS])
+      )
+    ]
+}
+
+// Only the shell is ported to Linux. There the package is reduced to the shell
+// targets, so `swift build` and `swift test` need no Apple-only module.
+#if os(Linux)
+let shell: Set<String> = [
+  "Swsh", "CSwshSupport", "SwifttyExec", "SwshAgent", "SwshCLI", "SwshTests",
+  "SwifttyExecTests",
+]
+package.targets.removeAll { !shell.contains($0.name) }
+package.products.removeAll { $0.name != "Swsh" && $0.name != "swsh" }
+package.dependencies.removeAll { dependency in
+  if case .sourceControl(_, let location, _) = dependency.kind {
+    return !location.hasSuffix("swift-crypto.git")
+  }
+  return true
+}
+// The editor display tests replay output through the terminal engine.
+for target in package.targets where target.name == "SwshTests" {
+  target.dependencies.removeAll { dependency in
+    if case .byNameItem(let name, _) = dependency {
+      return name == "SwifttyEngine"
+    }
+    return false
+  }
+}
+#endif

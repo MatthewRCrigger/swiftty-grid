@@ -11,6 +11,8 @@ public enum FramingError: Error, Equatable, Sendable {
   case invalidSnapshot(SnapshotValidationError)
   case trailingData
   case truncated
+  /// An `SMXB/1` screen that fails decoding or the RST/1 frame limits.
+  case invalidFrame(String)
 }
 
 func makeEncoder() -> JSONEncoder {
@@ -102,38 +104,24 @@ public struct ControlRecordReader: Sendable {
   }
 }
 
-/// Snapshot stream payload: one record then FIN (spec §7.2).
+/// Screen stream payload: one record then FIN (spec §7.2).
 ///
-///     UInt8     encoding: 0 = plain UTF-8 JSON, 1 = RFC 1950 zlib
+///     UInt8     encoding: 2 = `SMXB/1`, 3 = `SMXB/1` in RFC 1950 zlib
 ///     UInt32BE  decodedLength
 ///     UInt32BE  encodedLength
-///     Byte[]    encoded snapshot JSON
+///     Byte[]    encoded frame record with an `rstHeader` envelope
+///
+/// Encodings 0 and 1 (legacy JSON `ScreenSnapshot`) are no longer sent or
+/// accepted.
 public enum SnapshotFrame {
   public enum Encoding: UInt8, Sendable {
-    case plain = 0
-    case zlib = 1
+    /// `SMXB/1` with an `rstHeader` envelope.
+    case smxb = 2
+    case smxbZlib = 3
+
+    var isCompressed: Bool { self == .smxbZlib }
   }
   public static let headerLength = 9
-
-  public static func encode(
-    _ snapshot: ScreenSnapshot,
-    encoding: Encoding = .zlib
-  ) throws -> [UInt8] {
-    let json = Array(try makeEncoder().encode(snapshot))
-    guard json.count <= RSTLimits.maxSnapshotDecodedBytes else {
-      throw FramingError.snapshotTooLarge
-    }
-    let body = encoding == .zlib ? Zlib.compress(json) : json
-    guard body.count <= RSTLimits.maxSnapshotEncodedBytes else {
-      throw FramingError.snapshotTooLarge
-    }
-    var out = [encoding.rawValue]
-    out.reserveCapacity(headerLength + body.count)
-    appendUInt32(UInt32(json.count), to: &out)
-    appendUInt32(UInt32(body.count), to: &out)
-    out.append(contentsOf: body)
-    return out
-  }
 
   /// Parsed header; lets a reader bound buffering before the body arrives.
   public struct Header: Equatable, Sendable {
@@ -157,43 +145,12 @@ public enum SnapshotFrame {
     guard decoded <= limits.maxSnapshotDecodedBytes,
       encoded <= limits.maxSnapshotEncodedBytes
     else { throw .snapshotTooLarge }
-    if encoding == .plain, decoded != encoded { throw .lengthMismatch }
+    if !encoding.isCompressed, decoded != encoded { throw .lengthMismatch }
     return Header(
       encoding: encoding,
       decodedLength: decoded,
       encodedLength: encoded
     )
-  }
-
-  /// Decodes and validates a complete stream payload. Only a fully
-  /// decoded, validated snapshot is ever returned.
-  public static func decode(
-    _ bytes: [UInt8],
-    limits: NegotiatedLimits = NegotiatedLimits()
-  ) throws(FramingError) -> ScreenSnapshot {
-    guard let header = try header(bytes, limits: limits) else {
-      throw .truncated
-    }
-    let total = headerLength + header.encodedLength
-    guard bytes.count >= total else { throw .truncated }
-    guard bytes.count == total else { throw .trailingData }
-    let body = Array(bytes[headerLength...])
-    let json: [UInt8]
-    switch header.encoding {
-    case .plain: json = body
-    case .zlib:
-      do { json = try Zlib.decompress(body, limit: header.decodedLength) } catch
-      { throw .decompression(error) }
-    }
-    guard json.count == header.decodedLength else { throw .lengthMismatch }
-    let snapshot: ScreenSnapshot
-    do {
-      snapshot = try JSONDecoder().decode(ScreenSnapshot.self, from: Data(json))
-    } catch { throw .malformedJSON }
-    do { try snapshot.validate(limits: limits) } catch {
-      throw .invalidSnapshot(error)
-    }
-    return snapshot
   }
 }
 
@@ -224,8 +181,8 @@ public struct SnapshotStreamReader: Sendable {
   }
 
   /// Call at FIN.
-  public func finish() throws(FramingError) -> ScreenSnapshot {
-    try SnapshotFrame.decode(buffer)
+  public func finishRecord() throws(FramingError) -> ScreenRecord {
+    try SnapshotFrame.decodeRecord(buffer)
   }
 }
 

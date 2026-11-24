@@ -1,6 +1,7 @@
 import AppKit
 import SwiftMuxProtocol
 import SwifttyCore
+import SwifttyMac
 
 /// Selection, mouse reporting, links, click-to-move and scrolling, as the
 /// direct terminal view offers them. Reports and shell-integration
@@ -9,7 +10,6 @@ import SwifttyCore
 extension MuxPaneView {
   var features: ServiceFeatures { controller?.features ?? [] }
 
-  /// Modes of the frame on screen.
   var modes: SupportedViewModes { presented?.frame.modes ?? [] }
 
   /// The program asked for mouse reports and the service can encode them.
@@ -23,12 +23,8 @@ extension MuxPaneView {
   }
 
   func cell(at p: NSPoint) -> (row: Int, column: Int) {
-    let scale = window?.backingScaleFactor ?? 2
-    let x = (p.x * scale - renderer.options.paddingX) / renderer.cellSize.width
-    let y =
-      ((bounds.height - p.y) * scale - renderer.options.paddingY)
-      / renderer.cellSize.height
-    return (TerminalGeometry.cellIndex(y), TerminalGeometry.cellIndex(x))
+    let cell = TerminalPointer.cell(at: p, in: self, renderer: renderer)
+    return (cell.row, cell.column)
   }
 
   /// History address of a viewport row of `presentation`.
@@ -93,29 +89,29 @@ extension MuxPaneView {
   override func mouseDown(with event: NSEvent) {
     window?.makeFirstResponder(self)
     controller?.focus(pane)
-    reportsLeftGesture = false
     pendingOutput = nil
-    if event.modifierFlags.contains(.command) {
-      openLink(at: event)
-      return
-    }
-    // Shift selects even while the program tracks the mouse.
-    if reportsMouse, !event.modifierFlags.contains(.shift) {
-      clearSelection()
-      reportsLeftGesture = true
-      sendMouse(.press, .left, event)
-      return
-    }
+    pointer.beginLeftGesture(
+      event,
+      reporting: reportsMouse,
+      openLink: {
+        openLink(at: event);
+        return true
+      },
+      report: {
+        clearSelection();
+        sendMouse(.press, .left, event)
+      },
+      select: { beginSelection(event, unit: $0) }
+    )
+  }
+
+  private func beginSelection(_ event: NSEvent, unit: FrozenSelection.Unit) {
     // Bind the gesture to the presentation actually shown.
     guard let base = frozen ?? presented else { return }
-    let unit: FrozenSelection.Unit =
-      switch event.clickCount {
-      case 2: .word
-      case 3...: .line
-      default: .cell
-      }
     let at = cell(for: event)
     selectionDragged = unit != .cell
+    live = nil
+    placedSelection = nil
     if unit == .cell {
       selection = nil
       frozen = nil
@@ -129,10 +125,13 @@ extension MuxPaneView {
   }
 
   override func mouseDragged(with event: NSEvent) {
-    if reportsLeftGesture {
-      if reportsDrag { sendMouse(.motion, .left, event) }
-      return
-    }
+    pointer.dragLeftGesture(
+      select: { extendSelection(event) },
+      report: { if reportsDrag { sendMouse(.motion, .left, event) } }
+    )
+  }
+
+  private func extendSelection(_ event: NSEvent) {
     let at = cell(for: event)
     if selection == nil, let (anchor, base) = pendingAnchor {
       frozen = base
@@ -141,14 +140,24 @@ extension MuxPaneView {
     selection?.head = at
     selectionDragged = true
     needsDisplay = true
+    // Live selection extends across pages: dragging past an edge scrolls
+    // history, one request until the next frame is drawn.
+    if liveSelecting, !autoscrollPending, let rows = frozen?.frame.grid.rows,
+      at.row < 0 || at.row >= rows
+    {
+      autoscrollPending = true
+      controller?.scroll(pane, lines: at.row < 0 ? 1 : -1)
+    }
   }
 
   override func mouseUp(with event: NSEvent) {
-    if reportsLeftGesture {
-      reportsLeftGesture = false
-      sendMouse(.release, .left, event)
-      return
-    }
+    pointer.endLeftGesture(
+      select: { endSelection() },
+      report: { sendMouse(.release, .left, event) }
+    )
+  }
+
+  private func endSelection() {
     let click = pendingAnchor
     pendingAnchor = nil
     if !selectionDragged {
@@ -182,6 +191,10 @@ extension MuxPaneView {
     frozen = nil
     pendingAnchor = nil
     selectionDragged = false
+    live = nil
+    placedSelection = nil
+    autoscrollPending = false
+    copyToken &+= 1
     needsDisplay = true
   }
 
@@ -244,41 +257,40 @@ extension MuxPaneView {
   // MARK: Scrolling
 
   override func scrollWheel(with event: NSEvent) {
-    let scale = window?.backingScaleFactor ?? 2
-    let delta =
-      event.hasPreciseScrollingDeltas
-      ? event.scrollingDeltaY / max(1, renderer.cellSize.height / scale)
-      : event.scrollingDeltaY
-    scrollAccumulator += delta
-    let lines = Int(scrollAccumulator.rounded(.towardZero))
-    scrollAccumulator -= CGFloat(lines)
+    let mode: TerminalPointer.ScrollMode
     if reportsMouse {
-      let across =
-        event.hasPreciseScrollingDeltas
-        ? event.scrollingDeltaX / max(1, renderer.cellSize.width / scale)
-        : event.scrollingDeltaX
-      horizontalScrollAccumulator += across
-      let columns = Int(horizontalScrollAccumulator.rounded(.towardZero))
-      horizontalScrollAccumulator -= CGFloat(columns)
-      for _ in 0 ..< abs(lines) {
-        sendMouse(.press, lines > 0 ? .wheelUp : .wheelDown, event)
-      }
-      for _ in 0 ..< abs(columns) {
-        sendMouse(.press, columns > 0 ? .wheelLeft : .wheelRight, event)
-      }
-      return
-    }
-    horizontalScrollAccumulator = 0
-    guard lines != 0 else { return }
-    if features.contains(.mouseReporting), modes.contains(.alternateScreen),
-      modes.contains(.alternateScroll)
+      mode = .mouse
+    } else if features.contains(.mouseReporting),
+      modes.contains(.alternateScreen), modes.contains(.alternateScroll)
     {
-      // Programs on the alternate screen (pagers) scroll with arrows.
-      for _ in 0 ..< abs(lines) {
-        controller?.send(.key(lines > 0 ? .up : .down, []), to: pane)
-      }
+      mode = .arrows
     } else {
-      controller?.scroll(pane, lines: lines)
+      mode = .history
+    }
+    pointer.scroll(
+      event,
+      in: self,
+      renderer: renderer,
+      mode: mode,
+      multiplier: config.mouseScrollMultiplier
+    ) { input in
+      switch input {
+      case let .wheel(button):
+        let mapped: MuxMouse.Button
+        switch button {
+        case .wheelUp: mapped = .wheelUp
+        case .wheelDown: mapped = .wheelDown
+        case .wheelLeft: mapped = .wheelLeft
+        case .wheelRight: mapped = .wheelRight
+        default: return
+        }
+        sendMouse(.press, mapped, event)
+      case let .key(key):
+        if let key = Self.muxKey(key) {
+          controller?.send(.key(key, []), to: pane)
+        }
+      case let .history(lines): controller?.scroll(pane, lines: lines)
+      }
     }
   }
 
@@ -506,6 +518,9 @@ extension MuxPaneView {
       .commandOutput(in: pane, at: address) { [weak self] output in
         guard let self else { return }
         guard let output else { return NSSound.beep() }
+        // A new command-output request replaces any old frozen selection;
+        // otherwise the requested history frame could never be admitted.
+        clearSelection()
         pendingOutput = output
         if let presented { selectPendingOutput(in: presented) }
       }

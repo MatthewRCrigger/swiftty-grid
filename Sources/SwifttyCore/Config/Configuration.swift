@@ -1,4 +1,5 @@
 import Foundation
+import SwifttyConfig
 
 /// Colors a theme or the configuration sets; nil leaves the color to the
 /// layer below (built-in defaults, then the theme, then the configuration).
@@ -14,7 +15,6 @@ public struct ColorSet: Sendable, Equatable {
 
   public init() {}
 
-  /// Applies this layer on top of `base`.
   public func applied(to base: Palette) -> Palette {
     var p = base
     p.foreground = foreground ?? p.foreground
@@ -162,24 +162,38 @@ public struct ThemeSelection: Sendable, Equatable {
     return fields
   }
 
+  /// The `theme` value that selects this, as the Settings window writes it.
+  public var configurationValue: String {
+    func field(_ name: String) -> String {
+      let special = ",:=\"\\".unicodeScalars
+      guard name.unicodeScalars.contains(where: special.contains) else {
+        return name
+      }
+      let escaped = name.replacing("\\", with: "\\\\")
+        .replacing("\"", with: "\\\"")
+      return "\"\(escaped)\""
+    }
+    if light == dark, field(light) == light { return light }
+    return "light:\(field(light)),dark:\(field(dark))"
+  }
+
   public func name(for scheme: ColorScheme) -> String {
     scheme == .light ? light : dark
   }
 }
 
-/// Frontend settings in Ghostty's configuration syntax: `key = value`
-/// lines, `#` comments, repeatable keys, an empty value restoring the
-/// default, and `config-file` includes (`?path` when optional).
-///
-/// Only the keys these frontends implement are recognised; others are
-/// reported in `diagnostics` and otherwise ignored, so a Ghostty config
-/// file can be shared.
+/// Where a workspace window shows its tabs.
+public enum TabPosition: String, Sendable, CaseIterable {
+  /// A strip in the window toolbar.
+  case top
+  /// A sidebar beside the panes.
+  case left
+}
+
+/// Frontend settings populated from JSONC or configured programmatically.
 public struct Configuration: Sendable, Equatable {
-  /// File-loading budgets, shared across a root file and its include queue.
+  /// Maximum UTF-8 bytes in a configuration file.
   public static let maxFileBytes = 1024 * 1024
-  public static let maxLoadedBytes = 4 * 1024 * 1024
-  public static let maxLoadedFiles = 128
-  /// Fonts.
   /// Supported point sizes for configuration and interactive zoom.
   public static let fontSizeRange: ClosedRange<Double> = 1 ... 200
   /// Bounds a programmatic point size; NaN uses the default 13 pt.
@@ -187,12 +201,6 @@ public struct Configuration: Sendable, Equatable {
     guard !size.isNaN else { return Configuration().fontSize }
     return min(max(size, fontSizeRange.lowerBound), fontSizeRange.upperBound)
   }
-
-  /// Ghostty's `macos-icon` values.
-  static let ghosttyIcons: Set = [
-    "official", "blueprint", "chalkboard", "microchip", "glass", "holographic",
-    "paper", "retro", "xray", "custom", "custom-style",
-  ]
 
   public var fontFamily = "Menlo"
   public var fontFamilyBold: String?
@@ -233,6 +241,12 @@ public struct Configuration: Sendable, Equatable {
   public var rectangleChecksumReport = false
   public var copyOnSelect = false
   public var mouseHideWhileTyping = false
+  /// Lines per discrete mouse-wheel notch (`mouse-scroll-multiplier`);
+  /// precise trackpad scrolling is unaffected, and mouse-reporting
+  /// programs get one wheel event per notch.
+  public var mouseScrollMultiplier = Self.defaultMouseScrollMultiplier
+  public static let defaultMouseScrollMultiplier = 3.0
+  public static let mouseScrollMultiplierRange = 0.01 ... 10_000.0
   public var linkURL = true
 
   /// History cell budget in bytes (`scrollback-limit`, canonically
@@ -245,9 +259,15 @@ public struct Configuration: Sendable, Equatable {
   public var scrollbackCompression = true
   /// Ghostty command syntax: shell expansion by default, or `direct:` arguments.
   public var command: String?
+  public var preferredShell: ShellKind?
+  public var shellProfiles: [String: ShellLaunchProfile] = [:]
   public var workingDirectory: String?
+  public var windowWidth: Double?
+  public var windowHeight: Double?
   public var windowPaddingX: Double = 4
   public var windowPaddingY: Double = 4
+  /// Where workspace tabs show (`window.tabs`).
+  public var tabPosition = TabPosition.top
 
   public var keybindings = Keybindings.defaults
 
@@ -256,6 +276,10 @@ public struct Configuration: Sendable, Equatable {
 
   /// Problems found while loading, as `file:line: message`.
   public var diagnostics: [String] = []
+
+  /// System display preferences applied by `accommodating(_:)`; never read
+  /// from a file.
+  public var accommodations = DisplayAccommodations()
 
   public struct CellAdjustment: Sendable, Equatable {
     public var fraction: Double = 0
@@ -266,9 +290,9 @@ public struct Configuration: Sendable, Equatable {
 
   // MARK: Loading
 
-  /// `$XDG_CONFIG_HOME/swiftty/config` (default `~/.config/swiftty/config`).
+  /// `$XDG_CONFIG_HOME/swiftty/config.jsonc` (default `~/.config/swiftty/config.jsonc`).
   public static var defaultURL: URL {
-    configHome.appendingPathComponent("swiftty/config")
+    configHome.appendingPathComponent("swiftty/config.jsonc")
   }
 
   static var configHome: URL {
@@ -283,205 +307,20 @@ public struct Configuration: Sendable, Equatable {
 
   /// Where `theme` names are looked up, in order, before the built-ins.
   public var themeDirectories: [URL] = [
-    Configuration.configHome.appendingPathComponent("swiftty/themes"),
-    Configuration.configHome.appendingPathComponent("ghostty/themes"),
+    Configuration.configHome.appendingPathComponent("swiftty/themes")
   ]
 
-  /// Loads `url` (and its includes). A missing file yields the defaults.
-  public static func load(from url: URL = defaultURL) -> Configuration {
-    var config = Configuration()
-    var includes = Includes()
-    _ = includes.enqueue(url, optional: true)
-    config.loadIncludes(&includes)
-    return config
-  }
-
-  /// Parses configuration text; relative includes resolve against `directory`.
-  public static func parse(
-    _ text: String,
-    directory: URL? = nil
-  ) -> Configuration {
-    var config = Configuration()
-    config.apply(text, directory: directory)
-    return config
-  }
-
-  /// A queue shared by all files in one load. Clearing it drops only
-  /// pending includes; already applied settings remain in the configuration.
-  private struct Includes {
-    var files: [(url: URL, optional: Bool)] = []
-    var next = 0
-    var processed = 0
-    var bytesRead = 0
-    var reportedFileLimit = false
-
-    mutating func enqueue(_ url: URL, optional: Bool) -> Bool {
-      guard processed + files.count - next < Configuration.maxLoadedFiles else {
-        return false
-      }
-      files.append((url, optional))
-      return true
-    }
-
-    mutating func pop() -> (url: URL, optional: Bool)? {
-      guard next < files.count else { return nil }
-      defer {
-        next += 1
-        processed += 1
-      }
-      return files[next]
-    }
-
-    mutating func clear() {
-      files.removeAll(keepingCapacity: true)
-      next = 0
+  /// Parses a complete JSONC document. Invalid input yields defaults and diagnostics.
+  public static func parse(_ text: String) -> Configuration {
+    do { return Configuration(jsonc: try ConfigLoader.decode(text)) } catch {
+      var config = Configuration(jsonc: .default)
+      config.diagnostics = [error.localizedDescription]
+      return config
     }
   }
 
-  private mutating func loadIncludes(_ includes: inout Includes) {
-    var loaded: Set<URL> = []
-    while let file = includes.pop() {
-      guard ConfigurationFile.path(for: file.url) != nil else {
-        include(file.url, optional: file.optional, includes: &includes)
-        continue
-      }
-      let canonicalURL = file.url.standardizedFileURL.resolvingSymlinksInPath()
-      guard loaded.insert(canonicalURL).inserted else {
-        diagnostics.append("\(file.url.path): include cycle")
-        continue
-      }
-      include(file.url, optional: file.optional, includes: &includes)
-    }
-  }
-
-  private mutating func include(
-    _ url: URL,
-    optional: Bool,
-    includes: inout Includes
-  ) {
-    let text: String
-    let limit = min(
-      Self.maxFileBytes,
-      max(0, Self.maxLoadedBytes - includes.bytesRead)
-    )
-    do {
-      text = try ConfigurationFile.read(url, maxBytes: limit) {
-        includes.bytesRead += $0
-      }
-    } catch {
-      if case ConfigurationFile.Failure.tooLarge = error {
-        let reason =
-          limit < Self.maxFileBytes
-          ? "configuration byte budget exceeded (\(Self.maxLoadedBytes) bytes)"
-          : "file exceeds \(Self.maxFileBytes) bytes"
-        diagnostics.append("\(url.path): \(reason)")
-        return
-      }
-      let missing =
-        (error as? CocoaError)
-        .map { $0.code == .fileReadNoSuchFile || $0.code == .fileNoSuchFile }
-        ?? false
-      if !optional || !missing {
-        diagnostics.append("\(url.path): cannot read")
-      }
-      return
-    }
-    apply(
-      text,
-      name: url.path,
-      directory: url.deletingLastPathComponent(),
-      includes: &includes
-    )
-  }
-
-  /// Applies `text` on top of the current values.
-  public mutating func apply(
-    _ text: String,
-    name: String = "config",
-    directory: URL? = nil
-  ) {
-    var includes = Includes()
-    apply(text, name: name, directory: directory, includes: &includes)
-    loadIncludes(&includes)
-  }
-
-  private mutating func apply(
-    _ text: String,
-    name: String,
-    directory: URL?,
-    includes: inout Includes
-  ) {
-    for (i, raw)
-      in text.split(
-        omittingEmptySubsequences: false,
-        whereSeparator: \.isNewline
-      )
-      .enumerated()
-    {
-      let line = raw.trimmingCharacters(in: .whitespaces)
-      let scalars = line.unicodeScalars
-      guard !line.isEmpty, scalars.first != "#" else { continue }
-      guard let eq = scalars.firstIndex(of: "=") else {
-        diagnostics.append("\(name):\(i + 1): expected key = value")
-        continue
-      }
-      let key = String(scalars[..<eq]).trimmingCharacters(in: .whitespaces)
-      let rawValue = String(scalars[scalars.index(after: eq)...])
-        .trimmingCharacters(in: .whitespaces)
-      var value: String =
-        if key == "font-feature", rawValue.hasPrefix("\""),
-          let closingQuote = rawValue.dropFirst().firstIndex(of: "\""),
-          closingQuote != rawValue.index(before: rawValue.endIndex)
-        {
-          // CSS feature lists quote each tag rather than the whole value.
-          rawValue
-        } else { Self.unquote(rawValue) }
-      if key == "config-file" {
-        if value.isEmpty {
-          includes.clear()
-          continue
-        }
-        let optional =
-          !rawValue.hasPrefix("\"") && value.unicodeScalars.first == "?"
-        let path = optional ? String(value.unicodeScalars.dropFirst()) : value
-        let url = Self.fileURL(path, directory: directory)
-        if !includes.enqueue(url, optional: optional),
-          !includes.reportedFileLimit
-        {
-          includes.reportedFileLimit = true
-          diagnostics.append(
-            "\(name):\(i + 1): configuration file limit \(Self.maxLoadedFiles) exceeded"
-          )
-        }
-        continue
-      }
-      if key == "custom-shader", !value.isEmpty, let directory {
-        value = Self.fileURL(value, directory: directory).path
-      }
-      if let error = set(key, value) {
-        diagnostics.append("\(name):\(i + 1): \(key): \(error)")
-      }
-    }
-  }
-
-  private static func fileURL(_ path: String, directory: URL?) -> URL {
-    let expanded = (path as NSString).expandingTildeInPath
-    if expanded.unicodeScalars.first != "/", let directory {
-      return directory.appendingPathComponent(expanded)
-    }
-    return URL(fileURLWithPath: expanded)
-  }
-
-  /// Quoted values use the same syntax in configuration and theme files.
-  static func unquote(_ value: String) -> String {
-    let scalars = value.unicodeScalars
-    if scalars.first == "\"", scalars.last == "\"", scalars.count >= 2 {
-      return String(scalars.dropFirst().dropLast())
-    }
-    return value
-  }
-
-  /// Sets one key; returns an error message when it cannot be used.
+  /// Sets a programmatic option; returns an error when it cannot be used.
+  /// File loading and persistence use the JSONC model, not these option names.
   public mutating func set(_ key: String, _ value: String) -> String? {
     let defaults = Configuration()
     func bool(_ defaultValue: Bool = true) -> Bool? {
@@ -556,6 +395,10 @@ public struct Configuration: Sendable, Equatable {
       case "block_hollow": (cursorStyle, cursorHollow) = (.block, true)
       default: return invalid()
       }
+    case "tab-position":
+      guard let position = value.isEmpty ? .top : TabPosition(rawValue: value)
+      else { return invalid() }
+      tabPosition = position
     case "cursor-style-blink":
       if value.isEmpty {
         cursorStyleBlink = nil
@@ -588,24 +431,30 @@ public struct Configuration: Sendable, Equatable {
         return invalid()
       };
       mouseHideWhileTyping = b
+    case "mouse-scroll-multiplier":
+      guard
+        let v = value.isEmpty
+          ? defaults.mouseScrollMultiplier
+          : double(Self.mouseScrollMultiplierRange)
+      else { return invalid() }
+      mouseScrollMultiplier = v
     case "link-url":
       guard let b = bool(defaults.linkURL) else { return invalid() };
       linkURL = b
     case "scrollback-limit", "scrollback-limit-bytes", "scrollback-limit-lines",
       "scrollback-compression":
       return setScrollback(key, value)
+    case "shell-profile":
+      guard let kind = ShellKind(rawValue: value) else {
+        return "Unknown shell profile"
+      }
+      preferredShell = kind
     case "command": command = value.isEmpty ? nil : value
     case "working-directory":
       guard !value.utf8.contains(0) else { return invalid() }
       workingDirectory =
         value.isEmpty ? nil : (value as NSString).expandingTildeInPath
     case "window-padding-x", "window-padding-y": return setPadding(key, value)
-    case "macos-icon":
-      // Accepted so a shared Ghostty config loads cleanly; Swiftty has
-      // one icon.
-      guard value.isEmpty || Self.ghosttyIcons.contains(value) else {
-        return invalid()
-      }
     case "keybind":
       if value.isEmpty {
         keybindings = .defaults
@@ -798,6 +647,12 @@ public struct Configuration: Sendable, Equatable {
     return colors.applied(to: palette)
   }
 
+  /// Everything to report about this configuration, one line each.
+  public var problems: [String] {
+    diagnostics + missingThemes.map { "theme unavailable: \($0)" }
+      + missingFontStyles.map { "font style unavailable: \($0)" }
+  }
+
   /// Theme names that could not be loaded (missing, unreadable or invalid).
   public var missingThemes: [String] {
     guard let theme else { return [] }
@@ -864,11 +719,13 @@ public struct Configuration: Sendable, Equatable {
     o.cursorStyle = cursorStyle
     o.hollowCursor = cursorHollow
     o.cursorOpacity = cursorOpacity
+    o.reducesMotion = accommodations.reduceMotion
     return o
   }
 
   public func sessionConfiguration(
-    scheme: ColorScheme = .dark
+    scheme: ColorScheme = .dark,
+    nativeShellPath: String? = nil
   ) -> SessionConfiguration {
     #if os(macOS)
     let defaultsToHome = !SessionConfiguration.isCommandLineLaunch
@@ -879,6 +736,7 @@ public struct Configuration: Sendable, Equatable {
       workingDirectory: resolvedWorkingDirectory(defaultsToHome: defaultsToHome)
     )
     if let command { s.command = Self.commandArguments(command) }
+    applyShellProfile(to: &s, nativeShellPath: nativeShellPath)
     s.scrollbackLimitBytes = scrollbackLimit
     s.scrollbackLimitRows = scrollbackLimitLines
     s.scrollbackCompression = scrollbackCompression

@@ -1,13 +1,13 @@
 # SSH identity, Keychain storage, and iCloud sync
 
-**Status:** Proposed; documentation only, not an implementation or test report.  
-**Version:** 0.2  
-**Date:** 2026-10-16  
+**Status:** Implemented (`Sources/SSHIdentity`, `Apps/Store`). [README.md](README.md) records verification status; open device and CloudKit validation is tracked in [todo.md](todo.md) and §12.  
+**Version:** 0.3  
+**Date:** 2026-11-20  
 **Target:** `chr33s/swiftty`  
 **Reference implementation:** `chr33s/shell`  
 **Reviewed revisions:** Swiftty `b45ebc40518d92ab87c0abc3507790e0401e5787`; Shell `8069632c971107c05330bd56da9e32bbb7866793`.
 
-MUST, MUST NOT, and SHOULD are normative. Numerical bounds below are proposed product limits, not measured performance or Apple platform limits.
+MUST, MUST NOT, and SHOULD are normative. Numerical bounds below are product limits enforced in code, not measured performance or Apple platform limits.
 
 ## 1. Goal and interpretation
 
@@ -39,11 +39,11 @@ Full feature support targets iPhone, iPad, Mac Catalyst, and windowed visionOS, 
 
 Required capabilities are Ed25519 generation; bounded OpenSSH Ed25519 private-key import, unencrypted or passphrase-protected (§6.4); reusable identities; public-key copy/export; Keychain persistence; device-only or iCloud Keychain storage; profile/public-metadata sync; optional known-host sync; recovery UI; and migration of existing Swiftty keys. If Swiftty later exports or backs up a key with passphrase protection, it writes a standard encrypted OpenSSH key with the same `bcrypt_pbkdf` import uses (§6.3); no second password KDF is introduced.
 
-Passwords continue to use the existing prompt/session-memory behavior. Persistent password storage and saved import passphrases are not part of this change.
+Passwords use the existing prompt/session-memory behavior unless the user saves one for a host (§13.3). Saved import passphrases are not part of this change.
 
 ### 3.2 Explicit exclusions
 
-RSA/ECDSA authentication expansion, Secure Enclave keys, user certificates, SSH agents, forwarding, ProxyJump, full `~/.ssh/config` import, private-key export, automatic server authorization, and cross-app Shell vault sharing are deferred. Shell supports a broader identity surface; this release deliberately retains Swiftty's Ed25519 transport boundary. [S1, W3, W6]
+User certificates, SSH agents, forwarding, ProxyJump, full `~/.ssh/config` import, private-key export, automatic server authorization, and cross-app Shell vault sharing are deferred. ECDSA identities, Secure Enclave keys and saved passwords were added in v0.3 (§13). RSA and keyboard-interactive authentication remain excluded because SwiftNIO SSH, Swiftty's only SSH stack, supports neither; §13.4 records the decision. [S1, W3, W6]
 
 For this feature's first release, tvOS retains local key authentication and explicit generation, without new import or cloud-sync UI. This is a product boundary, not a claim that Apple APIs universally prohibit those features. tvOS must still receive the read-only login fix. Watch remains a companion with no credentials, identity store, SSH connection, or new cloud entitlements. Existing platform builds must continue to pass. [W6, W7]
 
@@ -87,7 +87,7 @@ Show separate metadata states (`off`, `pending`, `up to date`, `offline`, `accou
 
 ## 5. Models and ownership
 
-All names in this section are proposed interfaces, not claims of existing symbols.
+Names in this section describe contracts; §10 maps them to source files, and symbol names may differ.
 
 | Type | Required contract |
 |---|---|
@@ -104,7 +104,7 @@ Private key material belongs only to the Keychain adapter and short-lived authen
 
 Use a single atomic snapshot for related local data/outbox/checkpoint changes, not independently updated JSON files advertised as a transaction. Advance in-memory committed state only after the write succeeds. Keep corruption distinct from an empty store, retain a recoverable previous snapshot, and never overwrite an unreadable store with defaults.
 
-Proposed bounds: 256 live hosts, 256 live identities, 1,024 live trust entries, and 16 MiB per connection-state snapshot. Preserve existing host-field validation. Tombstones count toward storage bounds but cannot be silently pruned; storage exhaustion is a visible recoverable error, not successful saving or sync.
+Bounds: 256 live hosts, 256 live identities, 1,024 live trust entries, and 16 MiB per connection-state snapshot. Preserve existing host-field validation. Tombstones count toward storage bounds but cannot be silently pruned; storage exhaustion is a visible recoverable error, not successful saving or sync.
 
 ### 5.1 Identity invariants
 
@@ -166,7 +166,7 @@ A key rename alone remains compatible with reuse.
 
 Adapt the relevant Shell parser/normalizer logic, with provenance and security review, but do not carry over its Citadel-based decryption path. Required input is one `openssh-key-v1` Ed25519 identity, unencrypted or encrypted as §6.4 allows. Other ciphers or KDFs, other algorithms, certificates, and public-only files receive explicit unsupported-input errors. [S6]
 
-Validate every length before allocation, key count, check integers, deterministic padding, public/private consistency, and complete consumption of the input. Proposed limits: 64 KiB input, one key, and 1 KiB comment. Report keys exceeding limits rather than silently weakening them.
+Validate every length before allocation, key count, check integers, deterministic padding, public/private consistency, and complete consumption of the input. Limits: 64 KiB input, one key, and 1 KiB comment. Report keys exceeding limits rather than silently weakening them.
 
 Parsing runs off the main actor with bounded concurrency. Cancellation discards its eventual result and must prevent persistence or profile mutation.
 
@@ -195,7 +195,7 @@ Import reads encrypted `openssh-key-v1` files as `ssh-keygen` writes them, so us
 
 ### 7.1 Storage attributes
 
-Use `kSecClassGenericPassword` for canonical Ed25519 secret payloads. Proposed service: `dev.chr33s.swiftty.ssh-identity.v1`; account: lowercase identity UUID. Read the resolved access group from build configuration and specify it on every scoped operation.
+Use `kSecClassGenericPassword` for canonical Ed25519 secret payloads. Service: `dev.chr33s.swiftty.ssh-identity.v1`; account: lowercase identity UUID. Read the resolved access group from build configuration and specify it on every scoped operation.
 
 | Policy | Synchronizable | Accessibility for new items |
 |---|---|---|
@@ -230,7 +230,7 @@ Deleting a host never deletes a shared identity. Identity deletion shows referen
 
 ### 8.1 Container and records
 
-Use Swiftty's own proposed container `iCloud.dev.chr33s.swiftty`, the user's private database, and a custom zone `SwifttyConnectionsV1`. This is a proposed identifier, not a verified provisioned resource. Never reuse `iCloud.dev.chr33s.shell`. [S1, S5]
+Use Swiftty's own container (default `iCloud.dev.chr33s.swiftty`, selected per build with `SWIFTTY_CLOUDKIT_CONTAINER`), the user's private database, and a custom zone `SwifttyConnectionsV1`. The container must be provisioned for the signing team; builds without it omit sync. Never reuse `iCloud.dev.chr33s.shell`. [S1, S5]
 
 | Record type | Payload |
 |---|---|
@@ -301,14 +301,14 @@ A missing replacement can be repaired from the matching legacy item using the sa
 |---|---|
 | `Sources/SSHClient/Ed25519Keys.swift` | Retain generation/public formatting and compatibility interfaces; remove app login dependence on load-or-create. |
 | New `Sources/SSHIdentity/` | Identity models, resolver, Keychain adapter, import adapter, typed errors, injectable stores. |
-| `Apps/Shared/HostProfile.swift`, `HostProfileStore.swift` | Versioned auth decoding, stable references, compatibility migration. |
-| New `Apps/Shared/ConnectionStore.swift`, `ConnectionSyncCoordinator.swift` | Atomic non-secret state, operation journals, private CloudKit sync. |
+| `Apps/Store/HostProfile.swift`, `HostProfileStore.swift` | Versioned auth decoding, stable references, compatibility migration. |
+| New `Apps/Store/ConnectionStore.swift`, `ConnectionSyncCoordinator.swift` | Atomic non-secret state, operation journals, private CloudKit sync. |
 | `Apps/Shared/SSHAccess.swift` | Inject resolver; preserve host/pairing checks; share behavior across all SSH callers. |
 | `Apps/Shared/HostViews.swift`, `RoamingAppModel.swift`; new key/settings views | Picker, generation/import, lifecycle handling, availability and recovery UI. |
 | `Package.swift`, `Apps/project.yml`, entitlement sources and `Scripts/configure-links.sh` | Wire client-only dependencies and configured capabilities; preserve generated Associated Domains entitlements. |
 | Tests plus `README.md`, `spec.roaming.md`, `spec.connection-setup.md` | Contract tests, migration fixtures, platform evidence, and accepted-scope cross-references. |
 
-Proposed access group: `$(AppIdentifierPrefix)dev.chr33s.swiftty`, expanded from one build setting into both entitlements and runtime configuration. Enable CloudKit only for participating direct clients; configure development/production containers and deploy the production schema before TestFlight verification. Missing capability errors must not fall back to plaintext files. Do not add client credential access to SwifttyEngine, SwiftMux services, `swifttyd`, or Watch. [W7, A6]
+Access group: `$(AppIdentifierPrefix)dev.chr33s.swiftty`, expanded from one build setting into both entitlements and runtime configuration. Enable CloudKit only for participating direct clients; configure development/production containers and deploy the production schema before TestFlight verification. Missing capability errors must not fall back to plaintext files. Do not add client credential access to SwifttyEngine, SwiftMux services, `swifttyd`, or Watch. [W7, A6]
 
 **P1 — Local identity foundation:** stable IDs, explicit creation/import, read-only resolution, migration, device-only Keychain tests. Ship no sync promises.
 
@@ -354,6 +354,58 @@ All checks are pending. No builds, device tests, cloud provisioning, or implemen
 The design decisions are explicit: Ed25519 first; device-only default; opt-in metadata sync; per-identity secret sync; no silent fallback; no shared Shell vault; immutable key material/storage policy; foreground CloudKit; no automatic server authorization.
 
 Implementation must still verify the actual provisioned container/access groups and legacy accessibility, confirm the `_CryptoExtras` AES dependency remains the one swift-certificates already links, measure `bcrypt_pbkdf` on supported hardware (import's 1024-round bound, and the export default if export is added), and execute the acceptance matrix. These are release gates, not claims that the repository already satisfies them.
+
+## 13. Authentication methods beyond Ed25519 (v0.3)
+
+Adapted from Shell §3–§4 within Swiftty's SwiftNIO SSH boundary. Every rule above still applies: one selected credential, offered once; no password fallback; read-only resolution; UUID references.
+
+### 13.1 Key algorithms
+
+| Algorithm | Wire name | Generate | Import |
+|---|---|---|---|
+| Ed25519 (default) | `ssh-ed25519` | Yes | `openssh-key-v1`, unencrypted or §6.4-encrypted |
+| ECDSA P-256 / P-384 / P-521 | `ecdsa-sha2-nistp256` / `384` / `521` | Yes | `openssh-key-v1` (same ciphers and KDF as §6.4); unencrypted SEC 1 `EC PRIVATE KEY` and PKCS #8 `PRIVATE KEY` on a named curve |
+
+- `SSHKeyAlgorithm` (in `SSHClient`) names the algorithms; `SSHSigningKey` holds one private key for an authentication operation and maps it to `NIOSSHPrivateKey`. `SSHCredential.publicKey(_:)` replaces the Ed25519-only case; `SSHCredential.ed25519(_:)` remains as a constructor.
+- `SSHIdentityMetadata.publicKey` is the canonical `"<type> <base64>"` line for any algorithm. Validation requires a supported algorithm, a line that `NIOSSHPublicKey` parses and re-serializes byte-for-byte, a matching algorithm field and a matching `SHA256:` fingerprint.
+- Keychain payloads gain a leading format byte: `1` Ed25519 seed (unchanged), `2` curve tag plus raw ECDSA scalar, `3` Secure Enclave handle. Unknown bytes or curves are `malformed`.
+- ECDSA import checks the curve name against the key type, strips the mpint sign byte, left-pads to the curve's scalar size, derives the public point and requires it to equal both the private section's point and the file's public blob (`keyMismatch` otherwise). Encrypted PEM, explicit curve parameters, DSA and RSA are refused with named errors.
+- CloudKit `SwifttySSHIdentityV1` records keep schema v1; a record with an unknown algorithm stays opaque (`unsupported`) rather than malformed, so an older build preserves a newer device's ECDSA identity.
+
+### 13.2 Secure Enclave keys
+
+- **Policy:** `IdentityStoragePolicy.secureEnclave`, chosen only at generation, only for P-256 and only where `SecureEnclave.isAvailable`. Imported keys can never use it (`unsupportedKeyType`). `isDeviceBound` is true for it and for `deviceOnly`.
+- **Generation:** `SecureEnclave.P256.Signing.PrivateKey` with access control `privateKeyUsage`, plus `userPresence` when the user keeps **Require Face ID, Touch ID or Passcode** on (the default). The private key never leaves the Secure Enclave.
+- **Storage:** the sealed handle (`dataRepresentation`) is a generic-password item in its own service, `dev.chr33s.swiftty.ssh-identity.v1.secure-enclave`, not synchronizable, `WhenUnlockedThisDeviceOnly`. Orphan recovery for software keys never lists it. A payload whose kind does not match the namespace's policy is refused on write and read.
+- **Other devices:** metadata may sync, but resolution there finds no item and reports **Not on this device** (`unavailableOnThisDevice`); no copy, repair-by-import or iCloud-copy action is offered. The UI states the key cannot be exported, backed up or synced, and is lost with the device.
+- **Use:** signing may show the system's biometric or passcode prompt. Automatic reconnection only runs in the foreground ([spec.roaming.md §9.1](spec.roaming.md#91-ordinary-ssh-recovery-and-transport-options)), so it never needs UI from the background.
+- **Labels:** pickers and rows show `Ed25519`, `ECDSA P-256`, … or `P-256 · Secure Enclave` (Shell §12).
+
+### 13.3 Saved passwords
+
+- The password prompt offers **Save in Keychain**, off by default. A saved password is a generic-password item: service `dev.chr33s.swiftty.ssh-password.v1`, account the lowercase host UUID, not synchronizable, `WhenUnlockedThisDeviceOnly`. It never enters snapshots, CloudKit, queues or logs, and its descriptions are redacted.
+- The item stores the host name, port and username it was entered for. It is offered only to that saved host with that exact endpoint (host name case-insensitive); an edited endpoint never receives it. Unsaved drafts cannot save one.
+- A rejected saved password is deleted. Deleting the host deletes it. The host editor shows **Forget Saved Password** while one exists.
+- Authentication still offers only the host's selected method. A key host never receives a saved password.
+
+### 13.4 Excluded methods
+
+| Method | Reason |
+|---|---|
+| RSA keys | SwiftNIO SSH has no RSA client keys. Import reports `unsupportedAlgorithm("ssh-rsa")`; nothing falls back. |
+| keyboard-interactive | SwiftNIO SSH parses only `publickey`, `password` and `hostbased` methods. Supporting it requires a change to that package, which this spec does not authorize; servers needing it must enable `password` or `publickey`. |
+| OpenSSH user certificates | Still deferred (§3.2). |
+
+### 13.5 Acceptance
+
+| ID | Required evidence |
+|---|---|
+| ALG-01 | Ed25519 and ECDSA P-256/384/521 keys authenticate against an in-process SwiftNIO SSH server; a different key of the same type is rejected (`SSHResilienceTests`). |
+| ALG-02 | `ssh-keygen` ECDSA fixtures (all three curves, unencrypted and aes256-ctr) and a named-curve PEM key import with the expected public line; explicit-parameter and encrypted PEM are refused (`KeyAlgorithmTests`). |
+| ALG-03 | Payloads round-trip for every algorithm; unknown formats and curves fail; tampered fingerprints and mismatched algorithms fail validation. |
+| SE-01 | A Secure Enclave identity's metadata on a device without its item resolves to `unavailableOnThisDevice`; software payloads are refused in its namespace. |
+| SE-02 | Signed physical-device run: generate with and without user presence, authenticate, relaunch, delete; confirm the item is absent from iCloud Keychain on a second device. **Pending** — unsigned test runners cannot create Secure Enclave keys. |
+| PW-01 | Saved passwords match only their endpoint, are redacted, and are removed on rejection and host deletion. |
 
 ## References
 

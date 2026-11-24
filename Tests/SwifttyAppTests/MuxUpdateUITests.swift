@@ -1,6 +1,7 @@
 import Foundation
 import SwiftMuxClient
 import SwiftMuxProtocol
+import SwiftMuxXPC
 import SwiftMuxService
 @testable import Swiftty
 import Testing
@@ -93,8 +94,7 @@ struct MuxUpdateUITests {
       controller.stage()
     default: controller.cancel()
     }
-    // Let the old asynchronous stage/cancel operations run while detach is
-    // held.
+    // Let the old async stage/cancel operations run while detach is held.
     try await Task.sleep(for: .milliseconds(20))
     #expect(detaches == 1)
     #expect(confirmations == 1)

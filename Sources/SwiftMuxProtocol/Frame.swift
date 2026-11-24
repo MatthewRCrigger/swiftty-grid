@@ -239,6 +239,17 @@ public struct HistoryWindow: Codable, Sendable, Equatable {
     self.scrollbackRows = scrollbackRows
   }
 
+  /// Largest absolute row, count or offset a frame may carry. Far beyond
+  /// any history, and small enough that row arithmetic cannot overflow.
+  public static let maxRow = 1 << 48
+
+  /// Every field is non-negative and at most `maxRow`, so sums of a field
+  /// and a grid coordinate (`viewportTop + y`) cannot overflow.
+  public var isBounded: Bool {
+    [firstRow, availableRows, viewportTop, viewportOffset, scrollbackRows]
+      .allSatisfy { $0 >= 0 && $0 <= Self.maxRow }
+  }
+
   public func address(
     viewportRow y: Int,
     alternateScreen: Bool
@@ -302,6 +313,11 @@ public struct PaneFrame: Codable, Sendable, Equatable {
   public var title: String
   /// The program's drop registration (`dropTargets`); nil when none.
   public var dropTarget: FrameDropTarget?
+  /// Per row, the service's edit version (spec.multiplexer.md §4, "Row
+  /// identity and versions"). With the row's address it identifies the
+  /// row's content: equal identities mean equal content. Nil from a
+  /// service that does not track versions.
+  public var rowVersions: [UInt64]?
 
   public init(
     identity: FrameIdentity,
@@ -315,7 +331,8 @@ public struct PaneFrame: Codable, Sendable, Equatable {
     history: HistoryWindow,
     search: FrameSearch?,
     title: String,
-    dropTarget: FrameDropTarget? = nil
+    dropTarget: FrameDropTarget? = nil,
+    rowVersions: [UInt64]? = nil
   ) {
     self.identity = identity
     self.grid = grid
@@ -329,6 +346,40 @@ public struct PaneFrame: Codable, Sendable, Equatable {
     self.search = search
     self.title = title
     self.dropTarget = dropTarget
+    self.rowVersions = rowVersions
+  }
+
+  /// Identity of row `y`, or nil when the frame carries no versions.
+  public func rowIdentity(_ y: Int) -> RowIdentity? {
+    guard let rowVersions, y >= 0, y < rowVersions.count else { return nil }
+    return RowIdentity(
+      address: history.address(
+        viewportRow: y,
+        alternateScreen: grid.alternateScreen
+      ),
+      version: rowVersions[y]
+    )
+  }
+
+  /// Row keys `[generation, alternate, row, version, screen]` for
+  /// address-based selections (`PresentationSelection`) and keyed diffs;
+  /// `screen` is 1 for a row that can still change in place.
+  public var rowKeys: [[UInt64]]? {
+    guard let identities = rowIdentities else { return nil }
+    let screenTop = history.viewportTop + history.viewportOffset
+    return identities.map {
+      [
+        $0.address.generation, $0.address.alternateScreen ? 1 : 0,
+        UInt64(bitPattern: Int64($0.address.row)), $0.version,
+        $0.address.alternateScreen || $0.address.row >= screenTop ? 1 : 0,
+      ]
+    }
+  }
+
+  /// Identities of every row, or nil without versions.
+  public var rowIdentities: [RowIdentity]? {
+    guard let rowVersions, rowVersions.count == grid.rows else { return nil }
+    return (0 ..< grid.rows).map { rowIdentity($0)! }
   }
 
   /// Text of row `y`, trailing blanks trimmed.
@@ -361,9 +412,9 @@ public struct PaneFrame: Codable, Sendable, Equatable {
   }
 }
 
-/// Decides which owned frame is visible. Nothing installs while
-/// unattached. A stale server instance, attachment, geometry revision, layout revision, or older frame
-/// revision never replaces a newer installed frame. A frame with the
+/// Decides which owned frame is visible. Nothing installs while unattached.
+/// A stale server instance, attachment, geometry or layout revision, or older
+/// frame revision never replaces a newer installed frame. A frame with the
 /// installed revision is accepted again: the service resends a complete
 /// frame on resubscription without advancing the revision.
 public struct FrameInstallation: Sendable, Equatable {
@@ -394,7 +445,6 @@ public struct FrameInstallation: Sendable, Equatable {
     return true
   }
 
-  /// Keeps only frames of `attachment`.
   public mutating func retain(attachment: AttachmentID) {
     visible = visible.filter { $0.value.attachment == attachment }
   }

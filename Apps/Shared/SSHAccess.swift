@@ -4,26 +4,6 @@ import SSHClient
 import SSHIdentity
 import TerminalSurface
 
-/// Where the app keeps non-secret state: trusted host public keys,
-/// transfer manifests and staged files. tvOS offers no durable local
-/// storage, so it uses Caches there (spec §2.3).
-enum RoamingStorage {
-  static var directory: URL {
-    if let override = UITesting.storageDirectory { return override }
-    #if os(tvOS)
-    let base = URL.cachesDirectory
-    #else
-    let base = URL.applicationSupportDirectory
-    #endif
-    return base.appending(path: "Swiftty", directoryHint: .isDirectory)
-  }
-
-  /// Trusted SSH host keys (public keys only).
-  static var knownHostsURL: URL {
-    directory.appending(path: "known_hosts.json", directoryHint: .notDirectory)
-  }
-}
-
 /// Why an SSH connection for a saved host could not be made. Messages
 /// carry no secrets.
 enum SSHAccessError: Error, Equatable, Sendable {
@@ -213,11 +193,14 @@ final class SSHAccess {
     for host: HostProfile,
     expectedHostKeys: Set<String>? = nil
   ) -> SSHClient.SSHClientConfiguration {
-    SSHClient.SSHClientConfiguration(
+    let resilience = app?.resilience ?? .default
+    return SSHClient.SSHClientConfiguration(
       host: host.host,
       port: host.port,
       username: host.username,
-      expectedHostKeyFingerprints: expectedHostKeys
+      expectedHostKeyFingerprints: expectedHostKeys,
+      forceIPv4: resilience.forceIPv4,
+      keepalive: resilience.keepalive
     )
   }
 
@@ -264,9 +247,7 @@ final class SSHAccess {
     case .key:
       guard let app, let reference else { throw .cancelled }
       do {
-        return .ed25519(
-          try await app.identityStore.resolve(reference).privateKey
-        )
+        return try await app.identityStore.resolve(reference).credential
       } catch .cancelled { throw .cancelled } catch {
         throw .keyUnavailable(error)
       }
@@ -561,7 +542,7 @@ final class SSHAccess {
     guard let reference, let store = app?.identityStore else { return nil }
     return .resolved { @Sendable in
       do throws(IdentityResolutionError) {
-        return .ed25519(try await store.resolve(reference).privateKey)
+        return try await store.resolve(reference).credential
       } catch { throw SSHAccessError.keyUnavailable(error) }
     }
   }

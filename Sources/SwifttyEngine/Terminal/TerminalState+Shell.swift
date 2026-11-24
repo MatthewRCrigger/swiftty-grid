@@ -104,6 +104,10 @@ extension TerminalState {
       semanticState = .input
       markInputLine()
     case 0x43:  // C
+      if onShellCommandFinished != nil || onShellCommandStarted != nil {
+        shellCommand = captureShellCommand()
+        onShellCommandStarted?(shellCommand)
+      }
       semanticState = .output
       clearInputLine()
       // At column zero the output replaces this row's prompt; after
@@ -116,8 +120,31 @@ extension TerminalState {
       clearInputLine()
       lastExitCode = Self.semanticExitCode(rest)
       commandFinished = true
+      onShellCommandFinished?(shellCommand, lastExitCode)
+      shellCommand = ""
     default: break
     }
+  }
+
+  private func captureShellCommand() -> String {
+    guard !isAlternateScreen, let offset = inputOffset,
+      let row = primaryInputLineRow()
+    else { return "" }
+    let start = TerminalPoint(
+      row: screenAbsoluteRow(row) + offset / columns,
+      column: offset % columns
+    )
+    var end = TerminalPoint(
+      row: screenAbsoluteRow(cursor.y),
+      column: cursor.x - 1
+    )
+    if cursor.pendingWrap { end.column = cursor.x }
+    if end.column < 0 {
+      end.row -= 1
+      end.column = columns - 1
+    }
+    guard end >= start, end.row - start.row <= 1024 else { return "" }
+    return String(text(from: start, to: end).prefix(16_384))
   }
 
   private static func promptCursorKeys(
@@ -419,7 +446,6 @@ extension TerminalState {
     let target = min(linear(p), end)
     let from = linear(cursorPoint)
     guard target != from else { return 0 }
-    // Count characters between the two positions.
     var moves = 0
     for i in min(target, from) ..< max(target, from) {
       let row = start.row + i / columns
@@ -657,6 +683,7 @@ extension TerminalState {
     inputOffset = nil
     hasSemanticPrompts = false
     lastExitCode = nil
+    shellCommand = ""
     titleStack = []
     penStack = []
     underlineColors = []

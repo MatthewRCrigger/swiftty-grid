@@ -1,3 +1,4 @@
+import CoreTestSupport
 import TestSupport
 #if canImport(UIKit)
 import Metal
@@ -27,8 +28,7 @@ extension ViewLifecycleTests {
       bar.removeFromSuperview()
     }
     func findButton(in parent: UIView) -> UIButton? {
-      if let button = parent as? UIButton,
-        button.accessibilityLabel == AccessoryKey.up.title
+      if let button = parent as? UIButton, button.accessibilityLabel == "Escape"
       {
         return button
       }
@@ -39,7 +39,7 @@ extension ViewLifecycleTests {
     var keys: [AccessoryKey] = []
     bar.onKey = { keys.append($0) }
     _ = bar.perform(NSSelectorFromString("keyDown:"), with: button)
-    #expect(keys == [.up])
+    #expect(keys == [.escape])
     if repeating {
       let deadline = ContinuousClock.now + .seconds(2)
       while keys.count < 2, ContinuousClock.now < deadline {
@@ -92,13 +92,13 @@ extension ViewLifecycleTests {
     let session = TerminalSession(columns: 10, rows: 2)
     let view = try TerminalUIView(
       session: session,
-      configuration: Configuration.parse("keybind=ctrl+a=text:X")
+      configuration: Configuration.configured([("keybind", "ctrl+a=text:X")])
     )
     let stale = try #require(
       view.keyCommands?
         .first { $0.input == "a" && $0.modifierFlags == .control }
     )
-    view.apply(Configuration.parse("keybind=ctrl+a=text:Y"))
+    view.apply(Configuration.configured([("keybind", "ctrl+a=text:Y")]))
     if rebuild { _ = view.keyCommands }
     let writes = Mutex<[UInt8]>([])
     session.onWrite = { bytes in
@@ -117,16 +117,18 @@ extension ViewLifecycleTests {
     #expect(writes.withLock { $0 } == Array("Y".utf8))
   }
 
-  @Test(.enabled(if: hasMetal), arguments: [0, 1, 2, 3, 4, 5])
+  // An accessory key no longer interrupts a held physical key: it is
+  // refused (DirectionPadEventTests).
+  @Test(.enabled(if: hasMetal), arguments: [0, 1, 2, 3, 5])
   func `new text bindings and composition stop an older key repeat`(
     _ transition: Int
   ) throws {
     let session = TerminalSession(columns: 10, rows: 2)
     let view = try TerminalUIView(
       session: session,
-      configuration: Configuration.parse(
-        "keybind=b=ignore\nkeybind=ctrl+b=ignore"
-      )
+      configuration: Configuration.configured([
+        ("keybind", "b=ignore"), ("keybind", "ctrl+b=ignore"),
+      ])
     )
     defer { view.releaseHardwareKeys() }
     session.feed(Array("\u{1B}[=10u".utf8))
@@ -152,7 +154,6 @@ extension ViewLifecycleTests {
     case 2:
       view.setMarkedText("中", selectedRange: NSRange(location: 1, length: 0))
     case 3: view.insertText("x")
-    case 4: view.accessoryKey(.tab)
     default:
       let command = try #require(
         view.keyCommands?
@@ -212,7 +213,7 @@ extension ViewLifecycleTests {
     let session = TerminalSession(columns: 10, rows: 2)
     let view = try TerminalUIView(
       session: session,
-      configuration: Configuration.parse("keybind=ctrl+b=ignore")
+      configuration: Configuration.configured([("keybind", "ctrl+b=ignore")])
     )
     defer { view.releaseHardwareKeys() }
     session.feed(Array("\u{1B}[=10u".utf8))
@@ -426,7 +427,9 @@ extension ViewLifecycleTests {
   {
     let firstSession = TerminalSession(columns: 10, rows: 2)
     let secondSession = TerminalSession(columns: 10, rows: 2)
-    let config = Configuration.parse("keybind = unconsumed:all:ctrl+a=text:X")
+    let config = Configuration.configured([
+      ("keybind", "unconsumed:all:ctrl+a=text:X")
+    ])
     let first = try TerminalUIView(session: firstSession, configuration: config)
     let second = try TerminalUIView(session: secondSession)
     let firstWrites = Mutex<[UInt8]>([])
@@ -467,9 +470,9 @@ extension ViewLifecycleTests {
   @Test(.enabled(if: hasMetal))
   func `performable copy consumes the key when a selection exists`() throws {
     let session = TerminalSession(columns: 10, rows: 2)
-    let config = Configuration.parse(
-      "keybind = performable:ctrl+c=copy_to_clipboard"
-    )
+    let config = Configuration.configured([
+      ("keybind", "performable:ctrl+c=copy_to_clipboard")
+    ])
     let view = try TerminalUIView(session: session, configuration: config)
     let clipboard = try #require(
       UIPasteboard(name: .init(rawValue: UUID().uuidString), create: true)
@@ -507,9 +510,9 @@ extension ViewLifecycleTests {
 
   @Test(.enabled(if: hasMetal))
   func `unavailable performable copy bindings pass the key through`() throws {
-    let config = Configuration.parse(
-      "keybind = performable:ctrl+c=copy_to_clipboard"
-    )
+    let config = Configuration.configured([
+      ("keybind", "performable:ctrl+c=copy_to_clipboard")
+    ])
     let session = TerminalSession(columns: 10, rows: 2)
     let view = try TerminalUIView(session: session, configuration: config)
     defer { view.releaseHardwareKeys() }
@@ -539,9 +542,9 @@ extension ViewLifecycleTests {
   func `bindings send original keys only when unconsumed`(
     _ unconsumed: Bool
   ) throws {
-    let config = Configuration.parse(
-      "keybind = \(unconsumed ? "unconsumed:" : "")ctrl+a=text:X"
-    )
+    let config = Configuration.configured([
+      ("keybind", "\(unconsumed ? "unconsumed:" : "")ctrl+a=text:X")
+    ])
     let session = TerminalSession(columns: 10, rows: 2)
     let view = try TerminalUIView(session: session, configuration: config)
     defer { view.releaseHardwareKeys() }
@@ -569,7 +572,7 @@ extension ViewLifecycleTests {
 
   @Test(.enabled(if: hasMetal))
   func `unconsumed printable bindings preserve text input`() throws {
-    let config = Configuration.parse("keybind = unconsumed:a=text:X")
+    let config = Configuration.configured([("keybind", "unconsumed:a=text:X")])
     let session = TerminalSession(columns: 10, rows: 2)
     let view = try TerminalUIView(session: session, configuration: config)
     let writes = Mutex<[UInt8]>([])

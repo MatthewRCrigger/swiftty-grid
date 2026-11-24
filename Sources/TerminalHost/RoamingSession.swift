@@ -3,6 +3,7 @@ import Dispatch
 import Foundation
 import ScreenProtocol
 import SessionCore
+import SwiftMuxExport
 import SwiftMuxProtocol
 import SwiftMuxService
 import SwifttyEngine
@@ -18,6 +19,11 @@ import Synchronization
 /// in-process SMX client, so the native app and remote clients share one
 /// single-writer rule. Detaching releases the lease; the shell keeps
 /// running. Never logs tokens, input or terminal contents.
+///
+/// Sendable: ledger, attachment, lease and revision state are confined to
+/// the serial owner `queue`; `status` lives in the `statusBox` Mutex;
+/// `onTerminateRequested` is set once by the registry before publication.
+/// No unsafe storage.
 public final class RoamingSession: @unchecked Sendable {
   public enum State: String, Sendable, Hashable {
     case reserved, attached, detached, exited, terminated
@@ -64,9 +70,10 @@ public final class RoamingSession: @unchecked Sendable {
   public let id: SessionID
   public var workspace: WorkspaceID { id.workspace }
   let queue: DispatchQueue
-  private let service: MuxService
+  private let panes: any RoamingPanes
   private let statusBox: Mutex<Status>
-  private let snapshotEncoder: @Sendable (ScreenSnapshot) throws -> [UInt8]
+  /// Tests: sees (and may hold or fail) each encoded screen record.
+  private let screenEncoder: ScreenEncoder
   private let encodeQueue = DispatchQueue(
     label: "swiftmux.roaming.snapshot-encode",
     qos: .utility
@@ -75,6 +82,13 @@ public final class RoamingSession: @unchecked Sendable {
   /// Called (on the owner queue) when an attached client asks to
   /// terminate; the registry revokes credentials and ends the workspace.
   var onTerminateRequested: (@Sendable (SessionID) -> Void)?
+
+  /// Tests: sees each captured screen in full when it is submitted for
+  /// sending, the only place a delta's complete screen exists. Nil in
+  /// production.
+  let submittedScreenObserver = Mutex<(@Sendable (CapturedScreen) -> Void)?>(
+    nil
+  )
 
   // MARK: Owner-queue state
 
@@ -101,10 +115,32 @@ public final class RoamingSession: @unchecked Sendable {
       for send in snapshotSends.values { send.task.cancel() }
     }
   }
+  /// A captured screen: a legacy snapshot, or the shared frame model with
+  /// its envelope (`paneFrames`).
+  package enum CapturedScreen: Sendable {
+    case frame(PaneFrame, RSTFrameHeader)
+
+    package var screenRevision: UInt64 {
+      switch self {
+      case let .frame(_, h): h.screenRevision
+      }
+    }
+  }
+  /// Encodes one screen record (the header and the record to send).
+  package typealias ScreenEncoder =
+    @Sendable (RSTFrameHeader, [UInt8]) throws -> [UInt8]
   private struct SnapshotEncoding: Sendable {
-    let snapshot: ScreenSnapshot
+    let screen: CapturedScreen
     let stream: UInt64
     let attachment: HostAttachment
+    /// The acknowledged frame a delta may name; nil sends a full screen.
+    let baseline: FrameBaseline?
+  }
+  /// An encoded record, and for a frame the baseline it establishes.
+  private struct EncodedScreen: Sendable {
+    let payload: [UInt8]
+    let baseline: FrameBaseline?
+    let full: Bool
   }
   private struct SnapshotSend {
     let stream: UInt64
@@ -118,7 +154,7 @@ public final class RoamingSession: @unchecked Sendable {
   /// At most the current attachment's two scheduler-owned captures wait here.
   /// Replacement removes stale captures before another worker can start them.
   private var pendingSnapshotEncodes: [SnapshotEncoding] = []
-  private var mux: MuxLocalSession?
+  private var mux: (any RoamingMux)?
   /// The SMX attachment of `mux`'s lease.
   private var muxAttachment: AttachmentID?
   /// Called once the previous lease is fully released.
@@ -135,9 +171,13 @@ public final class RoamingSession: @unchecked Sendable {
   private var screenRevision: UInt64 = 0
   private var geometryGeneration: UInt64 = 0
   private var layoutRevision: UInt64 = 0
+  /// The workspace's tabs and panes as `layoutControl` clients see them.
+  private var remoteLayout: RemoteLayout?
   private var activePane: PaneID?
   private var exitStatus: Int32?
   private var terminated = false
+  /// The state last reported to scripts (owner queue).
+  private var reportedState: State?
   private var writerFailed = false
   private var columns: Int
   private var rows: Int
@@ -148,22 +188,39 @@ public final class RoamingSession: @unchecked Sendable {
   /// held, and the exact lease generation a takeover may displace.
   private var target: ResumeTarget?
 
-  init(
+  /// A session of the in-process SwiftMux service.
+  convenience init(
     id: SessionID,
     service: MuxService,
     grid: GridSize,
     floor: Floor = Floor(),
     pendingInputLimit: Int = RSTLimits.maxPendingInputBytes,
-    snapshotEncoder: @escaping @Sendable (ScreenSnapshot) throws -> [UInt8] = {
-      try SnapshotFrame.encode($0)
-    }
+    screenEncoder: @escaping ScreenEncoder = { $1 }
+  ) {
+    self.init(
+      id: id,
+      panes: LocalRoamingPanes(service: service),
+      grid: grid,
+      floor: floor,
+      pendingInputLimit: pendingInputLimit,
+      screenEncoder: screenEncoder
+    )
+  }
+
+  init(
+    id: SessionID,
+    panes: any RoamingPanes,
+    grid: GridSize,
+    floor: Floor = Floor(),
+    pendingInputLimit: Int = RSTLimits.maxPendingInputBytes,
+    screenEncoder: @escaping ScreenEncoder = { $1 }
   ) {
     epoch = floor.epoch
     screenRevision = floor.screenRevision
     resizeRevision = floor.resizeRevision
     self.id = id
-    self.service = service
-    self.snapshotEncoder = snapshotEncoder
+    self.panes = panes
+    self.screenEncoder = screenEncoder
     columns = grid.columns
     rows = grid.rows
     ledger = HostInputLedger(byteLimit: pendingInputLimit)
@@ -232,7 +289,6 @@ public final class RoamingSession: @unchecked Sendable {
     }
   }
 
-  /// The writer currently authorized for input, if any.
   public var writerID: WriterID? { queue.sync { ledger.writerID } }
 
   /// Installs `writer` for subsequent input (bootstrap create/resume). A
@@ -266,19 +322,6 @@ public final class RoamingSession: @unchecked Sendable {
     return try result.get()
   }
 
-  /// An owned export of the active pane's screen (diagnostics and tests).
-  public func currentSnapshot() async -> ScreenSnapshot? {
-    let (pane, stamp) = queue.sync { (activePane, stamp(epoch: epoch)) }
-    guard let pane else { return nil }
-    return await withCheckedContinuation { continuation in
-      service.inspect(
-        pane: pane,
-        { ScreenExporter.export($0, stamp: stamp) },
-        completion: { continuation.resume(returning: $0) }
-      )
-    }
-  }
-
   private func endAuthorizationOnQueue() {
     guard !terminated else { return }
     revokeLeaseAdmission()
@@ -288,6 +331,7 @@ public final class RoamingSession: @unchecked Sendable {
       $0.state = .terminated
       $0.isAttached = false
     }
+    reportState()
     if let a = attachment {
       a.isCurrent = false
       a.closeAfterFlush()
@@ -400,11 +444,11 @@ public final class RoamingSession: @unchecked Sendable {
     }
     let admission = LeaseAdmission(connection: a.connection)
     leaseAdmission = admission
-    let session = MuxLocalSession(queue: queue)
+    let session = panes.makeMux(workspace: workspace, queue: queue)
     // Fails this attach without touching a newer one's client.
     let failAttach = { [self] (code: RSTErrorCode) in
       admission.revoke()
-      if mux === session { closeMux {} } else { session.close() }
+      if mux === session { closeMux {} } else { session.close(then: nil) }
       completion(.failure(terminated ? .unknownSession : code))
     }
     let refusal = { [self] () -> RSTErrorCode? in
@@ -450,7 +494,7 @@ public final class RoamingSession: @unchecked Sendable {
       stale.close()
     }
     mux = session
-    session.connect(to: service, frontend: .native, remote: true)
+    session.connect()
     let target = WorkspaceSelector.id(workspace)
     session.request(
       .attach(AttachRequest(target)),
@@ -530,6 +574,14 @@ public final class RoamingSession: @unchecked Sendable {
     a.scheduler.reset()
     a.highestSubmittedScreenRevision = 0
     a.exitNoticeSent = false
+    a.features = RSTFeatures.supported.agreed(
+      with: a.clientFeatures.withLock { $0 }
+    )
+    a.submittedBaselines = [:]
+    a.deltaBaseline = nil
+    a.fullScreenPending = false
+    a.lastFullScreenRevision = 0
+    a.copyInFlight = false
     touch(state: exitStatus == nil ? .attached : .exited, attached: true)
     statusBox.withLock { $0.isAttached = true }
     a.send(
@@ -545,6 +597,7 @@ public final class RoamingSession: @unchecked Sendable {
       )
     )
     completion(.success(epoch))
+    sendLayout()
     pumpInput()
     a.scheduler.markDirty()
     pumpSnapshots(a)
@@ -622,6 +675,20 @@ public final class RoamingSession: @unchecked Sendable {
       s.lastActivity = now
       s.lastActivityWall = wall
     }
+    reportState()
+  }
+
+  /// Tells scripts when a device's connection is lost (`detached`) or
+  /// restored (`attached`), and when the session exits or ends.
+  private func reportState() {
+    let state = statusBox.withLock { $0.state }
+    guard state != reportedState else { return }
+    reportedState = state
+    panes.sessionChanged(
+      id.description,
+      workspace: workspace,
+      state: state.rawValue
+    )
   }
 
   // MARK: Service events (owner queue)
@@ -660,6 +727,10 @@ public final class RoamingSession: @unchecked Sendable {
       return
     }
     layoutRevision = ws.layoutRevision
+    let layout = RemoteLayout(ws)
+    let changed = Self.layoutChanged(from: remoteLayout, to: layout)
+    remoteLayout = layout
+    if changed { sendLayout() }
     let allExited =
       !ws.panes.isEmpty && ws.panes.allSatisfy { $0.exitStatus != nil }
     statusBox.withLock { $0.allPanesExited = allExited }
@@ -676,6 +747,14 @@ public final class RoamingSession: @unchecked Sendable {
     if pane != activePane {
       activePane = pane
       exitStatus = nil
+      // A history window belongs to the pane it was opened on; a move
+      // still resolving there must not land on the new one.
+      if let a = attachment {
+        a.historyTop = nil
+        a.pendingViewportLines = 0
+        a.liveReturns &+= 1
+      }
+      if let pane { mux?.present(pane: pane, top: nil, generation: 0) }
       if let status = summary?.exitStatus {
         exited(status)
       } else {
@@ -686,10 +765,79 @@ public final class RoamingSession: @unchecked Sendable {
           s.exitStatus = nil
           s.exitedAt = nil
         }
+        reportState()
       }
       contentChanged()
     } else if let status = summary?.exitStatus, exitStatus == nil {
       exited(status)
+    }
+  }
+
+  /// Whether a client shown `previous` must be sent `layout`. Revisions
+  /// also advance for split ratios and zoom, which a layout does not
+  /// carry: a change in revision alone sends nothing.
+  static func layoutChanged(
+    from previous: RemoteLayout?,
+    to layout: RemoteLayout
+  ) -> Bool {
+    guard var previous else { return true }
+    previous.revision = layout.revision
+    return previous != layout
+  }
+
+  /// The current layout, to an attachment that agreed `layoutControl`.
+  private func sendLayout() {
+    guard let a = attachment, a.isCurrent, a.features.contains(.layoutControl),
+      let remoteLayout
+    else { return }
+    a.send(.layout(epoch: a.epoch, remoteLayout))
+  }
+
+  /// Applies a client's layout change with the lease held for it
+  /// (spec.roaming.md §7.6). The screen follows the active pane through
+  /// the layout event that results, as for a change made on the Mac.
+  private func performLayout(
+    _ action: LayoutAction,
+    request id: UInt64,
+    for a: HostAttachment
+  ) {
+    func finish(_ error: RSTErrorCode?) {
+      guard a === attachment, a.isCurrent else { return }
+      a.send(.layoutResult(epoch: a.epoch, requestID: id, error: error))
+    }
+    guard let session = mux, session.isOpen, muxAttachment != nil else {
+      return finish(.notAttached)
+    }
+    let command: MuxCommand
+    switch action {
+    case let .split(axis):
+      guard let pane = activePane else { return finish(.notAttached) }
+      command = .split(pane: pane, axis: axis, launch: nil)
+    case let .focusPane(pane): command = .focusPane(pane)
+    case let .closePane(pane): command = .endPane(pane)
+    case .newTab: command = .newTab(name: nil, launch: nil)
+    case let .selectTab(tab): command = .selectTab(tab)
+    case let .renameTab(tab, name): command = .renameTab(tab, name: name)
+    case let .closeTab(tab): command = .endTab(tab)
+    case let .renameWorkspace(name):
+      command = .renameWorkspace(.id(workspace), name: name)
+    }
+    session.request(command) { [weak self, weak session] result in
+      guard let self, let session, self.mux === session else { return }
+      switch result {
+      case .success: finish(nil)
+      case let .failure(error): finish(Self.layoutCode(error))
+      }
+    }
+  }
+
+  private static func layoutCode(_ error: MuxError) -> RSTErrorCode {
+    switch error.code {
+    case .leaseHeld, .alreadyAttached, .staleAttachment: .writerBusy
+    case .resourceLimit, .quiescing: .limitExceeded
+    case .notFound, .invalidRequest, .staleLayout, .paneExited: .inputInvalid
+    case .unauthorized: .unauthorized
+    default: .internalError
     }
   }
 
@@ -709,12 +857,13 @@ public final class RoamingSession: @unchecked Sendable {
       s.exitStatus = status
       s.exitedAt = now
     }
+    reportState()
     contentChanged()
   }
 
-  private func contentChanged() {
+  private func contentChanged(interactive: Bool = false) {
     guard let a = attachment, a.isCurrent else { return }
-    a.scheduler.markDirty()
+    a.scheduler.markDirty(interactive: interactive)
     pumpSnapshots(a)
   }
 
@@ -742,23 +891,54 @@ public final class RoamingSession: @unchecked Sendable {
       // Input returns a history window to live output, as typing does
       // in a local terminal.
       a.pendingViewportLines = 0
+      a.liveReturns &+= 1
       if a.historyTop != nil {
         a.historyTop = nil
+        if let pane = activePane {
+          mux?.present(pane: pane, top: nil, generation: a.historyGeneration)
+        }
         contentChanged()
       }
       admit(input, from: a)
     case let .viewport(_, lines): moveHistoryWindow(by: Int(lines), for: a)
     case let .screenAck(_, revision):
-      guard revision <= a.highestSubmittedScreenRevision else {
+      acknowledgeScreen(revision, adoptingBase: true, from: a)
+    case let .requestFullScreen(_, revision):
+      guard a.features.contains(.screenDeltas) else {
         a.fail(.malformed)
         detachOnQueue(a)
         return
       }
-      for stream in a.scheduler.acknowledged(revision: revision) {
-        a.connection.cancelSnapshot(stream: stream)
+      // Retires the refused delta's stream without making it the base. One
+      // full screen answers every request made before it is sent, and a
+      // full screen already submitted after the refused delta answers it
+      // too, so repeated requests cannot multiply work.
+      let answered = a.fullScreenPending || revision < a.lastFullScreenRevision
+      if !answered {
+        a.deltaBaseline = nil
+        a.fullScreenPending = true
       }
+      acknowledgeScreen(revision, adoptingBase: false, from: a)
+      guard !answered else { return }
+      a.scheduler.markDirty()
       pumpSnapshots(a)
+    case let .copySelection(request):
+      guard a.features.contains(.copySelection) else {
+        a.fail(.malformed)
+        detachOnQueue(a)
+        return
+      }
+      copySelection(request, for: a)
+    case let .layoutAction(_, id, action):
+      guard a.features.contains(.layoutControl) else {
+        a.fail(.malformed)
+        detachOnQueue(a)
+        return
+      }
+      performLayout(action, request: id, for: a)
     case let .ping(_, nonce): a.send(.pong(epoch: a.epoch, nonce: nonce))
+    // The answer to a copy delivery ping (`sendCopy`); others are stale.
+    case let .pong(_, nonce): releaseCopyFence(a, nonce: nonce)
     case .detach:
       a.send(.detached(epoch: a.epoch))
       detachOnQueue(a)
@@ -773,6 +953,316 @@ public final class RoamingSession: @unchecked Sendable {
       a.fail(.malformed)
       detachOnQueue(a)
     }
+  }
+
+  /// Copies a selection from the pane's grid (spec.roaming.md §7.5): one
+  /// copy per attachment, its text sent in ordered chunks, each in its own
+  /// turn so input acknowledgements are not held behind a large copy.
+  private func copySelection(
+    _ request: ControlMessage.CopySelection,
+    for a: HostAttachment
+  ) {
+    let epoch = a.epoch
+    let requestID = request.requestID
+    func finish(_ error: RSTErrorCode) {
+      finishCopy(a, epoch: epoch, requestID: requestID, error: error)
+    }
+    guard !a.copyInFlight else {
+      return a.send(
+        .copyResult(
+          epoch: epoch,
+          requestID: request.requestID,
+          totalBytes: nil,
+          error: .busy
+        )
+      )
+    }
+    guard let pane = activePane, let startRow = Int(exactly: request.startRow),
+      let endRow = Int(exactly: request.endRow),
+      let startColumn = Int(exactly: request.startColumn),
+      let endColumn = Int(exactly: request.endColumn)
+    else { return finish(.historyUnavailable) }
+    var identities: [RowIdentity] = []
+    for pair in request.screenRowVersions {
+      guard let row = Int(exactly: pair[0]) else {
+        return finish(.selectionChanged)
+      }
+      identities.append(
+        RowIdentity(
+          address: HistoryAddress(
+            generation: request.generation,
+            alternateScreen: request.alternateScreen,
+            row: row
+          ),
+          version: pair[1]
+        )
+      )
+    }
+    func point(_ row: Int, _ column: Int) -> SelectionPoint {
+      SelectionPoint(
+        address: HistoryAddress(
+          generation: request.generation,
+          alternateScreen: request.alternateScreen,
+          row: row
+        ),
+        column: column
+      )
+    }
+    let copy = CopySelectionRequest(
+      pane: pane,
+      start: point(startRow, startColumn),
+      end: point(endRow, endColumn),
+      unit: request.unit,
+      screenRowVersions: identities
+    )
+    guard let mux else { return finish(.historyUnavailable) }
+    a.copyInFlight = true
+    mux.copy(
+      pane: pane,
+      copy,
+      { [weak self] result in
+        self?.queue
+          .async { [weak self] in
+            guard let self, a === self.attachment, a.isCurrent, a.epoch == epoch
+            else {
+              a.copyInFlight = false
+              return
+            }
+            switch result {
+            case nil:
+              self.finishCopy(
+                a,
+                epoch: epoch,
+                requestID: requestID,
+                error: .historyUnavailable
+              )
+            case let .failure(error)?:
+              let code: RSTErrorCode =
+                switch error.code {
+                case .selectionChanged: .selectionChanged
+                case .resourceLimit: .limitExceeded
+                default: .historyUnavailable
+                }
+              self.finishCopy(
+                a,
+                epoch: epoch,
+                requestID: requestID,
+                error: code
+              )
+            case let .success(text)?:
+              guard text.utf8.count <= ControlMessage.maxCopyBytes else {
+                return self.finishCopy(
+                  a,
+                  epoch: epoch,
+                  requestID: requestID,
+                  error: .limitExceeded
+                )
+              }
+              self.sendCopy(
+                Self.chunks(text),
+                index: 0,
+                total: UInt64(text.utf8.count),
+                request: request.requestID,
+                epoch: epoch,
+                to: a
+              )
+            }
+          }
+      }
+    )
+  }
+
+  private func finishCopy(
+    _ a: HostAttachment,
+    epoch: UInt64,
+    requestID: UInt64,
+    error: RSTErrorCode
+  ) {
+    a.copyInFlight = false
+    a.send(
+      .copyResult(
+        epoch: epoch,
+        requestID: requestID,
+        totalBytes: nil,
+        error: error
+      )
+    )
+  }
+
+  /// Longest a copy chunk waits for the client to acknowledge the screens
+  /// in flight, so a copy still finishes if acknowledgements stop.
+  static let copyScreenWait: Duration = .seconds(2)
+
+  private func sendCopy(
+    _ chunks: [String],
+    index: Int,
+    total: UInt64,
+    request: UInt64,
+    epoch: UInt64,
+    to a: HostAttachment,
+    waited: Bool = false
+  ) {
+    // A new epoch cancels the copy; its client discards partial text.
+    guard a === attachment, a.isCurrent, a.epoch == epoch else {
+      a.copyInFlight = false
+      return
+    }
+    // Over QUIC, Network sends queued control-stream data ahead of a
+    // snapshot stream, so a copy that kept the control stream full held
+    // every screen, the echo of typing included, until it finished. Each
+    // chunk waits until no screen awaits acknowledgement, at most
+    // `copyScreenWait`.
+    if index < chunks.count, !waited, !a.scheduler.streams.isEmpty {
+      holdCopyChunk(for: a) { [weak self] in
+        self?
+          .sendCopy(
+            chunks,
+            index: index,
+            total: total,
+            request: request,
+            epoch: epoch,
+            to: a,
+            waited: true
+          )
+      }
+      return
+    }
+    guard index < chunks.count else {
+      a.copyInFlight = false
+      a.send(
+        .copyResult(
+          epoch: epoch,
+          requestID: request,
+          totalBytes: total,
+          error: nil
+        )
+      )
+      return
+    }
+    a.send(
+      .copyChunk(
+        epoch: epoch,
+        requestID: request,
+        index: UInt64(index),
+        text: chunks[index]
+      )
+    )
+    // One chunk in flight at a time: input acknowledgements and screens
+    // wait behind at most one chunk, and a large copy cannot overflow the
+    // byte limit. A transport accepts far more than one chunk before the
+    // client reads it (QUIC: about a second's worth), so the next chunk
+    // waits for the client's pong to a ping sent after this one; the
+    // ordered control stream means the pong follows the chunk's arrival.
+    a.copyPingNonce &+= 1
+    let nonce = a.copyPingNonce
+    a.send(.ping(epoch: epoch, nonce: nonce))
+    a.copyFence = (
+      nonce,
+      { [weak self] in
+        self?
+          .sendCopy(
+            chunks,
+            index: index + 1,
+            total: total,
+            request: request,
+            epoch: epoch,
+            to: a
+          )
+      }
+    )
+    queue.asyncAfter(deadline: .now() + Self.copyDeliveryWait.dispatchInterval)
+    { [weak self, a] in self?.releaseCopyFence(a, nonce: nonce) }
+  }
+
+  /// Longest a copy waits for the pong that shows its last chunk arrived.
+  static let copyDeliveryWait: Duration = .seconds(2)
+
+  /// Sends the next copy chunk once the client answered `nonce`, or the
+  /// wait for it ran out. Stale or unknown pongs do nothing.
+  private func releaseCopyFence(_ a: HostAttachment, nonce: UInt64) {
+    guard let fence = a.copyFence, fence.nonce == nonce else { return }
+    a.copyFence = nil
+    fence.next()
+  }
+
+  /// Holds `chunk` until `releaseHeldCopyChunk` finds no screen in flight,
+  /// or `copyScreenWait` passes. Runs on the session queue.
+  private func holdCopyChunk(
+    for a: HostAttachment,
+    _ chunk: @escaping @Sendable () -> Void
+  ) {
+    a.heldCopyToken &+= 1
+    let token = a.heldCopyToken
+    a.heldCopyChunk = chunk
+    queue.asyncAfter(deadline: .now() + Self.copyScreenWait.dispatchInterval) {
+      [a] in
+      guard a.heldCopyToken == token, let held = a.heldCopyChunk else { return }
+      a.heldCopyChunk = nil
+      held()
+    }
+  }
+
+  /// Sends a held copy chunk once every screen in flight is acknowledged
+  /// or has failed. Called before the next capture, so the chunk is queued
+  /// ahead of that screen and the screen waits behind at most one chunk.
+  private func releaseHeldCopyChunk(_ a: HostAttachment) {
+    guard a.scheduler.streams.isEmpty, let held = a.heldCopyChunk else {
+      return
+    }
+    a.heldCopyChunk = nil
+    held()
+  }
+
+  /// Splits on scalar boundaries into pieces whose JSON encoding fits
+  /// `ControlMessage.maxCopyChunkBytes`. Escapes count at encoded size
+  /// (newline, quote, backslash: 2 bytes; other controls: 6).
+  static func chunks(_ text: String) -> [String] {
+    var out: [String] = []
+    var current = String.UnicodeScalarView()
+    var bytes = 0
+    for scalar in text.unicodeScalars {
+      let size = jsonWidth(scalar)
+      if bytes + size > ControlMessage.maxCopyChunkBytes {
+        out.append(String(current))
+        current = String.UnicodeScalarView()
+        bytes = 0
+      }
+      current.append(scalar)
+      bytes += size
+    }
+    if !current.isEmpty || out.isEmpty { out.append(String(current)) }
+    return out
+  }
+
+  /// Encoded size of `scalar` inside a JSON string.
+  static func jsonWidth(_ scalar: Unicode.Scalar) -> Int {
+    switch scalar.value {
+    case 0x22, 0x5C, 0x08, 0x09, 0x0A, 0x0C, 0x0D: 2
+    case 0 ..< 0x20: 6
+    default: UTF8.width(scalar)
+    }
+  }
+
+  /// Retires streams up to `revision`; with `adoptingBase` the screen at
+  /// `revision` becomes the base of later deltas.
+  private func acknowledgeScreen(
+    _ revision: UInt64,
+    adoptingBase: Bool,
+    from a: HostAttachment
+  ) {
+    guard revision <= a.highestSubmittedScreenRevision else {
+      a.fail(.malformed)
+      detachOnQueue(a)
+      return
+    }
+    for stream in a.scheduler.acknowledged(revision: revision) {
+      a.connection.cancelSnapshot(stream: stream)
+    }
+    if adoptingBase, let baseline = a.submittedBaselines[revision] {
+      a.deltaBaseline = baseline
+    }
+    a.submittedBaselines = a.submittedBaselines.filter { $0.key > revision }
+    pumpSnapshots(a)
   }
 
   /// Moves `a`'s history window. Requests that arrive while a move is
@@ -796,25 +1286,41 @@ public final class RoamingSession: @unchecked Sendable {
     a.pendingViewportLines = 0
     a.viewportMoveInFlight = true
     let current = a.historyTop
-    service.inspect(
+    let generation = a.historyGeneration
+    // Comparing `historyTop` alone misses input that arrives while a move
+    // from live output resolves: live stays nil, so the move would apply.
+    let liveReturns = a.liveReturns
+    guard let mux else { return }
+    mux.historyTop(
       pane: pane,
-      { ScreenExporter.historyTop($0, from: current, moving: lines) },
-      completion: { [weak self] resolved in
+      from: current,
+      generation: generation,
+      moving: lines,
+      { [weak self] resolved in
         self?.queue
           .async { [weak self] in
             a.viewportMoveInFlight = false
             guard let self, a === self.attachment, a.isCurrent else { return }
             // Nil `resolved`: the pane is gone. Nil top: live output.
-            if let top = resolved, a.historyTop == current, top != current {
-              a.historyTop = top
-              self.contentChanged()
+            if let resolved, a.historyTop == current,
+              a.liveReturns == liveReturns,
+              resolved.top != current || resolved.generation != generation
+            {
+              a.historyTop = resolved.top
+              a.historyGeneration = resolved.generation
+              self.mux?
+                .present(
+                  pane: pane,
+                  top: resolved.top,
+                  generation: resolved.generation
+                )
+              self.contentChanged(interactive: true)
             }
             self.resolveViewportMove(for: a)
           }
       }
     )
   }
-
 
   private func admit(_ input: ControlMessage.Input, from a: HostAttachment) {
     let sequence = input.sequence
@@ -888,6 +1394,18 @@ public final class RoamingSession: @unchecked Sendable {
       }
       mux.input(
         .input(.key(name, modifiers)),
+        attachment: smx,
+        pane: pane,
+        done
+      )
+    case let .wheel(wheel):
+      // The service reports it only while the program tracks the mouse.
+      guard mux.welcome?.features.contains(.mouseReporting) == true else {
+        done(nil)
+        return
+      }
+      mux.input(
+        .input(.mouse(Self.muxMouse(wheel))),
         attachment: smx,
         pane: pane,
         done
@@ -1004,7 +1522,7 @@ public final class RoamingSession: @unchecked Sendable {
         newlineCount: newlines,
         limits: limits
       )
-    case .key: return MuxService.permanentlyExceedsKey(limits: limits)
+    case .key, .wheel: return MuxService.permanentlyExceedsKey(limits: limits)
     case .resize: return false
     }
   }
@@ -1012,6 +1530,27 @@ public final class RoamingSession: @unchecked Sendable {
   private func acknowledge(_ sequence: UInt64) {
     guard let a = attachment, a.isCurrent else { return }
     a.send(.inputAck(epoch: a.epoch, sequence: sequence))
+  }
+
+  static func muxMouse(_ wheel: SemanticWheel) -> MuxMouse {
+    var modifiers: MuxKeyModifiers = []
+    if wheel.modifiers.contains(.shift) { modifiers.insert(.shift) }
+    if wheel.modifiers.contains(.alt) { modifiers.insert(.alt) }
+    if wheel.modifiers.contains(.control) { modifiers.insert(.control) }
+    let button: MuxMouse.Button =
+      switch wheel.direction {
+      case .up: .wheelUp
+      case .down: .wheelDown
+      case .left: .wheelLeft
+      case .right: .wheelRight
+      }
+    return MuxMouse(
+      .press,
+      button,
+      column: wheel.column,
+      row: wheel.row,
+      modifiers: modifiers
+    )
   }
 
   /// Without `keypadKeys`, keypad keys become the keys they type.
@@ -1082,39 +1621,45 @@ public final class RoamingSession: @unchecked Sendable {
   }
 
   private func pumpSnapshots(_ a: HostAttachment) {
+    releaseHeldCopyChunk(a)
     guard a === attachment, a.isCurrent, let pane = activePane else { return }
     pruneSnapshotWork()
     let now = ContinuousClock.now
     switch a.scheduler.next(now: now) {
     case .idle: return
     case let .wait(until):
-      guard !a.timerArmed else { return }
-      a.timerArmed = true
+      if let armed = a.timerDeadline, armed <= until { return }
+      a.timerDeadline = until
       let delay = now.duration(to: until)
       queue.asyncAfter(deadline: .now() + delay.dispatchInterval) {
         [weak self, a] in
-        a.timerArmed = false
+        // A superseded later timer may still fire; pumping is idempotent.
+        if a.timerDeadline == until { a.timerDeadline = nil }
         self?.pumpSnapshots(a)
       }
     case let .capture(cancel):
       if let cancel { a.connection.cancelSnapshot(stream: cancel) }
       screenRevision += 1
       let stamp = stamp(epoch: a.epoch)
-      let historyTop = a.historyTop
+      let window = a.historyTop.map {
+        (top: $0, generation: a.historyGeneration)
+      }
       a.nextStreamID += 1
       let stream = a.nextStreamID
       a.scheduler.started(stream: stream, revision: stamp.screenRevision)
       pruneSnapshotWork()
       let exit = exitStatus
-      // Exported in the pane's order, so every byte parsed before this
-      // point (including final output after exit) is included.
-      service.inspect(
+      guard let mux else {
+        return captured(nil, stream: stream, exit: exit, to: a)
+      }
+      mux.capture(
         pane: pane,
-        { ScreenExporter.export($0, stamp: stamp, historyTop: historyTop) },
-        completion: { [weak self] snapshot in
+        stamp: stamp,
+        window: window,
+        { [weak self] screen in
           self?.queue
             .async { [weak self] in
-              self?.captured(snapshot, stream: stream, exit: exit, to: a)
+              self?.captured(screen, stream: stream, exit: exit, to: a)
             }
         }
       )
@@ -1122,14 +1667,15 @@ public final class RoamingSession: @unchecked Sendable {
   }
 
   private func captured(
-    _ snapshot: ScreenSnapshot?,
+    _ screen: CapturedScreen?,
     stream: UInt64,
     exit: Int32?,
     to a: HostAttachment
   ) {
     guard wantsSnapshot(stream: stream, from: a) else { return }
-    guard let snapshot else {
+    guard let screen else {
       a.scheduler.failed(stream: stream)
+      releaseHeldCopyChunk(a)
       return
     }
     if let exit, !a.exitNoticeSent {
@@ -1138,25 +1684,57 @@ public final class RoamingSession: @unchecked Sendable {
         .sessionExited(
           epoch: a.epoch,
           status: exit,
-          finalScreenRevision: snapshot.screenRevision
+          finalScreenRevision: screen.screenRevision
         )
       )
     }
-    transmit(snapshot, stream: stream, to: a)
+    transmit(screen, stream: stream, to: a)
   }
 
   /// Retains only captures still owned by the bounded scheduler, rather than
   /// queueing one encoding closure for every superseded screen revision.
   private func transmit(
-    _ snapshot: ScreenSnapshot,
+    _ screen: CapturedScreen,
     stream: UInt64,
     to a: HostAttachment
   ) {
     pruneSnapshotWork()
+    let deltas = a.features.contains(.screenDeltas) && !a.fullScreenPending
     pendingSnapshotEncodes.append(
-      SnapshotEncoding(snapshot: snapshot, stream: stream, attachment: a)
+      SnapshotEncoding(
+        screen: screen,
+        stream: stream,
+        attachment: a,
+        baseline: deltas ? a.deltaBaseline : nil
+      )
     )
     startNextSnapshotEncoding()
+  }
+
+  /// Encodes a legacy snapshot, or a frame as a delta against `baseline`
+  /// when that is smaller than half the frame, otherwise in full.
+  private static func encode(
+    _ job: SnapshotEncoding,
+    encoder: ScreenEncoder
+  ) throws -> EncodedScreen {
+    switch job.screen {
+    case let .frame(frame, header):
+      let envelope = SMXB.Envelope.rst(header.bytes)
+      let delta = job.baseline.flatMap {
+        FrameDeltaBuilder.delta(from: frame, base: $0)
+      }
+      let record =
+        delta.map { SMXB.encode($0, envelope: envelope) }
+        ?? SMXB.encode(frame, envelope: envelope)
+      return EncodedScreen(
+        payload: try encoder(
+          header,
+          try SnapshotFrame.encode(frame: [UInt8](record))
+        ),
+        baseline: FrameBaseline(frame),
+        full: delta == nil
+      )
+    }
   }
 
   private func wantsSnapshot(stream: UInt64, from a: HostAttachment) -> Bool {
@@ -1181,16 +1759,16 @@ public final class RoamingSession: @unchecked Sendable {
     else { return }
     let job = pendingSnapshotEncodes.removeFirst()
     encodingSnapshot = true
-    let encode = snapshotEncoder
+    let encode = screenEncoder
     encodeQueue.async { [weak self] in
-      let result = Result { try encode(job.snapshot) }
+      let result = Result { try Self.encode(job, encoder: encode) }
       self?.queue
         .async { [weak self] in self?.snapshotEncoded(result, job: job) }
     }
   }
 
   private func snapshotEncoded(
-    _ result: Result<[UInt8], any Error>,
+    _ result: Result<EncodedScreen, any Error>,
     job: SnapshotEncoding
   ) {
     encodingSnapshot = false
@@ -1200,14 +1778,29 @@ public final class RoamingSession: @unchecked Sendable {
     guard wantsSnapshot(stream: stream, from: a) else { return }
     switch result {
     case .failure: snapshotFailed(stream: stream, to: a, retry: true)
-    case let .success(payload):
+    case let .success(encoded):
+      let payload = encoded.payload
       // A peer can acknowledge before the send's completion reaches this
       // queue. Publish the bound before starting transport work, but never
       // include captures still waiting for encoding or an available slot.
+      let revision = job.screen.screenRevision
       a.highestSubmittedScreenRevision = max(
         a.highestSubmittedScreenRevision,
-        job.snapshot.screenRevision
+        revision
       )
+      if let baseline = encoded.baseline {
+        a.submittedBaselines[revision] = baseline
+        if a.submittedBaselines.count > 8,
+          let oldest = a.submittedBaselines.keys.min()
+        {
+          a.submittedBaselines.removeValue(forKey: oldest)
+        }
+      }
+      if encoded.full {
+        a.fullScreenPending = false
+        a.lastFullScreenRevision = max(a.lastFullScreenRevision, revision)
+      }
+      submittedScreenObserver.withLock { $0 }?(job.screen)
       let id = UUID()
       let task = Task { [weak self] in
         let retry: Bool?
@@ -1239,7 +1832,7 @@ public final class RoamingSession: @unchecked Sendable {
   {
     guard wantsSnapshot(stream: stream, from: a) else { return }
     a.scheduler.failed(stream: stream)
-    if retry { pumpSnapshots(a) }
+    if retry { pumpSnapshots(a) } else { releaseHeldCopyChunk(a) }
   }
 }
 

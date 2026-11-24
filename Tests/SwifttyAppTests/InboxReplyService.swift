@@ -4,6 +4,7 @@ import MuxNavigation
 import SwiftMuxClient
 import SwiftMuxExport
 import SwiftMuxProtocol
+import SwiftMuxXPC
 @testable import Swiftty
 import SwifttyCore
 import Synchronization
@@ -21,6 +22,8 @@ final class InboxReplyService: Sendable {
     var holdNextTab = false
     var tabReply: (SMXChannel, ServerMessage)?
     var newTabs = 0
+    var tabLaunches: [LaunchSpec?] = []
+    var splitLaunches: [LaunchSpec?] = []
     var ratios: [Double] = []
     var geometry: [GeometryBatch] = []
     var attentionRequested = false
@@ -269,9 +272,13 @@ final class InboxReplyService: Sendable {
       case let .setSplitRatio(_, _, ratio):
         state.withLock { $0.ratios.append(ratio) }
         result = .ok
-      case .newTab:
+      case let .split(_, _, launch):
+        state.withLock { $0.splitLaunches.append(launch) }
+        result = .ok
+      case let .newTab(_, launch):
         let held = state.withLock { state -> Bool in
           state.newTabs += 1
+          state.tabLaunches.append(launch)
           guard state.holdNextTab else { return false }
           state.holdNextTab = false
           state.tabReply = (channel, .reply(id: id, result: .success(.ok)))

@@ -372,7 +372,7 @@ The codec call itself is not preemptible. One bounded unit limits the amount of 
 
 Enable automatic compression first on validated native macOS builds. The engine API exposes requested and effective policy plus a diagnostic reason for fallback.
 
-Other Apple targets compile with a valid uncompressed backend. Enable mapped compression on iOS, iPadOS, Catalyst, visionOS, or tvOS only after checking platform API support, memory accounting, lifecycle behavior, and representative device latency/energy. Do not add a background execution entitlement or compression work while an app is suspended.
+Other Apple targets compile with a valid uncompressed backend. Enable mapped compression on iOS, iPadOS, Catalyst, visionOS, or tvOS only after checking platform API support, memory accounting, lifecycle behavior, and representative device latency/energy. iOS and iPadOS have since passed these checks (§17). Do not add a background execution entitlement or compression work while an app is suspended.
 
 The watch companion remains outside the terminal engine dependency graph. Linux support is not part of the current package's product promise. [R01]
 
@@ -380,36 +380,34 @@ On memory pressure, first release reclaimable free backing and idle workspace. D
 
 ## 10. Configuration and compatibility
 
-Add canonical Ghostty-style names while preserving Swiftty's finite retention semantics.
+File configuration follows the JSONC contract in [spec.md](spec.md#configuration).
+`terminal.scrollback_limit` caps physical history rows (default 10,000 in the
+JSONC model). The internal history-cell byte budget and compression policy
+remain available to programmatic embedders and the SwiftMux service.
 
-| Setting | Proposed behavior |
-| --- | --- |
-| `scrollback-limit` | Existing byte-limit alias; remains accepted |
-| `scrollback-limit-bytes` | New canonical alias for the same logical history-cell budget |
-| `scrollback-limit-lines` | New finite physical-row limit; default 100,000 for direct sessions |
-| `scrollback-compression` | New boolean; default requested `true`, effective only on validated supported backends |
-
-Example:
-
-```ini
-scrollback-limit-bytes = 10000000
-scrollback-limit-lines = 100000
-scrollback-compression = true
+```jsonc
+{
+  "terminal": { "scrollback_limit": 100000, },
+}
 ```
 
 Rules:
 
-- Old and new byte keys write the same field in normal configuration/include order; the last valid assignment wins. Do not invent a separate priority rule.
+- Ghostty-style assignments, aliases, repeated keys and includes are not file
+  configuration syntax. Programmatic option setters can still address the
+  underlying byte, row and compression fields.
 - Zero bytes or zero lines disables history. Preserve programmatic nonpositive-limit behavior.
-- Negative config-file numbers, overflow, and `unlimited` are diagnosed and ignored under the existing invalid-value policy; they must not become zero silently.
-- Empty-value reset follows the existing configuration mechanism for the canonical field.
+- Negative JSONC limits, overflow and `unlimited` are validation errors; an
+  invalid document reports diagnostics and uses defaults, never silent zero.
+- Omitting `terminal.scrollback_limit` restores the JSONC default.
 - Keep the public `Configuration.scrollbackLimit` property compatible; add row/compression fields and map them into `SessionConfiguration`.
 - Retention limits apply when a terminal/pane is created; resize recomputes physical capacity from the same configured budgets. This feature does not introduce retroactive resizing of existing retention.
 - A live compression toggle may stop or resume maintenance. Turning it off does not eagerly decode existing history; those pages remain readable and restore on demand.
 - SwiftMux service limits and pane admission stay authoritative. Add compression policy through local `MuxServiceConfiguration` and `PaneRuntime`, rather than changing `MuxLimits` or SMX wire messages.
 - Presentation-only sessions force history off and cannot arm maintenance.
 
-The new aliases and boolean do not exist in the inspected config parser. They are proposed additions, not existing compatibility. [R11] [R12] [R25]
+The historical parser references describe the former line-oriented format;
+current file loading uses JSONC. [R11] [R12] [R25]
 
 ## 11. Accounting, failures, and invariants
 
@@ -476,7 +474,7 @@ Keep new storage internals in the engine. Avoid a general storage framework or d
 | `TerminalState.swift`, `TerminalReflow.swift`, invariant checks | Shared-table epochs, reflow reads, full cold-state verification |
 | `SessionConfiguration.swift`, core `Configuration.swift` | Policy and finite config aliases |
 | `SwifttyCore/Session/TerminalSession.swift` | Direct-owner maintenance lifecycle |
-| `SwiftMuxService/PaneRuntime.swift`, `Model.swift`, `MuxService+Panes.swift` | Headless-owner policy and scheduling without wire changes |
+| `SwiftMuxService/PaneRuntime.swift` and its `PaneRuntime+*.swift` extensions, `Model.swift`, `MuxService+Panes.swift` | Headless-owner policy and scheduling without wire changes |
 | `SnapshotBuilder.swift`, `SnapshotStorage.swift`, engine `OwnedScreen.swift` | Viewport protection, immutable copied frames |
 | `Sources/SwifttyBench` and existing test targets | New storage-state metrics, transitions, and replay coverage |
 | `README.md`, `spec.md` | Public warm/cold read costs, configuration, measurement evidence |
@@ -579,7 +577,7 @@ Add explicit `scrollback-memory`, `scrollback-compression`, and `scrollback-resu
 
 ## 14. Commands and environment
 
-The inspected package uses Swift tools 6.4, a `mise` pin of Swift 6.4.1, and Apple platform deployment declarations at 27.0. Use the repository's supported Mac/Xcode environment. The commands below were checked against source; they were not executed during specification writing. [R01] [R30]
+The inspected package uses Swift tools 6.4, Xcode 27's Swift 6.4 toolchain (`mise.toml` pins the other tools, not Swift), and Apple platform deployment declarations at 27.0. Use the repository's supported Mac/Xcode environment. The commands below were checked against source; they were not executed during specification writing. [R01] [R30]
 
 ### Existing build and verification commands
 
@@ -697,7 +695,7 @@ Decisions taken where the specification left room, or deviated:
 - **Promotion reasons** are read, recycle, compaction and other; preserved scans are counted separately as scan decodes.
 - **Scheduling.** One process coordinator (weak registrations, one timer, round-robin, one step in flight) with an injectable clock. Output, input, viewport, resize and clear postpone work by 250 ms; a borrowed read that promoted cold history requests a pass without postponing pending work. Memory pressure releases idle workspace only.
 
-Default enablement was gated on the acceptance Mac: Mac17,7 (Apple M5 Max), 128 GB RAM, macOS 27.0.1, Xcode 27.1, Swift 6.4.1, AC power, 16 KiB VM pages, Release builds, LZ4 confirmed on the corpora below. Baseline is `5eef5ae5`. All gates below passed there, so `scrollback-compression` defaults to on for native macOS only.
+Default enablement was gated on the acceptance Mac: Mac17,7 (Apple M5 Max), 128 GB RAM, macOS 27.0.1, Xcode 27.1, Swift 6.4.1, AC power, 16 KiB VM pages, Release builds, LZ4 confirmed on the corpora below. Baseline is `5eef5ae5`. All gates below passed there, so `scrollback-compression` defaults to on for native macOS; the iPad evidence below later extended it to iOS and iPadOS.
 
 | Gate (§13) | Result |
 | --- | --- |

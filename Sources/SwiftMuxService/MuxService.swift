@@ -1,9 +1,11 @@
+import SwiftMuxGuardian
 import Darwin
 import Dispatch
 import Foundation
 import MuxAttention
 import os
 import SwiftMuxProtocol
+import SwiftMuxXPC
 
 /// The persistent session service: workspace graph, stable identities,
 /// one interactive lease per workspace, layout revisions and frame
@@ -17,7 +19,9 @@ public actor MuxService {
     queue.asUnownedSerialExecutor()
   }
 
-  public nonisolated let instance = ServerInstanceID()
+  /// A planned replacement's candidate continues its predecessor's
+  /// instance, so frontends keep accepting its frames (full frames follow).
+  public nonisolated let instance: ServerInstanceID
   nonisolated let configuration: MuxServiceConfiguration
   nonisolated let launcher: PaneLauncher
   private let log = Logger(
@@ -26,6 +30,7 @@ public actor MuxService {
   )
   private let startedAt = Date()
 
+  var automation = ServiceAutomation()
   var workspaces: [Workspace] = []
   var panes: [PaneID: PaneRecord] = [:]
   var clients: [UUID: Client] = [:]
@@ -38,8 +43,30 @@ public actor MuxService {
   /// Last observer window id issued (`ViewerViewport.id`).
   var nextWindowID: UInt64 = 0
   /// Last granted lease generation per workspace; `takeover` names it.
-  private var leaseGenerations: [WorkspaceID: UInt64] = [:]
+  var leaseGenerations: [WorkspaceID: UInt64] = [:]
+  /// Removed graph panes still count toward capacity until process ownership
+  /// retirement is acknowledged. Failure cannot turn into a false empty state.
+  var retiringPanes: [PaneID: PaneRuntime] = [:]
+  var retirementFailures: [PaneID: MuxError] = [:]
   var pendingLaunches = 0
+  var workerWorkspaceClaimed = false
+  /// Saved layouts (spec.durability.md §12.2): causes since the gateway's
+  /// last `savedLayoutState`, the cause of the change in progress (nil is
+  /// a command), why the workspace ended and the End being applied.
+  var savedLayoutCauses: SavedLayoutCauses = []
+  var savedLayoutCause: SavedLayoutCauses?
+  var savedLayoutEnd: SavedLayoutEnd?
+  var pendingEndDisposition: SavedLayoutDisposition?
+  /// Template creations whose launches have not all settled.
+  var templateCreations: [UUID: TemplateCreation] = [:]
+  /// One saved-output snapshot being paged to the gateway (C1).
+  var savedOutputExport: SavedOutputExport?
+  /// Planned replacement: admission is closed for a cut (§7.2).
+  var migrationFrozen = false
+  /// The controller lease a checkpoint carried, until its relay resumes it
+  /// or it is fenced (§6).
+  var provisionalLease: Lease?
+  var gatewayPeerPID: Int32?
   var pendingHistoryBytes = 0
   /// Latest frontend theme, applied to every pane and to new ones.
   var theme: MuxTheme?
@@ -69,14 +96,24 @@ public actor MuxService {
   /// Called once the empty-state barrier holds for `idleExitDelay`.
   private var onIdle: (@Sendable () -> Void)?
   /// OSC 7501 attention inbox (spec.inbox.md §3).
-  private var attention: InboxHub
-  private var snoozeTimer: InboxSnoozeTimer?
+  var attention: InboxHub
+  var snoozeTimer: InboxSnoozeTimer?
 
   var limits: MuxLimits { configuration.limits }
 
   public init(configuration: MuxServiceConfiguration) throws(MuxError) {
     try configuration.limits.validateForService()
+    guard
+      configuration.workerWorkspace == nil
+        || configuration.paneProcessFactory != nil
+    else {
+      throw MuxError(
+        .invalidRequest,
+        "worker workspace requires a process adapter"
+      )
+    }
     self.configuration = configuration
+    instance = configuration.instance ?? ServerInstanceID()
     queue = DispatchSerialQueue(label: "swiftmux.service", qos: .userInitiated)
     attention = InboxHub(serviceEpoch: instance, limits: configuration.limits)
     launcher = PaneLauncher(
@@ -101,10 +138,25 @@ public actor MuxService {
     return listener.endpoint
   }
 
-  private nonisolated func start(_ listener: SMXListener) {
+  /// An anonymous listener for a frontend in this process that forwards
+  /// another transport (the roaming host): hellos may declare
+  /// `forwardedTransport`, so remote clients get remote restrictions. Only
+  /// code holding the endpoint can connect.
+  package nonisolated func listenForwarding() -> SMXEndpoint {
+    let listener = SMXListener(anonymousOn: queue)
+    start(listener, forwarding: true)
+    return listener.endpoint
+  }
+
+  private nonisolated func start(
+    _ listener: SMXListener,
+    forwarding: Bool = false
+  ) {
     listener.activate(connectionQueue: queue) { [weak self] channel in
       guard let self else { return }
-      self.queue.async { self.assumeIsolated { $0.accept(channel) } }
+      self.queue.async {
+        self.assumeIsolated { $0.accept(channel, forwarding: forwarding) }
+      }
     }
     queue.async { self.assumeIsolated { $0.listeners.append(listener) } }
   }
@@ -126,8 +178,14 @@ public actor MuxService {
 
   // MARK: Connections
 
-  private func accept(_ channel: SMXChannel) {
+  private func accept(_ channel: SMXChannel, forwarding: Bool = false) {
     // OS-provided peer identity, never a claimed pid or bundle id.
+    guard
+      !configuration.requiresGatewayBinding || gatewayPeerPID == channel.peerPID
+    else {
+      channel.cancel()
+      return
+    }
     guard channel.peerEUID == geteuid() else {
       log.error("rejecting peer with euid \(channel.peerEUID)")
       channel.cancel()
@@ -140,6 +198,7 @@ public actor MuxService {
       return
     }
     let client = Client(channel: channel)
+    client.acceptsForwarding = forwarding
     register(client)
     let id = client.id
     let recordLimit = SMXCodec.clientRecordLimit(limits)
@@ -157,6 +216,27 @@ public actor MuxService {
     )
   }
 
+  /// A worker host fences all old connections before publishing another
+  /// gateway binding, including replacement by the same OS process.
+  nonisolated func setGatewayPeer(
+    _ pid: Int32?,
+    completion: @escaping @Sendable () -> Void
+  ) {
+    onQueue { service in
+      service.gatewayPeerPID = nil
+      for id in Array(service.clients.keys) {
+        if let client = service.clients[id],
+          case let .xpc(channel) = client.transport
+        {
+          channel.cancel()
+        }
+        service.disconnected(id, reason: "gateway authority changed")
+      }
+      service.gatewayPeerPID = pid
+      completion()
+    }
+  }
+
   func register(_ client: Client) {
     clients[client.id] = client
     idleWork?.cancel()
@@ -168,9 +248,13 @@ public actor MuxService {
       quiesceOwner = nil
       // A lost updater cannot leave admission frozen. Process shutdown
       // remains irreversible even if its former update owner disconnects.
-      if !exitRequested { quiescing = false }
+      if !exitRequested {
+        quiescing = false
+        scheduleAutomationTopology()
+      }
     }
     attention.unsubscribe(id)
+    automation.subscribers.remove(id)
     if let ws = clientLeases[id] {
       // Connection loss: nobody owns the remaining input any more, so it
       // is fenced like a takeover. Observers and PTYs stay.
@@ -183,6 +267,7 @@ public actor MuxService {
     } else if clientViewers[id] != nil {
       releaseViewer(id, notify: false, reason: "connection lost: \(reason)")
     }
+    scheduleAutomationTopology()
     checkIdle()
   }
 
@@ -285,11 +370,32 @@ public actor MuxService {
     case let .input(record): input(record, from: id)
     case let .frameAck(pane, revision, attachment):
       frameAck(pane, revision, attachment: attachment, from: id)
-    case .inboxAck: inboxAcknowledged(by: id)
+    case let .inboxAck(revision, token):
+      inboxAcknowledged(by: id, revision: revision, token: token)
+    case let .requestFullFrame(pane, revision, attachment):
+      requestFullFrame(pane, revision, attachment: attachment, from: id)
     }
   }
 
   private func handshake(_ hello: Hello, client: Client) {
+    if let transport = hello.forwardedTransport {
+      let gatewayBound: Bool =
+        if configuration.requiresGatewayBinding,
+          configuration.workerWorkspace != nil,
+          case let .xpc(channel) = client.transport
+        { gatewayPeerPID == channel.peerPID } else { false }
+      guard gatewayBound || client.acceptsForwarding else {
+        send(
+          .rejected(
+            MuxError(.unauthorized, "forwarding requires the current gateway")
+          ),
+          to: client.id
+        )
+        client.cancel()
+        return
+      }
+      client.remote = transport == .remote
+    }
     guard SMX.compatibleVersions.contains(hello.protocolVersion) else {
       send(
         .rejected(
@@ -318,6 +424,7 @@ public actor MuxService {
       return
     }
     client.hello = hello
+    scheduleAutomationTopology()
     send(
       .welcome(
         Welcome(
@@ -328,7 +435,11 @@ public actor MuxService {
             ? SMX.terminalProfile : nil,
           limits: limits,
           innerTerm: configuration.innerTerm,
-          features: .supported,
+          features: configuration.requiresGatewayBinding
+            && configuration.workerWorkspace != nil
+            ? .supported.union([.workspaceGraph, .savedLayoutMetadata])
+            : .supported,
+          forwardedTransport: hello.forwardedTransport,
         ),
       ),
       to: client.id,
@@ -364,12 +475,30 @@ public actor MuxService {
     let ok = { reply(.success(.ok)) }
     let fail = { (e: MuxError) in reply(.failure(e)) }
     switch command {
+    case let .subscribeAutomation(on):
+      guard !client.remote, hello.frontend == .native else {
+        return fail(
+          MuxError(
+            .unauthorized,
+            "automation UI requires a local native client"
+          )
+        )
+      }
+      subscribeAutomation(client.id, enabled: on)
+      ok()
     case .status: reply(.success(.status(status)))
     case .listWorkspaces: reply(.success(.workspaces(summaries)))
     case let .newWorkspace(request): newWorkspace(request, reply: reply)
-    case let .endWorkspace(selector):
+    case let .newWorkspaceFromTemplate(template):
+      guard gatewayGraphWorkspace(client) != nil else {
+        return fail(
+          MuxError(.unauthorized, "templates require the current local gateway")
+        )
+      }
+      newWorkspace(from: template, reply: reply)
+    case let .endWorkspace(selector, disposition):
       let ws = try workspace(selector)
-      endWorkspace(ws.id)
+      endWorkspace(ws.id, disposition: disposition ?? .ended)
       ok()
     case let .renameWorkspace(selector, name):
       let i = try workspaceIndex(selector)
@@ -384,6 +513,19 @@ public actor MuxService {
       }
       workspaces[i].name = name
       commitLayout(workspaces[i].id)
+      ok()
+    case let .endWorkspaceIfUnused(id, onlyIfExited):
+      guard !client.remote, hello.frontend == .control else {
+        return fail(MuxError(.unauthorized, "local control clients only"))
+      }
+      let ended =
+        onlyIfExited ? endIfAllPanesExited(id) : endIfNeverUsedLocally(id)
+      ended ? ok() : fail(MuxError(.notFound, "workspace kept"))
+    case let .roamingSessionChanged(id, workspace, state):
+      guard !client.remote, hello.frontend == .control else {
+        return fail(MuxError(.unauthorized, "local control clients only"))
+      }
+      roamingSessionChanged(id, workspace: workspace, state: state)
       ok()
     case .detachActive:
       // Update barrier and `swmux detach`: every holder is told.
@@ -416,6 +558,15 @@ public actor MuxService {
         hello: hello,
         reply: reply,
       )
+    case let .resumeAttachment(attachment, nextInput):
+      reply(
+        resumeAttachment(
+          attachment,
+          nextInput: nextInput,
+          client: client,
+          hello: hello
+        )
+      )
     case .detach:
       if let ws = clientLeases[client.id] {
         releaseLease(ws, notify: false, reason: "detached")
@@ -425,6 +576,37 @@ public actor MuxService {
       ok()
     case let .switchWorkspace(selector):
       try switchWorkspace(selector, client: client, reply: reply)
+    case let .observeWorkspaceGraph(on):
+      guard let workspace = gatewayGraphWorkspace(client) else {
+        return fail(
+          MuxError(
+            .unauthorized,
+            "graph observation requires the current local gateway"
+          )
+        )
+      }
+      client.observesWorkspaceGraph = on
+      client.workspaceGraphOutstanding = false
+      reply(.success(.workspaceGraph(snapshot(workspace))))
+    case .savedLayoutState:
+      guard let workspace = gatewayGraphWorkspace(client) else {
+        return fail(
+          MuxError(.unauthorized, "saved layouts require the current gateway")
+        )
+      }
+      reply(.success(.savedLayoutState(takeSavedLayoutState(workspace))))
+    case let .exportSavedOutput(pane, revision, offset):
+      guard gatewayGraphWorkspace(client) != nil else {
+        return fail(
+          MuxError(.unauthorized, "saved output requires the current gateway")
+        )
+      }
+      exportSavedOutput(
+        pane: pane,
+        ifChangedSince: revision,
+        offset: offset,
+        reply: reply
+      )
     case let .observeWorkspaces(on):
       client.observesWorkspaces = on
       reply(.success(.workspaces(summaries)))
@@ -495,6 +677,8 @@ public actor MuxService {
       } catch { fail(error) }
       return
     }
+    // A different frontend: the lease a replacement carried is fenced.
+    fenceProvisionalLease(reason: "another frontend attached")
     guard leases[ws.id] == nil else {
       return fail(
         MuxError(.leaseHeld, "another frontend controls this workspace"),
@@ -520,6 +704,7 @@ public actor MuxService {
       return fail(MuxError(.quiescing, "service is preparing to update"))
     }
     let ws = try workspace(selector)
+    fenceProvisionalLease(reason: "another frontend took control")
     // Names the lease the user agreed to displace; a newer holder
     // (or none) means the prompt is stale.
     guard expected == leaseGenerations[ws.id, default: 0] else {
@@ -592,11 +777,9 @@ public actor MuxService {
 
   /// Lease and snapshot at one ordering point; frames follow on
   /// subscription.
-  private func grantLease(
-    _ ws: Workspace,
-    to client: Client,
-    hello: Hello,
-  ) -> MuxReply {
+  func grantLease(_ ws: Workspace, to client: Client, hello: Hello, )
+    -> MuxReply
+  {
     recordLocalUse(ws.id, by: client)
     leaseGenerations[ws.id, default: 0] &+= 1
     let lease = Lease(
@@ -632,7 +815,11 @@ public actor MuxService {
       switch command {
       case let .subscribeInbox(on):
         if on {
-          let snapshot = try attention.subscribe(client.id)
+          let snapshot = try attention.subscribe(
+            client.id,
+            requiresToken: client.hello?.capabilities
+              .contains(.inboxAcknowledgementTokens) == true
+          )
           client.subscribesInbox = true
           reply(.success(.inbox(snapshot)))
         } else {
@@ -690,7 +877,7 @@ public actor MuxService {
 
   /// After any reduction or acknowledgement: schedule the coalesced
   /// flush and the next snooze expiry.
-  private func attentionChanged() {
+  func attentionChanged() {
     if attention.inbox.hasPendingUpdate, !attention.flushScheduled {
       attention.flushScheduled = true
       queue.asyncAfter(deadline: .now() + InboxHub.flushDelay) { [weak self] in
@@ -714,14 +901,22 @@ public actor MuxService {
     snoozeTimer?.schedule(expiry)
   }
 
-  private func flushInbox() {
+  func flushInbox() {
     for (client, update) in attention.flush() {
       send(.event(.inbox(update)), to: client)
     }
   }
 
-  private func inboxAcknowledged(by client: UUID) {
-    if let resync = attention.acknowledge(client) {
+  private func inboxAcknowledged(
+    by client: UUID,
+    revision: UInt64,
+    token: UUID?
+  ) {
+    if let resync = attention.acknowledge(
+      client,
+      revision: revision,
+      token: token
+    ) {
       send(.event(.inbox(resync)), to: client)
     }
   }
@@ -729,8 +924,11 @@ public actor MuxService {
   /// Sends the workspace list to metadata observers once the current turn
   /// is done, so a change made in several steps (a teardown) sends one.
   func publishWorkspaces() {
+    scheduleAutomationTopology()
     guard !workspacesPublishScheduled,
-      clients.values.contains(where: \.observesWorkspaces)
+      clients.values.contains(where: {
+        $0.observesWorkspaces || $0.observesWorkspaceGraph
+      })
     else { return }
     workspacesPublishScheduled = true
     // An exit can flush early; the queued turn then has nothing to send.
@@ -740,6 +938,14 @@ public actor MuxService {
   private func flushWorkspaces() {
     workspacesPublishScheduled = false
     let observers = clients.values.filter(\.observesWorkspaces)
+    let graphs = clients.values.filter(\.observesWorkspaceGraph)
+    if !graphs.isEmpty, let workspace = configuration.workerWorkspace {
+      let graph = snapshot(workspace)
+      for client in graphs where !client.workspaceGraphOutstanding {
+        client.workspaceGraphOutstanding = true
+        send(.event(.workspaceGraph(graph)), to: client.id)
+      }
+    }
     guard !observers.isEmpty else { return }
     let list = summaries
     for client in observers { send(.event(.workspaces(list)), to: client.id) }
@@ -755,6 +961,32 @@ public actor MuxService {
     let ok = { reply(.success(.ok)) }
     let fail = { (e: MuxError) in reply(.failure(e)) }
     switch command {
+    case let .automationKey(pane, shortcut):
+      guard clients[client]?.remote == false, shortcut.utf8.count <= 128,
+        locate(pane: pane, in: leased) != nil
+      else {
+        return fail(
+          MuxError(
+            .unauthorized,
+            "automation requires a locally controlled pane"
+          )
+        )
+      }
+      _ = automation.runtime?.handleKey(shortcut, pane: pane.description)
+      ok()
+    case let .automationFocus(pane):
+      guard clients[client]?.remote == false,
+        locate(pane: pane, in: leased) != nil
+      else {
+        return fail(
+          MuxError(
+            .unauthorized,
+            "automation focus requires a locally controlled pane"
+          )
+        )
+      }
+      automation.runtime?.setActivePane(pane.description)
+      ok()
     case let .newTab(name, launch):
       if let name, !validName(name) { return fail(invalidName) }
       newTab(name: name, launch: launch, in: leased, reply: reply)
@@ -860,12 +1092,53 @@ public actor MuxService {
     case .clearScreen, .resetTerminal, .link, .commandOutput,
       .clipboardReadResult, .clipboardWriteResult:
       handleTerminal(command, workspace: leased, reply: reply)
-    case .status, .listWorkspaces, .newWorkspace, .endWorkspace,
-      .renameWorkspace, .detachActive, .endAllWorkspaces, .attach, .detach,
-      .switchWorkspace, .quiesce, .setTheme, .takeover, .observeWorkspaces,
-      .subscribeInbox, .inbox, .locateAttention, .markSeen, .snooze,
-      .markReviewed:
+    case let .copySelection(request):
+      copySelection(
+        request,
+        attachment: leases[leased]?.attachment,
+        workspace: leased,
+        reply: reply
+      )
+    case let .setOutputOptOut(on):
+      guard clients[client]?.remote == false,
+        let w = workspaces.firstIndex(where: { $0.id == leased })
+      else { return fail(MuxError(.unauthorized, "local workspaces only")) }
+      if workspaces[w].outputOptOut != on {
+        workspaces[w].outputOptOut = on
+        savedLayoutCauses.insert(.metadata)
+        publishWorkspaces()
+      }
+      ok()
+    case .status, .listWorkspaces, .newWorkspace, .newWorkspaceFromTemplate,
+      .endWorkspace, .renameWorkspace, .detachActive, .endAllWorkspaces,
+      .endWorkspaceIfUnused, .roamingSessionChanged, .attach, .detach,
+      .switchWorkspace, .quiesce, .setTheme, .takeover, .resumeAttachment,
+      .observeWorkspaces, .observeWorkspaceGraph, .savedLayoutState,
+      .exportSavedOutput, .subscribeAutomation, .subscribeInbox, .inbox,
+      .locateAttention, .markSeen, .snooze, .markReviewed:
       ok()  // handled by `handle`
+    }
+  }
+
+  /// Copies a client-local selection from the authoritative grid, for the
+  /// lease or an observer (`attachment` keys the row versions it saw).
+  func copySelection(
+    _ request: CopySelectionRequest,
+    attachment: AttachmentID?,
+    workspace: WorkspaceID,
+    reply: @escaping Reply,
+  ) {
+    guard let attachment,
+      let runtime = attachedRuntime(request.pane, in: workspace)
+    else { return reply(.failure(MuxError(.notFound, "pane"))) }
+    guard request.screenRowVersions.count <= CopySelectionRequest.maxScreenRows,
+      request.start.column >= 0, request.end.column >= 0
+    else { return reply(.failure(MuxError(.invalidRequest, "copy request"))) }
+    runtime.copySelection(request, attachment: attachment) { result in
+      switch result {
+      case let .success(text): reply(.success(.copied(text)))
+      case let .failure(error): reply(.failure(error))
+      }
     }
   }
 
@@ -883,23 +1156,31 @@ public actor MuxService {
         return fail(MuxError(.notFound, "pane"))
       }
       if case .clearScreen = command {
-        runtime.clearScreen()
+        runtime.clearScreen { error in
+          reply(error.map { .failure($0) } ?? .success(.ok))
+        }
       } else {
-        runtime.resetTerminal()
+        runtime.resetTerminal { error in
+          reply(error.map { .failure($0) } ?? .success(.ok))
+        }
       }
-      ok()
     case let .link(pane, address, column, detectURLs):
       guard let runtime = attachedRuntime(pane, in: leased) else {
         return fail(MuxError(.notFound, "pane"))
       }
-      runtime.link(at: address, column: column, detectURLs: detectURLs) {
-        reply(.success(.link($0)))
-      }
+      runtime.link(
+        at: address,
+        column: column,
+        detectURLs: detectURLs,
+        failure: { reply(.failure($0)) }
+      ) { reply(.success(.link($0))) }
     case let .commandOutput(pane, address):
       guard let runtime = attachedRuntime(pane, in: leased) else {
         return fail(MuxError(.notFound, "pane"))
       }
-      runtime.commandOutput(at: address) { reply(.success(.commandOutput($0))) }
+      runtime.commandOutput(at: address, failure: { reply(.failure($0)) }) {
+        reply(.success(.commandOutput($0)))
+      }
     case let .clipboardReadResult(pane, token, result):
       guard let runtime = attachedRuntime(pane, in: leased) else {
         return fail(MuxError(.notFound, "pane"))
@@ -938,7 +1219,9 @@ public actor MuxService {
       reply(.failure(MuxError(.notFound, "pane")))
       return
     }
-    runtime.search(query, step: forward) { reply(.success(.search($0))) }
+    runtime.search(query, step: forward, failure: { reply(.failure($0)) }) {
+      reply(.success(.search($0)))
+    }
   }
 
   /// Lease and update-barrier admission for a command.
@@ -961,6 +1244,11 @@ public actor MuxService {
       clientViewers[client.id] == nil
     {
       return MuxError(.notAttached, "this connection holds no attachment")
+    }
+    // A planned replacement admits only reads that leave engine state as
+    // the cut left it; everything else retries after release or abort.
+    if migrationFrozen, !command.allowedWhileMigrating {
+      return MuxError(.quiescing, "workspace is moving to a new worker")
     }
     // At the update barrier only status, ending sessions and leaving are
     // admitted; the workspace graph is otherwise frozen.
@@ -1122,7 +1410,6 @@ public actor MuxService {
     locate(pane: pane).flatMap { workspaces[$0.0].id == workspace ? $0 : nil }
   }
 
-  /// A pane of the attached workspace.
   func attachedRuntime(
     _ pane: PaneID,
     in workspace: WorkspaceID,
@@ -1151,6 +1438,7 @@ public actor MuxService {
   /// Commits a validated mutation: new revision, then notify the lease.
   func commitLayout(_ id: WorkspaceID) {
     guard let i = workspaces.firstIndex(where: { $0.id == id }) else { return }
+    savedLayoutCauses.insert(savedLayoutCause ?? .command)
     workspaces[i].layoutRevision &+= 1
     let snap = snapshot(workspaces[i])
     if let lease = leases[id] { send(.event(.layout(snap)), to: lease.client) }
@@ -1201,7 +1489,9 @@ public actor MuxService {
   }
 
   private func sendLocation(_ id: PaneID, to client: UUID?) {
-    guard let client, let pane = panes[id] else { return }
+    guard let client, let pane = panes[id],
+      clients[client]?.hello?.capabilities.contains(.paneLocation) == true
+    else { return }
     send(
       .event(
         .location(id, directory: pane.workingDirectory, host: pane.workingHost)
@@ -1216,17 +1506,25 @@ public actor MuxService {
     switch event {
     case let .title(title):
       panes[id]?.title = title
+      savedLayoutCauses.insert(.metadata)
+      publishWorkspaces()
       if let client { send(.event(.title(id, title)), to: client) }
+    case let .program(program):
+      panes[id]?.program = program
+      if let client,
+        clients[client]?.hello?.capabilities.contains(.paneProgram) == true
+      {
+        send(.event(.program(id, program)), to: client)
+      }
     case .bell: if let client { send(.event(.bell(id)), to: client) }
-    case let .workingDirectory(dir):
+    case let .workingDirectory(dir, host):
+      let local = SavedLayoutHost.isLocal(host)
       panes[id]?.workingDirectory = dir
+      panes[id]?.workingHost = local ? nil : host
+      if local { panes[id]?.localDirectory = dir }
+      savedLayoutCauses.insert(.metadata)
+      publishWorkspaces()
       sendLocation(id, to: client)
-    case let .workingHost(host):
-      panes[id]?.workingHost = host.isEmpty ? nil : host
-      sendLocation(id, to: client)
-    case let .foreground(command):
-      panes[id]?.foreground = command
-      if let client { send(.event(.foreground(id, command)), to: client) }
     case let .status(epoch, changes):
       let tab = locate(pane: id).map { workspaces[$0.0].tabs[$0.1].id }
       attention.apply(
@@ -1246,6 +1544,8 @@ public actor MuxService {
         )
       }
       panes[id]?.exitStatus = status
+      automationRuntime?
+        .emit(.processExited(exitCode: status), pane: id.description)
       if let client {
         send(
           .event(.paneExited(id, status: status, truncated: forced)),
@@ -1253,15 +1553,18 @@ public actor MuxService {
         )
       }
       let record = panes[id]!
+      // Layout changes from here on were caused by the exit (§12.2.5).
+      savedLayoutCause = .exit
+      defer { savedLayoutCause = nil }
       if record.detachedFromLayout {
-        panes.removeValue(forKey: id)
+        retirePaneRecord(id)
       } else if let ws = workspaces.first(where: { $0.id == record.workspace }),
         ws.remainOnExit
       {
         commitLayout(ws.id)
       } else {
         removeFromLayout(id)
-        panes.removeValue(forKey: id)
+        retirePaneRecord(id)
       }
       checkIdle()
     case let .clipboardRead(request):
@@ -1302,6 +1605,7 @@ public actor MuxService {
     // Cancellation cleanup is queued on each pane ahead of any later input.
     cancelPastes(wsID, discardDeferredInput: fence)
     resetViewports(wsID)
+    forgetRowVersions(wsID, of: current.attachment)
     for slot in current.frames.values { releaseBudget(slot) }
     leases.removeValue(forKey: wsID)
     leaseOrder.removeAll { $0 == wsID }
@@ -1309,6 +1613,14 @@ public actor MuxService {
     if notify { send(.event(.detached(reason: reason)), to: current.client) }
     publishWorkspaces()
     checkIdle()
+  }
+
+  /// A detached attachment's row versions are no longer needed.
+  func forgetRowVersions(_ wsID: WorkspaceID, of attachment: AttachmentID) {
+    guard let ws = workspaces.first(where: { $0.id == wsID }) else { return }
+    for pane in ws.allPanes {
+      panes[pane]?.runtime.forgetRowVersions(of: attachment)
+    }
   }
 
   private func resetViewports(_ wsID: WorkspaceID) {
@@ -1320,8 +1632,8 @@ public actor MuxService {
   /// attachment, pending launches or teardowns. Live control connections
   /// do not hold this process barrier; idle exit additionally checks them.
   public var isEmpty: Bool {
-    workspaces.isEmpty && panes.isEmpty && pendingLaunches == 0
-      && leases.isEmpty
+    workspaces.isEmpty && panes.isEmpty && retiringPanes.isEmpty
+      && pendingLaunches == 0 && leases.isEmpty
   }
 
   func checkIdle() {

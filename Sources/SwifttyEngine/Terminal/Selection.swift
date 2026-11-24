@@ -237,7 +237,21 @@ extension TerminalState {
 
   // MARK: Selection
 
+  /// A selection a new gesture starts (a click, double- or triple-click).
+  /// Unlike `setSelection`, it never continues a presentation selection:
+  /// an end landing where that one was clamped to the frame would
+  /// otherwise keep its old host address beyond the frame.
+  public mutating func beginSelection(_ newValue: Selection?) {
+    setSelection(nil)
+    setSelection(newValue)
+  }
+
   public mutating func setSelection(_ newValue: Selection?) {
+    // Clearing also ends a presentation selection kept off the frame.
+    if newValue == nil {
+      presentationSelection = nil
+      presentedSelection = nil
+    }
     let clamped = newValue.map { s in
       Selection(
         anchor: clamp(s.anchor),
@@ -309,6 +323,7 @@ extension TerminalState {
 
   /// Moving cells in place replaces their selected content. Selections
   /// elsewhere, including scrollback and cells outside margins, survive.
+  @inline(__always)
   package mutating func invalidateSelection(
     rows range: Range<Int>,
     from left: Int,
@@ -316,7 +331,17 @@ extension TerminalState {
   ) {
     guard left < right, !range.isEmpty else { return }
     markSearchDirty()
-    guard selection != nil else { return }
+    if selection != nil {
+      clearSelection(ifOverlapping: range, from: left, to: right)
+    }
+  }
+
+  @inline(never)
+  private mutating func clearSelection(
+    ifOverlapping range: Range<Int>,
+    from left: Int,
+    to right: Int
+  ) {
     for y in range {
       if let selected = selectedColumns(inScreenRow: y),
         selected.overlaps(left ..< right)

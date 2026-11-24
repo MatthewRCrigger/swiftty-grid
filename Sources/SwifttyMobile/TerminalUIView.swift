@@ -11,7 +11,10 @@ import UIKit
 public final class TerminalUIView: MTKView, MTKViewDelegate {
   private static let surfaces = NSHashTable<TerminalUIView>.weakObjects()
   public let session: TerminalSession
+  /// The configuration as presented (`DisplayAccommodations` applied).
   public private(set) var configuration: Configuration
+  /// The configuration as given, restored when a preference turns off.
+  private var configured: Configuration
   let renderer: MetalRenderer
   private lazy var redraw = DisplayDrawScheduler { [weak self] in
     self?.drawPendingFrame()
@@ -26,7 +29,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   /// on them (mouse tracking is masked without mouse reporting).
   var lastModes: Modes = .initial
   /// The same frame's modes as the terminal reported them.
-  private var programModes: Modes = .initial
+  private(set) var programModes: Modes = .initial
   /// Cursor of the last drawn frame, for placing IME candidates.
   var lastCursor: CursorState?
   private(set) var gridSize = (columns: 0, rows: 0)
@@ -36,6 +39,13 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   /// How far the whole terminal is lifted above a docked keyboard, in
   /// points. The grid keeps its size; its top scrolls out of view.
   private(set) var keyboardLift: CGFloat = 0
+  /// The lift that keeps the cursor visible at live output; held while
+  /// the viewport is in history, which hides the cursor.
+  private(set) var liveKeyboardLift: CGFloat = 0
+  /// Scrolling back lowers the lifted view before moving into history.
+  var keyboardReveal = KeyboardReveal()
+  /// Viewport offset of the last drawn frame (0 = live output).
+  private(set) var lastViewportOffset = 0
   /// Set while the scene is in the background: no frames are drawn.
   private(set) var isRenderingPaused = false
   private var isSceneActive = true
@@ -52,10 +62,28 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
     if let bar = loadedAccessoryBar { return bar }
     let bar = TerminalAccessoryBar()
     bar.onKey = { [weak self] key in self?.accessoryKey(key) }
+    bar.onDiscreteKey = { [weak self] key in self?.discreteKey(key) }
+    bar.onPaste = { [weak self] in _ = self?.perform(.pasteFromClipboard) }
     bar.onDismiss = { [weak self] in _ = self?.resignFirstResponder() }
+    bar.onPadIntent = { [weak self] intent in self?.padIntent(intent) ?? false }
+    bar.update(sticky)
     loadedAccessoryBar = bar
+    updatePadAvailability()
     return bar
   }
+
+  /// The accessory's virtual key run (pad slides and discrete arrows),
+  /// separate from hardware held keys.
+  lazy var virtualKeys: VirtualKeyOwner = {
+    let owner = VirtualKeyOwner()
+    owner.send = { [weak self] event in self?.session.send(.key(event)) }
+    owner.isAuthorized = { [weak self] in
+      self?.effectiveCapabilities.textInput == true
+    }
+    return owner
+  }()
+  /// Generation of the pad's held run, if it holds one.
+  var padRun: UInt64?
 
   /// IME composition, drawn as the renderer's preedit.
   var markedText = ""
@@ -71,7 +99,11 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   /// HID usage owning the repeat timer; other releases leave it running.
   var keyRepeatUsage: Int?
   /// Key commands and their actions, keyed by unique issued identifiers.
-  var keyCommandCache: [UIKeyCommand]?
+  var keyCommandCache: [UIKeyCommand]? {
+    didSet { searchKeyCommandCache = nil }
+  }
+  /// `keyCommandCache` filtered to search navigation (find field focused).
+  var searchKeyCommandCache: [UIKeyCommand]?
   var keyCommandBindings: [String: Keybindings.Binding] = [:]
   #if !os(tvOS)
   /// Defaults to the system clipboard; tests can use a local pasteboard.
@@ -118,6 +150,11 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   var isSearchVisible = false
 
   var scrollAccumulator = ScrollAccumulator()
+  /// Travel of the current one-finger pan.
+  var panTravel = CGPoint.zero
+  /// Whether the current pan drags between panes (`true`) or scrolls;
+  /// nil while undecided.
+  var panPages: Bool?
   var horizontalScrollAccumulator = ScrollAccumulator()
   var momentum = ScrollMomentum()
   var horizontalMomentum = ScrollMomentum()
@@ -130,7 +167,6 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   var momentumModifiers: KeyModifiers = []
   var pinchStartSize: CGFloat = 0
 
-  /// Pointer.
   /// Last cell the pointer hovered over.
   var hoverCell: (column: Int, row: Int)?
   var hoverPoint: CGPoint?
@@ -153,7 +189,6 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   /// The cursor blinks (DECSCUSR / mode 12, or `cursor-style-blink`).
   private var cursorBlinks = false
 
-  /// Accessibility.
   /// UIKit's text-input defaults must not turn the container into a
   /// single element that hides its reading element and find controls.
   override public var isAccessibilityElement: Bool {
@@ -180,6 +215,18 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   /// safe-area margins around the view); its alpha is the configured
   /// background opacity.
   public var onBackgroundColor: ((UIColor) -> Void)?
+  /// A mostly sideways one-finger drag, for paging between panes. Nil
+  /// leaves every pan to scrolling.
+  public var onPaneDrag: ((PaneDrag) -> Void)?
+  /// Called once, then cleared, on the next frame that redraws most of the
+  /// screen: a different pane's screen has arrived.
+  public var onScreenReplaced: (() -> Void)?
+  /// While set, frames are not drawn: the picture stays as it is (a pane
+  /// switch slides it away). Damage accumulates; clearing it draws the
+  /// newest screen.
+  public var holdsFrames = false {
+    didSet { if oldValue, !holdsFrames { requestRedraw() } }
+  }
   private var lastBackground: UInt32?
 
   // Text input traits: a terminal wants keys as typed.
@@ -208,6 +255,8 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
     fontSize: CGFloat? = nil
   ) throws {
     self.session = session
+    configured = configuration
+    let configuration = configuration.accommodating(.current)
     self.configuration = configuration
     let overrideSize = fontSize.map(Self.boundedFontSize)
     explicitFontSize = overrideSize
@@ -235,17 +284,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
     applyTranslucency()
     loadShader()
 
-    session.onUpdate = { [weak self] in
-      DispatchQueue.main.async {
-        MainActor.assumeIsolated { self?.setNeedsDisplay() }
-      }
-    }
-    session.onEvent = { [weak self] event in
-      DispatchQueue.main.async {
-        MainActor.assumeIsolated { self?.handle(event) }
-      }
-    }
-
+    installSessionCallbacks()
     installGestures()
     installKittyClipboard()
     Self.surfaces.add(self)
@@ -276,6 +315,14 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
       name: UIAccessibility.voiceOverStatusDidChangeNotification,
       object: nil,
     )
+    for name in DisplayAccommodations.changeNotifications {
+      center.addObserver(
+        self,
+        selector: #selector(accommodationsChanged),
+        name: name,
+        object: nil,
+      )
+    }
     registerForTraitChanges([
       UITraitPreferredContentSizeCategory.self, UITraitDisplayScale.self,
     ]) { (view: TerminalUIView, _) in view.applyFont() }
@@ -326,14 +373,21 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   /// Applies a new configuration (font, colors, render options,
   /// shader) to the running view.
   public func apply(_ configuration: Configuration) {
-    self.configuration = configuration
+    configured = configuration
+    self.configuration = configuration.accommodating(.current)
     keyCommandCache = nil
     keyCommandBindings.removeAll()
     applyColorScheme()
     applyTranslucency()
     loadShader()
     applyFont()
+    // Reduce Motion lives in the render options `applyFont` just set.
+    updateFrameDriving()
   }
+
+  /// Reduce Motion, Reduce Transparency or Darken Colors changed.
+  @objc
+  private func accommodationsChanged() { apply(configured) }
 
   private func loadShader() {
     var source: String?
@@ -418,6 +472,41 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
     }
     updateGrid()
     updateFrameDriving()
+  }
+
+  /// Routes the session's updates and events to the live views showing it,
+  /// never to one captured view. A session has one handler of each and
+  /// notifies again only after a snapshot, so a handler held by a discarded
+  /// view (SwiftUI can build more than one for a session) would swallow
+  /// every later update and leave the view on screen unpainted.
+  private func installSessionCallbacks() {
+    session.onUpdate = { [weak session] in
+      DispatchQueue.main.async {
+        MainActor.assumeIsolated {
+          guard let session else { return }
+          for view in Self.views(showing: session) { view.setNeedsDisplay() }
+        }
+      }
+    }
+    session.onEvent = { [weak session] event in
+      DispatchQueue.main.async {
+        MainActor.assumeIsolated {
+          guard let session else { return }
+          Self.eventTarget(for: session)?.handle(event)
+        }
+      }
+    }
+  }
+
+  static func views(showing session: TerminalSession) -> [TerminalUIView] {
+    surfaces.allObjects.filter { $0.session === session }
+  }
+
+  /// Events (title, bell, clipboard) run once: on the view in a window,
+  /// else on any view of the session.
+  static func eventTarget(for session: TerminalSession) -> TerminalUIView? {
+    let views = views(showing: session)
+    return views.first { $0.window != nil } ?? views.first
   }
 
   override public func didMoveToWindow() {
@@ -603,6 +692,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
     }
     guard inset != keyboardInset else { return }
     keyboardInset = inset
+    keyboardReveal.reset()
     let info = notification.userInfo
     let duration =
       (info?[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?
@@ -616,6 +706,18 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
     )
   }
   #endif
+
+  /// Whether `damage` covers at least half of `rows`: a new screen rather
+  /// than output to the shown one.
+  nonisolated static func redrawsMostRows(
+    _ damage: DamageRegion,
+    rows: Int
+  ) -> Bool {
+    if damage.isFull { return true }
+    guard rows > 0 else { return false }
+    let damaged = (0 ..< rows).count { damage.contains(row: $0) }
+    return damaged * 2 >= rows
+  }
 
   /// Lift that keeps the cursor row (and the bottom padding) above the
   /// keyboard, at most the covered height.
@@ -639,12 +741,15 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
     duration: TimeInterval = 0,
     options: UIView.AnimationOptions = []
   ) {
-    let lift = Self.keyboardLift(
-      covered: keyboardInset,
-      height: bounds.height,
-      cursorRow: lastCursor?.y,
-      geometry: geometry
-    )
+    if lastViewportOffset == 0 {
+      liveKeyboardLift = Self.keyboardLift(
+        covered: keyboardInset,
+        height: bounds.height,
+        cursorRow: lastCursor?.y,
+        geometry: geometry
+      )
+    }
+    let lift = max(0, liveKeyboardLift - keyboardReveal.revealed)
     guard lift != keyboardLift else { return }
     keyboardLift = lift
     let apply = { [self] in
@@ -744,6 +849,8 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   }
 
   private func drawPendingFrame() {
+    // Cleared later with a redraw request of its own.
+    guard !holdsFrames else { return }
     guard isSurfaceVisible, !isRenderingPaused else {
       updateFrameDriving()
       redraw.request()
@@ -759,7 +866,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
   public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
   public func draw(in view: MTKView) {
-    guard !isRenderingPaused else { return }
+    guard !isRenderingPaused, !holdsFrames else { return }
     let surfaceVisible = isSurfaceVisible
     let snapshot = session.snapshot()
     programModes = snapshot.modes
@@ -778,8 +885,21 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
     }
     hoverViewportOffset = snapshot.viewportOffset
     hoverGeometry = geometry
+    // Typing or output at live moves the cursor: lift it back into view.
+    if snapshot.viewportOffset == 0, lastViewportOffset == 0,
+      snapshot.cursor != lastCursor
+    {
+      keyboardReveal.reset()
+    }
+    if let replaced = onScreenReplaced,
+      Self.redrawsMostRows(snapshot.damage, rows: snapshot.rows.count)
+    {
+      onScreenReplaced = nil
+      replaced()
+    }
     lastCursor = snapshot.cursor
-    if keyboardInset > 0 { updateKeyboardLift() }
+    lastViewportOffset = snapshot.viewportOffset
+    if keyboardInset > 0 || keyboardLift > 0 { updateKeyboardLift() }
     if hasSelection, snapshot.selection == nil {
       hasSelection = false
       selectionOrigin = nil
@@ -1027,6 +1147,7 @@ public final class TerminalUIView: MTKView, MTKViewDelegate {
       releaseHardwareKeys()
       discardComposition()
     }
+    updatePadAvailability()
     if !available.search, isSearchVisible { hideSearch() }
     if !available.scrollback {
       stopMomentum()

@@ -1,8 +1,10 @@
 import AppKit
 import Foundation
 import MetalKit
+import SwiftMuxBridge
 import SwiftMuxClient
 import SwiftMuxProtocol
+import SwiftMuxXPC
 import SwiftMuxService
 @testable import Swiftty
 import SwifttyCore
@@ -11,7 +13,7 @@ import Testing
 import TestSupport
 
 /// Drives the native SwiftMux window against an in-process service with
-/// real shells: Metal presentation, semantic input, IME, frozen selection,
+/// real shells: Metal presentation, semantic input, IME, live selection,
 /// accessibility, splits, divider ratios and close-to-detach.
 @MainActor
 @Suite(.serialized, .timeLimit(.minutes(1)))
@@ -29,11 +31,13 @@ struct MuxNativeTests {
     let workspace: WorkspaceID
   }
 
-  func open() async throws -> Fixture {
+  func open(javaScriptDirectory: URL? = nil) async throws -> Fixture {
     _ = NSApplication.shared
-    let service = try MuxService(
-      configuration: MuxServiceConfiguration(launcherPath: try Self.launcher())
+    var serviceConfiguration = MuxServiceConfiguration(
+      launcherPath: try Self.launcher()
     )
+    serviceConfiguration.javaScriptDirectory = javaScriptDirectory
+    let service = try MuxService(configuration: serviceConfiguration)
     let endpoint = service.listenAnonymously()
     let connection = try await MuxConnection.connect(
       endpoint: endpoint,
@@ -59,6 +63,18 @@ struct MuxNativeTests {
         connection: connection
       )
       controller.window?.isReleasedWhenClosed = false
+      // Replacement windows (observing after a takeover, reattaching)
+      // connect to this service, never the installed one.
+      controller.connectService = {
+        try await MuxConnection.connect(
+          endpoint: endpoint,
+          frontend: .native,
+          capabilities: MuxWorkspaceController.clientCapabilities
+        )
+      }
+      // Most tests inspect the window a takeover leaves; observing
+      // replaces it (`MuxTakeControlTests` turn it on).
+      controller.observesAfterTakeover = false
       controller.showWindow(nil)
       return Fixture(
         service: service,
@@ -160,11 +176,15 @@ struct MuxNativeTests {
   }
 
   @Test(.enabled(if: hasMetal))
-  func `word selection freezes the presented frame`() async throws {
+  func `word selection follows new output and ends on a clear`() async throws {
     let f = try await open()
     defer { f.controller.close() }
     let view = try #require(activeView(f.controller))
     f.controller.send(.text("echo pick-me\r"), to: view.pane)
+    _ = await waitPresented(view) { $0.lines.contains("pick-me") }
+    // A resize renumbers history and ends a live selection: select once
+    // the window's first geometry has been applied.
+    try await Task.sleep(for: .milliseconds(300))
     let frame = try #require(
       await waitPresented(view) { $0.lines.contains("pick-me") }
     )
@@ -194,16 +214,82 @@ struct MuxNativeTests {
     )
     view.mouseDown(with: down)
     #expect(view.accessibilitySelectedText() == "pick-me")
-    // New output does not change the frozen selection or its text.
-    f.controller.send(.text("clear; echo replaced\r"), to: view.pane)
-    try await Task.sleep(for: .milliseconds(300))
-    view.draw(in: view)
+    // Live selection (spec.multiplexer.md §4): new output keeps drawing
+    // and the selection keeps its text while its row is unchanged.
+    f.controller.send(.text("echo more-output\r"), to: view.pane)
+    #expect(
+      await waitPresented(view) { $0.lines.contains("more-output") } != nil
+    )
     #expect(view.accessibilitySelectedText() == "pick-me")
     #expect(
-      (view.accessibilityValue() as? String)?.contains("replaced") == false
+      (view.accessibilityValue() as? String)?.contains("more-output") == true
     )
-    view.clearSelection()
+    // A clear renumbers history: the selection ends rather than marking
+    // unrelated text.
+    f.controller.send(.text("clear; echo replaced\r"), to: view.pane)
     #expect(await waitPresented(view) { $0.lines.contains("replaced") } != nil)
+    #expect(view.selection == nil)
+  }
+
+  @Test(.enabled(if: hasMetal))
+  func `a selection scrolled out of view copies while output streams`()
+    async throws
+  {
+    let f = try await open()
+    defer { f.controller.close() }
+    let view = try #require(activeView(f.controller))
+    f.controller.send(.text("echo pick-me\r"), to: view.pane)
+    _ = await waitPresented(view) { $0.lines.contains("pick-me") }
+    try await Task.sleep(for: .milliseconds(300))
+    let frame = try #require(
+      await waitPresented(view) { $0.lines.contains("pick-me") }
+    )
+    let row = try #require(frame.lines.firstIndex(of: "pick-me"))
+    // Select the word as a double click would.
+    view.frozen = view.presented
+    view.selection = FrozenSelection(
+      anchor: (row, 2),
+      head: (row, 2),
+      unit: .word
+    )
+    view.draw(in: view)
+    // Scroll it out of view, and keep output streaming while copying.
+    f.controller.send(
+      .text(
+        "seq 1 200; i=0; while [ $i -lt 40 ]; do echo tick-$i; sleep 0.05; i=$((i+1)); done\r"
+      ),
+      to: view.pane
+    )
+    _ = await waitPresented(view) { $0.lines.contains("200") }
+    #expect(view.selection == nil)  // hidden: above the shown rows
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString("sentinel", forType: .string)
+    view.copy(nil)
+    var copied: String?
+    for _ in 0 ..< 200 {
+      view.draw(in: view)
+      copied = NSPasteboard.general.string(forType: .string)
+      if copied != "sentinel" { break }
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    // The reply is matched in the service's addresses, which do not move
+    // as output scrolls the viewport.
+    #expect(copied == "pick-me")
+  }
+
+  @Test
+  func `ends dragged past an edge clamp to that edge's cells`() throws {
+    let frame = try FrameExporter.frame(
+      from: TerminalSession(columns: 10, rows: 4)
+        .withState { $0.captureOwnedScreen() },
+      identity: .unbound
+    )
+    let above = FrozenSelection(anchor: (-3, 7), head: (1, 4), unit: .cell)
+      .span(in: frame)
+    #expect(above.startRow == 0 && above.startColumn == 0)
+    let below = FrozenSelection(anchor: (1, 4), head: (9, 2), unit: .cell)
+      .span(in: frame)
+    #expect(below.endRow == 3 && below.endColumn == 9)
   }
 
   @Test(.enabled(if: hasMetal))
@@ -226,22 +312,19 @@ struct MuxNativeTests {
     let left = try #require(
       await waitPresented(firstView) { $0.grid.columns < full.grid.columns }
     )
-    // The new pane first publishes its initial launch geometry. Wait for
-    // the frame resized to the split, rather than accepting that first frame
-    // merely because it happens to be narrower than the original window.
+    // The new pane first publishes its launch geometry; wait for the split
+    // size rather than accept that frame for merely being narrower.
     _ = try #require(
       await waitPresented(otherView) {
         $0.grid.columns < full.grid.columns
           && abs(left.grid.columns - $0.grid.columns) <= 2
       }
     )
-    // A divider ratio change resizes the panes.
     c.setRatio(0.25, path: [])
     let narrowed = await waitPresented(firstView) {
       $0.grid.columns < left.grid.columns - 4
     }
     #expect(narrowed != nil)
-    // Closing the window only detaches; the workspace and shells remain.
     let pid = await f.service.panePID(first)
     c.close()
     let control = try await MuxConnection.connect(

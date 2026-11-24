@@ -1,3 +1,5 @@
+import CoreTestSupport
+import TestSupport
 import AppKit
 import SwiftMuxProtocol
 @testable import Swiftty
@@ -181,7 +183,9 @@ extension MuxNativeTests {
       defer { try? FileManager.default.removeItem(at: shader) }
       let view = try #require(activeView(f.controller))
       #expect(view.isPaused)
-      f.controller.apply(Configuration.parse("custom-shader = \(shader.path)"))
+      f.controller.apply(
+        Configuration.configured([("custom-shader", "\(shader.path)")])
+      )
       #expect(view.renderer.isAnimating)
       #expect(!view.isPaused)
       f.controller.apply(Configuration())

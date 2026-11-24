@@ -31,8 +31,7 @@ public struct QUICRSTConnector: Sendable {
     self.idleTimeout = idleTimeout
   }
 
-  /// Connects and returns an `RSTConnection`; it also conforms to
-  /// `RSTPathEvents`.
+  /// The returned connection also conforms to `RSTPathEvents`.
   public func connect(
     host: String,
     port: UInt16,
@@ -116,7 +115,12 @@ public struct QUICRSTConnector: Sendable {
       role: .client,
       group: group,
       queue: queue,
-      limits: limits
+      limits: limits,
+      settings: QUICOptions.describe(
+        role: "client",
+        idleTimeout: idleTimeout,
+        initialMaxData: initialMaxDataForTesting
+      )
     )
     connection.attachGroupHandlers()
     // Why Network framework is waiting (no usable path, local network

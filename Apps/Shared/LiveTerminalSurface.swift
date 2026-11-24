@@ -3,15 +3,15 @@ import Network
 import Observation
 import SSHClient
 import ScreenProtocol
+import SwiftMuxProtocol
 import SessionCore
 import SwiftUI
 import SwifttyCore
 import Synchronization
 import TerminalSurface
 
-// The live terminal surfaces behind `TerminalScreen` (replacing the
-// former placeholder): one MainActor controller per opened
-// `TerminalScreenModel`, owning the display session and its backend.
+// Live surfaces behind `TerminalScreen`: one MainActor controller per
+// opened `TerminalScreenModel`, owning the display session and its backend.
 
 /// Real surfaces for `app`'s sessions: a roaming presentation fed by
 /// `RoamingClient`, or an ordinary SSH shell.
@@ -95,7 +95,7 @@ struct EndpointStageNotice: Hashable, Sendable {
         Sign-in succeeded; this address is the one the Mac's roaming \
         configuration advertises. A local-network name or address may not be \
         reachable over the route used for SSH, such as cellular or a VPN. \
-        The session is kept on the Mac.
+        The workspace is kept on the Mac.
         """,
       bundle: #bundle
     )
@@ -119,15 +119,6 @@ struct EndpointStageNotice: Hashable, Sendable {
   }
 }
 
-/// Holds the current client for nonisolated input submission.
-final class ClientSlot: Sendable {
-  private let value = Mutex<RoamingClient?>(nil)
-
-  var client: RoamingClient? { value.withLock { $0 } }
-
-  func set(_ client: RoamingClient?) { value.withLock { $0 = client } }
-}
-
 // MARK: - Roaming
 
 /// One roaming terminal: a presentation-mode `TerminalSession` displaying
@@ -144,7 +135,7 @@ final class RoamingTerminalController: TerminalSurfaceController {
     /// it, resuming a workspace once one was granted. Without a choice,
     /// only a remembered workspace is resumed: nothing is created.
     case selected
-    /// An explicit Start New Session: forget the remembered session and
+    /// An explicit New Workspace: forget the remembered session and
     /// create one.
     case newSession
   }
@@ -152,17 +143,26 @@ final class RoamingTerminalController: TerminalSurfaceController {
   let model: TerminalScreenModel
   let display: TerminalSession
   private(set) var phase: SurfacePhase = .preparing(.localized("Signing in"))
+  /// The workspace's tabs and panes, from a host with `layoutControl`;
+  /// nil hides the Panes and Tabs menus.
+  private(set) var layout: RemoteLayout?
+  /// Why the last layout action failed, until dismissed.
+  var layoutFailure: String?
+  /// Frames on their way to `display`, so a pane's screen can be kept
+  /// when it is left.
+  @ObservationIgnored
+  private lazy var frameTap = FrameTap(forward: display)
+  /// Each pane's last screen, shown beside the terminal while paging to it.
+  @ObservationIgnored
+  private var paneScreens: [PaneID: PresentationFrame] = [:]
 
   @ObservationIgnored
   private weak var app: RoamingAppModel?
   @ObservationIgnored
   private(set) var selection: HostConnectionSelection
   @ObservationIgnored
-  private let slot: ClientSlot
-  @ObservationIgnored
-  private let pump: OrderedInputPump
-  @ObservationIgnored
-  private var client: RoamingClient?
+  private var backend: RoamingScreenBackend?
+  private var client: RoamingClient? { backend?.client }
   @ObservationIgnored
   private var grid = GridSize(columns: 80, rows: 24)
   @ObservationIgnored
@@ -170,6 +170,11 @@ final class RoamingTerminalController: TerminalSurfaceController {
   /// Lifecycle and grid calls to the client, applied in order.
   @ObservationIgnored
   private let lifecycleQueue = ClientLifecycleQueue()
+  /// Layout actions, in order among themselves. Each waits for the host's
+  /// answer, which a half-open path withholds until reattachment, so they
+  /// never hold up lifecycle calls or a close.
+  @ObservationIgnored
+  private let layoutQueue = ClientLifecycleQueue()
   @ObservationIgnored
   private var closed = false
   /// The detach or terminate begun by `beginClose(_:)`.
@@ -181,6 +186,12 @@ final class RoamingTerminalController: TerminalSurfaceController {
   private var monitor: NWPathMonitor?
   @ObservationIgnored
   private var pathSeen = false
+  /// The windows showing this screen.
+  @ObservationIgnored
+  private var scenes = ScenePhases()
+  /// The last lifecycle call was `enterBackground`.
+  @ObservationIgnored
+  private var backgrounded = false
   #if os(macOS) || targetEnvironment(macCatalyst)
   @ObservationIgnored
   private var powerMonitor: SystemPowerMonitor?
@@ -200,17 +211,6 @@ final class RoamingTerminalController: TerminalSurfaceController {
       configuration: Configuration().sessionConfiguration()
     )
     self.display = display
-    let slot = ClientSlot()
-    self.slot = slot
-    pump = OrderedInputPump(submit: { input in
-      guard let client = slot.client else { return .refused(.notActive(.idle)) }
-      return await client.submit(input)
-    })
-    // Semantic input arrives on the session queue, in order; the pump
-    // keeps that order across the hop to the client actor.
-    display.semanticInputHandler = { [pump] input in
-      if let input = SurfaceInput(input) { pump.enqueue(input) }
-    }
     display.gridProposalHandler = { [weak self] columns, rows in
       DispatchQueue.main.async {
         MainActor.assumeIsolated { self?.propose(columns: columns, rows: rows) }
@@ -221,6 +221,16 @@ final class RoamingTerminalController: TerminalSurfaceController {
       DispatchQueue.main.async {
         MainActor.assumeIsolated {
           _ = self?.serial { await $0.scrollViewport(by: lines) }
+        }
+      }
+    }
+    // A selection reaching beyond the shown rows is copied from the host
+    // (spec.roaming.md §7.5); the view writes the pasteboard when it lands.
+    display.remoteCopyHandler = { [weak self] selection, done in
+      DispatchQueue.main.async {
+        MainActor.assumeIsolated {
+          guard let client = self?.client else { return done(nil) }
+          Task { done(try? await client.copySelection(selection)) }
         }
       }
     }
@@ -273,11 +283,12 @@ final class RoamingTerminalController: TerminalSurfaceController {
       return
     }
     phase = .preparing(.localized("Signing in"))
-    if let old = client {
-      client = nil
-      slot.set(nil)
+    if let old = backend {
+      backend = nil
+      display.semanticInputHandler = nil
       lifecycleQueue.use(nil)
-      await old.close(.detach)
+      layoutQueue.use(nil)
+      await old.close()
     }
     guard !closed, !Task.isCancelled else { return }
     let endpoint: SSHEndpoint
@@ -295,17 +306,23 @@ final class RoamingTerminalController: TerminalSurfaceController {
     }
     guard !closed, !Task.isCancelled else { return }
 
-    let client = RoamingClient(
+    let backend = RoamingScreenBackend(
       bootstrapper: SSHBootstrapper(endpoint: endpoint),
       connector: QUICGrantConnector(fallbackHost: endpoint.configuration.host),
-      sink: display,
+      sink: frameTap,
       configuration: RoamingClientConfiguration(initialGrid: grid)
     )
-    self.client = client
-    slot.set(client)
+    self.backend = backend
+    backend.bindInput(to: display)
+    let client = backend.client
     lifecycleQueue.use(client)
+    layoutQueue.use(client)
     let token = ObjectIdentifier(client)
-    await client.setStatusHandler { [weak self] status in
+    let frameTap = frameTap
+    backend.onStatus = { [weak self] status in
+      // In order with the frames the client installs: the shown pane's
+      // next frame follows its Layout.
+      frameTap.show(status.layout?.activeTabLayout?.activePane)
       DispatchQueue.main.async {
         MainActor.assumeIsolated { self?.apply(status, from: token) }
       }
@@ -323,10 +340,11 @@ final class RoamingTerminalController: TerminalSurfaceController {
     // A reveal's pane focus and takeover apply to this attempt only.
     if case let .resume(id, _?) = intent { self.intent = .resume(id, nil) }
     phase = .preparing(
-      resuming ? .localized("Resuming session") : .localized("Starting session")
+      resuming
+        ? .localized("Resuming workspace") : .localized("Starting workspace")
     )
     do {
-      try await client.start(target)
+      try await backend.start(target)
       guard !closed else { return }
       if case .preparing = phase { phase = .running }
     } catch {
@@ -342,6 +360,12 @@ final class RoamingTerminalController: TerminalSurfaceController {
   private func apply(_ status: RoamingStatus, from token: ObjectIdentifier) {
     guard !closed, let client, ObjectIdentifier(client) == token else { return }
     model.observe(status)
+    if status.layout != layout {
+      layout = status.layout
+      // Forget closed panes' screens.
+      let live = Set(layout?.tabs.flatMap { $0.panes.map(\.id) } ?? [])
+      paneScreens = paneScreens.filter { live.contains($0.key) }
+    }
     guard let app else { return }
     switch status.state {
     case .sessionLost:
@@ -358,6 +382,99 @@ final class RoamingTerminalController: TerminalSurfaceController {
         if intent == .create { intent = .resume(id, nil) }
       }
       if status.state == .active, phase != .running { phase = .running }
+    }
+  }
+
+  /// Changes the workspace layout on the Mac; the screen follows the
+  /// active pane. A refusal is shown; a reattachment cancels silently.
+  func perform(_ action: LayoutAction) {
+    keepShownPaneScreen()
+    guard !closed else { return }
+    layoutQueue.enqueue { [weak self] client in
+      do { try await client.layout(action) } catch let error
+        as RoamingClient.LayoutError
+      {
+        guard error.code != .staleEpoch else { return }
+        let message = Self.describe(error.code)
+        DispatchQueue.main.async {
+          MainActor.assumeIsolated { self?.layoutFailure = message }
+        }
+      } catch {}
+    }
+  }
+
+  /// The shown tab has another pane to swipe to.
+  var canSwitchPanes: Bool { (layout?.activeTabLayout?.panes.count ?? 0) > 1 }
+
+  /// Shows the next (or previous) pane of the shown tab, wrapping around.
+  func switchPane(next: Bool) {
+    guard let tab = layout?.activeTabLayout,
+      let target = Self.neighbor(
+        of: tab.activePane,
+        in: tab.panes.map(\.id),
+        next: next
+      )
+    else { return }
+    perform(.focusPane(pane: target))
+  }
+
+  /// The last screen seen of the pane a page turn would show.
+  func neighborScreen(next: Bool) -> PresentationFrame? {
+    guard let tab = layout?.activeTabLayout,
+      let target = Self.neighbor(
+        of: tab.activePane,
+        in: tab.panes.map(\.id),
+        next: next
+      )
+    else { return nil }
+    return paneScreens[target]
+  }
+
+  /// Keeps the shown pane's screen for when the user pages back to it.
+  private func keepShownPaneScreen() {
+    // Filed under the pane the frame shows, which lags a Layout that
+    // already names the next pane.
+    guard let (pane, frame) = frameTap.latestPaneFrame else { return }
+    paneScreens[pane] = frame
+  }
+
+  /// The pane after (or before) `current`, wrapping; nil with no other.
+  nonisolated static func neighbor<ID: Equatable>(
+    of current: ID,
+    in panes: [ID],
+    next: Bool
+  ) -> ID? {
+    guard panes.count > 1, let index = panes.firstIndex(of: current) else {
+      return nil
+    }
+    let step = next ? 1 : panes.count - 1
+    return panes[(index + step) % panes.count]
+  }
+
+  nonisolated static func describe(_ code: RSTErrorCode) -> String {
+    switch code {
+    case .unsupported, .notAttached:
+      String(
+        localized: "The Mac isn't accepting layout changes right now.",
+        bundle: #bundle
+      )
+    case .writerBusy:
+      String(
+        localized: "Another device is controlling this workspace.",
+        bundle: #bundle
+      )
+    case .limitExceeded:
+      String(
+        localized: "The workspace can't hold any more panes or tabs.",
+        bundle: #bundle
+      )
+    case .inputInvalid:
+      String(
+        localized: "That tab or pane is no longer there, or the name was refused.",
+        bundle: #bundle
+      )
+    default:
+      String(localized: "The Mac couldn't change the layout.", bundle: #bundle)
     }
   }
 
@@ -390,14 +507,27 @@ final class RoamingTerminalController: TerminalSurfaceController {
   /// Mobile, spatial and TV scenes detach in the background and
   /// reattach in the foreground. A Mac window losing focus is not a
   /// suspension; sleep is (spec §9, `SystemPowerMonitor`).
-  func scenePhaseChanged(_ phase: ScenePhase) {
+  ///
+  /// The controller belongs to the screen model, which more than one
+  /// window can show, so only the windows' combined phase counts: one of
+  /// two windows going to the background detaches nothing. Transient
+  /// inactivity (Control Center, a permission alert) never detaches
+  /// (spec.apple.md A02). Whether the last call detached is remembered, so
+  /// a window shown after the others went away still reattaches, while a
+  /// screen's first appearance does not.
+  func scenePhaseChanged(_ phase: ScenePhase?, scene: UUID) {
+    guard let change = scenes.set(phase, for: scene) else { return }
     switch model.profile.kind {
     case .catalyst: return
     case .mobile, .vision, .tv: break
     }
-    switch phase {
-    case .background: serial { await $0.enterBackground() }
-    case .active: serial { await $0.enterForeground() }
+    switch change.new {
+    case .background where !backgrounded:
+      backgrounded = true
+      serial { await $0.enterBackground() }
+    case .active where change.old != nil || backgrounded:
+      backgrounded = false
+      serial { await $0.enterForeground() }
     default: break
     }
   }
@@ -454,8 +584,8 @@ final class RoamingTerminalController: TerminalSurfaceController {
     closed = true
     runTask?.cancel()
     let pendingLifecycle = lifecycleQueue.use(nil)
-    slot.set(nil)
-    pump.close()
+    layoutQueue.use(nil)
+    backend?.stopInput()
     monitor?.cancel()
     #if os(macOS) || targetEnvironment(macCatalyst)
     powerMonitor?.invalidate()
@@ -464,14 +594,14 @@ final class RoamingTerminalController: TerminalSurfaceController {
     display.semanticInputHandler = nil
     display.gridProposalHandler = nil
     display.viewportScrollHandler = nil
-    let client = client
+    let backend = backend
     // An already-dispatched detach finishes first. Neither it nor the
     // close needs the main actor.
     let closing = Task.detached(priority: .high) {
-      guard let client else { return }
+      guard let backend else { return }
       await pendingLifecycle?.value
-      await client.close(mode)
-      await client.setStatusHandler(nil)
+      await backend.close(mode)
+      backend.onStatus = nil
     }
     self.closing = closing
     return closing
@@ -514,11 +644,11 @@ final class RoamingTerminalController: TerminalSurfaceController {
     case .sessionLost:
       SurfaceProblem(
         title: resuming
-          ? .localized("Previous session no longer exists")
-          : .localized("Session lost"),
+          ? .localized("Previous workspace no longer exists")
+          : .localized("Workspace lost"),
         detail: String(
           localized: """
-            The Mac no longer has this session: it expired, was terminated, or the \
+            The Mac no longer has this workspace: it expired, was ended, or the \
             helper restarted. Nothing was replayed into another shell.
             """,
           bundle: #bundle
@@ -531,7 +661,7 @@ final class RoamingTerminalController: TerminalSurfaceController {
         title: .localized("Mac unreachable over SSH"),
         detail: String(
           localized:
-            "The session is kept on the Mac. Try again when the network is back.",
+            "The workspace is kept on the Mac. Try again when the network is back.",
           bundle: #bundle
         ),
         actions: [.retry]
@@ -561,7 +691,7 @@ final class RoamingTerminalController: TerminalSurfaceController {
         detail: String(
           localized: """
             The selected SSH key could not be read: it was deleted, is not on this \
-            device, or the device is locked. The session is kept on the Mac; no \
+            device, or the device is locked. The workspace is kept on the Mac; no \
             credentials were sent.
             """,
           bundle: #bundle
@@ -632,8 +762,14 @@ final class RoamingTerminalController: TerminalSurfaceController {
 // MARK: - Ordinary SSH
 
 /// An ordinary SSH shell (spec §A.3.B): a local `TerminalSession` fed
-/// by an SSH shell channel. A different shell from any roaming session;
-/// it ends with its connection and is never resumed.
+/// by an SSH shell channel. A different shell from any roaming session; a
+/// shell ends with its connection and is never resumed.
+///
+/// With automatic reconnection on (spec.roaming.md §9.1), a dropped
+/// connection opens a **new** shell in the same screen, after bounded
+/// bursts of attempts, and says so natively; nothing typed into the old
+/// shell is replayed. Health checks and TCP keepalive detect a half-open
+/// connection.
 @MainActor
 @Observable
 final class SSHShellController: TerminalSurfaceController {
@@ -648,6 +784,8 @@ final class SSHShellController: TerminalSurfaceController {
   @ObservationIgnored
   private let access: SSHAccess
   @ObservationIgnored
+  private weak var app: RoamingAppModel?
+  @ObservationIgnored
   private(set) var selection: HostConnectionSelection
   @ObservationIgnored
   private var backend: SSHStreamBackend?
@@ -657,10 +795,41 @@ final class SSHShellController: TerminalSurfaceController {
   private var runTask: Task<Void, Never>?
   @ObservationIgnored
   private var cleanupTask: Task<Void, Never>?
+  /// The dropped shell's close. It detaches the backend from `session`, so
+  /// a replacement waits for it before using the session.
+  @ObservationIgnored
+  private var retiring: Task<Void, Never>?
   @ObservationIgnored
   private var closed = false
   @ObservationIgnored
   private var started = false
+  /// Identifies the current shell; callbacks from a replaced one are
+  /// ignored.
+  @ObservationIgnored
+  private var generation = 0
+  /// Present while recovering a lost connection.
+  @ObservationIgnored
+  private(set) var recovery: RecoverySchedule?
+  @ObservationIgnored
+  private var recoveryTask: Task<Void, Never>?
+  /// An attempt is signing in or opening a shell now.
+  @ObservationIgnored
+  private var attempting = false
+  @ObservationIgnored
+  private var healthTask: Task<Void, Never>?
+  @ObservationIgnored
+  private var probeTask: Task<Void, Never>?
+  @ObservationIgnored
+  private var monitor: NWPathMonitor?
+  @ObservationIgnored
+  private var pathSeen = false
+  @ObservationIgnored
+  private var scenes = ScenePhases()
+  @ObservationIgnored
+  private var backgrounded = false
+  /// Shells opened by automatic recovery, for the status notice and tests.
+  @ObservationIgnored
+  private(set) var replacementShells = 0
 
   init(
     model: TerminalScreenModel,
@@ -668,6 +837,7 @@ final class SSHShellController: TerminalSurfaceController {
     access: SSHAccess? = nil
   ) {
     self.model = model
+    self.app = app
     self.access = access ?? app.ssh
     selection = model.selection ?? app.connectionSelection(for: model.host)
     model.selection = selection
@@ -695,19 +865,30 @@ final class SSHShellController: TerminalSurfaceController {
       }
     }
     refusalRelay = relay
+    installIdleInputHandler()
+    model.previewLines = { [session] in session.withState { $0.screenLines } }
+  }
+
+  private var settings: ConnectionResilienceSettings {
+    app?.resilience ?? .default
+  }
+
+  /// Until a shell is open, input is refused rather than queued for it.
+  private func installIdleInputHandler() {
+    let relay = refusalRelay
     session.inputHandler = { input in
       // The view reports focus as soon as it appears, often before the
       // shell opens; that is not the user's input, so it raises no notice.
       if case .focus = input { return }
-      relay.report(.notActive(.idle))
+      relay?.report(.notActive(.idle))
     }
-    model.previewLines = { [session] in session.withState { $0.screenLines } }
   }
 
   /// Opens the shell once; a new shell needs a new screen.
   func start() {
     guard !closed, runTask == nil, backend == nil, !started else { return }
     started = true
+    observeSystem()
     runTask = Task {
       await run()
       runTask = nil
@@ -718,12 +899,23 @@ final class SSHShellController: TerminalSurfaceController {
     phase = .preparing(.localized("Signing in"))
     model.observe(.connecting)
     do {
+      try await openShell()
+    } catch {
+      guard !closed else { return }
+      model.observe(.lost)
+      phase = .failed(Self.problem(for: error))
+    }
+  }
+
+  /// Signs in, opens a shell channel and installs its backend.
+  private func openShell() async throws {
+    do {
       selection = try await access.prepare(selection)
       model.selection = selection
       let connection = try await access.connectPrepared(selection)
       guard !closed else {
         await connection.close()
-        return
+        throw CancellationError()
       }
       self.connection = connection
       phase = .preparing(.localized("Opening shell"))
@@ -733,10 +925,15 @@ final class SSHShellController: TerminalSurfaceController {
         columns: columns,
         rows: rows
       )
+      // The dropped backend's close clears the session's writer and resets
+      // its parser; that must not land on the replacement's output.
+      await retiring?.value
       guard !closed else {
         await channel.close()
-        return
+        throw CancellationError()
       }
+      generation += 1
+      let current = generation
       let backend = SSHStreamBackend(channel: channel, session: session)
       backend.onInputRefusal = { [relay = refusalRelay] refusal in
         relay?.report(refusal)
@@ -744,64 +941,59 @@ final class SSHShellController: TerminalSurfaceController {
       backend.onScreenInstalled = { [weak self] date in
         DispatchQueue.main.async {
           MainActor.assumeIsolated {
-            guard let self, !self.closed else { return }
+            guard let self, !self.closed, self.generation == current else {
+              return
+            }
             self.model.screenInstalled(at: date)
           }
         }
       }
       backend.onLifecycleChange = { [weak self] lifecycle in
         DispatchQueue.main.async {
-          MainActor.assumeIsolated { self?.apply(lifecycle) }
+          MainActor.assumeIsolated {
+            guard let self, self.generation == current else { return }
+            self.apply(lifecycle)
+          }
         }
       }
       self.backend = backend
       phase = .running
       backend.start()
+      startHealthChecks()
     } catch {
       // Shell setup owns a fresh connection. A rejected child channel
       // can leave SSH authenticated, so release the parent on failure.
       let failedConnection = connection
       connection = nil
       await failedConnection?.close()
-      guard !closed else { return }
-      model.observe(.lost)
-      if let error = error as? SSHAccessError {
-        phase = .failed(RoamingTerminalController.problem(for: error))
-      } else {
-        phase = .failed(
-          SurfaceProblem(
-            title: .localized("Shell unavailable"),
-            detail: String(
-              localized: "The Mac refused to open a shell on this connection.",
-              bundle: #bundle
-            ),
-            actions: [.retry]
-          )
-        )
-      }
+      throw error
     }
   }
 
   private func apply(_ lifecycle: SurfaceLifecycle) {
     guard !closed, cleanupTask == nil else { return }
-    model.observe(lifecycle)
-    if lifecycle.isFinal { releaseResources() }
     switch lifecycle {
     case .lost:
-      phase = .failed(
-        SurfaceProblem(
-          title: .localized("SSH connection lost"),
-          detail: String(
-            localized: """
-              This ordinary SSH shell ended with its connection and cannot be resumed. \
-              A roaming session on the Mac is not affected.
-              """,
-            bundle: #bundle
-          ),
-          actions: [.retry]
-        )
-      )
+      guard settings.autoReconnect, let connection else {
+        shellLost()
+        return
+      }
+      // Only a dropped connection is recovered. A channel the server closed
+      // on a live connection is a shell that ended, not a network failure.
+      let current = generation
+      Task { [weak self] in
+        let health =
+          connection.isActive
+          ? await connection.probe(timeout: .seconds(5)) : .closed
+        guard let self, !self.closed, self.generation == current,
+          self.cleanupTask == nil
+        else { return }
+        if health == .responsive { self.shellLost() } else { self.beginRecovery() }
+      }
     case let .exited(status):
+      // The program ended; that is not a network failure to recover from.
+      model.observe(lifecycle)
+      releaseResources()
       phase = .failed(
         SurfaceProblem(
           title: .localized("Shell exited"),
@@ -814,13 +1006,274 @@ final class SSHShellController: TerminalSurfaceController {
           actions: [.retry]
         )
       )
+    default:
+      model.observe(lifecycle)
+      if lifecycle.isFinal { releaseResources() }
+    }
+  }
+
+  private func shellLost() {
+    model.observe(.lost)
+    releaseResources()
+    phase = .failed(Self.connectionLost)
+  }
+
+  // MARK: Recovery
+
+  /// The connection dropped: drop the dead shell, then open new ones until
+  /// one succeeds, the user closes the screen, or an error needs the user.
+  private func beginRecovery() {
+    guard recovery == nil, !closed else { return }
+    model.observe(.interrupted)
+    dropShell()
+    recovery = RecoverySchedule(attemptsPerBurst: settings.attemptsPerBurst)
+    if !backgrounded { scheduleRecovery() }
+    else { phase = .preparing(.localized("Waiting to reconnect")) }
+  }
+
+  private func scheduleRecovery() {
+    guard var schedule = recovery, !closed, recoveryTask == nil else { return }
+    let delay = schedule.next()
+    let total = schedule.total
+    recovery = schedule
+    if schedule.isCoolingDown, delay == RecoverySchedule.cooldown {
+      phase = .failed(Self.retrying(after: delay))
+    } else {
+      phase = .preparing(.localized("Reconnecting (attempt \(total))"))
+    }
+    recoveryTask = Task { [weak self] in
+      try? await Task.sleep(for: delay)
+      guard let self, !Task.isCancelled else { return }
+      await self.attemptRecovery()
+    }
+  }
+
+  private func attemptRecovery() async {
+    guard !closed, recovery != nil else {
+      recoveryTask = nil
+      return
+    }
+    phase = .preparing(.localized("Reconnecting"))
+    model.observe(.connecting)
+    attempting = true
+    defer { attempting = false }
+    do {
+      try await openShell()
+      recoveryTask = nil
+      guard !closed else { return }
+      recovery = nil
+      replacementShells += 1
+      // Honest outcome (Shell's "New shell opened"): the previous shell and
+      // anything it was running are gone; no input was replayed.
+      inputNotice = .localized(
+        """
+        New shell opened. The connection dropped, so the previous shell ended \
+        and was not resumed; a command it was running may not have finished.
+        """
+      )
+    } catch {
+      recoveryTask = nil
+      guard !closed else { return }
+      // Backgrounding cancelled this attempt. A foreground return while it
+      // was in flight left the next attempt to it.
+      if Task.isCancelled {
+        if !backgrounded { scheduleRecovery() }
+        return
+      }
+      if Self.blocksRecovery(error) {
+        recovery = nil
+        model.observe(.lost)
+        phase = .failed(Self.problem(for: error))
+        return
+      }
+      if !backgrounded { scheduleRecovery() }
+    }
+  }
+
+  /// A trigger (foreground, network path change, explicit retry) starts a
+  /// fresh burst now rather than waiting out a cooldown.
+  private func triggerRecovery() {
+    guard var schedule = recovery, !closed, !backgrounded else { return }
+    schedule.trigger()
+    recovery = schedule
+    // An attempt in flight finishes; if it fails, the next starts at once.
+    guard !attempting else { return }
+    recoveryTask?.cancel()
+    recoveryTask = nil
+    scheduleRecovery()
+  }
+
+  /// Errors that need the user: credentials, trust, a cancelled prompt.
+  static func blocksRecovery(_ error: any Error) -> Bool {
+    if error is CancellationError { return true }
+    guard let error = error as? SSHAccessError else { return false }
+    return error != .unreachable
+  }
+
+  /// Closes the dead connection without ending the screen.
+  private func dropShell() {
+    // The dead backend's own close must not end this screen.
+    generation += 1
+    healthTask?.cancel()
+    healthTask = nil
+    probeTask?.cancel()
+    probeTask = nil
+    let backend = backend
+    let connection = connection
+    self.backend = nil
+    self.connection = nil
+    installIdleInputHandler()
+    retiring = Task.detached(priority: .high) {
+      await backend?.close()
+      await connection?.close()
+    }
+  }
+
+  // MARK: Health
+
+  /// Periodic bounded probes while the shell is shown in the foreground.
+  private func startHealthChecks() {
+    healthTask?.cancel()
+    healthTask = nil
+    guard settings.healthChecks, !backgrounded else { return }
+    let interval = Duration.seconds(settings.probeInterval)
+    healthTask = Task { [weak self] in
+      while !Task.isCancelled {
+        try? await Task.sleep(for: interval)
+        guard !Task.isCancelled, let self else { return }
+        await self.checkHealth()
+      }
+    }
+  }
+
+  /// One bounded check. An unresponsive connection is closed, so the
+  /// backend reports it lost and recovery starts.
+  private func checkHealth() async {
+    guard let connection, recovery == nil, !closed else { return }
+    let health = await connection.probe()
+    guard !closed, connection === self.connection else { return }
+    if health != .responsive { await connection.close() }
+  }
+
+  /// A single check on foreground activation or a path change, even with
+  /// periodic checks off.
+  private func probeOnce() {
+    guard probeTask == nil, connection != nil else { return }
+    probeTask = Task { [weak self] in
+      await self?.checkHealth()
+      self?.probeTask = nil
+    }
+  }
+
+  // MARK: System events
+
+  func scenePhaseChanged(_ phase: ScenePhase?, scene: UUID) {
+    guard let change = scenes.set(phase, for: scene) else { return }
+    switch model.profile.kind {
+    case .catalyst: return
+    case .mobile, .vision, .tv: break
+    }
+    switch change.new {
+    case .background where !backgrounded:
+      backgrounded = true
+      healthTask?.cancel()
+      healthTask = nil
+      recoveryTask?.cancel()
+      recoveryTask = nil
+    case .active where change.old != nil || backgrounded:
+      backgrounded = false
+      if recovery != nil {
+        triggerRecovery()
+      } else if backend != nil {
+        startHealthChecks()
+        probeOnce()
+      }
     default: break
     }
   }
 
+  private func observeSystem() {
+    let monitor = NWPathMonitor()
+    monitor.pathUpdateHandler = { [weak self] _ in
+      DispatchQueue.main.async {
+        MainActor.assumeIsolated { self?.pathChanged() }
+      }
+    }
+    monitor.start(queue: DispatchQueue(label: "dev.swiftty.ssh.path"))
+    self.monitor = monitor
+  }
+
+  private func pathChanged() {
+    guard pathSeen else {
+      pathSeen = true
+      return
+    }
+    guard !closed, !backgrounded else { return }
+    if recovery != nil { triggerRecovery() } else { probeOnce() }
+  }
+
+  // MARK: Problems
+
+  static var connectionLost: SurfaceProblem {
+    SurfaceProblem(
+      title: .localized("SSH connection lost"),
+      detail: String(
+        localized: """
+          This ordinary SSH shell ended with its connection and cannot be resumed. \
+          Your workspace on the Mac is not affected.
+          """,
+        bundle: #bundle
+      ),
+      actions: [.retry]
+    )
+  }
+
+  static func retrying(after delay: Duration) -> SurfaceProblem {
+    SurfaceProblem(
+      title: .localized("SSH connection lost"),
+      detail: String(
+        localized: """
+          Still trying to reconnect, every \(delay.components.seconds) seconds. \
+          A reconnect opens a new shell; the previous one ended with its \
+          connection.
+          """,
+        bundle: #bundle
+      ),
+      actions: [.retry]
+    )
+  }
+
+  static func problem(for error: any Error) -> SurfaceProblem {
+    if let error = error as? SSHAccessError {
+      return RoamingTerminalController.problem(for: error)
+    }
+    return SurfaceProblem(
+      title: .localized("Shell unavailable"),
+      detail: String(
+        localized: "The Mac refused to open a shell on this connection.",
+        bundle: #bundle
+      ),
+      actions: [.retry]
+    )
+  }
+
+  /// The problem card's action while recovering: try now. Otherwise the
+  /// view opens a new screen.
+  func retryNow() -> Bool {
+    guard recovery != nil, !closed else { return false }
+    backgrounded = false
+    triggerRecovery()
+    return true
+  }
+
+  // MARK: Close
+
   func beginClose(_ mode: RoamingCloseMode) -> Task<Void, Never> {
     closed = true
     runTask?.cancel()
+    recoveryTask?.cancel()
+    recoveryTask = nil
+    recovery = nil
     return releaseResources()
   }
 
@@ -833,6 +1286,12 @@ final class SSHShellController: TerminalSurfaceController {
   @discardableResult
   private func releaseResources() -> Task<Void, Never> {
     if let cleanupTask { return cleanupTask }
+    healthTask?.cancel()
+    healthTask = nil
+    probeTask?.cancel()
+    probeTask = nil
+    monitor?.cancel()
+    monitor = nil
     refusalRelay?.close()
     refusalRelay = nil
     let backend = backend
@@ -848,4 +1307,44 @@ final class SSHShellController: TerminalSurfaceController {
   }
 
   func dismissInputNotice() { inputNotice = nil }
+}
+
+/// Forwards roaming frames to the display, keeping the newest and the pane
+/// it shows.
+final class FrameTap: PresentationSink {
+  private struct State {
+    /// The active pane of the newest Layout.
+    var shown: PaneID?
+    var newest: PresentationFrame?
+    /// The pane `newest` belongs to: the one shown when it arrived.
+    var newestPane: PaneID?
+  }
+
+  private let forward: TerminalSession
+  private let state = Mutex(State())
+
+  init(forward: TerminalSession) { self.forward = forward }
+
+  /// The newest frame with its pane; nil before a Layout named one.
+  var latestPaneFrame: (PaneID, PresentationFrame)? {
+    state.withLock { s in
+      guard let pane = s.newestPane, let frame = s.newest else { return nil }
+      return (pane, frame)
+    }
+  }
+
+  /// A Layout made `pane` active; called in order with `install(_:)`. The
+  /// host sends the new pane's screen after its Layout, so the newest frame
+  /// still belongs to the pane shown before.
+  func show(_ pane: PaneID?) { state.withLock { $0.shown = pane } }
+
+  @discardableResult
+  func install(_ frame: PresentationFrame) -> Bool {
+    guard forward.install(frame) else { return false }
+    state.withLock { s in
+      s.newest = frame
+      s.newestPane = s.shown
+    }
+    return true
+  }
 }

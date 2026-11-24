@@ -4,12 +4,21 @@ import SwifttyEngine
 
 /// Converts a consistent owned capture into a `PaneFrame`.
 public enum FrameExporter {
-  /// - Throws: `resourceLimit` when valid state exceeds an export budget;
-  ///   cells are never silently omitted.
+  /// Shown for a grapheme cluster longer than the frame budget allows.
+  package static let replacementCharacter: UInt32 = 0xFFFD
+
+  /// A cluster longer than `limits.maxGraphemeScalars` is shown as
+  /// `overlongGrapheme` (U+FFFD by default) rather than failing the frame;
+  /// nil fails it instead.
+  ///
+  /// - Throws: `resourceLimit` when valid state exceeds another export
+  ///   budget (or an over-long cluster has no placeholder); cells are
+  ///   never silently omitted.
   package static func frame(
     from screen: OwnedScreen,
     identity: FrameIdentity,
-    limits: MuxLimits = .standard
+    limits: MuxLimits = .standard,
+    overlongGrapheme: UInt32? = replacementCharacter
   ) throws(MuxError) -> PaneFrame {
     guard
       let count = limits.cellCount(columns: screen.columns, rows: screen.rows)
@@ -25,6 +34,8 @@ public enum FrameExporter {
     var styles: [FrameStyle] = [.plain]
     var lookup: [FrameStyle: UInt16] = [.plain: 0]
     var graphemes: [[UInt32]] = []
+    // Neighbouring cells usually share a style: skip the table lookup.
+    var last: (style: FrameStyle, index: UInt16) = (.plain, 0)
     for i in 0 ..< count {
       let cell = screen.cells[i]
       let a = cell.attributes
@@ -36,8 +47,11 @@ public enum FrameExporter {
         flags: flags.rawValue,
         underlineColor: a.underlineColor
       )
-      if let idx = lookup[style] {
+      if style == last.style {
+        styleIndex[i] = last.index
+      } else if let idx = lookup[style] {
         styleIndex[i] = idx
+        last = (style, idx)
       } else {
         guard styles.count < limits.maxStyles,
           let index = UInt16(exactly: styles.count)
@@ -45,6 +59,7 @@ public enum FrameExporter {
         lookup[style] = index
         styleIndex[i] = index
         styles.append(style)
+        last = (style, index)
       }
       if cell.flags.contains(.spacerTail) {
         kinds[i] = CellKind.continuation.rawValue
@@ -54,11 +69,16 @@ public enum FrameExporter {
         if cell.width == 2 { kinds[i] = CellKind.wideLead.rawValue }
         if cell.isGrapheme {
           let scalars = screen.graphemes[Int(cell.glyph)]
-          guard scalars.count <= limits.maxGraphemeScalars else {
-            throw MuxError(.resourceLimit, "grapheme cluster length")
+          if scalars.count > limits.maxGraphemeScalars {
+            // A profile with a placeholder shows it instead of failing.
+            guard let overlongGrapheme else {
+              throw MuxError(.resourceLimit, "grapheme cluster length")
+            }
+            glyphs[i] = overlongGrapheme
+          } else {
+            glyphs[i] = FrameGrid.graphemeFlag | UInt32(graphemes.count)
+            graphemes.append(scalars)
           }
-          glyphs[i] = FrameGrid.graphemeFlag | UInt32(graphemes.count)
-          graphemes.append(scalars)
         } else {
           glyphs[i] = cell.glyph
         }

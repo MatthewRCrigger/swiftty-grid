@@ -32,13 +32,8 @@ extension MainActorIntegrationTests.IdentityAccountBoundaryTests {
       rootView: NavigationStack { SSHKeyDetailView(model: model, id: id) }
     )
     window.makeKeyAndOrderFront(nil)
-    let enhancedUI = NSAccessibility.Attribute(
-      rawValue: "AXEnhancedUserInterface"
-    )
-    let previous =
-      NSApp.accessibilityAttributeValue(enhancedUI) as? Bool ?? false
-    NSApp.accessibilitySetValue(true, forAttribute: enhancedUI)
-    defer { NSApp.accessibilitySetValue(previous, forAttribute: enhancedUI) }
+    let restoreEnhancedUI = enableEnhancedUserInterface()
+    defer { restoreEnhancedUI() }
     try await body(window)
   }
 
@@ -101,7 +96,7 @@ extension MainActorIntegrationTests.IdentityAccountBoundaryTests {
           let replacement = SSHIdentityMetadata(
             id: original.id,
             name: "Account B",
-            publicKey: IdentitySecret(.init()).publicKey,
+            publicKeyLine: IdentitySecret(.init()).publicKeyLine,
             storage: .deviceOnly,
             revision: LogicalRevision(counter: 100, deviceID: UUID())
           )

@@ -73,12 +73,22 @@ extension View {
     #endif
   }
 
+  /// Glass behind the view, reaching into the safe areas unless
+  /// `fillsSafeArea` is false: a terminal leaves its insets to
+  /// `TerminalChromeBackground`, which the glass would cover. GRID
+  /// platforms without glass get the flat true-black surface instead.
   @ViewBuilder
-  func glassSurface() -> some View {
-    if keepsGlass {
+  func glassSurface(fillsSafeArea: Bool = true) -> some View {
+    if !keepsGlass {
+      if fillsSafeArea {
+        background { GridColor.surface0.ignoresSafeArea() }
+      } else {
+        background { GridColor.surface0 }
+      }
+    } else if fillsSafeArea {
       background { Color.clear.glassPanel(cornerRadius: 0).ignoresSafeArea() }
     } else {
-      background { GridColor.surface0.ignoresSafeArea() }
+      background { Color.clear.glassPanel(cornerRadius: 0) }
     }
   }
 

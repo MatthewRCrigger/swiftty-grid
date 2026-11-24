@@ -8,6 +8,12 @@ extension TerminalView {
     guard capabilities.allows(action, presentation: session.isPresentation)
     else { return false }
     switch action {
+    case .newTab:
+      return NSApp.sendAction(
+        Selector(("newTerminalTab:")),
+        to: nil,
+        from: self
+      )
     case .copyToClipboard: return copySelection()
     case .pasteFromClipboard: return pasteClipboard()
     case let .increaseFontSize(n): setFontSize(fontSize + CGFloat(n))
@@ -42,7 +48,8 @@ extension TerminalView {
     case .clearScreen: session.mutate { $0.clearScreenKeepingCursorLine() }
     case .reset: session.reset()
     case .text, .textBytes, .csi, .esc:
-      action.bytes.map { session.send(.bytes($0)) }
+      guard let bytes = action.bytes else { return false }
+      return submitInput(.bytes(bytes))
     case .ignore: break
     }
     return true
@@ -59,8 +66,7 @@ extension TerminalView {
     }
     guard let text = pasteboard.string(forType: .string) else { return false }
     clearSelection()
-    session.send(.paste(text))
-    return true
+    return submitInput(.paste(text))
   }
 
   @objc
@@ -68,10 +74,19 @@ extension TerminalView {
 
   private func copySelection() -> Bool {
     guard capabilities.localCopy else { return false }
-    guard let text = session.withState({ $0.selectionText }), !text.isEmpty
+    guard
+      session.withState({
+        $0.selection != nil || $0.presentationSelectionBeyondView != nil
+      })
     else { return false }
-    pasteboard.clearContents()
-    pasteboard.setString(text, forType: .string)
+    // A remote selection reaching beyond the shown rows is copied from the
+    // host; the pasteboard is written once the text arrives.
+    let pasteboard = pasteboard
+    session.copySelectedText { text in
+      guard let text, !text.isEmpty else { return }
+      pasteboard.clearContents()
+      pasteboard.setString(text, forType: .string)
+    }
     return true
   }
 

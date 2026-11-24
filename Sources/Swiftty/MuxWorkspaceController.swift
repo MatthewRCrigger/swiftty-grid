@@ -20,6 +20,9 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// What the service accepts beyond the original profile.
   let features: ServiceFeatures
   private(set) var config: Configuration
+  /// Once a profile is selected, clearing it must resolve the configuration
+  /// default rather than revive the service's original launch snapshot.
+  private var resolvesShellPreference: Bool
   /// Manual zoom for this window's panes, or nil for the configured size.
   private var fontSize: Double?
   let workspaceContent = NSView()
@@ -34,13 +37,37 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   private(set) var views: [PaneID: MuxPaneView] = [:]
   private(set) var containers: [PaneID: MuxPaneContainer] = [:]
   let tabStrip = MuxTabStrip()
-  /// Sanitized program titles, from snapshots and title events.
-  private var titles: [PaneID: String] = [:]
+  /// OSC 7 locations for the GRID status bar and remote marks.
   private var locations: [PaneID: GridLocation] = [:]
-  /// The program holding each pane's terminal; nil entries are at the shell.
-  private var foregrounds: [PaneID: String] = [:]
+  /// Holds the tab strip when tabs show on the left (`window.tabs`).
+  let tabSidebar = MuxTabSidebar()
+  /// Where the tab strip shows now: the toolbar or the sidebar.
+  private(set) var tabPosition = TabPosition.top
+  private var panesAtEdge: NSLayoutConstraint!
+  /// The panes start below the toolbar (tabs on top) or at the window's
+  /// top edge, under its transparent titlebar (tabs on the left).
+  private var panesBelowToolbar: NSLayoutConstraint?
+  private var panesAtTop: NSLayoutConstraint!
+  private var panesBesideSidebar: NSLayoutConstraint!
+  private var panesTrailing: NSLayoutConstraint!
+  private var panesBottom: NSLayoutConstraint!
+  /// The sidebar is hidden by its toggle (tabs on the left only).
+  private(set) var sidebarCollapsed = false
+  /// Space around the panes' card when tabs show on the left: the same
+  /// as the gap between split panes, so the window's padding is even.
+  static let cardMargin = CGFloat(MuxLayoutView.divider)
+  let automationStatus = JavaScriptStatusBar()
+  var automationKeys: Set<String> = []
+  var automationTabIcons: [TabID: String] = [:]
+  /// Icon names scripts chose per pane (`ui.setPaneIcon`), from the
+  /// local table only.
+  var automationPaneIcons: [PaneID: String] = [:]
+  var automationFocusedPane: PaneID?
+  var automationNotify: @MainActor (String, String) -> Void =
+    JavaScriptNotifications.deliver
+  let displayState = WorkspaceDisplayState()
   /// Panes with output the user has not seen (hidden tabs, bells).
-  private(set) var activity: Set<PaneID> = []
+  var activity: Set<PaneID> { displayState.activity }
   /// A divider drag shown locally before the service commits it.
   private var ratioProposal: RatioProposal?
   private var ratioSending = false
@@ -53,13 +80,41 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   static let maxQueuedCommands = 64
   private var pipelineTasks: [Task<Void, Never>] = []
   private var tasks: [Task<Void, Never>] = []
-  private let connectionAttempts = MuxConnectionAttempts()
+  let connectionAttempts = MuxConnectionAttempts()
   private var geometryGeneration: UInt64 = 0
   private var sentGeometry: (revision: UInt64, entries: [GeometryBatch.Entry])?
   private var geometryScheduled = false
   private var geometryDeferred = false
   private var subscribed: [PaneID] = []
   private var detached = false
+  /// Controller, or a read-only observer: a window that lost control
+  /// keeps showing the workspace live as one (`startObserving`).
+  private(set) var role: AttachmentRole = .controller
+  /// Shown over a window that lost control: typing or its button takes
+  /// control back (`requestControl`).
+  let controlBar = MuxControlBar()
+  /// Input typed while asking for control, replayed in the window that
+  /// gets it, in order.
+  var controlReplays: [@MainActor (MuxWorkspaceController) -> Void] = []
+  /// A request for control is in flight; further input only queues.
+  var requestingControl = false {
+    didSet { controlBar.isBusy = requestingControl }
+  }
+  /// Most input kept while asking for control.
+  static let maxControlReplays = 256
+  /// Replacing this window with a live observer is in progress; a
+  /// request for control waits for it (`startObserving`).
+  var startingObserver = false
+  /// Input asked for control while `startingObserver`.
+  var controlRequestedWhileObserving = false
+  /// Whether a takeover elsewhere turns this window into a live observer
+  /// (tests that inspect the frozen window turn it off).
+  var observesAfterTakeover = true
+  /// Whether taking this workspace's control needs asking (tests force
+  /// a prompt for a local holder standing in for another device).
+  var decideTakeControl: (WorkspaceSummary) -> MuxTakeControl.Decision = {
+    MuxTakeControl.decide($0)
+  }
   private var presentationAttachment: AttachmentID?
   /// Lease loss leaves inbox metadata available until the window closes.
   private var closed = false
@@ -68,12 +123,40 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// Whether this window still holds its workspace's lease: false once
   /// it detached, lost its connection or another frontend took over
   /// (the window then shows "SwiftMux — detached").
-  var holdsLease: Bool { !isClosed && !detached && attachedWorkspace != nil }
+  var holdsLease: Bool {
+    !isClosed && !detached && attachedWorkspace != nil && role == .controller
+  }
+  /// Whether this window shows its workspace live without controlling it.
+  var isObserving: Bool {
+    !isClosed && !detached && attachedWorkspace != nil && role == .observer
+  }
   var onClose: (() -> Void)?
   /// Receives the window that replaced this one after it lost its lease
   /// (inbox "Open" reattaching); the app keeps one SwiftMux window.
   var onReplaced: ((MuxWorkspaceController) -> Void)?
-  /// Connects such a replacement (tests use an in-process service).
+  /// Shared native control for routed windows. Window closure releases only
+  /// its worker transport; the caller owns this control connection.
+  var gateway: MuxGatewayConnection?
+  /// Shared app control is refreshed only for a new explicit attachment attempt.
+  var reconnectGateway: (@MainActor () async throws -> MuxGatewayConnection)?
+  /// Shown until the first input (spec.durability.md §12.2.7).
+  static let reopenedNotice =
+    "Reopened from saved layout — earlier processes ended"
+  /// The reopened workspace may carry previous output (C1).
+  var offersPreviousOutput = false
+  var previousOutputViewers: [SavedOutputViewer] = []
+  /// Set when this window shows a reopened saved layout.
+  var showsReopenedNotice = false {
+    didSet {
+      if showsReopenedNotice {
+        window?.subtitle = Self.reopenedNotice
+      } else if window?.subtitle == Self.reopenedNotice {
+        window?.subtitle = ""
+      }
+    }
+  }
+  var gatewayRecovery: Task<Void, Never>?
+  /// Connects a legacy replacement (tests use an in-process service).
   var connectService: @MainActor () async throws -> MuxConnection = {
     try await MuxWorkspaceController.connect()
   }
@@ -96,7 +179,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     limits = welcome.limits
     features = welcome.features
     config = configuration
-    let window = Self.makeWorkspaceWindow()
+    resolvesShellPreference = configuration.preferredShell != nil
+    let window = Self.makeWorkspaceWindow(configuration: configuration)
     super.init(window: window)
     window.delegate = self
     let content = workspaceContent
@@ -111,26 +195,67 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     layoutView.translatesAutoresizingMaskIntoConstraints = false
     layoutView.controller = self
     content.addSubview(layoutView)
+    content.addSubview(automationStatus)
     content.addSubview(statusBar)
+    controlBar.translatesAutoresizingMaskIntoConstraints = false
+    controlBar.isHidden = true
+    controlBar.onTakeControl = { [weak self] in self?.requestControl() }
+    content.addSubview(controlBar)
+    tabSidebar.translatesAutoresizingMaskIntoConstraints = false
+    tabSidebar.isHidden = true
+    content.addSubview(tabSidebar)
+    panesAtEdge = layoutView.leadingAnchor.constraint(
+      equalTo: content.leadingAnchor
+    )
+    panesBesideSidebar = layoutView.leadingAnchor.constraint(
+      equalTo: tabSidebar.trailingAnchor
+    )
+    panesTrailing = layoutView.trailingAnchor.constraint(
+      equalTo: content.trailingAnchor
+    )
+    panesBottom = layoutView.bottomAnchor.constraint(
+      equalTo: statusBar.topAnchor
+    )
+    // The window's layout guide is reachable only once the content is in
+    // the window: `applyTitlebar` makes the constraint to it.
+    panesAtTop = layoutView.topAnchor.constraint(equalTo: content.topAnchor)
     NSLayoutConstraint.activate([
-      layoutView.topAnchor.constraint(equalTo: content.topAnchor),
-      layoutView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-      layoutView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-      layoutView.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+      panesAtTop, panesAtEdge, panesTrailing, panesBottom,
+      tabSidebar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+      tabSidebar.topAnchor.constraint(equalTo: content.topAnchor),
+      tabSidebar.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
       statusBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
       statusBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-      statusBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+      statusBar.bottomAnchor.constraint(equalTo: automationStatus.topAnchor),
+      tabSidebar.widthAnchor.constraint(equalToConstant: MuxTabSidebar.width),
+      automationStatus.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+      automationStatus.trailingAnchor.constraint(
+        equalTo: content.trailingAnchor
+      ),
+      automationStatus.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+      controlBar.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+      controlBar.topAnchor.constraint(
+        equalTo: content.safeAreaLayoutGuide.topAnchor,
+        constant: 8
+      ),
+      controlBar.widthAnchor.constraint(
+        lessThanOrEqualTo: content.widthAnchor,
+        constant: -32
+      ),
     ])
     TerminalWindowBackground.apply(
       to: window,
       content: content,
-      configuration: configuration
+      configuration: configuration,
+      underTitlebar: true
     )
     workspaceToolbar.onClick = { [weak self] in self?.toggleInbox() }
     workspaceToolbar.onNewTab = { [weak self] in self?.newTab() }
+    workspaceToolbar.onToggleSidebar = { [weak self] in self?.toggleSidebar() }
     window.toolbar = workspaceToolbar.toolbar
-    window.toolbarStyle = .unifiedCompact
+    window.toolbarStyle = .unified
     window.titleVisibility = .hidden
+    setTabPosition(configuration.tabPosition)
     startPipelines()
   }
 
@@ -146,6 +271,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     configuration: Configuration,
     connection: MuxConnection,
     takeover expectedLease: UInt64? = nil,
+    role: AttachmentRole = .controller,
     beforeReturnForTesting: (
       @MainActor (MuxWorkspaceController) async -> Void
     )? = nil,
@@ -172,7 +298,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     try Task.checkCancellation()
     let attach: MuxCommand =
       expectedLease.map { .takeover(target, expectedLease: $0) }
-      ?? .attach(AttachRequest(target))
+      ?? .attach(AttachRequest(target, role: role))
     guard
       case let .attached(attachment, ws) = try await connection.execute(
         attach,
@@ -185,11 +311,19 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       welcome: welcome,
       configuration: configuration,
     )
+    if expectedLease == nil { controller.role = role }
     controller.apply(ws, attached: true, attachment: attachment)
     controller.startEvents()
     controller.startInbox()
-    controller.sendTheme()
-    controller.observeAppearance()
+    if controller.role == .observer {
+      controller.startWatchingControl()
+    } else {
+      if controller.features.contains(.javaScript) {
+        controller.command(.subscribeAutomation(true))
+      }
+      controller.sendTheme()
+      controller.observeAppearance()
+    }
     do {
       await beforeReturnForTesting?(controller)
       try Task.checkCancellation()
@@ -231,11 +365,37 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       }
     }
     guard current?.isClosed != true else { throw CancellationError() }
+    var selectedGateway = current?.gateway
+    let openConnection: @MainActor () async throws -> MuxConnection
+    if let reconnect = current?.reconnectGateway {
+      openConnection = {
+        let gateway = try await reconnect()
+        selectedGateway = gateway
+        return
+          try await gateway.openWorkspace(
+            .id(target.workspace),
+            role: .controller,
+            capabilities: clientCapabilities
+          )
+          .connection
+      }
+    } else if let gateway = selectedGateway {
+      openConnection = {
+        try await gateway.openWorkspace(
+          .id(target.workspace),
+          role: .controller,
+          capabilities: clientCapabilities
+        )
+        .connection
+      }
+    } else {
+      openConnection = connect
+    }
     let connection: MuxConnection
     if let current {
-      connection = try await current.connectionAttempts.connect(connect)
+      connection = try await current.connectionAttempts.connect(openConnection)
     } else {
-      connection = try await connect()
+      connection = try await openConnection()
     }
     let controller = try await replace(
       current,
@@ -249,6 +409,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       controller.close()
       throw error
     }
+    controller.gateway = selectedGateway
     attached(controller)
     try await controller.revealAttention(pane: target.pane, tab: target.tab)
     return controller
@@ -305,20 +466,19 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
           while let event = try await connection.nextEvent() {
             switch event {
             case let .frame(frame):
-              guard
-                let presentation = MuxPaneView.importFrame(
-                  frame,
-                  limits: limits
-                )
-              else { continue }
+              let presentation = MuxPaneView.importFrame(frame, limits: limits)
               await self?.present(presentation)
             default: await self?.handle(event)
             }
           }
           if !Task.isCancelled {
-            await self?.connectionEnded("connection closed")
+            await self?.transportEnded("connection closed")
           }
-        } catch { await self?.connectionEnded(String(describing: error)) }
+        } catch {
+          if !Task.isCancelled {
+            await self?.transportEnded(String(describing: error))
+          }
+        }
       }
     )
   }
@@ -334,12 +494,15 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// Applies one non-frame event (internal for tests).
   func handle(_ event: MuxEvent) {
     switch event {
+    case let .automation(data): handleAutomation(data)
     case let .layout(ws): apply(ws)
     case let .title(pane, title):
-      titles[pane] = DisplayText.sanitize(title)
+      displayState.titles[pane] = DisplayText.sanitize(title)
       refreshChrome()
-    case let .foreground(pane, command):
-      foregrounds[pane] = command
+    case let .program(pane, program):
+      let program = ProgramName.sanitize(program)
+      guard displayState.programs[pane] != program else { return }
+      displayState.programs[pane] = program
       refreshChrome()
     case let .location(pane, directory, host):
       locations[pane] = GridLocation(directory: directory, host: host)
@@ -364,23 +527,43 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       refreshInbox()
     case let .clipboardRead(request): handleClipboardRead(request)
     case let .clipboardWrite(request): handleClipboardWrite(request)
-    case .paste, .frameUnavailable, .frame, .workspaces, .ready: break
+    case let .workspaces(list): controlHolderChanged(list)
+    case .paste, .frameUnavailable, .frame, .frameDelta, .workspaceGraph,
+      .ready:
+      break
     }
+  }
+
+  private func transportEnded(_ reason: String) {
+    let recover = holdsLease && reconnectGateway != nil
+    connectionEnded(reason)
+    if recover { recoverGatewayAttachment() }
   }
 
   private func connectionEnded(_ reason: String) {
     guard !detached else { return }
     detached = true
     stopPipelines()
-    for view in views.values { view.reset() }
+    // The last frames stay, dimmed, so the window still shows where
+    // things were; typing takes control back (`requestControl`).
+    for view in views.values { view.cancelComposition() }
+    layoutView.alphaValue = 0.55
     showsTabs(true)
     window?.title = "\(workspaceTitle) — detached (\(reason))"
+    let wasController = role == .controller
+    showControlBar(reason: reason)
+    // Taken over: keep showing the workspace live, read-only.
+    if wasController, observesAfterTakeover,
+      reason == MuxTakeControl.takenOverReason
+    {
+      startObserving()
+    }
   }
 
   // MARK: Layout
 
   private var workspaceTitle: String {
-    workspace.map { DisplayText.sanitize($0.name) }.flatMap(\.nonEmpty)
+    workspace.map { DisplayText.workspaceName($0.name) }.flatMap(\.nonEmpty)
       ?? "swiftty"
   }
 
@@ -417,7 +600,9 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
         subscribed = []
         sentGeometry = nil
       }
-      if let current = workspace, current.id != ws.id { activity = [] }
+      if let current = workspace, current.id != ws.id {
+        displayState.activity = []
+      }
       show(ws)
     }
   }
@@ -427,8 +612,14 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
 
   private func show(_ ws: WorkspaceSnapshot) {
     workspace = ws
-    for pane in ws.panes where titles[pane.id] == nil || !pane.title.isEmpty {
-      titles[pane.id] = DisplayText.sanitize(pane.title)
+    for pane in ws.panes
+    where displayState.titles[pane.id] == nil || !pane.title.isEmpty {
+      displayState.titles[pane.id] = DisplayText.sanitize(pane.title)
+    }
+    for pane in ws.panes where pane.program != nil {
+      displayState.programs[pane.id] = pane.program.flatMap(
+        ProgramName.sanitize
+      )
     }
     for pane in ws.panes {
       locations[pane.id] = GridLocation(
@@ -436,12 +627,13 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
         host: pane.workingHost
       )
     }
-    for pane in ws.panes { foregrounds[pane.id] = pane.foreground }
     let known = Set(ws.panes.map(\.id))
-    foregrounds = foregrounds.filter { known.contains($0.key) }
-    titles = titles.filter { known.contains($0.key) }
     locations = locations.filter { known.contains($0.key) }
-    activity.formIntersection(known)
+    displayState.titles = displayState.titles.filter { known.contains($0.key) }
+    displayState.programs = displayState.programs.filter {
+      known.contains($0.key)
+    }
+    displayState.activity.formIntersection(known)
     guard let tab = ws.activeTabSnapshot else {
       refreshChrome()
       return
@@ -460,6 +652,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       else { continue }
       view.controller = self
       let container = MuxPaneContainer(paneView: view)
+      container.terminalBackground = terminalBackground
       container.header.onAction = { [weak self] action in
         self?.headerAction(action, pane: id)
       }
@@ -469,7 +662,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     }
     for (id, view) in views { view.isActivePane = id == tab.activePane }
     // Shown panes are seen.
-    activity.subtract(visible)
+    displayState.activity.subtract(visible)
     if let proposal = ratioProposal, proposal.tab != tab.id {
       ratioProposal = nil
     }
@@ -487,12 +680,22 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   // MARK: Chrome
 
   func title(of pane: PaneID) -> String {
-    titles[pane].flatMap(\.nonEmpty) ?? "shell"
+    displayState.titles[pane].flatMap(\.nonEmpty) ?? "shell"
+  }
+
+  /// The pane's icon: a script's choice, else from its program and title.
+  func icon(of pane: PaneID) -> MuxIcon {
+    MuxIcons.icon(
+      title: title(of: pane),
+      program: displayState.programs[pane],
+      override: automationPaneIcons[pane]
+    )
   }
 
   /// The `command-theme` color for the program running in `pane`.
   private func tint(of pane: PaneID) -> NSColor? {
-    guard let rgb = foregrounds[pane].flatMap({ config.commandThemes[$0] })
+    guard
+      let rgb = displayState.programs[pane].flatMap({ config.commandThemes[$0] })
     else { return nil }
     return NSColor(
       srgbRed: CGFloat(rgb >> 16 & 0xFF) / 255,
@@ -503,22 +706,34 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   }
 
   /// Tab strip, pane headers and window title from the current snapshot.
-  private func refreshChrome() {
+  func refreshChrome() {
     guard !detached, let ws = workspace else { return }
     tabStrip.update(
       ws.tabs.map { tab in
         let name = DisplayText.sanitize(tab.name)
         // Service default names are numbers; show the program instead.
         let automatic = name.isEmpty || name.allSatisfy(\.isNumber)
-        let label = automatic ? title(of: tab.activePane) : name
+        let label =
+          automatic ? MuxIcons.displayTitle(title(of: tab.activePane)) : name
+        let panes = tab.layout.panes.count
+        let detail = [
+          automatic ? nil : title(of: tab.activePane),
+          panes > 1 ? "\(panes) panes" : nil,
+        ]
+        .compactMap { $0 }.joined(separator: " · ")
         return MuxTabItem(
           id: tab.id,
-          title: label,
-          symbol: MuxIcons.symbol(for: title(of: tab.activePane)),
+          title: [automationTabIcons[tab.id], label].compactMap { $0 }
+            .filter { !$0.isEmpty }.joined(separator: " "),
+          // The active pane's program in front, then the next pane's.
+          icons: ([tab.activePane]
+            + tab.layout.panes.filter { $0 != tab.activePane }.prefix(1))
+            .map(icon(of:)),
           isActive: tab.id == ws.activeTab,
           hasActivity: tab.id != ws.activeTab
             && tab.layout.panes.contains(where: activity.contains),
           name: automatic ? nil : tab.name,
+          detail: detail,
           tint: tint(of: tab.activePane)
         )
       }
@@ -527,7 +742,9 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     let split = tab.layout.panes.count > 1
     let order = tab.layout.panes
     for (id, container) in containers {
-      container.showsHeader = split
+      // Tabs on the left show every pane as a card with its header, which
+      // holds the sidebar controls while the sidebar is collapsed.
+      container.showsHeader = split || tabPosition == .left
       container.update(
         MuxPaneHeaderState(
           title: title(of: id),
@@ -536,6 +753,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
           isZoomed: tab.zoomedPane == id,
           hasExited: ws.pane(id)?.exitStatus != nil,
           exitStatus: ws.pane(id)?.exitStatus,
+          icon: icon(of: id),
           index: (order.firstIndex(of: id) ?? 0) + 1,
           count: order.count,
           remote: locations[id]?.isRemote ?? false,
@@ -543,8 +761,13 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
         )
       )
     }
-    let active = titles[tab.activePane].flatMap(\.nonEmpty)
-    window?.title = active ?? workspaceTitle
+    let active = displayState.titles[tab.activePane].flatMap(\.nonEmpty)
+    // The workspace, then what its active pane shows ("Workspace 0 — ~").
+    let shown = [workspaceTitle, active].compactMap { $0 }
+      .joined(separator: " — ")
+    window?.title = [automationTabIcons[tab.id], shown].compactMap { $0 }
+      .filter { !$0.isEmpty }.joined(separator: " ")
+    updateAutomationFocus()
     let size = views[tab.activePane]?.gridSize ?? (columns: 0, rows: 0)
     statusBar.status = GridStatus(
       theme: config.theme?.dark ?? "default",
@@ -555,22 +778,197 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       location: locations[tab.activePane] ?? GridLocation()
     )
     showsTabs(ws.tabs.count > 1)
+    placeSidebarControls()
   }
 
   /// A one-tab workspace shows its title, not a strip with one choice.
-  /// The new-tab and inbox controls stay either way.
+  /// The new-tab and inbox controls stay either way. The sidebar stays
+  /// (its width would otherwise come and go with the second tab), and it
+  /// names the tabs, so the toolbar shows no title.
   private func showsTabs(_ shown: Bool) {
-    workspaceToolbar.tabs.isHidden = !shown
-    window?.titleVisibility = shown ? .hidden : .visible
+    switch tabPosition {
+    case .top:
+      workspaceToolbar.tabs.isHidden = !shown
+      window?.titleVisibility = shown ? .hidden : .visible
+    case .left: window?.titleVisibility = .hidden
+    }
   }
 
   /// Whether the tab strip is shown (tests).
-  var showsTabStrip: Bool { !workspaceToolbar.tabs.isHidden }
+  var showsTabStrip: Bool {
+    switch tabPosition {
+    case .top: !workspaceToolbar.tabs.isHidden
+    case .left: !tabSidebar.isHidden && tabStrip.superview === tabSidebar
+    }
+  }
+
+  /// Moves the tab strip to the toolbar (top) or the sidebar (left).
+  func setTabPosition(_ position: TabPosition) {
+    let toolbar = workspaceToolbar
+    switch position {
+    case .top:
+      if toolbar.tabs.view !== tabStrip {
+        tabStrip.removeFromSuperview()
+        tabStrip.isVertical = false
+        toolbar.tabs.view = tabStrip
+      }
+    case .left:
+      if toolbar.tabs.view === tabStrip { toolbar.tabs.view = nil }
+      if tabStrip.superview !== tabSidebar {
+        tabStrip.removeFromSuperview()
+        tabStrip.isVertical = true
+        tabSidebar.host(tabStrip)
+      }
+    }
+    toolbar.show(position)
+    let moved = tabPosition != position
+    tabPosition = position
+    applyTitlebar()
+    layoutPanes()
+    showsTabs((workspace?.tabs.count ?? 0) > 1)
+    if moved {
+      refreshChrome()
+      layoutView.needsLayout = true
+    }
+  }
+
+  /// Tabs on the left hide the toolbar and run the content up under a
+  /// transparent titlebar: the sidebar and the panes reach the top edge,
+  /// the window controls over them. On top, the toolbar holds the tabs and
+  /// the content starts below it.
+  func applyTitlebar() {
+    guard let window else { return }
+    let left = tabPosition == .left
+    let glass = window.contentView is NSGlassEffectView
+    if left || glass {
+      window.styleMask.insert(.fullSizeContentView)
+    } else {
+      window.styleMask.remove(.fullSizeContentView)
+    }
+    window.titlebarAppearsTransparent = left || glass
+    workspaceToolbar.toolbar.isVisible = !left
+    // The window controls move with the titlebar's height.
+    tabSidebar.needsUpdateConstraints = true
+    if panesBelowToolbar == nil, workspaceContent.window === window,
+      let guide = window.contentLayoutGuide as? NSLayoutGuide
+    {
+      panesBelowToolbar = layoutView.topAnchor.constraint(
+        equalTo: guide.topAnchor
+      )
+    }
+    let below = left ? nil : panesBelowToolbar
+    panesBelowToolbar?.isActive = false
+    panesAtTop.isActive = below == nil
+    below?.isActive = true
+  }
+
+  /// Hides or shows the sidebar (tabs on the left). Hidden, New Tab goes
+  /// too; the toggle and the inbox move to the top-left pane's header.
+  @objc
+  func toggleSidebar(_ sender: Any? = nil) {
+    guard tabPosition == .left else { return }
+    sidebarCollapsed.toggle()
+    layoutPanes()
+  }
+
+  /// Places the sidebar and panes for the tab position: on the left the
+  /// panes sit in a rounded card beside the sidebar (or, collapsed, in
+  /// its place); on top they fill the window.
+  private func layoutPanes() {
+    let left = tabPosition == .left
+    let sidebarShown = left && !sidebarCollapsed
+    let margin = left ? Self.cardMargin : 0
+    tabSidebar.isHidden = !sidebarShown
+    workspaceToolbar.sidebarControls.isCollapsed = !sidebarShown
+    panesBesideSidebar.isActive = false
+    panesAtEdge.isActive = false
+    panesAtEdge.constant = left ? margin : 0
+    if sidebarShown {
+      panesBesideSidebar.isActive = true
+    } else {
+      panesAtEdge.isActive = true
+    }
+    panesTrailing.constant = -margin
+    panesBottom.constant = -margin
+    panesAtTop.constant = left ? margin : 0
+    layoutView.isCard = left
+    layoutView.needsLayout = true
+    refreshChrome()
+    placeSidebarControls()
+  }
+
+  /// Puts the sidebar controls where they show: the sidebar's top row, or
+  /// (collapsed) the header of the top-left pane, clear of the window
+  /// controls; tabs on top show none.
+  func placeSidebarControls() {
+    placeWindowControls()
+    let controls = workspaceToolbar.sidebarControls
+    let headers = containers.values.map(\.header)
+    // The top-left pane is found from laid-out frames.
+    if tabPosition == .left, sidebarCollapsed {
+      layoutView.layoutSubtreeIfNeeded()
+    }
+    guard tabPosition == .left else {
+      for h in headers where h.accessory === controls { h.setAccessory(nil) }
+      controls.removeFromSuperview()
+      return
+    }
+    guard sidebarCollapsed else {
+      for h in headers where h.accessory === controls { h.setAccessory(nil) }
+      tabSidebar.showControls(controls)
+      return
+    }
+    // Highest top edge, then leftmost (AppKit's y runs up).
+    let shown = containers.values.filter {
+      !$0.isHidden && $0.showsHeader && $0.superview === layoutView
+    }
+    guard
+      let target = shown.min(by: {
+        abs($0.frame.maxY - $1.frame.maxY) > 1
+          ? $0.frame.maxY > $1.frame.maxY : $0.frame.minX < $1.frame.minX
+      })
+    else { return }
+    for h in headers where h !== target.header && h.accessory === controls {
+      h.setAccessory(nil)
+    }
+    target.header.setAccessory(controls, inset: windowControlsInset(target))
+  }
+
+  /// Tabs on the left: the window controls centre on the pane headers'
+  /// row (the card's margin plus half a header), which the sidebar's top
+  /// row centres on in turn. On top, the toolbar places them.
+  func placeWindowControls() {
+    guard tabPosition == .left, let window else { return }
+    MuxWindowControls.center(window, at: windowControlsCenter)
+  }
+
+  /// Where the window controls centre below the top edge, tabs on the left.
+  static let windowControlsCenter =
+    cardMargin + MuxPaneContainer.headerHeight / 2
+  var windowControlsCenter: CGFloat { Self.windowControlsCenter }
+
+  /// How far a pane's header must leave room for the window controls over
+  /// its leading edge; none in full screen, where they hide.
+  private func windowControlsInset(_ container: MuxPaneContainer) -> CGFloat {
+    guard let window, !window.styleMask.contains(.fullScreen),
+      let zoom = window.standardWindowButton(.zoomButton), !zoom.isHidden,
+      zoom.window === window, container.window === window
+    else { return 0 }
+    let buttons = zoom.convert(zoom.bounds, to: nil)
+    let header = container.header.convert(container.header.bounds, to: nil)
+    guard buttons.minY < header.maxY, buttons.maxX > header.minX else {
+      return 0
+    }
+    return (buttons.maxX - header.minX).rounded(.up)
+  }
+
+  /// Whether the panes show in a rounded card (tests).
+  var panesInCard: Bool { layoutView.isCard }
 
   private func markActivity(_ pane: PaneID) {
     guard !detached else { return }
     guard pane != activePane || !subscribed.contains(pane) else { return }
-    guard activity.insert(pane).inserted else { return }
+    guard displayState.activity.insert(pane).inserted else { return }
     refreshChrome()
   }
 
@@ -609,7 +1007,11 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     guard let tab = activeTab, let tree = displayedLayout else {
       return ([], [])
     }
-    let area = MuxLayoutView.area(bounds, split: tree.panes.count > 1)
+    let area = MuxLayoutView.area(
+      bounds,
+      split: tree.panes.count > 1,
+      margin: layoutView.splitMargin
+    )
     if let zoomed = tab.zoomedPane, let view = containers[zoomed] {
       let frame = NSRect(
         x: area.x,
@@ -653,7 +1055,11 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       ratio,
       at: path,
       of: tree,
-      in: MuxLayoutView.area(layoutView.bounds, split: tree.panes.count > 1),
+      in: MuxLayoutView.area(
+        layoutView.bounds,
+        split: tree.panes.count > 1,
+        margin: layoutView.splitMargin
+      ),
       minimum: minimumPaneSize,
       divider: MuxLayoutView.divider
     )
@@ -723,7 +1129,9 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   }
 
   private func sendGeometry() {
-    guard !detached, let ws = workspace, let commands else { return }
+    // An observer's frames keep the controller's grid size.
+    guard !detached, role == .controller, let ws = workspace, let commands
+    else { return }
     let entries =
       views.compactMap { id, view -> GeometryBatch.Entry? in
         guard view.superview != nil, view.bounds.width > 0,
@@ -786,6 +1194,11 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
       failed?(MuxError(.notAttached))
       return
     }
+    // An observer's other commands would only be refused.
+    guard role == .controller || command.allowedForObserver else {
+      failed?(MuxError(.unauthorized, "this window does not control it"))
+      return
+    }
     let connection = connection
     let admission = commands.yield {
       do {
@@ -843,12 +1256,14 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   }
 
   func send(_ input: MuxInput, to pane: PaneID) {
-    guard !detached else { return }
+    guard !detached, role == .controller else { return }
+    if showsReopenedNotice { showsReopenedNotice = false }
     inputs?.send(input, to: pane)
   }
 
   func paste(_ text: String, to pane: PaneID) {
-    guard !detached else { return }
+    guard !detached, role == .controller else { return }
+    if showsReopenedNotice { showsReopenedNotice = false }
     inputs?.paste(text, to: pane)
   }
 
@@ -913,6 +1328,30 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
           found(output)
         } else {
           found(nil)
+        }
+      }
+    )
+  }
+
+  /// Copies a live selection from the service's grid
+  /// (spec.multiplexer.md §4, "Live selection across pages").
+  func copySelection(
+    _ request: CopySelectionRequest,
+    copied: @escaping @MainActor @Sendable (Result<String, MuxError>) -> Void
+  ) {
+    guard features.contains(.liveSelection) else {
+      return copied(.failure(MuxError(.invalidRequest, "no live selection")))
+    }
+    command(
+      .copySelection(request),
+      failed: { error in
+        copied(.failure(error as? MuxError ?? MuxError(.connectionLost)))
+      },
+      replied: { reply in
+        if case let .copied(text) = reply {
+          copied(.success(text))
+        } else {
+          copied(.failure(MuxError(.invalidRequest, "copy reply")))
         }
       }
     )
@@ -1097,12 +1536,26 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     tabStrip.buttons.first { $0.item?.isActive == true }?.beginRename()
   }
 
-  /// The service starts it with the workspace's launch spec.
-  func newTab() { command(.newTab(name: nil, launch: nil)) }
+  func newTab() {
+    let launch = resolvesShellPreference ? WorkspaceLaunch.spec(config) : nil
+    command(.newTab(name: nil, launch: launch))
+  }
 
   func split(_ axis: SplitAxis, pane: PaneID? = nil) {
     guard let pane = pane ?? activePane else { return }
-    command(.split(pane: pane, axis: axis, launch: nil))
+    var splitConfig = config
+    if splitConfig.workingDirectory == nil {
+      splitConfig.workingDirectory = "inherit"
+    }
+    let launch =
+      !resolvesShellPreference
+      ? nil
+      : WorkspaceLaunch.spec(
+        splitConfig,
+        currentDirectory: workspace?.pane(pane)?.workingDirectory
+          ?? FileManager.default.currentDirectoryPath
+      )
+    command(.split(pane: pane, axis: axis, launch: launch))
   }
 
   func toggleZoom(pane: PaneID? = nil) {
@@ -1157,12 +1610,13 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     _ message: String,
     _ detail: String,
     button: String = "End",
+    declined: @escaping @MainActor () -> Void = {},
     _ action: @escaping @MainActor () -> Void
   ) {
-    guard !isClosed else { return }
+    guard !isClosed else { return declined() }
     guard ask else { return action() }
     Task { @MainActor [weak self] in
-      guard let self, !isClosed else { return }
+      guard let self, !isClosed else { return declined() }
       let ok: Bool
       if let hook = confirmDestructive {
         ok = await hook(message)
@@ -1180,7 +1634,7 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
           ok = alert.runModal() == .alertFirstButtonReturn
         }
       }
-      if ok, !isClosed { action() }
+      if ok, !isClosed { action() } else { declined() }
     }
   }
 
@@ -1236,7 +1690,6 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     }
   }
 
-  /// Prompts for a workspace name.
   func beginRenamingWorkspace() {
     guard let window, attachedWorkspace != nil else { return }
     let alert = NSAlert()
@@ -1261,6 +1714,8 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   func detach() async {
     guard !closed else { return }
     closed = true
+    gatewayRecovery?.cancel()
+    gatewayRecovery = nil
     connectionAttempts.cancel()
     inboxReadID = UUID()
     detached = true
@@ -1280,6 +1735,9 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     let appearance = window?.effectiveAppearance ?? NSApp.effectiveAppearance
     let scheme = TerminalView.scheme(of: appearance)
     let p = config.palette(for: scheme)
+    for container in containers.values {
+      container.terminalBackground = terminalBackground
+    }
     var colors: [UInt32] = []
     colors.reserveCapacity(256)
     for i in 0 ..< 256 { colors.append(p.colors[i]) }
@@ -1301,7 +1759,33 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
     )
   }
 
+  /// The theme's terminal background at the configured opacity, as the
+  /// panes clear to it: a split tab's cards wear it around their terminal.
+  var terminalBackground: NSColor {
+    let appearance = window?.effectiveAppearance ?? NSApp.effectiveAppearance
+    let bg = config.palette(for: TerminalView.scheme(of: appearance)).background
+    let opacity =
+      config.backgroundOpacity.isNaN
+      ? 1 : max(0, min(1, config.backgroundOpacity))
+    return NSColor(
+      srgbRed: CGFloat(bg >> 16 & 0xFF) / 255,
+      green: CGFloat(bg >> 8 & 0xFF) / 255,
+      blue: CGFloat(bg & 0xFF) / 255,
+      // Quantized as the renderer's clear colour is.
+      alpha: CGFloat(UInt32(opacity * 255)) / 255
+    )
+  }
+
+  @objc
+  private func systemColorsChanged() { sendTheme() }
+
   func observeAppearance() {
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(systemColorsChanged),
+      name: NSColor.systemColorsDidChangeNotification,
+      object: nil
+    )
     appearanceObservation = NSApp.observe(\.effectiveAppearance) {
       [weak self] _, _ in
       DispatchQueue.main.async {
@@ -1331,18 +1815,24 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
 
   /// A configuration reload: new colours reach the engines.
   func apply(_ configuration: Configuration) {
+    resolvesShellPreference =
+      resolvesShellPreference || configuration.preferredShell != nil
     config = configuration
     for view in views.values { view.apply(paneConfiguration) }
+    setTabPosition(configuration.tabPosition)
     if let window {
       let focused =
         searchBar?.field.currentEditor() === window.firstResponder
         ? searchBar?.field : window.firstResponder as? NSView
       let selection = (focused as? NSControl)?.currentEditor()?.selectedRange
-      if TerminalWindowBackground.apply(
+      let moved = TerminalWindowBackground.apply(
         to: window,
         content: workspaceContent,
-        configuration: configuration
-      ), let focused {
+        configuration: configuration,
+        underTitlebar: true
+      )
+      applyTitlebar()
+      if moved, let focused {
         window.makeFirstResponder(focused)
         if let selection, let control = focused as? NSControl {
           control.currentEditor()?.selectedRange = selection
@@ -1416,8 +1906,27 @@ final class MuxWorkspaceController: NSWindowController, NSWindowDelegate {
   /// open, otherwise kept for the next time it opens.
   var inboxMessage: String?
 
+  // The window controls come and go with full screen, and the top-left
+  // pane changes with the window's size: the sidebar controls follow.
+  func windowDidResize(_ notification: Notification) {
+    tabSidebar.needsUpdateConstraints = true
+    placeSidebarControls()
+  }
+
+  func windowDidEnterFullScreen(_ notification: Notification) {
+    tabSidebar.needsUpdateConstraints = true
+    placeSidebarControls()
+  }
+
+  func windowDidExitFullScreen(_ notification: Notification) {
+    tabSidebar.needsUpdateConstraints = true
+    placeSidebarControls()
+  }
+
   func windowWillClose(_ notification: Notification) {
     closeRequested = true
+    gatewayRecovery?.cancel()
+    gatewayRecovery = nil
     connectionAttempts.cancel()
     detached = true
     stopPipelines()

@@ -1,3 +1,4 @@
+import CoreTestSupport
 import TestSupport
 #if canImport(UIKit)
 import SwifttyCore
@@ -10,9 +11,9 @@ extension ViewLifecycleTests {
   func `reading hit tests distinguish rows from terminal padding`(
     _ scaled: Bool
   ) throws {
-    let configuration = Configuration.parse(
-      "window-padding-x=7\nwindow-padding-y=9"
-    )
+    let configuration = Configuration.configured([
+      ("window-padding-x", "7"), ("window-padding-y", "9"),
+    ])
     let view = try TerminalUIView(
       session: TerminalSession(),
       configuration: configuration

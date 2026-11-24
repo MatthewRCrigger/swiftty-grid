@@ -5,6 +5,47 @@ import TestSupport
 
 struct GraphemeCompactionTests {
   @Test
+  func `a cluster grows in place without leaving garbage`() {
+    var vt = VT(12, 4)
+    vt.feed("👨\u{200D}👩\u{200D}👧\u{200D}👦x")
+    #expect(vt.state.graphemes.scalars.count == 7)
+    #expect(vt.state.scalars(of: vt.cell(0, 0)).count == 7)
+    vt.feed("\r\ne\u{301}\u{302}\u{303}")
+    #expect(vt.state.graphemes.scalars.count == 11)
+    #expect(
+      vt.state.scalars(of: vt.cell(0, 1)) == [
+        "e", "\u{301}", "\u{302}", "\u{303}",
+      ]
+    )
+  }
+
+  @Test
+  func `recorded break state still pairs regional indicators`() {
+    var vt = VT(12, 4)
+    vt.feed("🇯🇵🇺🇸🇫\u{200D}👩\u{200D}💻")
+    #expect(vt.state.scalars(of: vt.cell(0, 0)) == ["🇯", "🇵"])
+    #expect(vt.state.scalars(of: vt.cell(2, 0)) == ["🇺", "🇸"])
+    #expect(vt.state.scalars(of: vt.cell(4, 0)) == ["🇫", "\u{200D}"])
+    #expect(vt.state.scalars(of: vt.cell(6, 0)) == ["👩", "\u{200D}", "💻"])
+  }
+
+  @Test
+  func `a control sequence ends in-place growth of the last cluster`() {
+    var vt = VT(12, 4)
+    vt.feed("e\u{301}\(CSI)1m\u{302}")
+    let first = vt.cell(0, 0)
+    #expect(vt.state.scalars(of: first) == ["e", "\u{301}", "\u{302}"])
+    #expect(vt.state.graphemes.scalars.count == 5)
+    vt.feed("\u{303}")
+    #expect(
+      vt.state.scalars(of: vt.cell(0, 0)) == [
+        "e", "\u{301}", "\u{302}", "\u{303}",
+      ]
+    )
+    #expect(vt.state.graphemes.scalars.count == 6)
+  }
+
+  @Test
   func `repeated compaction preserves both screens and primary history`() {
     var actual = VT(12, 4)
     var reference = VT(12, 4)
@@ -70,6 +111,47 @@ struct GraphemeCompactionTests {
     let resizedSnapshot = builder.build(from: &actual.state)
     #expect(TestFixture(resizedSnapshot.text) == TestFixture(reference.lines))
     #expect(TestFixture(retainedSnapshot.text) == TestFixture(retainedText))
+    for index in 0 ..< actual.state.scrollbackCount {
+      #expect(
+        actual.state.scrollbackText(index)
+          == reference.state.scrollbackText(index)
+      )
+    }
+  }
+
+  /// Compaction copies short clusters as fixed blocks and longer ones
+  /// exactly: every length, across several growths of the table.
+  @Test
+  func `compaction preserves clusters of every length`() {
+    var actual = VT(60, 4, scrollback: 1 << 20)
+    var reference = VT(60, 4, scrollback: 1 << 20)
+    reference.state.graphemes.compactionLimit = .max
+    for round in 0 ..< 60 {
+      var line = ""
+      for length in 0 ..< 12 {
+        let marks = (length + round) % 13
+        line += "a" + String(repeating: "\u{301}", count: marks)
+        line += marks % 3 == 0 ? "👨\u{200D}👩\u{200D}👧 " : "é"
+      }
+      line += "\r\n"
+      actual.feed(line)
+      reference.feed(line)
+      if round % 3 == 0 { actual.state.compactGraphemes() }
+    }
+    actual.state.compactGraphemes()
+    #expect(
+      actual.state.graphemes.scalars.count
+        <= reference.state.graphemes.scalars.count
+    )
+    for y in 0 ..< 4 {
+      for x in 0 ..< 60 {
+        #expect(
+          actual.state.scalars(of: actual.cell(x, y))
+            == reference.state.scalars(of: reference.cell(x, y))
+        )
+      }
+    }
+    #expect(actual.state.scrollbackCount == reference.state.scrollbackCount)
     for index in 0 ..< actual.state.scrollbackCount {
       #expect(
         actual.state.scrollbackText(index)

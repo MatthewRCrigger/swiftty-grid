@@ -250,12 +250,15 @@ struct HostSessionTests {
         )
       )
       try await client.send(input(1, 2, .key(SemanticKey(.enter))))
-      _ = try await client.snapshot("output") {
+      let output = try await client.snapshot("output") {
         $0.textLines.contains("hist-199")
       }
-      // Scroll this attachment back through the pane's history.
+      // Scroll this attachment back through the pane's history. Frames
+      // retained from mid-output also lack hist-199, so only frames newer
+      // than the completed output count.
       try await client.send(.viewport(epoch: 1, lines: 100))
-      let window = try await client.snapshot("history window") { shot in
+      let window = try await client.snapshot("history window", after: output) {
+        shot in
         shot.textLines.contains { $0.hasPrefix("hist-") }
           && !shot.textLines.contains("hist-199")
       }
@@ -265,16 +268,20 @@ struct HostSessionTests {
       #expect(!shownRows.isEmpty && shownRows.max()! < 199)
       #expect(!window.cursor.visible)
       // The host's own view stays at live output.
-      let live = try #require(await session.currentSnapshot())
-      #expect(live.textLines.contains { $0.contains("$") })
+      let live = try #require(await liveLines(registry, session))
+      #expect(live.contains { $0.contains("$") })
       // Moving past the newest line returns to live output.
       try await client.send(.viewport(epoch: 1, lines: -1_000))
-      _ = try await client.snapshot("back to live") { shot in
+      let backToLive = try await client.snapshot("back to live", after: window)
+      { shot in
         shot.cursor.visible && shot.textLines.contains { $0.contains("$") }
       }
-      // Input also returns a window to live output.
+      // Input also returns a window to live output. Each wait is bounded by
+      // the previous frame: snapshot() otherwise matches older frames.
       try await client.send(.viewport(epoch: 1, lines: 50))
-      _ = try await client.snapshot("window again") { !$0.cursor.visible }
+      _ = try await client.snapshot("window again", after: backToLive) {
+        !$0.cursor.visible
+      }
       try await client.send(input(1, 3, .committedText("echo after-$((1+1))")))
       try await client.send(input(1, 4, .key(SemanticKey(.enter))))
       _ = try await client.snapshot("live after input") {
@@ -284,9 +291,50 @@ struct HostSessionTests {
     }
   }
 
+  /// Clearing scrollback (`ESC[3J`, as `clear` sends) renumbers the
+  /// pane's rows. A window opened before it must not pin output to the
+  /// old row number once new output passes it: the client sees live.
   @Test
-  func `a burst of viewport requests moves by its whole distance`()
+  func `a history window does not outlive the row numbering it was opened in`()
     async throws
+  {
+    try await withRegistry { registry in
+      let grant = try await registry.create(
+        grid: GridSize(columns: 40, rows: 8)
+      )
+      let client = TestClient(registry)
+      _ = try await client.attached(grant)
+      _ = try await client.snapshot("prompt") { screenText($0).contains("$") }
+      try await client.send(
+        input(
+          1,
+          1,
+          .committedText(
+            "i=0; while [ $i -lt 200 ]; do echo old-$i; i=$((i+1)); done; "
+              + "sleep 2; printf '\\033[3J'; i=0; "
+              + "while [ $i -lt 400 ]; do echo new-$i; i=$((i+1)); done"
+          )
+        )
+      )
+      try await client.send(input(1, 2, .key(SemanticKey(.enter))))
+      let output = try await client.snapshot("old output") {
+        $0.textLines.contains("old-199")
+      }
+      // Open a window while the command sleeps; no input follows.
+      try await client.send(.viewport(epoch: 1, lines: 50))
+      _ = try await client.snapshot("window", after: output) {
+        !$0.cursor.visible
+      }
+      let live = try await client.snapshot("live after clear") {
+        $0.textLines.contains("new-399")
+      }
+      #expect(live.cursor.visible)
+      #expect(client.badFrames == 0)
+    }
+  }
+
+  @Test
+  func `a burst of viewport requests moves by its whole distance`() async throws
   {
     try await withRegistry { registry in
       let grant = try await registry.create(
@@ -316,7 +364,8 @@ struct HostSessionTests {
       let newest = try #require(rows(live).max())
       // Twenty small steps, as a swipe sends them, without waiting.
       for _ in 0 ..< 20 { try await client.send(.viewport(epoch: 1, lines: 5)) }
-      let window = try await client.snapshot("moved 100 lines") { shot in
+      let window = try await client.snapshot("moved 100 lines", after: live) {
+        shot in
         guard let top = rows(shot).min() else { return false }
         return top <= newest - 100
       }
@@ -356,7 +405,7 @@ struct HostSessionTests {
       // A5: the service keeps parsing about 1.6 MB while detached.
       let deadline = ContinuousClock.now + .seconds(45)
       while await
-        !(session.currentSnapshot()?.textLines.contains("DONE-150000") ?? false)
+        !(liveLines(registry, session)?.contains("DONE-150000") ?? false)
       {
         guard ContinuousClock.now < deadline else {
           throw HostTestTimeout(what: "loop finished")

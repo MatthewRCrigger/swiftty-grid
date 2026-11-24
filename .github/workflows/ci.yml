@@ -1,4 +1,4 @@
-name: Swift checks
+name: CI
 
 on:
   push:
@@ -14,8 +14,9 @@ defaults:
 
 jobs:
   tests:
-    # The package and native test bundles require macOS 27 and Swift 6.4.
-    runs-on: namespace-profile-mac
+    # The package and native test bundles require macOS 27 and Xcode 27 / Swift 6.4
+    # or newer; setup-macos selects the newest Xcode installed on the image.
+    runs-on: xcode-27
     strategy:
       fail-fast: false
       matrix:
@@ -24,30 +25,115 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-macos
         with:
-          test-tools: 'true'
+          test-tools: "true"
       - name: Test
         shell: bash
+        env:
+          # A crashed bundle otherwise ends with only "Trace/BPT trap: 5".
+          SWIFT_BACKTRACE: enable=yes,interactive=no,color=no
         run: |
           case '${{ matrix.configuration }}' in
-            debug) Scripts/test-native.sh ;;
-            release) Scripts/test-native.sh -c release ;;
-            internal-checks) Scripts/test-native.sh -Xswiftc -DSWIFTTY_INTERNAL_CHECKS ;;
+            debug) Scripts/test-native.sh --disable-automatic-resolution ;;
+            release) Scripts/test-native.sh --disable-automatic-resolution -c release ;;
+            internal-checks) Scripts/test-native.sh --disable-automatic-resolution -Xswiftc -DSWIFTTY_INTERNAL_CHECKS ;;
           esac
+      - name: Show test host crash reports
+        # libdispatch and XPC misuse traps print nothing; the report has the stack.
+        if: failure()
+        run: |
+          find "$HOME/Library/Logs/DiagnosticReports" -name 'host-*.ips' \
+            -mmin -120 -print -exec cat {} \; 2>/dev/null || true
       - name: Build production products
         if: matrix.configuration == 'release'
-        run: swift build -c release
+        run: swift build --disable-automatic-resolution -c release
+      - name: Check native shell process and PTY behavior
+        if: matrix.configuration == 'release'
+        run: python3 Scripts/test-swsh.py "$(swift build -c release --show-bin-path)/swsh"
       - name: Check formatting and documentation
         if: matrix.configuration == 'debug'
         run: Scripts/format-swift.sh check
+      - name: Check unchecked Sendable documentation
+        if: matrix.configuration == 'debug'
+        run: Scripts/check-unchecked-sendable.sh
+      - name: Check agent request handling stays effect-free
+        if: matrix.configuration == 'debug'
+        run: Scripts/check-agent-purity.sh
+      - name: Check roaming client layering
+        if: matrix.configuration == 'debug'
+        run: Scripts/check-layering.sh
+  network-framework-27-2:
+    # Network framework behavior that first ships in macOS 27.2 (a stream reset
+    # leaves the QUIC connection open; migrated client traffic reaches the same
+    # connection). The GitHub xcode-27 image runs 27.0.1, where these tests
+    # skip, so they run on a self-hosted runner labelled macos-27-2. Set the
+    # repository variable MACOS_27_2_RUNNER=true once one is registered;
+    # SWIFTTY_REQUIRE_OS_GATED=1 makes the tests run (and fail) rather than skip.
+    if: vars.MACOS_27_2_RUNNER == 'true'
+    runs-on: [self-hosted, macOS, ARM64, macos-27-2]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-macos
+      - name: Require macOS 27.2 or newer
+        run: |
+          version="$(sw_vers -productVersion)"
+          test "$(printf '%s\n%s\n' "$version" 27.2 | sort -V | head -1)" = 27.2 ||
+            { echo "::error::runner is macOS $version; these tests need 27.2+"; exit 1; }
+      - name: Test OS-gated QUIC behavior
+        env:
+          SWIFTTY_REQUIRE_OS_GATED: "1"
+        run: >-
+          Scripts/test-native.sh --disable-automatic-resolution -c release
+          --filter 'reset partial stream is never delivered'
+          --filter 'traffic reaches the same connection after its address changes'
+  shell-baseline:
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-macos
+        with:
+          test-tools: "true"
+      - name: Extract pinned Swift 6.4.1
+        run: |
+          curl --fail --location --retry 3 \
+            https://download.swift.org/swift-6.4.1-release/xcode/swift-6.4.1-RELEASE/swift-6.4.1-RELEASE-osx.pkg \
+            -o "$RUNNER_TEMP/swift.pkg"
+          echo "c34e7e5fb0be4bcd61decfd40db1766434d8952d68e37aed90bcff4e8547951c  $RUNNER_TEMP/swift.pkg" | shasum -a 256 -c -
+          pkgutil --check-signature "$RUNNER_TEMP/swift.pkg"
+          pkgutil --expand-full "$RUNNER_TEMP/swift.pkg" "$RUNNER_TEMP/swift-expanded"
+          toolchain="$RUNNER_TEMP/swift-expanded/swift-6.4.1-RELEASE-osx-package.pkg/Payload"
+          echo "SWSH_BASELINE_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+          echo "$toolchain/usr/bin" >> "$GITHUB_PATH"
+      - name: Test pinned baseline
+        run: |
+          swift --version | head -1 | grep -Fx 'Apple Swift version 6.4.1 (swift-6.4.1-RELEASE)'
+          Scripts/test-native.sh --toolchain "$SWSH_BASELINE_TOOLCHAIN" \
+            --sdk "$(xcrun --sdk macosx --show-sdk-path)" --disable-automatic-resolution
+          python3 Scripts/test-swsh.py "$(swift build --show-bin-path)/swsh"
+  shell-linux:
+    # swsh is the only product ported to Linux; Package.swift reduces itself to
+    # the shell targets there.
+    runs-on: ubuntu-latest
+    container: swift:6.4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install test tools
+        run: apt-get update -qq && apt-get install -y -qq python3 zsh procps
+      - name: Test
+        run: swift test
+      - name: Check native shell process and PTY behavior
+        run: |
+          swift build --product swsh
+          python3 Scripts/test-swsh.py "$(swift build --show-bin-path)/swsh"
   frontends:
-    runs-on: namespace-profile-mac
+    runs-on: xcode-27
     strategy:
       fail-fast: false
       matrix:
         destination:
-          - 'generic/platform=iOS Simulator'
-          - 'generic/platform=macOS,variant=Mac Catalyst'
-          - 'generic/platform=visionOS Simulator'
+          - "generic/platform=iOS Simulator"
+          - "generic/platform=macOS,variant=Mac Catalyst"
+          - "generic/platform=visionOS Simulator"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-macos
@@ -55,4 +141,4 @@ jobs:
         run: >-
           xcodebuild -scheme SwifttyMobile -configuration Release
           -destination '${{ matrix.destination }}'
-          CODE_SIGNING_ALLOWED=NO build
+          -disableAutomaticPackageResolution CODE_SIGNING_ALLOWED=NO build

@@ -24,16 +24,24 @@ final class WorkspaceCoordinator {
   enum Intent: Hashable {
     case create
     case open(WorkspaceID)
+    /// A saved layout opening as a new workspace (spec.durability.md §12.2).
+    case reopen(WorkspaceID)
   }
 
   typealias Open =
     @MainActor (WorkspaceSelector?, Configuration, UInt64?) async throws ->
+    MuxWorkspaceController
+  /// Saved record, slots whose saved commands to run, configuration.
+  typealias Reopen =
+    @MainActor (WorkspaceID, [Int], Configuration) async throws ->
     MuxWorkspaceController
 
   private(set) var controllers: [MuxWorkspaceController] = []
   var configuration: Configuration
   private let listWorkspaces: @MainActor () async throws -> WorkspaceListing
   private let openWorkspace: Open
+  private let reopenSaved: Reopen?
+  private let usesGateway: Bool
   private let reportListError: @MainActor (any Error) -> Void
   private let reportOpenError: @MainActor (any Error) -> Void
   private let defaults: UserDefaults
@@ -49,13 +57,17 @@ final class WorkspaceCoordinator {
     configuration: Configuration,
     listWorkspaces: @escaping @MainActor () async throws -> WorkspaceListing,
     openWorkspace: @escaping Open,
+    reopenSaved: Reopen? = nil,
     reportListError: @escaping @MainActor (any Error) -> Void,
     reportOpenError: @escaping @MainActor (any Error) -> Void,
-    defaults: UserDefaults = .standard
+    defaults: UserDefaults = .standard,
+    usesGateway: Bool = false
   ) {
     self.configuration = configuration
     self.listWorkspaces = listWorkspaces
     self.openWorkspace = openWorkspace
+    self.reopenSaved = reopenSaved
+    self.usesGateway = usesGateway
     self.reportListError = reportListError
     self.reportOpenError = reportOpenError
     self.defaults = defaults
@@ -154,6 +166,55 @@ final class WorkspaceCoordinator {
     pending[intent] = (id, task)
   }
 
+  /// Opens a saved layout as a new workspace with fresh shells. Saved
+  /// commands run only when the user chooses them here; `automatic` never
+  /// runs them.
+  func reopen(_ entry: SavedWorkspaceListing, askAboutCommands: Bool = true) {
+    var commands: [Int] = []
+    if askAboutCommands, !entry.commands.isEmpty {
+      let alert = NSAlert()
+      alert.messageText = "Run saved commands?"
+      alert.informativeText =
+        entry.commands.map { $0.command.joined(separator: " ") }
+        .map { DisplayText.sanitize($0) }.joined(separator: "\n")
+        + "\n\nOther panes start new shells. Earlier processes are not resumed."
+      alert.addButton(withTitle: "Open Shells Only")
+      alert.addButton(withTitle: "Run Saved Commands")
+      alert.addButton(withTitle: "Cancel")
+      switch alert.runModal() {
+      case .alertFirstButtonReturn: break
+      case .alertSecondButtonReturn: commands = entry.commands.map(\.slot)
+      default: return
+      }
+    }
+    let intent = Intent.reopen(entry.id)
+    guard let reopenSaved, !terminating, pending[intent] == nil else { return }
+    let id = UUID()
+    let configuration = configuration
+    let task = Task { [weak self] in
+      guard let self else { return }
+      defer { if pending[intent]?.id == id { pending[intent] = nil } }
+      do {
+        let controller = try await reopenSaved(
+          entry.id,
+          commands,
+          configuration
+        )
+        guard !terminating, !Task.isCancelled else {
+          await controller.detach()
+          controller.close()
+          return
+        }
+        install(controller)
+        controller.showWindow(nil)
+      } catch is CancellationError {} catch {
+        guard !terminating else { return }
+        reportOpenError(error)
+      }
+    }
+    pending[intent] = (id, task)
+  }
+
   /// Shows `target` for an attention link. A window holding its workspace
   /// reveals it; a window that lost that workspace's lease is replaced
   /// once the target attaches; otherwise it opens in a new window. Other
@@ -171,6 +232,22 @@ final class WorkspaceCoordinator {
       ?? controllers.first {
         !$0.isClosed && $0.attachedWorkspace == target.workspace
       }
+    if usesGateway, current == nil {
+      let controller = try await openWorkspace(
+        .id(target.workspace),
+        configuration,
+        lease
+      )
+      guard !terminating, !Task.isCancelled else {
+        await controller.detach()
+        controller.close()
+        throw CancellationError()
+      }
+      install(controller)
+      controller.showWindow(nil)
+      try await controller.revealAttention(pane: target.pane, tab: target.tab)
+      return
+    }
     _ = try await MuxWorkspaceController.reveal(
       target,
       in: current,
@@ -211,6 +288,10 @@ final class WorkspaceCoordinator {
   }
 
   private func present(_ result: WorkspaceListing) {
+    if let records = result.gatewayRecords {
+      presentGateway(records, saved: result.reopenable)
+      return
+    }
     let list = result.workspaces
     let alert = NSAlert()
     alert.informativeText = "Workspaces keep running after their windows close."
@@ -229,7 +310,7 @@ final class WorkspaceCoordinator {
         shownHere ? " (open)" : ws.isAttached ? " (in use elsewhere)" : ""
       let panes = ws.paneCount == 1 ? "1 pane" : "\(ws.paneCount) panes"
       popup.addItem(
-        withTitle: "\(DisplayText.sanitize(ws.name)) — \(panes)\(state)"
+        withTitle: "\(DisplayText.workspaceName(ws.name)) — \(panes)\(state)"
       )
     }
     if let last = lastWorkspace,
@@ -250,20 +331,105 @@ final class WorkspaceCoordinator {
     }
   }
 
+  private func presentGateway(
+    _ records: [GatewayWorkspaceRecord],
+    saved: [SavedWorkspaceListing] = []
+  ) {
+    guard !records.isEmpty || !saved.isEmpty else {
+      present(WorkspaceListing(server: nil, workspaces: []))
+      return
+    }
+    let alert = NSAlert()
+    alert.messageText = "Open Workspace"
+    alert.informativeText =
+      "Unavailable workspaces retain their processes. Creating a new workspace does not replace or end them."
+      + (saved.isEmpty
+        ? ""
+        : " Saved layouts open as new workspaces with new shells; earlier processes are not resumed.")
+    let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
+    for record in records {
+      let state: String
+      switch record.state {
+      case .available:
+        state =
+          controller(holding: record.workspace) != nil
+          ? "open"
+          : record.summary?.isAttached == true
+            ? "in use elsewhere" : "available"
+      case .starting: state = "starting"
+      case .discovering: state = "discovering"
+      case .empty: state = "empty worker"
+      case .unavailable: state = "unavailable; processes retained"
+      }
+      let name =
+        record.summary.map { DisplayText.sanitize($0.name) }
+        ?? record.workspace.description
+      popup.addItem(withTitle: "\(name) — \(state)")
+    }
+    for entry in saved {
+      let panes = entry.paneCount == 1 ? "1 pane" : "\(entry.paneCount) panes"
+      let when =
+        entry.savedAt.map {
+          " " + $0.formatted(date: .abbreviated, time: .shortened)
+        } ?? ""
+      popup.addItem(
+        withTitle:
+          "\(DisplayText.sanitize(entry.name)) — saved\(when), \(panes); reopen with new shells"
+      )
+    }
+    if let index = records.firstIndex(where: { $0.workspace == lastWorkspace })
+    {
+      popup.selectItem(at: index)
+    }
+    alert.accessoryView = popup
+    alert.addButton(withTitle: "Open")
+    alert.addButton(withTitle: "New Workspace")
+    alert.addButton(withTitle: "Cancel")
+    switch alert.runModal() {
+    case .alertFirstButtonReturn:
+      let index = popup.indexOfSelectedItem
+      guard index < records.count else {
+        reopen(saved[index - records.count])
+        return
+      }
+      let record = records[index]
+      guard record.state == .available, let summary = record.summary else {
+        let error: MuxError
+        if case let .unavailable(reason) = record.state {
+          error = reason
+        } else {
+          error = MuxError(
+            .quiescing,
+            "workspace \(record.workspace) is not ready"
+          )
+        }
+        reportOpenError(error)
+        return
+      }
+      openChosen(summary, server: nil)
+    case .alertSecondButtonReturn: create()
+    default: break
+    }
+  }
+
   private func openChosen(_ ws: WorkspaceSummary, server: ServerInstanceID?) {
     guard controller(holding: ws.id) == nil, ws.isAttached else {
       return open(ws.id, server: server)
     }
+    let decision = MuxTakeControl.decide(ws)
+    guard case .ask = decision else {
+      return open(ws.id, server: server, takeover: decision.generation)
+    }
     let alert = NSAlert()
     alert.messageText =
-      "Take control of workspace “\(DisplayText.sanitize(ws.name))”?"
+      "Take control of workspace “\(DisplayText.workspaceName(ws.name))”?"
     alert.informativeText =
-      "Another window or device controls it. Taking over disconnects it there; its programs keep running."
+      "It is in use on \(MuxTakeControl.describe(ws.leaseHolder)). Taking over disconnects it there; its programs keep running."
     alert.alertStyle = .warning
     alert.addButton(withTitle: "Take Over")
     alert.addButton(withTitle: "Cancel")
     guard alert.runModal() == .alertFirstButtonReturn else { return }
-    open(ws.id, server: server, takeover: ws.leaseGeneration)
+    open(ws.id, server: server, takeover: decision.generation)
   }
 
   // MARK: Launch
@@ -283,10 +449,14 @@ final class WorkspaceCoordinator {
         do {
           let result = try await listWorkspaces()
           guard !terminating else { return }
-          switch Self.launchAction(result.workspaces, last: lastWorkspace) {
+          switch Self.launchAction(result, last: lastWorkspace) {
           case .open(let id): open(id, server: result.server)
           case .create: create()
           case .choose: present(result)
+          case let .reopen(ids):
+            for entry in result.reopenable where ids.contains(entry.id) {
+              reopen(entry, askAboutCommands: false)
+            }
           }
           return
         } catch { guard !terminating, retry(error) else { return } }
@@ -298,6 +468,39 @@ final class WorkspaceCoordinator {
     case open(WorkspaceID)
     case create
     case choose
+    /// Reopen at launch is automatic: each Saved record, once, with no
+    /// saved command (spec.durability.md §12.2.7).
+    case reopen([WorkspaceID])
+  }
+
+  nonisolated static func launchAction(
+    _ listing: WorkspaceListing,
+    last: WorkspaceID?
+  ) -> LaunchAction {
+    guard let records = listing.gatewayRecords else {
+      return launchAction(listing.workspaces, last: last)
+    }
+    guard !records.isEmpty else {
+      // No live workspace: offer saved layouts before creating one.
+      let saved = listing.reopenable.filter { $0.state == .saved }
+      guard !saved.isEmpty else { return .create }
+      switch listing.saved?.policy.reopenAtLaunch ?? .never {
+      case .ask: return .choose
+      case .automatic: return .reopen(saved.map(\.id))
+      case .never: return .create
+      }
+    }
+    let available = records.filter {
+      $0.state == .available && $0.summary?.isAttached == false
+    }
+    if let last, available.contains(where: { $0.workspace == last }) {
+      return .open(last)
+    }
+    // Unknown/unavailable records must not disappear from startup policy.
+    if records.count == 1, let only = available.first {
+      return .open(only.workspace)
+    }
+    return .choose
   }
 
   nonisolated static func launchAction(

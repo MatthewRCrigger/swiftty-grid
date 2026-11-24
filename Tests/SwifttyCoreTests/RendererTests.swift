@@ -1,3 +1,4 @@
+import CoreTestSupport
 import CoreText
 import Metal
 @testable import SwifttyCore
@@ -536,14 +537,14 @@ struct RendererTests {
   @Test(
     .enabled(if: device != nil),
     arguments: [
-      "adjust-cell-width = 1e308", "adjust-cell-height = 1e308",
-      "adjust-cell-height = 100000",
+      [("adjust-cell-width", "1e308")], [("adjust-cell-height", "1e308")],
+      [("adjust-cell-height", "100000")],
     ]
   )
   func `oversized cells cannot overflow glyph atlas coordinates`(
-    _ setting: String
+    _ setting: [(String, String)]
   ) throws {
-    let configuration = Configuration.parse(setting)
+    let configuration = Configuration.configured(setting)
     #expect(configuration.diagnostics.isEmpty)
     let manager = CoreTextFontManager()
     let font = manager.resolve(configuration.fontDescriptor(scale: 2))
@@ -556,7 +557,9 @@ struct RendererTests {
       font: font,
       manager: manager
     )
-    #expect((letter.size.x > 0) == setting.contains("width"))
+    #expect(
+      (letter.size.x > 0) == setting.contains(where: { $0.0.contains("width") })
+    )
   }
 
   @Test(.enabled(if: device != nil))
@@ -1010,7 +1013,6 @@ struct RendererTests {
     #expect(
       frame.inkCount(column: 1, row: 0, renderer: renderer, background: bg) == 0
     )  // space
-    // Red background cell.
     let cw = Int(renderer.cellSize.width)
     let ch = Int(renderer.cellSize.height)
     let red = frame.pixel(8 + 2 * cw + cw / 2, 8 + ch / 2)
@@ -1024,7 +1026,6 @@ struct RendererTests {
     #expect(
       frame.inkCount(column: 7, row: 0, renderer: renderer, background: bg) > 10
     )  // é cluster
-    // Block cursor at column 8.
     let cursor = frame.pixel(8 + 8 * cw + cw / 2, 8 + ch / 2)
     #expect(cursor.r > 200 && cursor.g > 200 && cursor.b > 200)
   }

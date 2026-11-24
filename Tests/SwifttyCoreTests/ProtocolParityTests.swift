@@ -1,3 +1,4 @@
+import CoreTestSupport
 @testable import SwifttyCore
 @testable import SwifttyEngine
 import Synchronization
@@ -939,7 +940,7 @@ struct ShellIntegrationReviewTests {
       Configuration.arguments(#"a\ b "c\"d" '' e"#) == ["a b", "c\"d", "", "e"]
     )
     #expect(
-      Configuration.parse("command = \"/opt/my shell\" --login")
+      Configuration.configured([("command", "\"/opt/my shell\" --login")])
         .sessionConfiguration().command == [
           "/bin/bash", "--noprofile", "--norc", "-c",
           "exec -l \"/opt/my shell\" --login",

@@ -2,11 +2,22 @@ import AppKit
 import Foundation
 import ServiceManagement
 import SwiftMuxClient
+import SwiftMuxGuardian
 import SwiftMuxProtocol
+import Synchronization
 
 // `swiftty --swiftmux-agent register|unregister|status` manages the bundled
 // SwiftMux LaunchAgent without opening windows (packaging checks, scripts).
 let arguments = CommandLine.arguments
+let gatewayService: String?
+do {
+  gatewayService = try GatewayLaunchOptions.service(
+    arguments: Array(arguments.dropFirst())
+  )
+} catch {
+  FileHandle.standardError.write(Data("swiftty: \(error)\n".utf8))
+  exit(64)
+}
 // Query before replacing the bundle: another copy or a command-line process
 // with the same executable name must not suppress opening this installation.
 if arguments.dropFirst().first == "--running-app" {
@@ -26,6 +37,18 @@ if arguments.dropFirst().first == "--running-app" {
   }
   print(running ? "running" : "stopped")
   exit(0)
+}
+if arguments.dropFirst().first == "--durable-sessions" {
+  let done = DispatchSemaphore(value: 0)
+  let status = Mutex<Int32>(0)
+  let rest = Array(arguments.dropFirst(2))
+  Task.detached {
+    let value = await DurableSessions.command(rest)
+    status.withLock { $0 = value }
+    done.signal()
+  }
+  done.wait()
+  exit(status.withLock { $0 })
 }
 if let i = arguments.firstIndex(of: "--swiftmux-agent") {
   let service = SMAppService.agent(plistName: SMX.agentPlistName)
@@ -66,7 +89,29 @@ if let i = arguments.firstIndex(of: "--swiftmux-agent") {
 }
 
 let app = NSApplication.shared
-let delegate = AppDelegate()
+// Once the durable topology is installed, the app uses its gateway; an
+// explicit `--gateway-service` still wins.
+let selectedGateway =
+  gatewayService
+  ?? (DurableSessions.isInstalled ? DurableSessions.gatewayControl : nil)
+let gatewayApplication = selectedGateway.map { service in
+  MuxGatewayApplication(connect: {
+    try await MuxGatewayConnection.connect(
+      peerRequirement: GuardianPeerSigningPolicy.requirementForCurrentProcess(),
+      channel: { .connect(machService: service, queue: $0) }
+    )
+  })
+}
+let delegate = AppDelegate(gatewayApplication: gatewayApplication)
 app.delegate = delegate
 app.setActivationPolicy(.regular)
+if DurableSessions.isInstalled {
+  Task { @MainActor in
+    guard let notice = await DurableSessions.startupNotice() else { return }
+    let alert = NSAlert()
+    alert.messageText = String(localized: "SwiftMux Sessions")
+    alert.informativeText = notice
+    alert.runModal()
+  }
+}
 app.run()

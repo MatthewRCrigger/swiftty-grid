@@ -34,7 +34,7 @@ public struct RenderOptions: Equatable, Sendable {
   public var searchBackground: UInt32 = 0xFFE082
   public var selectedSearchBackground: UInt32 = 0xF2A65A
   /// OSC 8 link id to underline (the one under the pointer), 0 for none.
-  public var hoveredLink: UInt8 = 0
+  public var hoveredLink: UInt32 = 0
   /// Cells to underline, in snapshot rows (a detected URL under the pointer).
   public var underlinedSpan: HighlightSpan?
   /// IME composition text, drawn underlined from the cursor.
@@ -48,6 +48,9 @@ public struct RenderOptions: Equatable, Sendable {
   /// Minimum WCAG contrast ratio between text and its background (1...21);
   /// text below it is drawn in black or white (Ghostty's `minimum-contrast`).
   public var minimumContrast: Double = 1
+  /// Reduce Motion: a custom shader's `time` stays at zero, so it draws a
+  /// static frame and never keeps the host animating.
+  public var reducesMotion = false
 
   public init() {}
 }
@@ -140,7 +143,9 @@ public final class MetalRenderer {
 
   /// Whether a custom post-processing shader animates (uses `time`), so
   /// the host keeps drawing.
-  public var isAnimating: Bool { postProcess?.usesTime ?? false }
+  public var isAnimating: Bool {
+    !options.reducesMotion && postProcess?.usesTime == true
+  }
 
   /// Padding around the grid, in pixels (`RenderOptions` overrides it).
   public var padding: CGFloat = 8 {
@@ -296,6 +301,14 @@ public final class MetalRenderer {
   public func tryDraw(
     _ snapshot: RenderSnapshot,
     in view: MTKView
+  ) -> SubmitResult { tryDraw(snapshot, in: view, onPresented: nil) }
+
+  /// The native presenter installs its callback only after nonblocking admission.
+  @MainActor
+  package func tryDraw(
+    _ snapshot: RenderSnapshot,
+    in view: MTKView,
+    onPresented: (@Sendable (any MTLDrawable) -> Void)?
   ) -> SubmitResult {
     guard inFlight.wait(timeout: .now()) == .success else { return .busy }
     guard let drawable = view.currentDrawable,
@@ -313,6 +326,9 @@ public final class MetalRenderer {
         acquired: true
       )
     else { return .resourceUnavailable }
+    #if os(macOS) && !targetEnvironment(macCatalyst)
+    if let onPresented { drawable.addPresentedHandler(onPresented) }
+    #endif
     commandBuffer.present(drawable)
     commandBuffer.commit()
     return .submitted
@@ -496,7 +512,8 @@ public final class MetalRenderer {
         from: intermediate,
         to: target,
         commandBuffer: commandBuffer,
-        time: Float(CACurrentMediaTime() - startTime),
+        time: options.reducesMotion
+          ? 0 : Float(CACurrentMediaTime() - startTime),
         makeEncoder: makeRenderEncoder,
       )
     }

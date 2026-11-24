@@ -8,6 +8,17 @@ import Testing
 /// sanitizing, minimum split sizes and hidden-pane activity.
 struct WorkspaceUITests {
   @Test
+  func defaultWorkspaceNamesShowWithAPrefix() {
+    #expect(DisplayText.workspaceName("0") == "Workspace 0")
+    #expect(DisplayText.workspaceName(" 12 ") == "Workspace 12")
+    #expect(DisplayText.workspaceName("dev") == "dev")
+    #expect(DisplayText.workspaceName("dev 2") == "dev 2")
+    #expect(DisplayText.workspaceName("") == "")
+    // Only ASCII digits are a service default.
+    #expect(DisplayText.workspaceName("\u{0663}") == "\u{0663}")
+  }
+
+  @Test
   func titlesAreSanitizedAndBounded() {
     #expect(DisplayText.sanitize("vim  main.swift") == "vim main.swift")
     // Controls, line breaks and bidi overrides never reach the chrome.
@@ -249,7 +260,7 @@ struct WorkspaceUITests {
       case "tab": try await c.execute(.endTab(tab))
       default: try await c.send(.text("exit\r"), to: pane)
       }
-      // Two seconds is the escalation grace, not the reaping bound.
+      // Five seconds is the escalation grace, not the reaping bound.
       // Use the forced-termination fixture's bound and observe completion.
       let deadline = ContinuousClock.now + .seconds(8)
       var exited = false
@@ -263,7 +274,7 @@ struct WorkspaceUITests {
             exited = true
             if removal == "forced" {
               #expect(truncated)
-              #expect(ContinuousClock.now - endedAt >= .seconds(2))
+              #expect(ContinuousClock.now - endedAt >= .seconds(5))
             }
             break
           }

@@ -106,7 +106,7 @@ A workspace grants one controller and at most four observers. Observers are loca
 
 ## 4. Owned frames and local messages
 
-Use one internal, versioned message contract, now `SMX/2`, carried as bounded value payloads over XPC. Start with explicitly tagged Codable JSON records in `Data`; XPC supplies message boundaries. This is a debuggable initial codec, not a performance claim. Avoid remote proxies for terminal objects and avoid exposing raw Swiftty representations.
+Use one internal, versioned message contract, now `SMX/2`, carried as bounded value payloads over XPC. Control records are explicitly tagged Codable JSON in `Data`; XPC supplies message boundaries. Frame payloads use the binary `SMXB/1` codec when both sides negotiate it, with JSON kept as the debuggable fallback (§4, "Binary frame codec"). Avoid remote proxies for terminal objects and avoid exposing raw Swiftty representations.
 
 The handshake identifies protocol version, build, server instance, frontend kind, accepted terminal profile and limits. Allow only explicitly compatible versions. Authenticate the connection using OS-provided peer identity, including the expected user and shipped executable identity; do not trust a claimed PID or bundle ID inside a message. The product is local and unprivileged; it is not a security boundary against the account owner.
 
@@ -116,7 +116,13 @@ signed code requires a nonempty team identifier and a parseable same-team peer
 requirement. Unexpected lookup or validity errors and incomplete signing
 metadata abort startup with exit status 78; they never select development
 fallback. Validate the identity before reading signing metadata, since the
-Security API can otherwise return partial data for corrupt signatures.
+Security API can otherwise return partial data for corrupt signatures. The same
+peer-signing policy (`PeerSigningPolicy`) can identify callers of the execution
+service ([spec.shell.md §11.5](spec.shell.md#115-swiftty)); code identity is not
+task authorization, and development same-user fallbacks must not become
+production assumptions.
+
+For confined execution ([spec.shell.md §11](spec.shell.md#11-confined-execution-an-execution-context-with-swsh-as-its-runner)), the multiplexer service and app are clients of the execution service and gain no path around it: a confined pane is a PTY attached to one execution context, input goes to that context only, and an agent identity is never given pane writes into a host pane.
 
 Commands have request IDs and explicit targets. Mutations produce typed results/errors, such as `alreadyAttached`, `staleGeometry`, `paneExited`, `historyUnavailable`, `resourceLimit` and `incompatibleVersion`. Command acknowledgement means the specified operation committed. Input acknowledgement means admission to the ordered writer, not execution by the shell. Never automatically replay uncertain input or mutating commands after connection loss.
 
@@ -128,7 +134,7 @@ A frame contains complete visible terminal state for one pane. Required groups a
 |---|---|
 | Identity | Server instance, attachment, pane, frame revision, accepted layout/geometry and viewport revisions |
 | Grid | Columns, rows, active screen, row metadata, explicit wide-cell continuation structure |
-| Text | Owned Unicode scalars/graphemes and bounded frame-local lookup tables |
+| Text | Owned Unicode scalars/graphemes and bounded frame-local lookup tables; a cluster longer than `maxGraphemeScalars` is shown as U+FFFD rather than failing the frame |
 | Appearance | Cell styles, colors/palette, row wraps, cursor position/style/visibility and supported overlays |
 | Interaction | Relevant terminal modes, history generation/range, stable row addressing for supported history actions |
 
@@ -146,7 +152,84 @@ Allow one frame delivery in flight and one newest pending complete frame per sub
 
 Export only subscribed visible panes when exported state changes, at an initial maximum of 60 Hz. Dirty state includes modes, cursor, palette, geometry, history/viewport and search metadata, not only cell damage. Use the ordered state-change boundary; a callback driven only by damaged cells is insufficient. Initial subscription, reattachment and resuming a paused subscription force a complete current frame even if no cells changed. Detached or hidden panes still parse output and maintain bounded history, but produce no unnecessary display frames. The native app may further pause drawing when occluded.
 
-The first version uses full frames and full damage. Deltas, compression, shared memory and IOSurface transfer are deferred until profiling identifies a real bottleneck. No per-client delta baseline is required for reconnecting.
+The first version used full frames and full damage. Measurement (§11) showed the JSON codec costing about 10 ms per 512×256 frame, so frames gain a binary codec and row deltas against an acknowledged baseline, specified below. Both are negotiated, and a full frame stays the unit of recovery: reconnecting needs no per-client delta baseline. Compression, shared memory and IOSurface transfer stay deferred until profiling of the binary codec identifies a real bottleneck.
+
+> **Status.** Row versions, the binary codec, the shared frame model, deltas and live selection (the next five subsections), and keyed TTY diffing (§6), are implemented; §11 ("Frames, deltas and live selection — 2026-11-19") records the evidence.
+
+### Row identity and versions
+
+Every exported row carries an identity `(HistoryAddress, version)`. The address is the existing absolute row address (history generation, screen, row). `version` is a `UInt64` from a monotonic sequence that each attachment's exporter keeps (`RowVersionTracker`): at export, a row whose canonical content (cells, resolved underline colors, graphemes, wrap flag; not hyperlink ids) differs from what that attachment last exported at the same address gets the next value, and an unchanged row keeps its version. Versions are assigned at export rather than in the engine's write paths, so erase, insert/delete, carriage-return overwrite and scroll-region rewrites are all covered by the comparison without touching the parser's hot loops. Each attachment numbers its own rows because an observer's frames are cropped to its own size, but every tracker draws from one process-wide sequence, so a replaced tracker (a reattach, an evicted attachment) never reissues an identity a client may still hold. A detached attachment's tracker is dropped; at most 16 are kept per pane, the least recently captured evicted first. A tracker keeps row content only for the screen and the two screens above it. Two exported rows with equal identity have identical content.
+
+Rows that have scrolled into history are immutable within a history generation. Any operation that rewrites history (reflow on resize, clear scrollback, reset, eviction that renumbers rows) advances the generation; it never edits a history row in place. Only screen rows, and alternate-screen rows, change under a stable address. Row versions are the single mechanism that both deltas and live selection use to detect in-place edits.
+
+Palette, cursor, modes, title, search and history-window metadata are not part of row content. Cell colors stay palette-tagged (`FrameStyle`), so a palette change does not alter any row version.
+
+### Binary frame codec
+
+`SMXB/1` is a little-endian binary encoding of exactly the `PaneFrame` and `FrameDelta` value models; it adds no fields JSON lacks. A client that decodes it sets `ClientCapabilities.binaryFrames` in its hello, and a service that sends it lists `ServiceFeatures.binaryFrames` in the welcome; deltas are negotiated the same way (`frameDeltas`), and row versions with copy as `ServiceFeatures.liveSelection`. Binary frame records travel as their own XPC payloads, recognised by the `SMXB` magic, which JSON never starts with. Control records stay JSON. A hello without `binaryFrames` receives JSON frames (and JSON `frameDelta` events with `frameDeltas`). `SWMUX_FRAME_CODEC=json` drops the client's `binaryFrames` for debugging.
+
+Layout:
+
+```text
+magic "SMXB", UInt8 version = 1, UInt8 kind (0 = full frame, 1 = delta)
+UInt32 payload length (excludes this 10-byte header)
+sections, each: UInt8 tag, UInt32 length, bytes
+  envelope: exactly one of identity (SwiftMux) or rstHeader (RST/1)
+  grid header, row identities, wrap bytes, glyphs, styles, kinds,
+  grapheme table, style table, underline colors, palette, cursor, modes,
+  history window, search, title (UTF-8), drop target, (delta) row ops
+```
+
+The grid's `glyphs`, `styles` and `kinds` buffers are written as raw little-endian arrays rather than base64. Integers that JSON writes as `Int` are fixed-width on the wire, and each field's range is the existing validation limit. Unknown section tags are an error in version 1; a later additive section requires a new negotiated codec version.
+
+Decode under the same rules as JSON (§4, "Full pane frames first"): check the total length against the frame budget before reading sections; check every section length, count and multiplication with overflow-checked arithmetic before slicing; reject duplicate, missing or out-of-order sections; then run the existing `PaneFrame` validation. Decoding never yields a partially valid frame.
+
+The two codecs must agree exactly: for every frame, `decode(SMXB(f)) == decode(JSON(f)) == f`. Round-trip, cross-codec and truncation/corruption fuzz tests cover full frames and deltas. A payload whose envelope belongs to the other protocol is malformed.
+
+### One frame model for SwiftMux and RST/1
+
+SwiftMux and the roaming protocol share one terminal frame model. A frame is a protocol **envelope** plus a common **body**:
+
+| Part | SwiftMux | RST/1 ([spec.roaming.md §6](spec.roaming.md#6-the-authoritative-terminal)) |
+|---|---|---|
+| Envelope | `FrameIdentity`: server, attachment, pane, revision, layout, geometry and viewport revisions | `rstHeader`: session, attachment epoch, screen revision, resize revision, `lastFullyAppliedInputSequence` |
+| Body | Grid with row identities, graphemes, style and underline-color tables, palette, cursor, modes, history window, search, title, drop target | The same |
+
+The body is today's `PaneFrame` without its identity. `FrameDelta` uses the same body parts, so one delta builder, one applier, one `SMXB/1` codec and one validator serve both protocols. Each protocol passes its own limits to the validator: SwiftMux uses §5's budgets; RST/1 uses its 200×80 grid, 64-byte grapheme, 1 KiB title and 4 MiB snapshot limits. A body field a protocol does not offer must be absent or zero, and the validator rejects it otherwise. For example, RST/1 rejects `search`, `dropTarget` and mouse modes unless a negotiated feature enables them.
+
+Colors stay palette-tagged with the frame's palette. The client resolves them, so a roaming host no longer pre-resolves RGB, and the result on screen is unchanged. Keep validation and the mapping to the engine's presentation types below the renderer, so the headless roaming core (`RoamingKit`) can use them without reaching the renderer (`Scripts/check-layering.sh`). Native mux import (`SwiftMuxBridge`) builds on the same validation rather than keeping a parallel one.
+
+The legacy JSON `ScreenSnapshot` remains only for RST/1 peers that do not negotiate `paneFrames`, and it is mapped to the same presentation types.
+
+
+### Frame deltas
+
+A delta updates one subscription from a baseline the client has **installed**: decoded, validated and imported as its newest presentation. It is not evidence of drawing. The frame acknowledgement gains `installedRevision`; transport credit release keeps its current meaning. The service records each subscription's baseline as the row identities of the frame named by the latest installed acknowledgement, which costs O(rows), not O(cells).
+
+A `FrameDelta` names its base revision and carries:
+
+| Part | Contents |
+|---|---|
+| Identity | Same as a full frame, plus `baseRevision` |
+| Row map | For each viewport row, either "copy baseline row k" (an unchanged or moved row, matched by identity) or "replace with an encoded row" |
+| Replaced rows | Cells, wrap flag and identity for the rows marked replace |
+| Tables | Grapheme, style and underline-color tables referenced only by the replaced rows of this delta |
+| Metadata | Complete cursor, modes, palette, history window, search, title and drop target |
+
+Matching by identity turns scrolling into row moves: after a one-line scroll on a 50-row screen, the delta copies 49 rows and replaces one. The client resolves table references when it imports a row, so copied rows never refer to an earlier delta's tables.
+
+Rules:
+
+- **Always against the installed baseline, never chained.** Each delta targets the latest *installed-acknowledged* revision, not an unacknowledged one. A newer pending delta can therefore replace an unsent older one, exactly as full frames do under the delivery bounds above.
+- **Retain recent baselines.** An acknowledgement takes time to reach the service. Meanwhile the client may install a newer frame, and the next delta still names the older acknowledged revision. The client therefore keeps its last four installed presentations, keyed by revision. They share storage for rows with equal identity, so retention costs about one frame plus the rows that changed. The service never names a base older than the latest installed acknowledgement it has received, so four covers one in-flight delivery, one pending replacement and the acknowledgement round trip.
+- **Apply atomically.** The client builds the new presentation from an immutable copy of the named retained baseline plus the delta, validates the result as a full frame and only then installs it, provided its revision is newer than the installed one; an older result is discarded without a request. A delta whose base is not retained, or whose server instance, attachment, pane, geometry revision, history generation or active screen does not match that base, is discarded, and the client sends `requestFullFrame` naming its revision instead of acknowledging it. The request releases that frame's credit as an acknowledgement would, but never adopts it as a base: an acknowledgement could start a capture against the refused frame before a separate request arrived. The service drops the base, discards a viewer's queued frame (encoded against the same base) and answers with a full frame. `MuxConnection` applies deltas itself: its consumers only ever see complete frames.
+- **Full frame instead of a delta** on subscription, resubscription, reattachment, resuming a paused subscription, geometry change, history-generation change, active-screen switch, a `requestFullFrame`, or when at least half the rows would be replaced.
+- **Integrity.** Each delta carries a CRC-32C (`CScrollbackChecksum`) over the new frame's ordered row identities. The client checks it after applying the delta, and a mismatch is handled like a base mismatch. This catches baseline bookkeeping errors cheaply; content equality is a test obligation, below.
+- **Per viewer.** The controller and each observer have their own baselines; deltas do not change the per-viewer queue bounds.
+
+The roaming RST/1 protocol reuses these rules unchanged: row identities, the row map, never chaining deltas, retained baselines, the full-frame triggers and the identity checksum. Only the row payload encoding and the baseline retention bound differ ([spec.roaming.md §7.4](spec.roaming.md#74-screen-deltas)). An implementation keeps one shared delta builder and applier, parameterized by row payload, rather than two copies of the rules.
+
+Tests replay recorded and generated workloads (typing echo, full-screen scrolling, scroll regions, CR progress bars, alternate-screen switches, resizes mid-stream, dropped and reordered acknowledgements) and require every delta-applied presentation to equal the full frame the service captured at the same revision.
 
 ### Shared history and selection
 
@@ -154,9 +237,32 @@ The service owns one PTY grid, bounded history and literal search per pane. Each
 
 A viewer's display size may crop or pad the authoritative grid. Only the controller may change PTY geometry, through the geometry batch and `TIOCSWINSZ`. The controller's viewport request does not crop the grid.
 
-For the smaller first implementation, selection and copy are local operations on one frozen owned viewport frame, including a viewport reached by scrolling or search. Freeze the presentation actually used for interaction, then perform word/line expansion and copy against its immutable cells, graphemes and wrap flags. New output must not change that selection; cancelling or completing selection resumes current frames. Row identity alone cannot protect against in-place edits such as carriage-return progress output.
+### Live selection across pages
 
-Initially, users scroll/search to the desired viewport before selecting; selection across multiple fetched pages is deferred. Retain the frozen selection within the same frame budgets. This policy avoids remote selection tokens, server-side retention of historical display frames and synchronous copy RPCs. If multi-page selection is added, give it an explicit bounded immutable-content contract.
+With `ServiceFeatures.liveSelection`, selection does not freeze the presentation. Frames keep installing while the user selects, and a selection may span any rows of the pane's current history generation, including rows never fetched by the client. The row identities above provide the bounded immutable-content contract: history rows cannot change within a generation, and screen rows are guarded by their versions.
+
+**Client state.** A selection is client-local: anchor and head as `(HistoryAddress, column)`, its unit (character, word or line) and, for every selected row the client has seen, that row's version. No selection state lives in the service.
+
+**Presentation.** On each installed frame the client maps the selection's addresses to viewport rows and draws the overlay there. The overlay moves with the text as output scrolls it. The client clears the selection, matching a direct Swiftty terminal, when:
+
+- a selected row in the frame has a version different from the recorded one (an in-place edit such as carriage-return progress output);
+- the history generation changes; or
+- a selected address falls below the frame's `firstRow` (evicted).
+
+**Extending across pages.** Dragging past the top or bottom edge, or extending with shift-click after scrolling or searching, issues ordinary viewport requests: at most one outstanding, at a bounded autoscroll rate. Word and line expansion at an endpoint uses that endpoint's row and its wrapped neighbours, which the client fetches with the same viewport request if they are off screen.
+
+**Copy.** If every selected row is in the installed frame, the client copies locally from that frame, without an RPC. Otherwise it sends `copySelection { pane, generation, start, end, unit, screenRowVersions }`, where `screenRowVersions` lists the recorded versions of selected screen rows; history rows need none. The service runs the request on the pane's ordered path, checks the generation, eviction and every listed version, and extracts text from its authoritative grid with the same wrap-joining, wide-cell and grapheme rules as local copy. Results:
+
+- the text, returned in the reply (`MuxReply.copied`), up to 8 MiB, which fits the server record limit (frame budget plus envelope) of the local channel;
+- `historyUnavailable` when the generation changed or a row was evicted;
+- `selectionChanged` when a listed screen-row version no longer matches;
+- `resourceLimit` when the text exceeds 8 MiB. The service never truncates silently.
+
+On an error the client clears the selection and says why. Copy is asynchronous: it never blocks the main actor, and the pasteboard is written only if the same selection is still current when the result arrives. A result that arrives after the selection changed is discarded. Observers may copy; copy is not a mutation.
+
+Accessibility exposes the selected text that lies within the installed presentation. It never calls the service synchronously.
+
+**Fallback.** A service without `liveSelection` keeps the frozen-frame policy: selection and copy are local operations on one frozen owned viewport frame, including a viewport reached by scrolling or search, and selection across fetched pages is unavailable.
 
 ### Illustrative application boundary
 
@@ -241,7 +347,9 @@ Use one fixed, tested outer profile from the shipped Swiftty build. Implement on
 
 Decode outer bytes incrementally into text, standard special keys, modifiers, prefix commands and bracketed paste. Preserve a documented ESC inter-byte policy, initially 30 ms; a single host does not resolve ambiguity in ESC-prefixed encodings. Prefix bytes inside paste remain literal. Advanced key and application mouse protocols are disabled for this first profile. [S6]
 
-Compose owned pane frames into one terminal-sized workspace. Draw minimal borders/status, copy/search overlays and the active cursor. Diff against the last fully completed output update. Complete a bounded update once output begins; dropping an encoded suffix could leave the host in the middle of an escape sequence or invalidate the diff baseline. Reconnect, resize or output failure resets the baseline.
+Compose owned pane frames into one terminal-sized workspace. Draw minimal borders/status, copy/search overlays and the active cursor. Diff against the last fully completed output update.
+
+**Keyed row diffing.** The compositor gives each composed output row a source key. For a row showing pane content, the key is: pane ID, the row's identity `(HistoryAddress, version)` (§4), the source column range, the destination column, the palette generation, and an overlay generation covering any selection, search, copy-mode or cursor-cell decoration drawn on that row. Chrome rows (borders, status) are keyed by a chrome generation that advances whenever their text or style changes. A composed row that spans several panes keys every segment. `DiffRenderer` skips comparing and encoding any row whose key equals the baseline's key for that row, and compares cells as today otherwise. Keys are only an optimization. A missing key, an unkeyed row, a palette change, `invalidate()`, reconnect, resize or output failure all fall back to the full cell comparison. The same applies to `swroam`, a one-pane composition over RST/1 frames ([spec.roaming.md §7.4](spec.roaming.md#74-screen-deltas)). Tests run recorded workloads through keyed and unkeyed diffing and require identical output bytes, including mutation tests that change a row's content without advancing its version, to prove the key is what skips work. Measure CPU per update with paired runs. Complete a bounded update once output begins; dropping an encoded suffix could leave the host in the middle of an escape sequence or invalidate the diff baseline. Reconnect, resize or output failure resets the baseline.
 
 Save outer termios before entering raw mode. Track enabled terminal modes, restore them on ordinary detach/errors/handled termination, and restore local state before waiting for service cleanup. Signal handlers only notify normal execution code. Cleanup after an uncatchable kill is outside this guarantee. [S12]
 
@@ -267,9 +375,18 @@ Implement three narrow additions:
 
 1. **Owned-frame exporter:** inside the engine module, capture terminal cells and interaction metadata atomically. Add bounded queue admission rather than calling synchronous snapshot APIs from their own queue.
 2. **Owned-frame importer:** inside Swiftty's rendering boundary, validate `PaneFrame` and construct independent immutable `RenderSnapshot` storage. Decode/validate off the main actor, then publish the finished presentation atomically.
-3. **Concrete `MuxPanePresenter`:** retain local snapshots, schedule drawing, send semantic input, request geometry/history operations, and subscribe/unsubscribe to its pane through the shared connection. An app/workspace controller owns the single connection and interactive lease; closing or rebinding one pane presenter does not detach the workspace. No generic plugin-backend framework is needed.
+3. **Concrete pane presenter (`MuxPaneView` in the implementation):** retain local snapshots, schedule drawing, send semantic input, request geometry/history operations, and subscribe/unsubscribe to its pane through the shared connection. An app/workspace controller owns the single connection and interactive lease; closing or rebinding one pane presenter does not detach the workspace. No generic plugin-backend framework is needed.
 
-Replace direct `session.withState`, `mutate`, `send`, `resize`, `start` and `stop` use throughout the view and its extensions. Changing only an initializer leaves input, copy/search, accessibility and lifetime tied to a local PTY. Reuse AppKit behavior and Metal rendering where their dependencies are already appropriate.
+The mux adapter routes state-dependent operations to the service rather than
+using direct-session `withState`, `mutate`, `send`, `resize`, `start` or `stop`.
+`MuxPaneView` holds pane identity and controller routing while composing the same
+package-internal `TerminalComposition`, `TerminalDisplay`, `TerminalKeyboard`,
+`TerminalPointer` and `TerminalAccessibility` helpers as the public direct view.
+See [shared native behavior](spec.md#shared-native-presentation-and-interaction).
+Do not retain parallel IME, pointer, accessibility or display orchestration behind
+a new wrapper, subclass `TerminalSession`, or create a dummy local session/PTY.
+Service-side encoding remains authoritative; typed mux input is never encoded
+against a speculative local mode mirror.
 
 At the pinned revision, the `SwifttyCore` target includes renderer/font code and shaders. The implementation splits out a headless `SwifttyEngine` target (section 11); the service holds no native renderer resources. [S16]
 
@@ -284,7 +401,15 @@ The exact path is:
 5. The presenter stores it as the newest pending frame with a monotonically increasing local presentation sequence.
 6. The Metal renderer reads cells/graphemes, fills its instance buffers/atlas, and attempts drawable submission. Only an accepted submission advances the presentation baseline.
 
-Keep the latest decoded/pending frame separate from the frame successfully admitted for drawing. Busy/no-drawable must not publish unseen content as the selection, IME-cursor or accessibility baseline. Track presentation completion where available; bind gestures to the presentation actually being shown. The existing view's assignment of `lastSnapshot` before a `Void`-returning draw call must change along with the renderer's submission result. Local selection overlays are applied through the importer/presenter without changing the frozen terminal content. [S13], [S15]
+Keep the latest decoded/pending frame separate from the frame successfully admitted for drawing. Busy/no-drawable must not publish unseen content as the selection, IME-cursor or accessibility baseline. Track presentation completion where available; bind gestures to the presentation actually being shown. The existing view's assignment of `lastSnapshot` before a `Void`-returning draw call must change along with the renderer's submission result. Local selection overlays are applied through the importer/presenter without changing the imported terminal content. A live selection (§4) re-maps its overlay only when a frame is admitted for drawing, so it always marks the presentation actually shown. [S13], [S15]
+
+`TerminalDisplay` preserves direct waiting submission but keeps mux nonblocking:
+it checks GPU capacity before acquiring a drawable. Refusal retains the newest
+pending frame and coalesces retry work. Pending command-output selection and
+file-drop registration advance only with accepted submission; a frozen selection
+(the fallback without `liveSelection`) keeps its displayed content while output arrives. Accessibility cache identity
+includes the retained source as well as sequence, because separate imports may
+reuse sequence values.
 
 Reset caches on pane rebind, reattach and server-instance change. The current renderer detects skipped snapshot sequence numbers; preserve that protection, force full damage on initial imports, and prevent overlapping sequence numbers from different panes confusing renderer/accessibility caches. [S13]
 
@@ -308,7 +433,7 @@ The existing Swiftty input code consults keyboard flags that are not part of `Re
 
 For the first native release, pointer actions focus panes, select/copy text and browse history. AppKit paste is an explicit operation, so no outer bracketed-paste decoder is needed; the shared service-side paste envelope and bounds still apply. Ctrl-C remains terminal input; native Copy is a separate app command. OSC 52 clipboard writes stay disabled; user-initiated copy writes to `NSPasteboard`. The kitty clipboard protocol (OSC 5522) is offered instead, because its reads and writes can be answered by the user: with `ServiceFeatures.kittyClipboard`, the service defers each read and committed write to the controller as a `clipboardRead` or `clipboardWrite` event, sent only to a client whose hello lists `ClientCapabilities.clipboardRequests` (otherwise the service refuses at once). The controller answers with `clipboardReadResult` or `clipboardWriteResult`. Native windows serve reads the user handed over (a paste event's follow-up, a type listing, a remembered password) without asking and prompt for everything else; replies that would not fit the pane's reply reserve answer EIO. A paste while the program enabled kitty paste events (frame mode `kittyPasteEvents`) is sent as `MuxInput.clipboardPaste(types:)`, and the service reports it with a one-time password instead of typing.
 
-Use the shared frozen-frame selection/copy and asynchronous history/search policy from section 4. Visible accessibility text, selected text and IME cursor positioning come from the retained interaction presentation. Do not block a main-actor accessibility callback on IPC. Existing Swiftty mouse/search/accessibility paths require this redirection because several consult live `TerminalSession` state. [S15], [S18]
+Use the shared live selection/copy policy from section 4 (frozen-frame selection when the service lacks `liveSelection`) and its asynchronous history/search policy. Visible accessibility text, selected text and IME cursor positioning come from the retained interaction presentation. Do not block a main-actor accessibility callback on IPC. Existing Swiftty mouse/search/accessibility paths require this redirection because several consult live `TerminalSession` state. [S15], [S18]
 
 Resolved hyperlinks, shell prompt navigation and application mouse reporting are added as explicit contracts, advertised in `Welcome.features` (`ServiceFeatures`) so a frontend uses them only with a service that offers them:
 
@@ -341,8 +466,9 @@ The ratios are illustrative. The window derives pixel rectangles from them and f
 
 | Element | Behaviour |
 |---|---|
-| Tab strip | One item per service tab, showing an icon, title, activity dot and close button, with a new-tab button at the end. Double-click renames the tab (`renameTab`). Numbered default names show the active pane's program title instead. The strip is a view of service state. |
-| Icons | Chosen locally from a fixed SF Symbol table keyed on words in the sanitized title (git, editor, game, assistant, monitor and so on). A program never supplies an image. |
+| Tab strip | One item per service tab, showing its icons, title, activity dot and close button, with a new-tab button at the end. A split tab stacks two tiles, the active pane's in front of the next pane's. Double-click renames the tab (`renameTab`). Numbered default names show the active pane's program title instead. The strip is a view of service state. |
+| Icons | Chosen locally from a fixed table: brand logos from developer-icons (MIT, pinned by `Scripts/fetch-brand-icons.sh`, drawn by alpha only as template images) with SF Symbol fallbacks. Tabs show a tile (the glyph in white on the brand's color, or on a dark neutral square); pane headers show the bare glyph tinted like the title. The table is keyed, most specific first, on: a name the user's script chose (`ui.setPaneIcon`); Claude Code's leading status glyph (`✳` or a braille spinner, which the title then drops); the pane's foreground program; the title's words. A runtime program (node, python) defers to a title that names the tool it runs. A program never supplies an image. |
+| Programs | The service reads each pane's foreground program a moment (250 ms) after output: the leader of the terminal's foreground process group (`proc_pidinfo` `e_tpgid`, `proc_name`); for an interpreter, its script's name (`KERN_PROCARGS2`); behind `ssh`, `mosh` or `et`, the program of the remote shell's running command (OSC 133 C to D). Names are bare (`ProgramName.sanitize`: ASCII letters, digits and `._+-`, at most 64 bytes). A change is sent as `MuxEvent.program` only to clients whose hello lists `ClientCapabilities.paneProgram`, and `PaneSummary.program` carries the latest. Because the service runs where the panes do, remote hosts report their own programs. |
 | Pane header | Shown when the tab has more than one pane. It shows the sanitized title, an active-pane marker, an exited marker and an activity dot, with split right, split down, zoom and end actions. It sits outside the cell grid; the pane's rows and columns come from the Metal view beneath it. |
 | Titles | `DisplayText.sanitize` drops control, format (including bidi overrides), private-use and unassigned scalars, folds whitespace and limits titles to 120 characters before they reach any chrome or accessibility label. |
 | Activity | `MuxEvent.activity(pane)` is sent once when an unsubscribed pane in one of the attached workspace's other tabs changes, and is re-armed when the pane is subscribed again. Starting a pane is not activity. A bell in an unfocused pane also sets the dot. Showing a pane clears it. |
@@ -437,12 +563,15 @@ Section 11 records the evidence for each gate.
 | C7 | Input and paste | Exactly ordered input; bounded paste and disconnect cleanup; no automatic replay |
 | C8 | Bounds and fairness | Noisy visible/detached panes and a slow client stay within budgets without starving input/control |
 | C9 | Owned frames/history | Malformed tables/widths/lengths fail safely; subscription/metadata-only changes produce frames; frozen selection survives in-place edits; stale history never copies different text |
+| C11 | Binary codec and deltas | `SMXB/1` and JSON decode every frame and delta to equal values; truncated/corrupt/oversized payloads fail before any allocation beyond the budget; every delta-applied presentation equals the service's full frame at that revision across scroll, scroll-region, CR-overwrite, alternate-screen, resize and lost/reordered-ack workloads; base or checksum mismatch recovers through one full frame |
+| C12 | Live selection | Output keeps rendering during a drag; the overlay follows scrolled text; an in-place edit, generation change or eviction under the selection clears it; selections spanning unfetched history copy exactly the service's text; `selectionChanged`/`historyUnavailable`/`resourceLimit` never yield partial or different text; copy never blocks the main actor |
 | C10 | Registration and upgrades | Denied/disabled service is respected; pending updates preserve sessions; incompatible app preserves old server |
 
 | Frontend gate | Required result |
 |---|---|
 | TTY profile | Exact shipped Swiftty profile passes decoder/encoder fixtures; no dependence on other terminal implementations |
 | TTY cleanup and output | Normal/error detach restores tty/modes; interrupted output invalidates baseline; paste bypasses prefix |
+| TTY keyed diffing | Keyed and unkeyed diffing emit identical bytes for scrolling, CR overwrite, split panes, overlays, palette changes and resize; any missing key falls back to the cell comparison |
 | Native parity | Export/import retains cells, wraps, colors, cursor and graphemes; compare renderer output with direct snapshots where deterministic |
 | Native lifetime | Window close, Quit, crash and Force Quit permit same-shell reattachment; service loss is distinguished |
 | Native IME and input | Dead keys, composed text, repeats, Ctrl keys, paste and pane changes deliver intended input once |
@@ -450,7 +579,9 @@ Section 11 records the evidence for each gate.
 | Native resource lifetime | Slow GPU, no drawable, dropped frames, redraw/rebind and teardown do not reuse in-flight buffers/stale CPU storage or make pending content the interaction baseline |
 | Native accessibility | Visible text/cursor/selection are correct without synchronous remote calls on the main actor |
 
-Measure parser throughput, input-to-display latency, client/service CPU, GPU work and memory at the configured limits. Report hardware, OS, build and workload. In the native phase, include no-client and occluded-window cases. Use results to decide whether a compact codec, deltas, shared resources or shared memory is justified.
+Measure parser throughput, input-to-display latency, client/service CPU, GPU work and memory at the configured limits. Report hardware, OS, build and workload. In the native phase, include no-client and occluded-window cases. Use results to decide whether compression, shared resources or shared memory is justified.
+
+For C11/C12, add paired runs (JSON vs `SMXB/1`, full frames vs deltas) of: export+encode and decode+import p95 at 200×50 and 512×256; bytes per frame for typing echo, full-screen scrolling and a CR progress bar; input-to-frame latency; and 32-visible-pane CPU and footprint. Targets, to be confirmed by measurement: 512×256 full-frame encode+decode p95 under 4 ms with `SMXB/1`, and a typing-echo delta at 200×50 under 2 KiB. Measure `copySelection` latency for 10,000 history rows at 512 columns.
 
 ## 11. Acceptance and measurement record
 
@@ -548,6 +679,180 @@ The footprint covers the whole bench process, so the client that decodes every f
 Notarization: the package script signs Developer ID builds with a secure timestamp. When `NOTARY_PROFILE` names a `notarytool` keychain profile, it also submits the app, staples the ticket and runs `spctl --assess`. No notary credentials are stored on this machine, so that step has not run. Without it, Gatekeeper rejects the Developer ID build as `Unnotarized Developer ID`, as expected.
 
 `FrameTimeTests` measures optimized code. It is now enabled only in optimized builds (`swift test -c release`), where it passes with p95 0.68 ms and 1.77 ms. Debug builds skip it rather than failing. The `SnapshotTests` search budget is gated the same way (release p95 0.009 ms). The PTY slave-leak test waited only 1 s for an asynchronous hang-up and failed under full-suite load (also on `main`); it now waits up to 10 s and returns as soon as EOF arrives. Three consecutive full `swift test` runs then passed (1,202 tests each).
+
+### Shared-surface measurements — 2026-11-01
+
+Baseline `78ee561d977bf4c1c25976126c07f8480370ec65` versus the shared-surface
+implementation. Hardware/build conditions and correctness evidence are in
+[spec.md](spec.md#shared-surface-implementation-and-validation--2026-11-01):
+Mac17,7, 18 cores, 128 GiB, macOS 27.2 (26B123), Swift 6.4.2, matching plain
+production Release builds, verified non-testable. Workload: `swiftmux-bench`,
+32 MiB of SGR/UTF-8/wide text, serial runs without concurrent desktop builds/tests.
+Logs: `/private/tmp/swiftty-final-{baseline,current}-mux-bench.log`.
+
+| Metric | Baseline | Current |
+|---|---:|---:|
+| Mux input-to-frame p95, ms | 1.616 | 1.523 |
+| Mux 200×50 import p95, ms | 1.198 | 1.171 |
+| Mux 200×50 GPU p95, ms | 1.231 | 1.248 |
+| GPU p95 beside saturating large renderer, ms | 2.027 | 2.011 |
+| Detached throughput, MiB/s | 255.3 | 235.9 |
+| Attached throughput, MiB/s | 278.7 | 290.3 |
+| 32 noisy panes, no client, CPU / MiB | 504.5% / 200.7 | 495.9% / 202.5 |
+| 32 noisy panes, one visible, CPU / MiB | 411.3% / 220.3 | 408.2% / 224.5 |
+| 32 visible noisy panes, CPU / MiB | 379.1% / 670.9 | 437.8% / 428.7 |
+| 32 visible noisy panes, frames/s | 1838.9 | 1840.7 |
+| Idle footprint, MiB | 38.9 | 38.9 |
+
+Resource/throughput values
+for the saturating multi-process workload vary with scheduling; they are reported
+as measurements, not claimed improvements. A reverse-order pair confirmed this:
+detached throughput was 249.9→249.6 MiB/s and 32-visible CPU was 549.3%→506.2%
+(baseline→current), reversing the initial CPU difference. Input-to-frame p95 was
+1.993→1.701 ms. Logs: `swiftty-final-{baseline,current}-mux-reverse.log`. The mux benchmark measures input to
+received frame, import and GPU rendering separately; these are not a combined
+physical key-to-pixel measurement.
+
+Three alternating isolated-frame pairs, five rounds each, reuse the existing mux
+benchmark's export/import and GPU functions. Across 15 rounds per version:
+
+| Median of round p95 values, ms | Baseline | Current |
+|---|---:|---:|
+| 200×50 import | 0.497 | 0.490 |
+| 200×50 GPU | 1.216 | 1.217 |
+| 512×256 import | 5.761 | 5.677 |
+| 512×256 GPU | 8.027 | 7.844 |
+
+Large-frame GPU round ranges overlap: 7.694–11.500 ms baseline and
+7.581–11.427 ms current. Logs:
+`/private/tmp/swiftty-final-{baseline,current}-probe-{1,2,3}.log`.
+
+
+### Frames, deltas and live selection — 2026-11-19
+
+Implements §4 "Row identity and versions", "Binary frame codec", "One frame model", "Frame deltas" and "Live selection across pages", §6 keyed row diffing, and the RST/1 features of spec.roaming.md §7.4–7.5.
+
+| Gate | Evidence |
+|---|---|
+| C11 codec | `FrameDeltaTests`: `SMXB/1` and JSON decode full frames and deltas to equal values; every prefix of a record and 2,000 random byte flips fail or yield a valid frame; wrong section order and oversized records are rejected. |
+| C11 deltas | `FrameDeltaTests` replays typing, scrolling, CR progress, scroll regions, screen switches and resizes; every applied delta equals the full frame (resolved cells and metadata); a foreign base, flipped checksum or bad row source is rejected. `LiveSelectionTests.typingArrivesAsAppliedDeltas` (binary and JSON) drives a real service: deltas applied, none refused. |
+| C12 live selection | `LiveSelectionTests`: copy spans 300 lines of history the client never fetched; a changed version, a stale generation and an in-place edit (`EDITED!` over the selected row) are refused with `selectionChanged`/`historyUnavailable`; an observer copies with its own row versions. Native: `MuxNativeTests` "word selection follows new output and ends on a clear". |
+| TTY keyed diffing | `KeyedDiffTests` (split panes, overlays, exit note, palette change) and `RoamingKeyedDiffTests`: keyed and unkeyed diffs write identical bytes; mutation checks show the key is what skips the row. |
+| RST/1 | `FrameWireTests` (encodings 2/3, `rstHeader`, profile rejection, new messages, feature dependencies), `HostFrameTests` (deltas applied; a client that loses its bases recovers with one full screen; copy of 10,000 rows in ordered chunks; a stale row is refused), and the QUIC end-to-end test "shared frames arrive as deltas and copy spans unfetched history". |
+
+Two defects found while implementing were fixed in the design. A client that refuses a delta must still acknowledge it, or the unacknowledged stream holds one of the two in-flight slots (RST/1) or the pane's only credit (SwiftMux); the client acknowledges, then requests a full frame. A live selection must remap only when its frame is admitted for drawing, or a refused GPU submission shifts it twice.
+
+`swiftmux-bench`, release build, same host as above, two consecutive runs (ranges are across the runs):
+
+| Measure | JSON | `SMXB/1` |
+|---|---:|---:|
+| 200×50 frame bytes | 104 KiB | 74 KiB |
+| 200×50 export+encode p95 | 1.28–1.39 ms | 0.33 ms |
+| 200×50 decode+validate+import p95 | 1.05–1.06 ms | 0.24 ms |
+| 512×256 frame bytes | 1,300 KiB | 953 KiB |
+| 512×256 export+encode p95 | 6.76–6.80 ms | 4.13–4.15 ms |
+| 512×256 decode+validate+import p95 | 5.41–5.68 ms | 3.15–3.17 ms |
+
+Both columns include row-version stamping. A 200×50 typing-echo, one-line-scroll or CR-progress delta is 1,911 bytes (a full frame is 71,775), meeting the 2 KiB target; the palette is omitted while unchanged and only replaced rows carry versions. Detached parser throughput was 227.6 and 267.3 MiB/s.
+
+Per-stage p95 at 512×256 (`swiftmux-bench --frame-stages`, three runs) after two follow-up optimizations, a last-style fast path in the exporter and row versions compared as 32-bit words:
+
+| Stage | Before | After |
+|---|---:|---:|
+| Capture | 0.28 ms | 0.28–0.30 ms |
+| Export | 1.80 ms | 0.46–0.50 ms |
+| Row-version stamp | 1.96 ms | 0.82–0.85 ms |
+| `SMXB/1` encode | 0.12 ms | 0.11 ms |
+| `SMXB/1` decode + validate | 1.04 ms | 1.03–1.09 ms |
+| Renderer import | 2.28 ms | 2.09–2.34 ms |
+
+The codec target (512×256 encode+decode under 4 ms p95) is met at about 1.2 ms. The whole pipeline is about 4.9 ms. Most of the remaining time is renderer import: it validates the frame a second time and then builds renderer storage.
+
+`copySelection` text extraction across a pane's whole history, at the service budgets with every screen row's version checked (`--frame-stages`): 80×24 over 10,024 rows (723 KiB) p50 74 ms, p95 83 ms; 512×256 over 2,304 rows (1,138 KiB; the 16 MiB budget binds) p50 46 ms, p95 52 ms. It runs on the pane queue and is asynchronous for the client.
+
+Roaming Apple clients select on a presentation session. The engine now carries a presentation selection in host addresses across installed frames (`PresentationSelection`, using the row keys `RoamingClient` attaches to each frame). It follows the rows as the host window moves, ends on an in-place edit or a new generation, and survives being scrolled wholly out of view. When it reaches beyond the shown rows, `TerminalSession.copySelectedText` copies it through `remoteCopyHandler`; the macOS and iOS views use that for Copy, and the roaming app connects it to `RoamingClient.copySelection`. Evidence: `PresentationSelectionTests` and the QUIC end-to-end test "a display selection scrolled out of view is copied from the host". In the full native run, two `AgentStartupTests` cases and one `ClipboardDropTests` case failed under load; each passes three of three runs alone.
+
+### Follow-up review and measurements — 2026-11-20
+
+**Renderer import without a second validation.** `MuxConnection` now validates JSON frames on arrival, as it already did for `SMXB/1` frames and applied deltas. It acknowledges an invalid frame and does not deliver it. Every frame it delivers is valid, so the native app imports with `FrameImporter.snapshot(fromValidated:)`, which skips the second pass and asserts validity in debug builds. The public `FrameImporter.snapshot(from:)` still validates. Per-stage p95 at 512×256 (`--frame-stages`, five runs): checked import 2.06–2.33 ms, validated import 1.18–1.34 ms; the validation pass alone was 0.81–0.98 ms. Evidence: `FrameDeltaTests.invalidJSONFramesAreAcknowledgedNotDelivered` (an invalid JSON frame for the attachment is acknowledged and the next valid frame is the first delivered); removing the arrival check traps the suite.
+
+**`screenDeltas` cost (spec.roaming.md §13).** `ScreenDeltaCostReport` (`SWIFTTY_DELTA_REPORT=1`, release build) runs a real host and `RoamingClient` over the in-process A3 path (stream delay 0–100 ms, 10% resets, late completion, control delay and duplication; no kills), with deltas on and with `screenDeltas` stripped from `Attach`. Bytes are wire records as delivered, zlib applied by the host when it helps. Client CPU is the thread CPU time of the client's per-record work (decode, validate, apply a delta to its base, map to a presentation), the median of 15 replays of the delivered records.
+
+| Workload | Deltas | Screens | Bytes/screen | Client CPU/screen |
+|---|---|---:|---:|---:|
+| 80×24 typing | off | 14 | 771 | 102 µs |
+| 80×24 typing | on | 17 (15 deltas) | 318 | 118 µs |
+| 200×80 scrolling | off | 73 | 1,564 | 455 µs |
+| 200×80 scrolling | on | 74 (72 deltas) | 465 | 552 µs |
+
+Deltas cut bytes per screen by 59% (typing) and 70% (scrolling). They cost 16–21% more client CPU, because applying a delta copies the base. This is the in-process impaired path, not packet-level loss over real QUIC.
+
+**A20/A22 follow-ups.**
+- A base refused by the client's own retention, without injection: one `ScreenAck` reaches the host after the client's 2 s base lifetime while output continues. The client refuses the host's next delta once, full screens answer until the replacement is acknowledged, and deltas resume (`ImpairedScreenDeltaTests` "a base aged out of the client's retention recovers through a full screen").
+- Apple clients do not re-derive a selection after reconnecting. Row versions come from a process-wide sequence, so a reattached exporter gives every row a new version. A selection then ends on the first frame that shows one of its rows, even when the text is unchanged; a selection off the frame ends when it comes back into view (`PresentationSelectionTests` "a reattachment's new row versions end the selection"). The client never shows or copies a selection against rows it cannot verify.
+
+**Defects fixed in this review** (each with a regression test that fails without the fix):
+- *QUIC stream credit.* An inbound stream that failed before `.ready`, or that `adopt`/`classify` refused, never returned its stream credit, so the server's retirement wait (`released >= opened`) stalled and its usable snapshot streams shrank by one. Each inbound stream now returns its credit exactly once, however it ends; delivery still holds the credit of a snapshot awaiting delivery.
+- *`swroam` and an external `SIGTSTP`.* The outer terminal stayed raw while stopped; it is now restored before the process stops and re-entered on `SIGCONT`. `run` also no longer enters raw mode or installs sources after a status handler has already finished it.
+- *`FrameValidator` and `search.selected`.* A selection index outside `0 ..< matchCount` (including a negative one, which `SMXB/1` cannot encode) is rejected.
+- *Roaming history window.* A window is pinned to the addressing generation it was resolved in, so a scrollback clear, reset or resize shows live output instead of pinning the old row number in renumbered rows. Switching the active pane returns the window to live output and drops a move still resolving on the old pane.
+- *Scrollback maintenance timer.* The coordinator arms and disarms its timer under the lock that decides it. Previously a disarm decided on one thread could cancel a deadline another thread armed after it, stopping idle compression process-wide.
+- *Presentation selection.* A new word or line selection no longer inherits an end that the previous live selection had clamped to the frame (`TerminalState.beginSelection`). A rectangle with an end clamped to the frame keeps its own columns instead of being drawn from column 0.
+- *`swsh` launcher payload.* The payload file is moved above the standard descriptors. In a shell started with stdin or stdout closed, a pipeline stage's wiring could overwrite it before the launcher read it.
+- *JSONC configuration.* The source index records positions only to depth 8 (every configuration key lies within depth 5), and unknown keys are checked in stored-offset order. A deeply nested 1 MiB file had taken about 30 s and 1.5 GB before it was rejected.
+- *`bindKey`.* A shortcut's key is named by its unshifted character, so `cmd+shift+1` matches ⌘⇧1, and the `+` key is named `plus`.
+
+### Follow-up review — 2026-11-21
+
+Commit `70687e56` (SSH identities, saved passwords, Secure Enclave keys, roaming layout, connection resilience) had one review pass. SavedPasswordStore, IdentitySecretStore, SecureEnclaveKeys, IdentityResolver, the ECDSA/PEM importer paths, QUIC stream-credit settlement, RemoteLayout, the roaming history window, MuxConnection validation, the workspace chrome and recovery scheduling were found clean.
+
+**Defects fixed in this review:**
+- *A cancelled health probe closed a healthy SSH connection.* `SSHConnection.probe` ran in its caller's task. The app cancels its health task on backgrounding and on every inactive-to-active transition (Control Center, a banner, a system alert). A probe whose channel open the server had not yet answered then aborted, and abandoning an unanswered open closes the parent connection, so recovery replaced the user's running shell. The probe now runs in its own task, bounded only by its timeout. Regression: `SSHResilienceTests.aCancelledProbeLeavesTheConnectionOpen` fails without the fix (connection closed, result not `.responsive`).
+- *Secure Enclave signing on the shared event loop.* NIOSSH signs on the channel's loop, and a key that requires user presence blocks that thread for the length of the prompt. Connections authenticated by a Secure Enclave key, when the caller names no group, now use `SSHConnection.secureEnclaveEventLoopGroup`, a one-loop group of their own, so a prompt no longer stalls every other SSH and SFTP channel. The connect deadline is still scheduled on that loop and is checked when the prompt returns, so a prompt longer than the connect timeout still fails with `connectTimeout`; that remains open (todo.md), needs a device, and has no automated test.
+- *ECDSA import left a copy of the private scalar unwiped.* Left-padding replaced the stripped scalar buffer, and the `defer` wiped only the replacement. The padded scalar is now built in one buffer, which the `defer` wipes. Not observable from a test.
+
+### Shaped real-QUIC measurements — 2026-11-21
+
+`ShapedQUICTests` (release build, `Scripts/test-shaped-quic.sh`) ran twice over loopback QUIC shaped by `Scripts/quic-shaper.sh` on macOS 27.2.1. Measured profile: 101–102 ms median one-way delay; 38 and 39 of 40 probe datagrams arrived. Connection loss is a server close at the next opportunity, not at an exact acknowledgement boundary.
+
+**A20.** Passed both runs. Every installed screen matched the host's complete screen at a strictly increasing revision: 75 and 84 screens, 23 and 25 deltas applied, no full-screen requests, 4 and 3 connections. A client without `screenDeltas` received full screens only.
+
+**A22.** History copy across unfetched rows during output returned the host's grid text in both runs (66,053 bytes in 1.2 and 1.5 s), and an edit under the selection yielded `selectionChanged` with no text. **Typing during a 2 MiB copy misses the requirement:** the echo of one key arrived after 16.2 s and 17.7 s, when the copy itself finished after 17.1 s and 17.9 s. The requirement is about one chunk, which is roughly 0.4 s for a 48 KiB chunk at 1 Mbit/s. The in-process A22 test passes because it checks the order of records on the control stream, and over the impaired link the host's sends wait for delivery. Over QUIC, `sendControl` returns once the transport accepts the bytes under flow control, so the host can queue most of the copy in the transport before the key's acknowledgement and echoed screen. Open in todo.md; the shaped test asserts the bound and fails.
+
+*Cause (instrumented shaped run, same day).* The host's chunk sends were paced to the link: the last chunk was accepted 1.0 s before the client read it. The input acknowledgement was accepted 0.6 s after the key and read 2.0 s after it. The echoed screen, 223 bytes, was accepted at 0.10 s but read at 16.55 s, 1 ms after the last chunk. Network.framework sent the snapshot stream only once the control stream had nothing queued, so during a copy every screen waited for the whole copy. A smaller control-stream receive window on the client (128 KiB) changed nothing. *Fix:* the host holds each copy chunk while a screen awaits acknowledgement, at most `RoamingSession.copyScreenWait` (2 s), and releases it before the next capture (§7.5). Regression: `HostFrameTests` "copy chunks wait for the screens in flight". It fails without the hold: a chunk is sent while a screen is unacknowledged, and with acknowledgements withheld the copy is not slowed by the cap. Not yet re-measured over shaped QUIC.
+
+*After the fixes (shaped QUIC, same day).* With the screen hold alone, the echo arrived after 1.35 s and the input acknowledgement after 1.34 s. Both still waited behind the roughly 1 s of chunks Network.framework accepts before the client reads them. The host now also sends a `Ping` after each chunk and sends the next chunk only on the matching `Pong`, at most `RoamingSession.copyDeliveryWait` (2 s) later (spec.roaming.md §7.5). Regression: `HostFrameTests` "the next copy chunk waits for the client to read the last". It fails without the ping: a second chunk follows while the first is unread. The host previously rejected a client `Pong` as malformed; it now accepts one, and ignores any that answers no outstanding ping. Measured with both fixes: echo 0.85 s, input acknowledgement read 0.80 s after the key, history copy 4.2 s (66,053 bytes). The 2 MiB copy took 30.0 s instead of 17–18 s, one chunk per transmission time plus round trip. A window of two chunks would recover most of that throughput, but typing would then wait behind up to two chunks, against §7.5's one.
+
+**Recovery tail.** In each slow recovery the first connection's QUIC handshake finished in about 0.25 s, but the host's lifecycle log shows the client's streams (0 and control stream 4) arriving only when the client closed the connection, 15 s later at its attach deadline. Network.framework held the client's first stream data; why is not known. The client now abandons an attempt that has no `Attached` within four handshake durations of the handshake (at least 1.5 s, at most a third of the attach deadline) and retries the first such attempt at once (spec.roaming.md §9). Regression: `RoamingAttachmentDeadlineTests.anAttemptWithoutAttachedIsRetriedAfterTheProgressWait`. It fails without the wait, because the attempt then ends only at the attach deadline. Shaped runs with the change (100 recoveries each), timed from the reconnect attempt to an installed current screen:
+
+| Run | p50 | p95 | Max | Recoveries with 2 / 3 connections |
+|---|---:|---:|---:|---:|
+| Before (two runs) | 0.50 s | 16.5–16.7 s | 16.5–33.5 s | 5 / 0 |
+| 8× handshake, no cap | 0.50 s | 3.05 s | 13.6 s | 5 / 0 |
+| 4× handshake, capped | 0.51 s | 2.29 s | 3.22 s | 6 / 0 |
+| 4× handshake, capped | 0.54 s | 2.83 s | 5.04 s | 10 / 1 |
+
+The 3 s p95 target held in both runs of the final version. How often a first connection stalls varies between runs (5–11%). A handshake slowed by loss is QUIC's own retransmission and is unchanged: one recovery's handshake took 2.2 s.
+
+**`screenDeltas` cost** (zlib on both sides; bytes are snapshot records as the client received them, and client CPU is the median of 15 replays):
+
+| Workload | Deltas | Screens, run 1 / run 2 | Bytes/screen | Client CPU/screen |
+|---|---|---:|---:|---:|
+| 80×24 typing | off | 14 / 18 | 792 / 791 | 118 / 71 µs |
+| 80×24 typing | on | 14 / 15 | 284 / 284 | 79 / 135 µs |
+| 200×80 scrolling | off | 49 / 58 | 1,564 / 1,571 | 493 / 505 µs |
+| 200×80 scrolling | on | 48 / 58 | 681 / 602 | 604 / 597 µs |
+
+Deltas cut bytes per screen by 64% for typing and by 56–62% for scrolling, close to the in-process figures (59% and 70%). Client CPU per screen at 80×24 is too noisy at 14–18 screens to compare. At 200×80, deltas cost about 18–23% more CPU, as in-process.
+
+**Recovery target** (100 warm reattachments, timed from the reconnect attempt to an installed current 80×24 screen):
+
+| Run | p50 | p95 | Max | Recoveries needing a second connection |
+|---|---:|---:|---:|---:|
+| 1 | 0.50 s | 16.7 s | 33.5 s | not recorded |
+| 2 | 0.50 s | 1.75 s | 17.1 s | 1 of 100 |
+
+From the server's close, p50 was 1.15–1.18 s, which includes the client noticing the loss. The 3 s p95 target held in run 2 and missed in run 1. The tail is recoveries whose first connection attempt stalls for about 15 s (`attachTimeout`) before a second attempt succeeds at once; run 1's 16.7 s p95 and 33.5 s maximum match one and two such stalls. Open in todo.md.
 
 ## 12. Primary sources and evidence boundary
 

@@ -1,3 +1,4 @@
+import CoreTestSupport
 import Foundation
 import SwifttyCore
 @testable import SwifttyMobile
@@ -313,16 +314,11 @@ struct ConfigurationUseTests {
   /// What the frontend reads from a Ghostty-syntax config.
   @Test
   func `frontend settings`() throws {
-    let config = Configuration.parse(
-      """
-      theme = light:Swiftty Light,dark:Swiftty Dark
-      font-size = 15
-      background-opacity = 0.8
-      background-blur = 20
-      cursor-style-blink = false
-      keybind = ctrl+shift+f=start_search
-      """
-    )
+    let config = Configuration.configured([
+      ("theme", "light:Swiftty Light,dark:Swiftty Dark"), ("font-size", "15"),
+      ("background-opacity", "0.8"), ("background-blur", "20"),
+      ("cursor-style-blink", "false"), ("keybind", "ctrl+shift+f=start_search"),
+    ])
     #expect(config.diagnostics.isEmpty)
     // overrides Dynamic Type
     #expect(config.fontSize != Configuration().fontSize)

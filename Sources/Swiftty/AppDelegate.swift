@@ -3,6 +3,7 @@ import MuxNavigation
 import SwiftMuxProtocol
 import SwifttyCore
 import SwifttyMac
+import SwifttyJS
 
 /// One window type: every terminal window is a service-backed workspace,
 /// and a plain shell is a workspace with one tab and one pane. Adding a
@@ -13,8 +14,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private var config: Configuration
   let workspaces: WorkspaceCoordinator
   private let muxUpdate = MuxUpdateController()
+  let gatewayApplication: MuxGatewayApplication?
   /// Connect a Device… (one panel; it owns the Bonjour registration).
   private var connectPanel: ConnectDevicePanelController?
+  /// swiftty › Settings… (one window).
+  private var settings: SettingsWindowController?
   private lazy var attentionLinks = AttentionLinkRouter(
     ownsWorkspace: { [weak self] id in
       self?.workspaces.controller(holding: id) != nil
@@ -26,6 +30,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   )
 
   init(
+    gatewayApplication: MuxGatewayApplication? = nil,
+    workspaceDefaults: UserDefaults = .standard,
     listMuxWorkspaces:
       @escaping @MainActor () async throws -> WorkspaceListing = {
         try await MuxWorkspaceController.listing()
@@ -42,12 +48,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   ) {
     let config = Configuration.load()
     self.config = config
+    self.gatewayApplication = gatewayApplication
+    let list: @MainActor () async throws -> WorkspaceListing
+    let open: WorkspaceCoordinator.Open
+    var reopen: WorkspaceCoordinator.Reopen?
+    if let owner = gatewayApplication {
+      list = { try await owner.listing() }
+      open = { try await owner.open($0, configuration: $1, takeover: $2) }
+      reopen = {
+        try await owner.reopen($0, runSavedCommands: $1, configuration: $2)
+      }
+    } else {
+      list = listMuxWorkspaces
+      open = openMuxWorkspace
+    }
     workspaces = WorkspaceCoordinator(
-      configuration: config,
-      listWorkspaces: listMuxWorkspaces,
-      openWorkspace: openMuxWorkspace,
+      configuration: config.accommodating(.current),
+      listWorkspaces: list,
+      openWorkspace: open,
+      reopenSaved: reopen,
       reportListError: reportMuxAttachError,
-      reportOpenError: reportMuxOpenError
+      reportOpenError: reportMuxOpenError,
+      defaults: workspaceDefaults,
+      usesGateway: gatewayApplication != nil
     )
     super.init()
   }
@@ -57,7 +80,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   /// contacting anything.
   func application(_ application: NSApplication, open urls: [URL]) {
     // A burst of links: only the newest navigates.
-    guard let url = urls.last else { return }
+    guard let url = urls.last,
+      supportsLegacyOperation("External attention links")
+    else { return }
     attentionLinks.handle(url)
   }
 
@@ -66,7 +91,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     continue userActivity: NSUserActivity,
     restorationHandler: @escaping ([any NSUserActivityRestoring]) -> Void
   ) -> Bool {
-    guard userActivity.activityType == NSUserActivityTypeBrowsingWeb,
+    guard supportsLegacyOperation("External attention links"),
+      userActivity.activityType == NSUserActivityTypeBrowsingWeb,
       let url = userActivity.webpageURL
     else { return false }
     attentionLinks.handle(url)
@@ -74,6 +100,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationDidFinishLaunching(_ notification: Notification) {
+    do { _ = try JavaScriptConfiguration.provision() } catch {
+      NSLog("Swiftty JavaScript configuration: %@", String(describing: error))
+    }
+    NSWorkspace.shared.notificationCenter.addObserver(
+      self,
+      selector: #selector(accommodationsChanged),
+      name: DisplayAccommodations.didChangeNotification,
+      object: nil
+    )
     NSApp.mainMenu = makeMenu()
     workspaces.launch()
     NSApp.activate()
@@ -93,6 +128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     connectPanel?.model.close()
     Task {
       await workspaces.terminate()
+      await gatewayApplication?.close()
       sender.reply(toApplicationShouldTerminate: true)
     }
     return .terminateLater
@@ -111,57 +147,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   // MARK: SwiftMux service
 
   @objc
-  func muxStageUpdate(_ sender: Any?) { muxUpdate.stage() }
+  func muxStageUpdate(_ sender: Any?) {
+    guard supportsLegacyOperation("App updates") else { return }
+    muxUpdate.stage()
+  }
 
   @objc
   func muxInstallUpdate(_ sender: Any?) {
+    guard supportsLegacyOperation("App updates") else { return }
     muxUpdate.install { [weak self] in
       await self?.workspaces.detachAll(closing: true)
     }
   }
 
   @objc
-  func muxCancelUpdate(_ sender: Any?) { muxUpdate.cancel() }
+  func muxCancelUpdate(_ sender: Any?) {
+    guard supportsLegacyOperation("App updates") else { return }
+    muxUpdate.cancel()
+  }
 
   /// Connection details, pairing code and foreground discovery for
   /// phones and tablets (spec.connection-setup.md D2).
   @objc
   func connectDevice(_ sender: Any?) {
+    guard supportsLegacyOperation("Device connections") else { return }
     let panel = connectPanel ?? ConnectDevicePanelController()
     connectPanel = panel
     panel.present()
+  }
+
+  private func supportsLegacyOperation(_ operation: String) -> Bool {
+    guard gatewayApplication != nil else { return true }
+    let alert = NSAlert()
+    alert.messageText = "\(operation) are not available for this gateway yet"
+    alert.informativeText = "Your workspaces remain running."
+    alert.runModal()
+    return false
   }
 
   // MARK: Configuration
 
   @objc
   func reloadConfiguration(_ sender: Any?) {
+    reload()
+    // An open Settings window lists the problems itself.
+    if settings?.window?.isVisible != true { reportProblems() }
+  }
+
+  /// Re-reads the file and applies it everywhere, Settings included.
+  private func reload() {
     config = Configuration.load()
     NSApp.mainMenu = makeMenu()
-    workspaces.apply(config)
-    reportProblems()
+    workspaces.apply(config.accommodating(.current))
+    settings?.model.refresh(config)
+  }
+
+  /// The native Settings window (spec.apple.md A01); its problems list
+  /// replaces the alert while it is open.
+  @objc
+  func openSettings(_ sender: Any?) {
+    let window =
+      settings
+      ?? SettingsWindowController(
+        model: SettingsModel(
+          url: Configuration.activeURL,
+          configuration: config,
+          reload: { [weak self] in
+            guard let self else { return Configuration.load() }
+            reload()
+            return config
+          }
+        ),
+        editFile: { [weak self] in self?.openConfiguration(nil) }
+      )
+    settings = window
+    window.model.refresh(config)
+    window.present()
+  }
+
+  /// Reduce Motion, Reduce Transparency or Increase Contrast changed: the
+  /// file is unchanged, only its presentation (spec.apple.md A05).
+  @objc
+  private func accommodationsChanged() {
+    workspaces.apply(config.accommodating(.current))
   }
 
   @objc
   func openConfiguration(_ sender: Any?) {
-    let url = Configuration.defaultURL
+    let url = Configuration.activeURL
     if !FileManager.default.fileExists(atPath: url.path) {
-      try? FileManager.default.createDirectory(
-        at: url.deletingLastPathComponent(),
-        withIntermediateDirectories: true
-      )
-      try? "# swiftty configuration (Ghostty syntax)\n"
-        .write(to: url, atomically: true, encoding: .utf8)
+      try? Configuration.createConfigurationTemplate(at: url)
     }
     NSWorkspace.shared.open(url)
   }
 
   /// Configuration errors, shown as a sheet on the front window.
   private func reportProblems() {
-    let problems =
-      config.diagnostics
-      + config.missingThemes.map { "theme unavailable: \($0)" }
-      + config.missingFontStyles.map { "font style unavailable: \($0)" }
+    let problems = config.problems
     guard !problems.isEmpty else { return }
     for problem in problems {
       FileHandle.standardError.write(Data("swiftty: \(problem)\n".utf8))
@@ -196,7 +278,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     submenu(
       "swiftty",
       [
-        item("Settings…", #selector(openConfiguration(_:)), key: ","),
+        item("Settings…", #selector(openSettings(_:)), key: ","),
+        item(
+          "Edit Configuration File…",
+          #selector(openConfiguration(_:)),
+          key: ",",
+          modifiers: [.command, .option]
+        ),
         item(
           "Reload Configuration",
           #selector(reloadConfiguration(_:)),
@@ -292,11 +380,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
           "Reset Terminal",
           #selector(TerminalView.resetTerminal(_:)),
           action: .reset
-        ),
+        ), .separator(), tabPositionMenuItem(),
       ]
     )
     NSApp.windowsMenu = submenu("Window", windowMenuItems())
     return main
+  }
+
+  /// View › Tabs: Top (the toolbar) or Left (a sidebar), saved to
+  /// `window.tabs` like the Settings picker.
+  private func tabPositionMenuItem() -> NSMenuItem {
+    let tabs = NSMenuItem(title: "Tabs", action: nil, keyEquivalent: "")
+    tabs.submenu = NSMenu(title: "Tabs")
+    for (title, position) in [
+      ("Top", TabPosition.top), ("Left", TabPosition.left),
+    ] {
+      let choice = item(title, #selector(setTabPosition(_:)))
+      choice.target = self
+      choice.representedObject = position.rawValue
+      choice.state = config.tabPosition == position ? .on : .off
+      tabs.submenu?.addItem(choice)
+    }
+    return tabs
+  }
+
+  @objc
+  func setTabPosition(_ sender: NSMenuItem) {
+    guard let value = sender.representedObject as? String,
+      let position = TabPosition(rawValue: value),
+      position != config.tabPosition
+    else { return }
+    do {
+      try ConfigurationEditor.apply(
+        [("tab-position", value)],
+        to: Configuration.activeURL
+      )
+    } catch {
+      let alert = NSAlert()
+      alert.messageText = "Tabs not moved"
+      alert.informativeText = "\(error)"
+      if let window = NSApp.keyWindow {
+        alert.beginSheetModal(for: window)
+      } else {
+        alert.runModal()
+      }
+      return
+    }
+    reload()
   }
 
   /// Helper management, apart from the terminal commands.
@@ -309,6 +439,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     service.submenu = NSMenu(title: "Terminal Service")
     service.submenu?
       .addItem(item("Connect a Device…", #selector(connectDevice(_:))))
+    if gatewayApplication != nil {
+      service.submenu?
+        .addItem(item("Saved Workspaces…", #selector(savedWorkspaces(_:))))
+    }
     service.submenu?.addItem(.separator())
     for update in [
       item("Stage Update…", #selector(muxStageUpdate(_:))),
@@ -342,6 +476,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       item(
         "Rename Workspace…",
         #selector(workspace.renameCurrentWorkspace(_:))
+      ), .separator(),
+      item("Show Previous Output", #selector(workspace.showPreviousOutput(_:))),
+      item(
+        "Discard Previous Output",
+        #selector(workspace.discardPreviousOutput(_:))
       ), .separator(),
       item("Close Window", #selector(NSWindow.performClose(_:)), key: "w"),
       item(

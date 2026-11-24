@@ -110,11 +110,7 @@ public enum TerminalGeometry {
 // MARK: - Key-binding actions
 
 public enum ActionDispatch {
-  /// - Parameters:
-  ///   - action: Requested keybinding action.
-  ///   - rows: Visible rows.
-  ///   - history: Available history rows.
-  /// - Returns: Viewport lines (positive towards history), or nil for other actions.
+  /// Viewport lines (positive towards history), or nil for non-scroll actions.
   public static func viewportDelta(
     for action: KeyAction,
     rows: Int,
@@ -151,6 +147,7 @@ public enum ActionDispatch {
     case .searchSelection: "Find Selection"
     case let .navigateSearch(next): next ? "Find Next" : "Find Previous"
     case .endSearch: "End Find"
+    case .newTab: "New Tab"
     case .clearScreen: "Clear Screen"
     case .reset: "Reset Terminal"
     case .text, .textBytes, .csi, .esc: "Send Text"
@@ -329,6 +326,13 @@ extension SurfaceCapabilities {
     return modes.subtracting(Modes.mouseTracking.union(.focusEvents))
   }
 
+  /// The modes a frontend routes scrolling by: tracking stays when wheel
+  /// reports reach the program, so a program that asked for the mouse
+  /// never receives scrolling as arrow keys.
+  public func scrollModes(_ modes: Modes) -> Modes {
+    wheelReporting ? modes : effectiveModes(modes)
+  }
+
   /// Whether a key-binding or menu action is available. `presentation`
   /// sessions display another terminal's frames, so local screen resets
   /// would only blank the copy until the next frame.
@@ -343,7 +347,7 @@ extension SurfaceCapabilities {
     case .clearScreen, .reset: !presentation
     case .text, .textBytes, .csi, .esc: textInput && !presentation
     case .increaseFontSize, .decreaseFontSize, .resetFontSize, .selectAll,
-      .ignore:
+      .ignore, .newTab:
       true
     }
   }

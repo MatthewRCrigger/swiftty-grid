@@ -1,3 +1,4 @@
+import CoreTestSupport
 import AppKit
 import Metal
 @testable import Swiftty
@@ -75,9 +76,9 @@ extension ViewBehaviorTests {
     `unavailable performable prompt navigation sends the key to the application`()
     throws
   {
-    let configuration = Configuration.parse(
-      "keybind=performable:ctrl+arrow_down=jump_to_prompt:1"
-    )
+    let configuration = Configuration.configured([
+      ("keybind", "performable:ctrl+arrow_down=jump_to_prompt:1")
+    ])
     let view = try makeView(configuration: configuration)
     let writes = Mutex<[UInt8]>([])
     view.session.onWrite = { bytes in
@@ -202,23 +203,26 @@ extension ViewBehaviorTests {
     arguments: [
       ("e\u{301}", 1), ("中", 2), ("👩‍💻", 2), ("🇻🇳", 2), ("❤\u{FE0F}", 2),
       ("⌚\u{FE0E}", 1),
-    ]
+    ],
+    [false, true]
   )
   func `IME candidate rectangles follow composition ranges`(
-    _ prefix: String,
-    _ columns: Int
+    _ sample: (String, Int),
+    _ mux: Bool
   ) throws {
-    let view = try makeView()
-    view.frame = NSRect(x: 0, y: 0, width: 640, height: 480)
-    view.session.feed(Array("\u{1B}[2;4H".utf8))
-    view.lastSnapshot = view.session.snapshot()
+    let (prefix, columns) = sample
+    let direct = try makeView()
+    let pane = try MuxPaneView(pane: .init(), configuration: Configuration())
+    let view: any NSTextInputClient = mux ? pane : direct
+    let renderer = mux ? pane.renderer : direct.renderer
+    let surface: NSView = mux ? pane : direct
+    surface.frame = NSRect(x: 0, y: 0, width: 640, height: 480)
     view.setMarkedText(
       prefix + "X",
       selectedRange: NSRange(location: prefix.utf16.count, length: 0),
       replacementRange: NSRange(location: NSNotFound, length: 0),
     )
-    let cellWidth =
-      view.renderer.cellSize.width / view.renderer.font.descriptor.scale
+    let cellWidth = renderer.cellSize.width / renderer.font.descriptor.scale
     let origin = view.firstRect(
       forCharacterRange: NSRange(location: 0, length: 0),
       actualRange: nil
@@ -303,9 +307,9 @@ extension ViewBehaviorTests {
     throws
   {
     let first = try makeView(
-      configuration: Configuration.parse(
-        "keybind = all:unconsumed:ctrl+a=text:X"
-      )
+      configuration: Configuration.configured([
+        ("keybind", "all:unconsumed:ctrl+a=text:X")
+      ])
     )
     let second = try makeView()
     let firstWrites = Mutex<[UInt8]>([])
@@ -351,9 +355,9 @@ extension ViewBehaviorTests {
   @Test(.enabled(if: hasMetal))
   func `performable copy consumes the key when a selection exists`() throws {
     let view = try makeView(
-      configuration: Configuration.parse(
-        "keybind = performable:ctrl+c=copy_to_clipboard"
-      )
+      configuration: Configuration.configured([
+        ("keybind", "performable:ctrl+c=copy_to_clipboard")
+      ])
     )
     let clipboard = NSPasteboard.withUniqueName()
     view.pasteboard = clipboard
@@ -399,9 +403,9 @@ extension ViewBehaviorTests {
   func `unavailable performable copy bindings pass the key through`(
     _ keyEquivalent: Bool
   ) throws {
-    let config = Configuration.parse(
-      "keybind = performable:ctrl+c=copy_to_clipboard"
-    )
+    let config = Configuration.configured([
+      ("keybind", "performable:ctrl+c=copy_to_clipboard")
+    ])
     let view = try makeView(configuration: config)
     let window = NSWindow(
       contentRect: .zero,
@@ -445,9 +449,9 @@ extension ViewBehaviorTests {
     _ keyEquivalent: Bool,
     _ control: Bool
   ) throws {
-    let config = Configuration.parse(
-      "keybind = unconsumed:\(control ? "ctrl+" : "")a=text:X"
-    )
+    let config = Configuration.configured([
+      ("keybind", "unconsumed:\(control ? "ctrl+" : "")a=text:X")
+    ])
     let view = try makeView(configuration: config)
     let window = NSWindow(
       contentRect: .zero,

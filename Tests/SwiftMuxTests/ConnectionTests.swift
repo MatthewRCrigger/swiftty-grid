@@ -2,6 +2,7 @@ import Dispatch
 import Foundation
 import SwiftMuxClient
 import SwiftMuxProtocol
+import SwiftMuxXPC
 import Synchronization
 import Testing
 import TestSupport
@@ -286,7 +287,7 @@ struct ConnectionTests {
   @Test
   func releasingSilentServiceClosesItsAcceptedConnections() async throws {
     var service: SilentService? = SilentService()
-    weak var weakService = service
+    weak let weakService = service
     defer { weakService?.stop() }
     let connection = try await MuxConnection.connect(
       endpoint: #require(service).listener.endpoint,

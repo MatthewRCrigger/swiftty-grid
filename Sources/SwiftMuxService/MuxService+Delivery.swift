@@ -1,3 +1,4 @@
+import SwiftMuxGuardian
 import Dispatch
 import Foundation
 import SwiftMuxProtocol
@@ -97,7 +98,10 @@ extension MuxService {
       guard let slot = current.frames[pane], slot.dirty, slot.capture == nil,
         slot.inflight == nil, let record = panes[pane]
       else { continue }
-      if now &- slot.lastSent < interval, slot.lastSent != 0 {
+      let viewportMoved =
+        record.runtime.currentViewport.load(ordering: .acquiring)
+        != slot.lastViewport
+      if now &- slot.lastSent < interval, slot.lastSent != 0, !viewportMoved {
         let due = slot.lastSent + interval
         wake = min(wake ?? due, due)
         continue
@@ -119,6 +123,9 @@ extension MuxService {
         server: instance,
         attachment: attachment,
         layoutRevision: layoutRevision,
+        encoding: clients[current.client]?.frameEncoding
+          ?? PaneRuntime.FrameEncoding(),
+        baseline: slot.baseline,
       ) { [weak self] result in
         self?
           .onQueue {
@@ -199,6 +206,7 @@ extension MuxService {
       inflight.revision == revision
     {
       leases[wsID]?.frames[pane]?.inflight = nil
+      leases[wsID]?.frames[pane]?.baseline = inflight.baseline
       inflightFrameBytes -= inflight.bytes
       let window =
         panes[pane]?.runtime.currentViewport.load(ordering: .acquiring) ?? 0
@@ -210,6 +218,49 @@ extension MuxService {
       return
     }
     acknowledgeViewer(pane, revision, attachment: attachment, from: id)
+  }
+
+  /// A delta could not be applied. Releases the refused frame's credit
+  /// (`revision`, as an acknowledgement would) without adopting it as a
+  /// base, and forgets the base, so the next frame of the pane is
+  /// complete. A viewer's queued frame was encoded against the same
+  /// unusable base and is dropped. Applies to the lease or the viewer
+  /// `attachment` names; anything else is ignored.
+  func requestFullFrame(
+    _ pane: PaneID,
+    _ revision: UInt64,
+    attachment: AttachmentID,
+    from id: UUID,
+  ) {
+    if let wsID = clientLeases[id], leases[wsID]?.attachment == attachment,
+      let slot = leases[wsID]?.frames[pane]
+    {
+      if let inflight = slot.inflight, inflight.revision == revision {
+        leases[wsID]?.frames[pane]?.inflight = nil
+        inflightFrameBytes -= inflight.bytes
+      }
+      leases[wsID]?.frames[pane]?.baseline = nil
+      leases[wsID]?.frames[pane]?.dirty = true
+    } else if let wsID = clientViewers[id] {
+      let released = withViewer(id, in: wsID) { viewer -> Int in
+        guard viewer.attachment == attachment, let slot = viewer.frames[pane]
+        else { return 0 }
+        var bytes = 0
+        if let inflight = slot.inflight, inflight.revision == revision {
+          viewer.frames[pane]?.inflight = nil
+          bytes += inflight.bytes
+          if let queued = slot.queued {
+            viewer.frames[pane]?.queued = nil
+            bytes += queued.frame.bytes
+          }
+        }
+        viewer.frames[pane]?.baseline = nil
+        viewer.frames[pane]?.dirty = true
+        return bytes
+      }
+      inflightFrameBytes -= released ?? 0
+    }
+    pump()
   }
 
   // MARK: Input
@@ -235,6 +286,11 @@ extension MuxService {
       return ack(MuxError(.inputGap, "expected input \(current.nextInput)"))
     }
     leases[wsID]?.nextInput += 1
+    leases[wsID]?.holder.lastInput = Date()
+    // Answered once, like any refusal: never written, never retried as-is.
+    if migrationFrozen {
+      return ack(MuxError(.quiescing, "workspace is moving to a new worker"))
+    }
     guard let pane = panes[record.pane], pane.workspace == wsID,
       !pane.detachedFromLayout
     else { return ack(MuxError(.notFound, "pane")) }
@@ -378,8 +434,17 @@ extension MuxService {
     guard let paste = leases[wsID]?.pastes.removeValue(forKey: pasteID),
       let runtime = panes[paste.pane]?.runtime
     else { return }
-    runtime.pasteCancel(id: pasteID, discardDeferredInput: discardDeferredInput)
-    { [weak self] state in
+    runtime.pasteCancel(
+      id: pasteID,
+      discardDeferredInput: discardDeferredInput,
+      failure: { [weak self] error in
+        guard let client else { return }
+        self?
+          .onQueue {
+            $0.send(.event(.frameUnavailable(paste.pane, error)), to: client)
+          }
+      }
+    ) { [weak self] state in
       guard let client else { return }
       self?
         .onQueue {

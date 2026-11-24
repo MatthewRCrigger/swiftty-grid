@@ -35,16 +35,21 @@ let package = Package(
         .library(name: "SwifttyCore", targets: ["SwifttyCore"]),
         .library(name: "SwifttyMobile", targets: ["SwifttyMobile"]),
         .library(name: "TestSupport", targets: ["TestSupport"]),
+        .library(name: "CoreTestSupport", targets: ["CoreTestSupport"]),
     ],
     targets: [
-        .target(name: "SwifttyEngine", dependencies: ["CScrollbackChecksum"],
+        .target(name: "SwifttyEngine", dependencies: ["Checksum"],
                 swiftSettings: [.enableExperimentalFeature("Lifetimes")]),
         .target(name: "CScrollbackChecksum"),
-        .target(name: "SwifttyCore", dependencies: ["SwifttyEngine"],
+        .target(name: "Checksum", dependencies: ["CScrollbackChecksum"]),
+        .target(name: "SwifttyConfig"),
+        .target(name: "SwifttyCore", dependencies: ["SwifttyEngine", "SwifttyConfig"],
                 resources: [.copy("Renderer/Shaders.metal")],
                 swiftSettings: [.enableExperimentalFeature("Lifetimes")]),
         .target(name: "SwifttyMobile", dependencies: ["SwifttyCore"]),
         .target(name: "TestSupport", path: "Tests/Support"),
+        .target(name: "CoreTestSupport", dependencies: ["SwifttyCore"],
+                path: "Tests/CoreSupport"),
     ]
 )
 ''')
@@ -94,7 +99,8 @@ project = {
             'dependencies': [
                 {'target': 'SimulatorReview'},
                 *({'package': 'SwifttyReview', 'product': product}
-                  for product in ('SwifttyCore', 'SwifttyMobile', 'TestSupport')),
+                  for product in ('SwifttyCore', 'SwifttyMobile', 'TestSupport',
+                                  'CoreTestSupport')),
             ],
             'settings': {'base': {
                 'PRODUCT_BUNDLE_IDENTIFIER': 'dev.chr33s.swiftty.review.simulator.tests',

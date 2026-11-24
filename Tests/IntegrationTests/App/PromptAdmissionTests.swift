@@ -144,7 +144,8 @@ extension MainActorIntegrationTests {
       overflow.cancel()
       #expect(await !(overflow.value))
       requests.last?.cancel()
-      #expect(try await !(#require(requests.last?.value)))
+      let last = try #require(requests.last)
+      #expect(await !last.value)
       var replacementStarted = false
       let replacement = Task {
         replacementStarted = true
@@ -171,7 +172,7 @@ extension MainActorIntegrationTests {
       defer { try? FileManager.default.removeItem(at: directory) }
       do {
         var app: RoamingAppModel? = RoamingAppModel()
-        weak var observedApp = app
+        weak let observedApp = app
         let store = FileHostTrustStore(
           fileURL: directory.appendingPathComponent("keys.json")
         )

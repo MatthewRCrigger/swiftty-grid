@@ -160,6 +160,160 @@ struct RoamingEndToEndTests {
     await harness.shutdown()
   }
 
+  @Test
+  func `the client reports and changes the workspace layout`() async throws {
+    let harness = try await Harness()
+    let display = TerminalSession(presentationColumns: 80, rows: 24)
+    let client = harness.makeClient(display: display)
+    try await client.start(.create(GridSize(columns: 80, rows: 24)))
+    try await waitFor("active") { await client.state == .active }
+    #expect(await client.supportsLayoutControl)
+    try await waitFor("layout") { await client.status.layout != nil }
+    let initial = try #require(await client.status.layout)
+    #expect(initial.activeTabLayout?.panes.count == 1)
+
+    try await client.layout(.split(axis: .topBottom))
+    try await waitFor("two panes") {
+      await client.status.layout?.activeTabLayout?.panes.count == 2
+    }
+    try await client.layout(.newTab)
+    try await waitFor("two tabs") {
+      await client.status.layout?.tabs.count == 2
+    }
+    // A refusal surfaces as the host's code; the attachment stays.
+    await #expect(throws: RoamingClient.LayoutError(.inputInvalid)) {
+      try await client.layout(.selectTab(tab: TabID()))
+    }
+    #expect(await client.state == .active)
+
+    await client.close(.terminate)
+    await harness.shutdown()
+  }
+
+  @Test
+  func `shared frames arrive as deltas and copy spans unfetched history`()
+    async throws
+  {
+    let harness = try await Harness()
+    let display = TerminalSession(presentationColumns: 40, rows: 8)
+    let client = harness.makeClient(display: display)
+    try await client.start(.create(GridSize(columns: 40, rows: 8)))
+    try await waitFor("active") { await client.state == .active }
+    _ = await client.submit(.text("seq 1 3000; echo done-mark"))
+    _ = await client.submit(.key(SemanticKey(.enter)))
+    try await waitFor("output") { screen(display).contains("done-mark") }
+    for word in ["one", "two", "three"] {
+      _ = await client.submit(.text("echo \(word)-x"))
+      _ = await client.submit(.key(SemanticKey(.enter)))
+      try await waitFor(word) { screen(display).contains("\(word)-x") }
+    }
+    // A pause longer than the base retention window: the newest base is
+    // kept, so the next keystroke still arrives as a delta.
+    try await Task.sleep(for: .milliseconds(2_500))
+    _ = await client.submit(.text("echo after-pause"))
+    _ = await client.submit(.key(SemanticKey(.enter)))
+    try await waitFor("after pause") {
+      screen(display).contains("after-pause\n")
+    }
+    let stats = await client.deltaStatistics
+    #expect(stats.applied > 0)
+    #expect(stats.requestedFull == 0)
+    // Copy from the oldest retained row to the newest output: rows the
+    // client never received come from the host's grid.
+    let frame = try #require(await client.currentPaneFrame)
+    let h = frame.history
+    let last = try #require(frame.lines.lastIndex(of: "three-x"))
+    let screenRows = (0 ... last).compactMap { frame.rowIdentity($0) }
+      .filter { $0.address.row >= h.viewportTop + h.viewportOffset }
+    func request(_ rows: [RowIdentity]) -> CopySelectionRequest {
+      CopySelectionRequest(
+        pane: PaneID(),
+        start: SelectionPoint(
+          address: HistoryAddress(
+            generation: h.generation,
+            alternateScreen: false,
+            row: h.firstRow
+          ),
+          column: 0
+        ),
+        end: SelectionPoint(
+          address: h.address(viewportRow: last, alternateScreen: false),
+          column: 39
+        ),
+        unit: .character,
+        screenRowVersions: rows
+      )
+    }
+    let text = try await client.copySelection(request(screenRows))
+    let lines = text.split(separator: "\n")
+    #expect(lines.contains("1500"))
+    #expect(lines.contains("done-mark"))
+    #expect(lines.last == "three-x")
+    var stale = screenRows
+    stale[stale.count - 1].version &+= 1000
+    await #expect(throws: RoamingClient.CopyError(.selectionChanged)) {
+      try await client.copySelection(request(stale))
+    }
+    await client.close(.terminate)
+    await harness.shutdown()
+  }
+
+  @Test
+  func `a display selection scrolled out of view is copied from the host`()
+    async throws
+  {
+    let harness = try await Harness()
+    let display = TerminalSession(presentationColumns: 40, rows: 8)
+    let client = harness.makeClient(display: display)
+    display.remoteCopyHandler = { selection, done in
+      Task { done(try? await client.copySelection(selection)) }
+    }
+    try await client.start(.create(GridSize(columns: 40, rows: 8)))
+    try await waitFor("active") { await client.state == .active }
+    _ = await client.submit(.text("seq 1 200; echo done-mark"))
+    _ = await client.submit(.key(SemanticKey(.enter)))
+    // The echoed command line also contains "done-mark"; wait for the
+    // output line and the prompt after it, so no later output edits the
+    // selected rows and ends the selection.
+    try await waitFor("output") {
+      let lines = display.withState { $0.screenLines }
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+      guard let mark = lines.lastIndex(of: "done-mark") else { return false }
+      return lines[(mark + 1)...].contains { $0.hasPrefix("$") }
+    }
+    // Select every shown row, then scroll this client's window back so
+    // the selection's end lies below what is shown.
+    let shown = display.withState { $0.screenLines }
+    display.mutate { state in
+      state.setSelection(
+        Selection(
+          anchor: state.viewportPoint(row: 0, column: 0),
+          head: state.viewportPoint(row: state.rows - 1, column: 39)
+        )
+      )
+    }
+    await client.scrollViewport(by: 3)
+    try await waitFor("window moved") {
+      display.withState { $0.presentationSelectionBeyondView } != nil
+    }
+    let text: String? = await withCheckedContinuation { continuation in
+      DispatchQueue.main.async {
+        display.copySelectedText { continuation.resume(returning: $0) }
+      }
+    }
+    let expected = shown.map { line in
+      var line = line
+      while line.last == " " { line.removeLast() }
+      return line
+    }
+    #expect(
+      text?.split(separator: "\n", omittingEmptySubsequences: false)
+        .map(String.init) == expected
+    )
+    await client.close(.terminate)
+    await harness.shutdown()
+  }
+
   @Test(arguments: [false, true])
   func `per-key echo keeps screens flowing`(loginShell: Bool) async throws {
     let harness = try await Harness(loginShell: loginShell)
@@ -251,7 +405,6 @@ struct RoamingEndToEndTests {
     _ = await client.submit(.key(SemanticKey(.enter)))
     try await waitFor("second output") { screen(display).contains("second-4") }
     let text = screen(display)
-    // Each command ran exactly once.
     #expect(text.components(separatedBy: "first-2").count - 1 == 1)
     #expect(text.components(separatedBy: "second-4").count - 1 == 1)
 

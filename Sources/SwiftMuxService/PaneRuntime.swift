@@ -1,3 +1,4 @@
+import SwiftMuxGuardian
 import Darwin
 import Dispatch
 import Foundation
@@ -5,16 +6,18 @@ import MuxAttention
 import SwiftMuxExport
 import SwiftMuxProtocol
 import SwifttyEngine
+import SwifttyJS
 import Synchronization
 
 /// Events a pane reports to the service, on the pane queue.
 enum PaneEvent: Sendable {
   case title(String)
+  /// The foreground program changed (`ProgramName`; empty when unknown).
+  case program(String)
   case bell
-  case workingDirectory(String)
-  case workingHost(String)
-  /// The foreground program changed; nil when the shell holds the terminal.
-  case foreground(String?)
+  /// `host` is the OSC 7 URL's host; nil or this Mac's name when local
+  /// (`SavedLayoutHost.isLocal`).
+  case workingDirectory(String, host: String?)
   /// OSC 7501 changes in stream order, under the terminal epoch they
   /// happened in. Always delivered before `finished`.
   case status(TerminalEpochID, [StatusChange])
@@ -26,12 +29,26 @@ enum PaneEvent: Sendable {
   case clipboardWrite(MuxClipboardWrite)
 }
 
-/// Events gathered off the parse path, shared with the emulator's hooks.
-final class PendingPaneEvents: Sendable { let events = Mutex<[PaneEvent]>([]) }
+/// The shell's running command's program, set from the emulator's hooks.
+final class ShellProgram: Sendable { let name = Mutex<String?>(nil) }
 
-/// One PTY, its process lifecycle and its authoritative terminal. Every
-/// operation runs on `queue` in order: output parsing, input writes,
-/// replies, resizes and frame capture.
+/// Events gathered off the parse path, shared with the emulator's hooks.
+final class PendingPaneEvents: Sendable {
+  let events = Mutex<[PaneEvent]>([])
+  /// Plain-text contents of clipboard writes awaiting the frontend's
+  /// answer, reported to scripts only once the write succeeds.
+  let clipboardTexts = Mutex<[UInt64: String]>([:])
+}
+
+/// A pane's authoritative terminal and queue-owned process adapter. The default
+/// GuardianPTY adapter owns descriptors, process lifecycle and byte-writer
+/// state. Launch/paste admission may complete later; the terminal never reads
+/// mutable writer counters to infer an operation's admission result. Ordered
+/// remote input/geometry barriers remain necessary before enabling IPC here.
+///
+/// Sendable: engine/parser and guardian calls are confined to `queue`;
+/// cross-queue admission/change counters use Mutex/Atomic. Callbacks are
+/// installed before publication and capture this runtime weakly.
 final class PaneRuntime: @unchecked Sendable {
   let id: PaneID
   let workspace: WorkspaceID
@@ -43,6 +60,10 @@ final class PaneRuntime: @unchecked Sendable {
   /// Admitted, unwritten input bytes; shared with the service for
   /// admission decisions.
   let outstandingInput = Mutex(0)
+  /// Includes requests queued for encoding and requests awaiting the process
+  /// owner's admission result, independently of byte/write credit.
+  static let inputOperationLimit = GuardianWire.commandWindow
+  private let inputOperations = Mutex(0)
   /// Set when a change notification is posted; cleared by the service.
   let changePosted = Atomic(false)
 
@@ -60,6 +81,26 @@ final class PaneRuntime: @unchecked Sendable {
   }
 
   private let resizes = Mutex(ResizeState())
+  private var geometryFailure: MuxError?
+  private var processFailure: MuxError?
+  private var resizing = false
+  private enum DeferredPaneWorkKind: Equatable {
+    case input
+    case control
+    case theme
+    case viewportReset
+    case begin(UInt64)
+    case chunk(UInt64)
+    case end(UInt64)
+  }
+  private struct DeferredPaneWork {
+    let kind: DeferredPaneWorkKind
+    let run: () -> Void
+    let cancel: () -> Void
+  }
+  // Data entries retain their input-operation reservation; each pending begin
+  // permits at most one additional end marker.
+  private var geometryWork: [DeferredPaneWork] = []
 
   // Set once before use, read on `queue`.
   var onChange: (@Sendable () -> Void)?
@@ -71,34 +112,12 @@ final class PaneRuntime: @unchecked Sendable {
   /// Idle history compression on this pane's queue; nil when off.
   private var scrollbackMaintenance: ScrollbackMaintenanceClient?
   private var parser = Parser()
-  private var writer: PaneWriter
+  private let process: any PaneProcess
   private let observePaneIO: (@Sendable (PaneID, PaneIOObservation) -> Void)?
-  private var master: Int32 = -1
-  private var slave: Int32 = -1
-  private(set) var pid: pid_t = 0
-  private var foreground: String?
-  private var lastForegroundCheck: UInt64 = 0
-  private var foregroundCheckPending = false
-  private var readSource: DispatchSourceRead?
-  private var readSourceActive = false
-  private var processingRead = false
-  private var replyExitPoll: DispatchSourceTimer?
-  /// Unparsed bytes in readBuffer, held while reply capacity is exhausted.
-  private var bufferedRead = 0 ..< 0
-  private var childIsExiting = false
-  private var writeSource: DispatchSourceWrite?
-  private var writeActive = false
-  private var exitSource: DispatchSourceProcess?
-  private var exitPoll: DispatchSourceTimer?
-  private let readBuffer: UnsafeMutableRawBufferPointer
-  private var exitStatus: Int32?
-  private var finished = false
-  private var forcedTermination = false
-  private var terminating = false
-  private var naturalDrainDeadline: DispatchTime?
-  private var terminationDeadline: DispatchTime?
-  private var groupKillSent = false
-  private var drainTimer: DispatchWorkItem?
+  private let javaScriptRuntime: JavaScriptRuntime?
+  var pid: pid_t { process.pid }
+  /// After launch: the child started in home, not the requested directory.
+  var directoryFallback: Bool { process.directoryFallback }
   /// Every committed state change advances this.
   private(set) var revision: UInt64 = 0
   /// Owned by this pane: the generation of the last applied geometry
@@ -108,6 +127,21 @@ final class PaneRuntime: @unchecked Sendable {
   private var changeCount: UInt64 = 0
   /// Matches of the last viewer search, valid while `changeCount` holds.
   private var viewerSearchCache: ViewerSearchCache?
+  /// Row versions per attachment (frames are cropped per viewer, so each
+  /// attachment numbers its own rows). Pane queue only.
+  private var rowTrackers: [AttachmentID: RowVersionTracker] = [:]
+  /// Attachments by most recent capture, oldest first (eviction order).
+  private var rowTrackerOrder: [AttachmentID] = []
+  /// Trackers kept for attachments that never detach cleanly.
+  static let maxRowTrackers = 16
+
+  /// Drops a detached attachment's row versions (pane queue).
+  func forgetRowVersions(of attachment: AttachmentID) {
+    queue.async { [self] in
+      rowTrackers.removeValue(forKey: attachment)
+      rowTrackerOrder.removeAll { $0 == attachment }
+    }
+  }
 
   private struct ViewerSearchCache {
     var query: String
@@ -119,15 +153,30 @@ final class PaneRuntime: @unchecked Sendable {
   let currentViewport = Atomic<UInt64>(0)
   /// New on creation and on every full reset (RIS).
   private var terminalEpoch = TerminalEpochID()
+  /// Foreground process reporting, on `queue`; only while a script listens.
+  private var foregroundKey: [String]?
+  private var foregroundGeneration: UInt64 = 0
+  private var lastForegroundCheck: DispatchTime?
+  private var foregroundCheckScheduled = false
+  static let foregroundInterval: DispatchTimeInterval = .milliseconds(250)
   /// Clipboard requests the emulator deferred during a parse, emitted
   /// with the batch's other events.
   private let clipboardRequests = PendingPaneEvents()
+  /// The program of the command line the shell is running (OSC 133 C to
+  /// D), which names what runs on the far side of an `ssh`.
+  private let shellProgram = ShellProgram()
+  /// The foreground program last reported (`onEvent(.program)`).
+  private var program = ""
+  private var programCheckPending = false
+  /// How long after output the foreground program is read: coalesces a
+  /// burst, and lets a command the shell just started exec first.
+  static let programCheckDelay: DispatchTimeInterval = .milliseconds(250)
   /// Status changes journaled per publish; past it the inbox resyncs
   /// from the records (intermediate transitions are then lost).
   static let statusJournalLimit = 4096
 
-  static let drainBound: DispatchTimeInterval = .seconds(1)
-  static let terminateGrace: DispatchTimeInterval = .seconds(2)
+  static let drainBound: DispatchTimeInterval = GuardianPTY.drainBound
+  static let terminateGrace: DispatchTimeInterval = GuardianPTY.terminateGrace
 
   init(
     id: PaneID,
@@ -138,16 +187,33 @@ final class PaneRuntime: @unchecked Sendable {
     innerTerm: String = SMX.fallbackInnerTerm,
     limits: MuxLimits,
     scrollbackCompression: Bool = true,
+    javaScriptRuntime: JavaScriptRuntime? = nil,
     observingIO: (@Sendable (PaneID, PaneIOObservation) -> Void)? = nil,
+    processOwner: (any PaneProcess)? = nil,
+    processQueue: DispatchQueue? = nil,
+    processFactory: (
+      @Sendable (PaneID, WorkspaceID, DispatchQueue, MuxLimits) ->
+        any PaneProcess
+    )? = nil,
   ) {
     self.id = id
     self.workspace = workspace
     self.limits = limits
+    self.javaScriptRuntime = javaScriptRuntime
     observePaneIO = observingIO
-    queue = DispatchQueue(
-      label: "swiftmux.pane.\(id.short)",
-      qos: .userInitiated,
-    )
+    queue =
+      processQueue
+      ?? DispatchQueue(label: "swiftmux.pane.\(id.short)", qos: .userInitiated,
+      )
+    process =
+      processOwner ?? processFactory?(id, workspace, queue, limits)
+      ?? GuardianPTY(
+        id: id,
+        workspace: workspace,
+        queue: queue,
+        limits: limits,
+        observingIO: observingIO
+      )
     self.historyBytes = historyBytes
     state = TerminalState(
       columns: columns,
@@ -155,6 +221,19 @@ final class PaneRuntime: @unchecked Sendable {
       scrollbackLimitBytes: historyBytes,
       scrollbackLimitRows: limits.historyRowsPerPane,
     )
+    let shellProgram = shellProgram
+    state.onShellCommandStarted = { command in
+      shellProgram.name.withLock { $0 = ProgramName.command(command) }
+    }
+    state.onShellCommandFinished = { command, code in
+      shellProgram.name.withLock { $0 = nil }
+      javaScriptRuntime?
+        .commandFinished(
+          command: command,
+          exitCode: code ?? -1,
+          pane: id.description
+        )
+    }
     // The inner identity matches the TERM panes run under; enhanced
     // keyboard reporting and clipboard writes are not offered.
     state.terminalVersion =
@@ -183,7 +262,18 @@ final class PaneRuntime: @unchecked Sendable {
       }
       return .deferred
     }
+    let recordsClipboard = javaScriptRuntime != nil
     state.kittyClipboardWriter = { [id] request in
+      if recordsClipboard,
+        let text = request.contents.first(where: {
+          $0.mime.hasPrefix("text/plain")
+        })
+      {
+        requests.clipboardTexts.withLock { texts in
+          if texts.count >= 16 { texts.removeAll() }
+          texts[request.token] = String(decoding: text.data, as: UTF8.self)
+        }
+      }
       requests.events.withLock {
         $0.append(
           .clipboardWrite(
@@ -206,8 +296,42 @@ final class PaneRuntime: @unchecked Sendable {
     state.programStatusEnabled = true
     state.programStatusCapacity = limits.statusRecordsPerPane
     state.programStatusJournalLimit = Self.statusJournalLimit
-    writer = PaneWriter(replyReserve: limits.replyReserveBytes)
-    readBuffer = .allocate(byteCount: limits.readTurnBytes, alignment: 16)
+    process.canConsume = { [weak self] in self?.enqueueReplies() ?? false }
+    process.consume = { [weak self] bytes in
+      guard let self else { return 0 }
+      return self.parser.consumePrefix(bytes, into: &self.state, replyLimit: 1)
+    }
+    if let javaScriptRuntime {
+      process.filter = { bytes in
+        javaScriptRuntime.filter(
+          bytes,
+          stream: .stdout,
+          pane: id.description,
+          maximumBytes: limits.readTurnBytes
+        )
+      }
+    }
+    process.hasPendingReply = { [weak self] in
+      self.map { !$0.state.output.isEmpty } ?? false
+    }
+    process.onBatch = { [weak self] in self?.publish() }
+    process.onInputReleased = { [weak self] bytes in self?.release(bytes) }
+    process.onUnavailable = { [weak self] error in
+      guard let self else { return }
+      self.processFailure = error
+      self.geometryFailure = error
+      self.cancelGeometryWork { _ in true }
+      self.noteChange()
+    }
+    process.onFinished = { [weak self] status, forced in
+      guard let self else { return }
+      self.cancelGeometryWork { _ in true }
+      self.parser = Parser()
+      self.state.programExited()
+      self.publishStatus()
+      self.noteChange()
+      self.onEvent?(.finished(status: status, forced: forced))
+    }
     state.setScrollbackCompression(scrollbackCompression)
     if state.scrollbackCompression.effective {
       scrollbackMaintenance = ScrollbackMaintenanceClient(
@@ -220,123 +344,89 @@ final class PaneRuntime: @unchecked Sendable {
     }
   }
 
-  deinit {
-    scrollbackMaintenance?.cancel()
-    // Weak source callbacks cannot run once deinitialization starts.
-    // Transfer exclusive reaping without retaining the service or PTY.
-    exitSource?.cancel()
-    exitPoll?.cancel()
-    replyExitPoll?.cancel()
-    if pid > 0, exitStatus == nil {
-      kill(-pid, SIGHUP)
-      kill(pid, SIGHUP)
-      PTYProcessShutdown.start(pid)
-    }
-    setReadActive(true)
-    readSource?.cancel()
-    if let writeSource {
-      // Never release a suspended source.
-      if !writeActive { writeSource.resume() }
-      writeSource.cancel()
-    }
-    if master >= 0 { close(master) }
-    if slave >= 0 { close(slave) }
-    readBuffer.deallocate()
+  deinit { scrollbackMaintenance?.cancel() }
+
+  // MARK: Planned replacement (spec.durability.md §6)
+
+  /// The pane's terminal at the cut: engine, parser and the counters that
+  /// keep frame and epoch identities continuous.
+  struct MigrationCheckpoint: Sendable {
+    var terminal: [UInt8]
+    var parser: [UInt8]
+    var revision: UInt64
+    var geometryGeneration: UInt64
+    var changeCount: UInt64
+    var viewport: UInt64
+    var epoch: TerminalEpochID
   }
 
-  // MARK: Launch
+  /// Before the cut: answer clipboard requests the app still holds, and
+  /// hand their replies to the writer.
+  func settleClipboardForMigration() {
+    queue.async { [self] in
+      guard !process.finished else { return }
+      state.settleKittyClipboardForCut()
+      _ = enqueueReplies()
+    }
+  }
 
-  /// Spawns the pane's process. Call on `queue`.
-  func launch(_ spec: LaunchSpec, launcher: PaneLauncher) throws(MuxError) {
-    dispatchPrecondition(condition: .onQueue(queue))
-    let p = try launcher.launch(
+  /// Refused while effects are unsettled (replies, events, clipboard).
+  func migrationCheckpoint() throws -> MigrationCheckpoint {
+    try queue.sync { () throws -> MigrationCheckpoint in
+      guard !resizing, geometryWork.isEmpty else {
+        throw CheckpointError("geometry change in flight")
+      }
+      var writer = CheckpointWriter()
+      parser.checkpoint(into: &writer)
+      return MigrationCheckpoint(
+        terminal: try state.checkpoint(),
+        parser: writer.bytes,
+        revision: revision,
+        geometryGeneration: geometryGeneration,
+        changeCount: changeCount,
+        viewport: currentViewport.load(ordering: .relaxed),
+        epoch: terminalEpoch
+      )
+    }
+  }
+
+  /// Before publication: replaces the fresh engine with the checkpointed
+  /// one, keeping this runtime's host hooks. Emits nothing.
+  func restoreMigration(_ c: MigrationCheckpoint) throws {
+    try queue.sync { () throws in
+      var restored = try TerminalState.restored(checkpoint: c.terminal)
+      var reader = CheckpointReader(c.parser)
+      var restoredParser = Parser()
+      try restoredParser.restore(from: &reader)
+      try reader.finish()
+      restored.onShellCommandFinished = state.onShellCommandFinished
+      restored.onShellCommandStarted = state.onShellCommandStarted
+      restored.kittyClipboardReader = state.kittyClipboardReader
+      restored.kittyClipboardWriter = state.kittyClipboardWriter
+      restored.setScrollbackCompression(state.scrollbackCompression.requested)
+      // A pane that adopted its process keeps the engine the cut left.
+      state = restored
+      parser = restoredParser
+      revision = c.revision
+      geometryGeneration = c.geometryGeneration
+      changeCount = c.changeCount
+      currentViewport.store(c.viewport, ordering: .relaxed)
+      terminalEpoch = c.epoch
+    }
+  }
+
+  func launch(
+    _ spec: LaunchSpec,
+    launcher: PaneLauncher,
+    completion: @escaping @Sendable (Result<Void, MuxError>) -> Void
+  ) {
+    process.start(
       spec,
-      pane: id,
-      workspace: workspace,
+      launcher: launcher,
       columns: state.columns,
       rows: state.rows,
+      completion: completion
     )
-    master = p.master
-    slave = p.slave
-    pid = p.pid
-    let fd = master
-    let read = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-    read.setEventHandler { [weak self] in self?.readAvailable() }
-    read.resume()
-    readSource = read
-    readSourceActive = true
-    let write = DispatchSource.makeWriteSource(fileDescriptor: fd, queue: queue)
-    write.setEventHandler { [weak self] in self?.flush() }
-    writeSource = write  // resumed only while output is pending
-    let exit = DispatchSource.makeProcessSource(
-      identifier: pid,
-      eventMask: .exit,
-      queue: queue,
-    )
-    exit.setEventHandler { [weak self] in self?.childExited() }
-    exit.resume()
-    exitSource = exit
-    // The child may have exited before the source was armed. Defer the
-    // check until this launch turn has queued service registration; it
-    // can synchronously drain output and emit the final lifecycle event.
-    queue.async { [weak self] in self?.childExited(pollIfNeeded: false) }
-  }
-
-  // MARK: Output
-
-  private func readAvailable() {
-    guard master >= 0, !processingRead else { return }
-    processingRead = true
-    defer { processingRead = false }
-    var budget = limits.readTurnBytes
-    var parsedAny = false
-    var sawEOF = false
-    while budget > 0 {
-      guard enqueueReplies() else {
-        setReadActive(false)
-        publish()
-        return
-      }
-      setReadActive(true)
-      if bufferedRead.isEmpty {
-        let n = Darwin.read(
-          master,
-          readBuffer.baseAddress,
-          min(budget, readBuffer.count),
-        )
-        if n > 0 {
-          observeIO(
-            .read,
-            bytes: UnsafeRawBufferPointer(rebasing: readBuffer[..<n])
-          )
-          bufferedRead = 0 ..< n
-        } else {
-          if n < 0, errno == EINTR { continue }
-          if n < 0, errno == EAGAIN { break }
-          sawEOF = true
-          break
-        }
-      }
-      let chunk = UnsafeBufferPointer(
-        start: readBuffer.baseAddress!.assumingMemoryBound(to: UInt8.self)
-          + bufferedRead.lowerBound,
-        count: bufferedRead.count,
-      )
-      let consumed = parser.consumePrefix(chunk, into: &state, replyLimit: 1)
-      bufferedRead =
-        (bufferedRead.lowerBound + consumed) ..< bufferedRead.upperBound
-      budget -= consumed
-      parsedAny = true
-    }
-    if parsedAny { publish() }
-    if !state.output.isEmpty { setReadActive(false) }
-    if sawEOF {
-      setReadActive(true)
-      readSource?.cancel()
-      readSource = nil
-      readSourceActive = false
-      if exitStatus != nil { finish() }
-    }
   }
 
   /// One complete command can remain pending beyond the writer reserve.
@@ -344,8 +434,8 @@ final class PaneRuntime: @unchecked Sendable {
   private func enqueueReplies() -> Bool {
     guard !state.output.isEmpty else { return true }
     state.output.withUnsafeBytes { observeIO(.replyGenerated, bytes: $0) }
-    if childIsExiting || exitStatus != nil || finished
-      || state.output.count > writer.replyReserve
+    if process.childIsExiting || process.exitStatus != nil || process.finished
+      || state.output.count > process.replyReserve
     {
       // Dead children cannot use replies. A custom reserve smaller than
       // one command retains the existing oversized-reply drop policy.
@@ -353,49 +443,45 @@ final class PaneRuntime: @unchecked Sendable {
       state.output.removeAll(keepingCapacity: true)
       return true
     }
-    guard writer.appendReply(state.output) else { return false }
+    guard process.appendReply(state.output) else { return false }
     state.output.withUnsafeBytes { observeIO(.replyQueued, bytes: $0) }
     state.output.removeAll(keepingCapacity: true)
-    flush()
+    process.flush()
     return true
   }
 
-  private func setReadActive(_ active: Bool) {
-    if active {
-      replyExitPoll?.cancel()
-      replyExitPoll = nil
-    }
-    guard let readSource, active != readSourceActive else { return }
-    readSourceActive = active
-    if active {
-      readSource.resume()
-    } else {
-      readSource.suspend()
-      pollPausedExit()
+  /// Reads the foreground program a moment after output, reporting it
+  /// when it changed. Pane queue.
+  private func scheduleProgramCheck() {
+    guard !programCheckPending else { return }
+    programCheckPending = true
+    queue.asyncAfter(deadline: .now() + Self.programCheckDelay) { [weak self] in
+      guard let self else { return }
+      programCheckPending = false
+      let current = currentProgram()
+      guard current != program else { return }
+      program = current
+      onEvent?(.program(current))
     }
   }
 
-  /// Darwin may delay NOTE_EXIT until the controlling terminal drains.
-  /// The short BSD record exposes exit-in-progress without a terminal lock.
-  private func pollPausedExit() {
-    guard replyExitPoll == nil else { return }
-    let poll = DispatchSource.makeTimerSource(queue: queue)
-    poll.schedule(
-      deadline: .now() + .milliseconds(25),
-      repeating: .milliseconds(25),
-    )
-    poll.setEventHandler { [weak self] in
-      guard let self, !self.finished, !self.readSourceActive else { return }
-      guard PTYProcessExit.hasStartedExiting(self.pid) else { return }
-      self.childIsExiting = true
-      self.readAvailable()
+  /// The pane's foreground program; behind `ssh` and the like, the
+  /// remote shell's command when it marks one (OSC 133).
+  func currentProgram() -> String {
+    guard let local = ForegroundProgram.name(session: process.pid) else {
+      return ""
     }
-    replyExitPoll = poll
-    poll.resume()
+    if ProgramName.remoteShells.contains(local),
+      let remote = shellProgram.name.withLock({ $0 })
+    {
+      return remote
+    }
+    return local
   }
 
   /// Flushes replies and events, then notifies the service once.
   private func publish() {
+    scheduleProgramCheck()
     state.refreshSearchIfNeeded()
     _ = enqueueReplies()
     publishStatus()
@@ -406,10 +492,29 @@ final class PaneRuntime: @unchecked Sendable {
       switch event {
       case let .title(raw):
         // Cleaned once here for every client's chrome.
-        onEvent?(.title(DisplayText.sanitize(raw)))
-      case .bell: onEvent?(.bell)
-      case let .workingDirectory(d): onEvent?(.workingDirectory(d))
-      case let .workingHost(h): onEvent?(.workingHost(h))
+        let title = DisplayText.sanitize(raw)
+        onEvent?(.title(title))
+        javaScriptRuntime?.emit(.titleChanged(title), pane: id.description)
+      case .bell:
+        onEvent?(.bell)
+        javaScriptRuntime?.emit(.bell, pane: id.description)
+      case let .notification(title, body):
+        javaScriptRuntime?
+          .emit(
+            .notification(
+              title: DisplayText.sanitize(title),
+              body: DisplayText.sanitize(body)
+            ),
+            pane: id.description
+          )
+      case let .progress(state, percent):
+        javaScriptRuntime?
+          .emit(.progress(state: state, percent: percent), pane: id.description)
+      case let .workingDirectory(d):
+        onEvent?(
+          .workingDirectory(d, host: state.workingDirectoryHost)
+        )
+        javaScriptRuntime?.directoryChanged(d, pane: id.description)
       default: break  // OSC 52 clipboard writes are disabled
       }
     }
@@ -420,32 +525,43 @@ final class PaneRuntime: @unchecked Sendable {
     for request in requests { onEvent?(request) }
     _ = state.takeDamage()
     noteScrollbackActivity()
+    checkForeground(afterOutput: true)
     noteChange()
-    checkForeground()
   }
 
-  /// Reports the foreground program when it changes. Output drives the
-  /// check, so it is rate limited with a trailing run: the prompt that
-  /// follows a command always gets seen.
-  private func checkForeground() {
-    guard master >= 0, pid > 0, exitStatus == nil else { return }
-    let now = DispatchTime.now().uptimeNanoseconds
-    if now &- lastForegroundCheck < 200_000_000 {
-      if !foregroundCheckPending {
-        foregroundCheckPending = true
-        queue.asyncAfter(deadline: .now() + .milliseconds(220)) { [weak self] in
-          guard let self else { return }
-          foregroundCheckPending = false
-          checkForeground()
-        }
+  /// At most one kernel read per interval. Output also schedules one
+  /// trailing read, which sees a command the shell forks after echoing it
+  /// or a prompt drawn before the kernel updates the foreground group.
+  private func checkForeground(afterOutput: Bool) {
+    guard let javaScriptRuntime, javaScriptRuntime.listens(to: .foreground),
+      !process.finished, process.pid > 0
+    else { return }
+    let now = DispatchTime.now()
+    let due = lastForegroundCheck.map { now >= $0 + Self.foregroundInterval }
+    if due ?? true {
+      lastForegroundCheck = now
+      let report = ForegroundProcess.report(root: process.pid)
+      if report.key != foregroundKey {
+        foregroundKey = report.key
+        foregroundGeneration &+= 1
+        javaScriptRuntime.emit(
+          .foregroundProcessChanged(
+            generation: foregroundGeneration,
+            foreground: report.foreground,
+            ancestors: report.ancestors
+          ),
+          pane: id.description
+        )
       }
-      return
+      guard afterOutput else { return }
     }
-    lastForegroundCheck = now
-    let current = ForegroundCommand.name(master: master, shell: pid)
-    if current != foreground {
-      foreground = current
-      onEvent?(.foreground(current))
+    guard !foregroundCheckScheduled else { return }
+    foregroundCheckScheduled = true
+    queue.asyncAfter(deadline: .now() + Self.foregroundInterval) {
+      [weak self] in
+      guard let self else { return }
+      foregroundCheckScheduled = false
+      checkForeground(afterOutput: false)
     }
   }
 
@@ -475,21 +591,69 @@ final class PaneRuntime: @unchecked Sendable {
     var epochChanged = false
     for change in journal.changes {
       switch change {
-      case let .report(record): batch.append(.report(Self.status(record)))
-      case let .removed(ids): batch.append(.removed(ids))
+      case let .report(record):
+        batch.append(.report(Self.status(record)))
+        if javaScriptRuntime != nil {
+          emitJavaScriptStatus(.report, record: Self.javaScriptStatus(record))
+        }
+      case let .removed(ids):
+        batch.append(.removed(ids))
+        emitJavaScriptStatus(.removed, ids: ids)
       case .reset:
         if !batch.isEmpty { onEvent?(.status(terminalEpoch, batch)) }
         batch = []
         terminalEpoch = TerminalEpochID()
+        emitJavaScriptStatus(.reset)
         epochChanged = true
       }
     }
     if journal.truncated {
       batch.append(.sync(journal.snapshot.records.map(Self.status)))
+      if javaScriptRuntime != nil {
+        emitJavaScriptStatus(
+          .sync,
+          records: journal.snapshot.records.map(Self.javaScriptStatus)
+        )
+      }
     }
     if !batch.isEmpty || epochChanged {
       onEvent?(.status(terminalEpoch, batch))
     }
+  }
+
+  private func emitJavaScriptStatus(
+    _ type: JavaScriptStatusChange.Kind,
+    record: JavaScriptProgramStatus? = nil,
+    ids: [String]? = nil,
+    records: [JavaScriptProgramStatus]? = nil
+  ) {
+    javaScriptRuntime?
+      .statusChanged(
+        JavaScriptStatusChange(
+          type: type,
+          paneId: id.description,
+          terminalEpoch: terminalEpoch.description,
+          record: record,
+          ids: ids,
+          records: records
+        )
+      )
+  }
+
+  private static func javaScriptStatus(
+    _ record: ProgramStatusRecord
+  ) -> JavaScriptProgramStatus {
+    let value = status(record)
+    return JavaScriptProgramStatus(
+      id: record.id,
+      state: value.state.rawValue,
+      kind: value.kind?.rawValue,
+      progress: record.progress,
+      app: record.app,
+      title: record.title,
+      message: record.message,
+      revision: String(record.revision)
+    )
   }
 
   static func status(_ r: ProgramStatusRecord) -> StatusRecord {
@@ -529,56 +693,158 @@ final class PaneRuntime: @unchecked Sendable {
 
   // MARK: Input
 
+  private func afterGeometry(
+    _ kind: DeferredPaneWorkKind,
+    estimate: Int,
+    run: @escaping () -> Void
+  ) {
+    // An active paste must finish so replies deferred behind it can drain.
+    let continuingPaste: Bool
+    if case let .chunk(id) = kind {
+      continuingPaste = process.pasteID == id
+    } else {
+      continuingPaste = false
+    }
+    guard resizing && !continuingPaste else {
+      run();
+      return
+    }
+    geometryWork.append(
+      DeferredPaneWork(
+        kind: kind,
+        run: run,
+        cancel: { [self] in
+          release(estimate)
+          finishInputOperation()
+        }
+      )
+    )
+  }
+
+  /// These service-wide settings have latest-value semantics and no retained
+  /// command result. Keep one pending value, in order with other pane work.
+  private func afterGeometrySetting(
+    _ kind: DeferredPaneWorkKind,
+    run: @escaping () -> Void
+  ) {
+    guard resizing else {
+      run();
+      return
+    }
+    geometryWork.removeAll { $0.kind == kind }
+    geometryWork.append(DeferredPaneWork(kind: kind, run: run, cancel: run))
+  }
+
+  private func afterGeometryControl(
+    failure: @escaping (MuxError) -> Void,
+    run: @escaping () -> Void
+  ) {
+    guard resizing else {
+      run();
+      return
+    }
+    guard
+      geometryWork.lazy.filter({ $0.kind == .control }).count
+        < Self.inputOperationLimit
+    else {
+      failure(MuxError(.resourceLimit, "pane geometry wait queue is full"))
+      return
+    }
+    geometryWork.append(
+      DeferredPaneWork(
+        kind: .control,
+        run: run,
+        cancel: { [self] in
+          failure(
+            geometryFailure ?? MuxError(.paneExited, "pane operation cancelled")
+          )
+        }
+      )
+    )
+  }
+
+  private func cancelGeometryWork(where matches: (DeferredPaneWorkKind) -> Bool)
+  {
+    let cancelled = geometryWork.filter { matches($0.kind) }
+    geometryWork.removeAll { matches($0.kind) }
+    for input in cancelled { input.cancel() }
+  }
+
   /// Admission happened in the service; `estimate` was reserved.
   func write(_ input: MuxInput, estimate: Int) {
     queue.async { [self] in
-      noteScrollbackActivity()
-      guard master >= 0, exitStatus == nil else {
-        release(estimate)
-        return
-      }
-      var bytes: [UInt8] = []
-      let terminalInputs: [TerminalInput] =
-        switch input {
-        case let .text(s): [.text(s)]
-        case let .key(key, mods):
-          [.key(KeyEvent(Self.key(key), modifiers: Self.modifiers(mods)))]
-        case let .focus(f): [.focus(f)]
-        case let .paste(s): [.paste(s)]
-        case let .mouse(m):
-          // Reported only while the program asks; the frontend's view of
-          // the modes may be a frame behind.
-          state.modes.isDisjoint(with: .mouseTracking)
-            ? [] : [.mouse(Self.mouse(m))]
-        case let .moveCursor(address, column):
-          promptClick(to: address, column: column)
-        case let .clipboardPaste(types):
-          // Nothing when the program turned paste events off meanwhile.
-          state.kittyPasteEvent(available: types).map { [.bytes($0)] } ?? []
-        case let .drag(drag): dragReport(drag).map { [.bytes($0)] } ?? []
+      afterGeometry(.input, estimate: estimate) { [self] in
+        noteScrollbackActivity()
+        guard process.isOpen, process.exitStatus == nil else {
+          release(estimate)
+          finishInputOperation()
+          return
         }
-      // Enhanced keyboard reporting is disabled in this profile.
-      for terminalInput in terminalInputs {
-        InputEncoder.encode(
-          terminalInput,
-          modes: state.modes,
-          keyboardFlags: 0,
-          into: &bytes,
-        )
+        var bytes: [UInt8] = []
+        let terminalInputs: [TerminalInput] =
+          switch input {
+          case let .text(s): [.text(s)]
+          case let .key(key, mods):
+            [.key(KeyEvent(Self.key(key), modifiers: Self.modifiers(mods)))]
+          case let .focus(f): [.focus(f)]
+          case let .paste(s): [.paste(s)]
+          case let .mouse(m):
+            // Reported only while the program asks; the frontend's view of
+            // the modes may be a frame behind.
+            state.modes.isDisjoint(with: .mouseTracking)
+              ? [] : [.mouse(Self.mouse(m))]
+          case let .moveCursor(address, column):
+            promptClick(to: address, column: column)
+          case let .clipboardPaste(types):
+            // Nothing when the program turned paste events off meanwhile.
+            state.kittyPasteEvent(available: types).map { [.bytes($0)] } ?? []
+          case let .drag(drag): dragReport(drag).map { [.bytes($0)] } ?? []
+          }
+        // Enhanced keyboard reporting is disabled in this profile.
+        for terminalInput in terminalInputs {
+          InputEncoder.encode(
+            terminalInput,
+            modes: state.modes,
+            keyboardFlags: 0,
+            into: &bytes,
+          )
+        }
+        switch input {
+        case .focus, .mouse, .drag: break
+        case .moveCursor where bytes.isEmpty: break
+        default:
+          guard state.viewportOffset != 0 else { break }
+          state.scrollViewportToBottom()
+          advanceViewport()
+          noteChange()
+        }
+        var reserved = estimate
+        if let javaScriptRuntime {
+          let filtered = javaScriptRuntime.filter(
+            Data(bytes),
+            stream: .stdin,
+            pane: id.description,
+            maximumBytes: limits.inputBytesPerPane
+          )
+          if filtered.count <= estimate {
+            bytes = Array(filtered)
+          } else if reserveAdditionalBytes(filtered.count - estimate) {
+            reserved = filtered.count
+            bytes = Array(filtered)
+          }
+        }
+        adjust(by: bytes.count - reserved)
+        guard !bytes.isEmpty else {
+          finishInputOperation();
+          return
+        }
+        let encodedCount = bytes.count
+        process.appendInput(bytes) { [self] admitted in
+          adjust(by: admitted - encodedCount)
+          finishInputOperation()
+        }
+        process.flush()
       }
-      switch input {
-      case .focus, .mouse, .drag: break
-      case .moveCursor where bytes.isEmpty: break
-      default:
-        guard state.viewportOffset != 0 else { break }
-        state.scrollViewportToBottom()
-        advanceViewport()
-        noteChange()
-      }
-      adjust(by: bytes.count - estimate)
-      guard !bytes.isEmpty else { return }
-      writer.appendInput(bytes)
-      flush()
     }
   }
 
@@ -636,42 +902,86 @@ final class PaneRuntime: @unchecked Sendable {
 
   func pasteBegin(id: UInt64, estimate: Int) {
     queue.async { [self] in
-      guard master >= 0, !finished, !writer.hasOpenPaste else {
-        release(estimate)
-        return
+      afterGeometry(.begin(id), estimate: estimate) { [self] in
+        guard process.isOpen, !process.finished, !process.hasOpenPaste else {
+          release(estimate)
+          finishInputOperation()
+          return
+        }
+        if state.viewportOffset != 0 {
+          state.scrollViewportToBottom()
+          advanceViewport()
+          noteChange()
+        }
+        process.beginPaste(
+          id: id,
+          bracketed: state.modes.contains(.bracketedPaste),
+          admitted: { [self] bytes in
+            adjust(by: bytes - estimate)
+            finishInputOperation()
+          }
+        )
+        process.flush()
       }
-      if state.viewportOffset != 0 {
-        state.scrollViewportToBottom()
-        advanceViewport()
-        noteChange()
-      }
-      let before = writer.pendingInputBytes
-      writer.beginPaste(
-        id: id,
-        bracketed: state.modes.contains(.bracketedPaste),
-      )
-      adjust(by: (writer.pendingInputBytes - before) - estimate)
-      flush()
     }
   }
 
   func pasteChunk(id: UInt64, text: String, estimate: Int) {
     queue.async { [self] in
-      guard master >= 0, !finished, writer.paste?.id == id else {
-        release(estimate)
-        return
+      afterGeometry(.chunk(id), estimate: estimate) { [self] in
+        guard process.isOpen, !process.finished, process.pasteID == id else {
+          release(estimate)
+          finishInputOperation()
+          return
+        }
+        var payload = text
+        var reserved = estimate
+        if let javaScriptRuntime {
+          let filtered = javaScriptRuntime.filter(
+            Data(text.utf8),
+            stream: .stdin,
+            pane: self.id.description,
+            maximumBytes: limits.inputBytesPerPane / 2
+          )
+          let estimateAfterFilter =
+            filtered.count + filtered.reduce(0) { $0 + ($1 == 0x0A ? 1 : 0) }
+          if estimateAfterFilter <= estimate {
+            payload = String(decoding: filtered, as: UTF8.self)
+          } else if reserveAdditionalBytes(estimateAfterFilter - reserved) {
+            reserved = estimateAfterFilter
+            payload = String(decoding: filtered, as: UTF8.self)
+          }
+        }
+        let reservedBytes = reserved
+        process.appendPaste(id: id, text: payload) { [self] bytes in
+          adjust(by: bytes - reservedBytes)
+          finishInputOperation()
+        }
+        process.flush()
       }
-      let before = writer.pendingInputBytes
-      writer.appendPaste(id: id, text: text)
-      adjust(by: (writer.pendingInputBytes - before) - estimate)
-      flush()
     }
   }
 
   func pasteEnd(id: UInt64) {
     queue.async { [self] in
-      writer.endPaste(id: id)
-      flush()
+      if resizing && process.pasteID != id {
+        guard geometryWork.contains(where: { $0.kind == .begin(id) }),
+          !geometryWork.contains(where: { $0.kind == .end(id) })
+        else { return }
+        geometryWork.append(
+          DeferredPaneWork(
+            kind: .end(id),
+            run: { [self] in
+              process.endPaste(id: id)
+              process.flush()
+            },
+            cancel: {}
+          )
+        )
+        return
+      }
+      process.endPaste(id: id)
+      process.flush()
     }
   }
 
@@ -683,16 +993,21 @@ final class PaneRuntime: @unchecked Sendable {
   func pasteCancel(
     id: UInt64,
     discardDeferredInput: Bool = false,
+    failure: @escaping @Sendable (MuxError) -> Void,
     completion: @escaping @Sendable (PasteState) -> Void,
   ) {
     queue.async { [self] in
-      let (discarded, wrote) = writer.cancelPaste(
-        id: id,
-        discardDeferredInput: discardDeferredInput
-      )
-      release(discarded)
-      flush()
-      completion(wrote ? .partial : .aborted)
+      cancelGeometryWork {
+        $0 == .begin(id) || $0 == .chunk(id) || $0 == .end(id)
+          || (discardDeferredInput && $0 == .input)
+      }
+      process.cancelPaste(id: id, discardDeferredInput: discardDeferredInput) {
+        result in
+        switch result {
+        case let .success(wrote): completion(wrote ? .partial : .aborted)
+        case let .failure(error): failure(error)
+        }
+      }
     }
   }
 
@@ -700,66 +1015,14 @@ final class PaneRuntime: @unchecked Sendable {
   /// writer's bytes when a lease is released.
   func discardUnwrittenInput() {
     queue.async { [self] in
-      release(writer.discardUnwrittenInput())
-      flush()
-    }
-  }
-
-  private func flush() {
-    guard master >= 0 else { return }
-    let fd = master
-    guard
-      let released = writer.flush({ buffer in
-        var offset = 0
-        while offset < buffer.count {
-          let n = Darwin.write(
-            fd,
-            buffer.baseAddress! + offset,
-            buffer.count - offset,
-          )
-          if n > 0 {
-            observeIO(
-              .written,
-              bytes: UnsafeRawBufferPointer(
-                rebasing: buffer[offset ..< offset + n]
-              )
-            )
-            offset += n
-            continue
-          }
-          if n < 0, errno == EINTR { continue }
-          if n < 0, errno == EAGAIN {
-            observeIO(
-              .writeBlocked,
-              bytes: UnsafeRawBufferPointer(rebasing: buffer[offset...]),
-              error: errno
-            )
-            break
-          }
-          observeIO(
-            .writeFailed,
-            bytes: UnsafeRawBufferPointer(rebasing: buffer[offset...]),
-            error: n < 0 ? errno : nil
-          )
-          return offset > 0 ? offset : nil
+      cancelGeometryWork {
+        switch $0 {
+        case .input, .begin, .chunk, .end: true
+        case .control, .theme, .viewportReset: false
         }
-        return offset
-      })
-    else {
-      release(writer.discardAll())
-      setWriteActive(false)
-      if !readSourceActive { readAvailable() }
-      return
+      }
+      process.cancelInput()
     }
-    release(released)
-    setWriteActive(!writer.isEmpty)
-    if !readSourceActive { readAvailable() }
-  }
-
-  private func setWriteActive(_ active: Bool) {
-    guard let writeSource, active != writeActive else { return }
-    writeActive = active
-    if active { writeSource.resume() } else { writeSource.suspend() }
   }
 
   private func observeIO(
@@ -786,10 +1049,34 @@ final class PaneRuntime: @unchecked Sendable {
     outstandingInput.withLock { $0 = max(0, $0 + delta) }
   }
 
-  /// Reserves credit for admission; false when over the per-pane budget.
+  /// Reserve one operation and its estimated bytes before scheduling work.
+  /// The operation slot survives PTY writes until its admission response.
+  /// Every admitted input operation has its guardian admission result.
+  var inputSettled: Bool { inputOperations.withLock { $0 == 0 } }
+
   func reserve(_ bytes: Int) -> Bool {
+    inputOperations.withLock { count in
+      guard count < Self.inputOperationLimit, reserveAdditionalBytes(bytes)
+      else { return false }
+      count += 1
+      return true
+    }
+  }
+
+  private func finishInputOperation() {
+    inputOperations.withLock { count in
+      precondition(count > 0, "input admission completed more than once")
+      count -= 1
+    }
+  }
+
+  /// A filter can enlarge an already admitted operation without reserving
+  /// another operation slot. Counts are checked before addition.
+  private func reserveAdditionalBytes(_ bytes: Int) -> Bool {
     outstandingInput.withLock { value in
-      guard value + bytes <= limits.inputBytesPerPane else { return false }
+      guard bytes >= 0, bytes <= limits.inputBytesPerPane - value else {
+        return false
+      }
       value += bytes
       return true
     }
@@ -797,7 +1084,7 @@ final class PaneRuntime: @unchecked Sendable {
 
   // MARK: Geometry, history and search
 
-  /// Engine resize, then `TIOCSWINSZ`, in this pane's order. Returns the
+  /// Commit engine geometry only after the ordered process resize succeeds. Returns the
   /// geometry generation frames carry once this request is applied.
   @discardableResult
   func resize(columns: Int, rows: Int) -> UInt64 {
@@ -825,33 +1112,57 @@ final class PaneRuntime: @unchecked Sendable {
         requests.pending = nil
         return request
       }
-      applyResize(request)
-      let again = resizes.withLock { requests in
-        if requests.pending != nil { return true }
-        requests.scheduled = false
-        return false
+      resizing = true
+      applyResize(request) { [self] in
+        resizing = false
+        if geometryFailure != nil { cancelGeometryWork { _ in true } }
+        let inputs = geometryWork
+        geometryWork.removeAll(keepingCapacity: true)
+        for input in inputs { input.run() }
+        let again = resizes.withLock { requests in
+          if requests.pending != nil { return true }
+          requests.scheduled = false
+          return false
+        }
+        if again { scheduleResize() }
       }
-      if again { scheduleResize() }
     }
   }
 
-  private func applyResize(_ request: ResizeRequest) {
-    geometryGeneration = request.generation
+  private func applyResize(
+    _ request: ResizeRequest,
+    completion: @escaping @Sendable () -> Void
+  ) {
     guard request.columns != state.columns || request.rows != state.rows else {
+      geometryFailure = nil
+      geometryGeneration = request.generation
       noteChange()
+      completion()
       return
     }
-    state.resize(columns: request.columns, rows: request.rows)
-    if master >= 0 {
-      var size = winsize(
-        ws_row: UInt16(clamping: state.rows),
-        ws_col: UInt16(clamping: state.columns),
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-      )
-      _ = ioctl(master, TIOCSWINSZ, &size)
+    let commit: @Sendable (Result<Void, MuxError>) -> Void = { [self] result in
+      switch result {
+      case .success:
+        geometryFailure = nil
+        geometryGeneration = request.generation
+        state.resize(columns: request.columns, rows: request.rows)
+        publish()
+      case let .failure(error):
+        geometryFailure = error
+        noteChange()
+      }
+      completion()
     }
-    publish()
+    if !process.isOpen || process.finished {
+      // Retained exit screens have geometry but no live PTY to resize.
+      commit(.success(()))
+    } else {
+      process.resize(
+        columns: request.columns,
+        rows: request.rows,
+        completion: commit
+      )
+    }
   }
 
   func scroll(
@@ -859,34 +1170,38 @@ final class PaneRuntime: @unchecked Sendable {
     completion: @escaping @Sendable (MuxError?) -> Void,
   ) {
     queue.async { [self] in
-      switch request {
-      case let .lines(n): state.scrollViewport(by: n)
-      case let .pages(n):
-        // The engine clamps to history; only the product can overflow.
-        let (lines, overflow) = n.multipliedReportingOverflow(
-          by: max(1, state.rows - 1),
-        )
-        state.scrollViewport(by: overflow ? (n < 0 ? .min : .max) : lines)
-      case .bottom: state.scrollViewportToBottom()
-      case .oldest: state.scrollViewport(by: .max)
-      case let .prompt(n):
-        guard state.jumpToPrompt(n) else {
-          completion(MuxError(.notFound, "no such prompt"))
-          return
+      afterGeometryControl(failure: { completion($0) }) { [self] in
+        switch request {
+        case let .lines(n): state.scrollViewport(by: n)
+        case let .pages(n):
+          // The engine clamps to history; only the product can overflow.
+          let (lines, overflow) = n.multipliedReportingOverflow(
+            by: max(1, state.rows - 1),
+          )
+          state.scrollViewport(by: overflow ? (n < 0 ? .min : .max) : lines)
+        case .bottom: state.scrollViewportToBottom()
+        case .oldest: state.scrollViewport(by: .max)
+        case let .prompt(n):
+          guard state.jumpToPrompt(n) else {
+            completion(MuxError(.notFound, "no such prompt"))
+            return
+          }
+        case let .top(address):
+          guard address.generation == state.addressingGeneration,
+            address.alternateScreen == state.isAlternateScreen,
+            state.contains(absoluteRow: address.row)
+          else {
+            completion(
+              MuxError(.historyUnavailable, "history address is stale")
+            )
+            return
+          }
+          state.scrollViewport(by: -state.viewportRow(absoluteRow: address.row))
         }
-      case let .top(address):
-        guard address.generation == state.addressingGeneration,
-          address.alternateScreen == state.isAlternateScreen,
-          state.contains(absoluteRow: address.row)
-        else {
-          completion(MuxError(.historyUnavailable, "history address is stale"))
-          return
-        }
-        state.scrollViewport(by: -state.viewportRow(absoluteRow: address.row))
+        advanceViewport()
+        noteChange()
+        completion(nil)
       }
-      advanceViewport()
-      noteChange()
-      completion(nil)
     }
   }
 
@@ -899,19 +1214,21 @@ final class PaneRuntime: @unchecked Sendable {
     completion: @escaping @Sendable (MuxError?) -> Void,
   ) {
     queue.async { [self] in
-      guard
-        place(
-          followTail: followTail,
-          historyGeneration: historyGeneration,
-          anchorRow: anchorRow,
-        )
-      else {
-        completion(MuxError(.historyUnavailable, "history anchor is stale"))
-        return
+      afterGeometryControl(failure: { completion($0) }) { [self] in
+        guard
+          place(
+            followTail: followTail,
+            historyGeneration: historyGeneration,
+            anchorRow: anchorRow,
+          )
+        else {
+          completion(MuxError(.historyUnavailable, "history anchor is stale"))
+          return
+        }
+        advanceViewport()
+        noteChange()
+        completion(nil)
       }
-      advanceViewport()
-      noteChange()
-      completion(nil)
     }
   }
 
@@ -920,32 +1237,35 @@ final class PaneRuntime: @unchecked Sendable {
   func search(
     _ query: String?,
     step forward: Bool?,
+    failure: @escaping @Sendable (MuxError) -> Void,
     completion: @escaping @Sendable (SearchResult) -> Void,
   ) {
     queue.async { [self] in
-      let changes: Bool
-      if let query {
-        state.search(query)
-        state.selectSearchMatch(forward: false)
-        changes = true
-      } else if let forward {
-        // Nothing to step to: the window stays. (Matches are current:
-        // the parser refreshes them after every read.)
-        changes = state.selectSearchMatch(forward: forward) != nil
-      } else {
-        changes = state.isSearching
-        state.endSearch()
+      afterGeometryControl(failure: { failure($0) }) { [self] in
+        let changes: Bool
+        if let query {
+          state.search(query)
+          state.selectSearchMatch(forward: false)
+          changes = true
+        } else if let forward {
+          // Nothing to step to: the window stays. (Matches are current:
+          // the parser refreshes them after every read.)
+          changes = state.selectSearchMatch(forward: forward) != nil
+        } else {
+          changes = state.isSearching
+          state.endSearch()
+        }
+        if changes {
+          advanceViewport()
+          noteChange()
+        }
+        completion(
+          SearchResult(
+            matchCount: state.searchMatches.count,
+            selected: state.searchSelected,
+          ),
+        )
       }
-      if changes {
-        advanceViewport()
-        noteChange()
-      }
-      completion(
-        SearchResult(
-          matchCount: state.searchMatches.count,
-          selected: state.searchSelected,
-        ),
-      )
     }
   }
 
@@ -953,12 +1273,18 @@ final class PaneRuntime: @unchecked Sendable {
 
   /// Clears the screen, keeping the cursor's line, as the direct view's
   /// Clear Screen does.
-  func clearScreen() {
+  func clearScreen(completion: @escaping @Sendable (MuxError?) -> Void) {
     queue.async { [self] in
-      guard !finished else { return }
-      state.clearScreenKeepingCursorLine()
-      advanceViewport()
-      noteChange()
+      afterGeometryControl(failure: { completion($0) }) { [self] in
+        guard !process.finished else {
+          completion(MuxError(.paneExited, "pane exited"));
+          return
+        }
+        state.clearScreenKeepingCursorLine()
+        advanceViewport()
+        noteChange()
+        completion(nil)
+      }
     }
   }
 
@@ -983,7 +1309,7 @@ final class PaneRuntime: @unchecked Sendable {
       return state.dragDrop(
         position(p),
         items:
-          items.filter { Self.replyFits([$0], reserve: writer.replyReserve) }
+          items.filter { Self.replyFits([$0], reserve: process.replyReserve) }
           .map { KittyDragAndDrop.Item(mime: $0.mime, data: Array($0.data)) }
       )
     case .leave: return state.dragLeave()
@@ -995,11 +1321,11 @@ final class PaneRuntime: @unchecked Sendable {
   func completeClipboardRead(_ token: UInt64, _ result: MuxClipboardReadResult)
   {
     queue.async { [self] in
-      guard !finished else { return }
+      guard !process.finished else { return }
       let answer: KittyClipboard.ReadResult =
         switch result {
         case let .success(available, contents, remember):
-          Self.replyFits(contents, reserve: writer.replyReserve)
+          Self.replyFits(contents, reserve: process.replyReserve)
             ? .success(
               available: available,
               contents: contents.map {
@@ -1022,7 +1348,7 @@ final class PaneRuntime: @unchecked Sendable {
     _ result: MuxClipboardWriteResult
   ) {
     queue.async { [self] in
-      guard !finished else { return }
+      guard !process.finished else { return }
       let answer: KittyClipboard.WriteResult =
         switch result {
         case let .success(remember): .success(remember: remember)
@@ -1034,6 +1360,12 @@ final class PaneRuntime: @unchecked Sendable {
         }
       state.completeKittyClipboardWrite(token, with: answer)
       _ = enqueueReplies()
+      let text = clipboardRequests.clipboardTexts.withLock {
+        $0.removeValue(forKey: token)
+      }
+      if case .success = result, let text {
+        javaScriptRuntime?.emit(.clipboardWritten(text), pane: id.description)
+      }
     }
   }
 
@@ -1046,14 +1378,20 @@ final class PaneRuntime: @unchecked Sendable {
   }
 
   /// Full reset (RIS) of the emulator; the process keeps running.
-  func resetTerminal() {
+  func resetTerminal(completion: @escaping @Sendable (MuxError?) -> Void) {
     queue.async { [self] in
-      guard !finished else { return }
-      parser = Parser()
-      state.reset()
-      publishStatus()
-      advanceViewport()
-      noteChange()
+      afterGeometryControl(failure: { completion($0) }) { [self] in
+        guard !process.finished else {
+          completion(MuxError(.paneExited, "pane exited"));
+          return
+        }
+        parser = Parser()
+        state.reset()
+        publishStatus()
+        advanceViewport()
+        noteChange()
+        completion(nil)
+      }
     }
   }
 
@@ -1077,21 +1415,24 @@ final class PaneRuntime: @unchecked Sendable {
     at address: HistoryAddress,
     column: Int,
     detectURLs: Bool,
+    failure: @escaping @Sendable (MuxError) -> Void,
     completion: @escaping @Sendable (MuxLink?) -> Void,
   ) {
     queue.async { [self] in
-      guard let p = point(address, column: column),
-        let link = state.link(at: p, detectURLs: detectURLs)
-      else { return completion(nil) }
-      completion(
-        MuxLink(
-          url: link.url,
-          start: self.address(link.range.start.row),
-          startColumn: link.range.start.column,
-          end: self.address(link.range.end.row),
-          endColumn: link.range.end.column
+      afterGeometryControl(failure: { failure($0) }) { [self] in
+        guard let p = point(address, column: column),
+          let link = state.link(at: p, detectURLs: detectURLs)
+        else { return completion(nil) }
+        completion(
+          MuxLink(
+            url: link.url,
+            start: self.address(link.range.start.row),
+            startColumn: link.range.start.column,
+            end: self.address(link.range.end.row),
+            endColumn: link.range.end.column
+          )
         )
-      )
+      }
     }
   }
 
@@ -1099,59 +1440,83 @@ final class PaneRuntime: @unchecked Sendable {
   /// output; scrolled into view as the direct view's selection is.
   func commandOutput(
     at address: HistoryAddress?,
+    failure: @escaping @Sendable (MuxError) -> Void,
     completion: @escaping @Sendable (CommandOutput?) -> Void,
   ) {
     queue.async { [self] in
-      let click = address.flatMap { point($0, column: 0) }
-      let prompts = state.promptRows()
-      var output = state.commandOutputRange(
-        at: click ?? TerminalPoint(row: prompts.last ?? 0, column: 0)
-      )
-      if output == nil, click == nil {
-        // Fresh prompts and commands without output are skipped.
-        for boundary in prompts.reversed() {
-          output = state.commandOutputRange(
-            at: TerminalPoint(row: boundary - 1, column: 0)
-          )
-          if output != nil { break }
-        }
-      }
-      guard let range = output else { return completion(nil) }
-      let before = state.viewportOffset
-      state.scrollToShow(row: range.start.row)
-      if state.viewportOffset != before {
-        advanceViewport()
-        noteChange()
-      }
-      completion(
-        CommandOutput(
-          start: self.address(range.start.row),
-          end: self.address(range.end.row),
-          text: state.text(from: range.start, to: range.end)
+      afterGeometryControl(failure: { failure($0) }) { [self] in
+        let click = address.flatMap { point($0, column: 0) }
+        let prompts = state.promptRows()
+        var output = state.commandOutputRange(
+          at: click ?? TerminalPoint(row: prompts.last ?? 0, column: 0)
         )
-      )
+        if output == nil, click == nil {
+          // Fresh prompts and commands without output are skipped.
+          for boundary in prompts.reversed() {
+            output = state.commandOutputRange(
+              at: TerminalPoint(row: boundary - 1, column: 0)
+            )
+            if output != nil { break }
+          }
+        }
+        guard let range = output else { return completion(nil) }
+        let before = state.viewportOffset
+        state.scrollToShow(row: range.start.row)
+        if state.viewportOffset != before {
+          advanceViewport()
+          noteChange()
+        }
+        completion(
+          CommandOutput(
+            start: self.address(range.start.row),
+            end: self.address(range.end.row),
+            text: state.text(from: range.start, to: range.end)
+          )
+        )
+      }
     }
   }
 
   /// Frontend theme: default colours and scheme, as a theme change does.
+  /// Text of a client-local selection (spec.multiplexer.md §4, "Live
+  /// selection across pages"). Fails rather than copying text the client
+  /// did not see: a changed generation or evicted row is
+  /// `historyUnavailable`, a changed screen row `selectionChanged`.
+  func copySelection(
+    _ request: CopySelectionRequest,
+    attachment: AttachmentID,
+    completion: @escaping @Sendable (Result<String, MuxError>) -> Void,
+  ) {
+    queue.async { [self] in
+      let tracker = rowTrackers[attachment]
+      completion(
+        SelectionCopy.text(request, in: state) { identity in
+          tracker?.matches(identity, in: state) ?? false
+        }
+      )
+    }
+  }
+
   func setTheme(_ theme: MuxTheme) {
     queue.async { [self] in
-      var colors = InlineArray<256, UInt32>(repeating: 0)
-      for i in 0 ..< 256 { colors[i] = theme.palette.colors[i] }
-      let p = theme.palette
-      state.setDefaultPalette(
-        Palette(
-          colors: colors,
-          foreground: p.foreground,
-          background: p.background,
-          cursor: p.cursor,
-          cursorText: p.cursorText,
-          selectionForeground: p.selectionForeground,
-          selectionBackground: p.selectionBackground,
-        ),
-      )
-      state.setColorScheme(theme.dark ? .dark : .light)
-      publish()
+      afterGeometrySetting(.theme) { [self] in
+        var colors = InlineArray<256, UInt32>(repeating: 0)
+        for i in 0 ..< 256 { colors[i] = theme.palette.colors[i] }
+        let p = theme.palette
+        state.setDefaultPalette(
+          Palette(
+            colors: colors,
+            foreground: p.foreground,
+            background: p.background,
+            cursor: p.cursor,
+            cursorText: p.cursorText,
+            selectionForeground: p.selectionForeground,
+            selectionBackground: p.selectionBackground,
+          ),
+        )
+        state.setColorScheme(theme.dark ? .dark : .light)
+        publish()
+      }
     }
   }
 
@@ -1162,10 +1527,12 @@ final class PaneRuntime: @unchecked Sendable {
   /// Returns the viewport to live output and clears search (detach).
   func resetViewport() {
     queue.async { [self] in
-      state.endSearch()
-      state.scrollViewportToBottom()
-      advanceViewport()
-      noteChange()
+      afterGeometrySetting(.viewportReset) { [self] in
+        state.endSearch()
+        state.scrollViewportToBottom()
+        advanceViewport()
+        noteChange()
+      }
     }
   }
 
@@ -1177,6 +1544,8 @@ final class PaneRuntime: @unchecked Sendable {
     var geometry: UInt64
     /// The viewport (a viewer's window) the frame shows.
     var viewportRevision: UInt64
+    /// What the client holds once it acknowledges this frame.
+    var baseline: FrameBaseline?
 
     var sent: SentFrame {
       SentFrame(
@@ -1184,8 +1553,15 @@ final class PaneRuntime: @unchecked Sendable {
         bytes: data.count,
         geometry: geometry,
         viewport: viewportRevision,
+        baseline: baseline,
       )
     }
+  }
+
+  /// How one client receives frames (negotiated at hello).
+  struct FrameEncoding: Sendable {
+    var binary = false
+    var deltas = false
   }
 
   /// Result of applying a viewer's anchor without touching the engine
@@ -1207,71 +1583,110 @@ final class PaneRuntime: @unchecked Sendable {
     attachment: AttachmentID,
     layoutRevision: UInt64,
     viewport: ViewerViewport? = nil,
+    encoding: FrameEncoding = FrameEncoding(),
+    baseline: FrameBaseline? = nil,
     completion: @escaping @Sendable (Result<CapturedFrame, MuxError>) -> Void,
   ) {
     queue.async { [self] in
-      // The controller's capture uses the engine state as it is; only a
-      // viewer window needs saving and restoring around the capture.
-      var saved: (offset: Int, search: TerminalState.TerminalSearchSnapshot)?
-      if let viewport {
-        saved = (state.viewportOffset, state.snapshotSearch())
-        if let failure = apply(viewport) {
-          restore(offset: saved!.offset, search: saved!.search)
-          completion(.failure(failure))
+      afterGeometryControl(failure: { completion(.failure($0)) }) { [self] in
+        if let geometryFailure = processFailure ?? geometryFailure {
+          completion(.failure(geometryFailure))
           return
         }
-      } else {
-        state.refreshSearchIfNeeded()
-      }
-      var screen = state.captureOwnedScreen()
-      let selected = state.searchSelected
-      let geometry = geometryGeneration
-      // A viewer capture does not share the controller's revision: each
-      // exported frame for this pane stays strictly newer than the last.
-      if viewport != nil { revision &+= 1 }
-      let shownRevision =
-        viewport?.revision ?? currentViewport.load(ordering: .relaxed)
-      if let saved { restore(offset: saved.offset, search: saved.search) }
-      rearmScrollbackMaintenanceIfNeeded()
-      if let viewport {
-        fit(
-          &screen,
-          columns: viewport.columns ?? screen.columns,
-          rows: viewport.rows ?? screen.rows,
+        // The controller's capture uses the engine state as it is; only a
+        // viewer window needs saving and restoring around the capture.
+        var saved: (offset: Int, search: TerminalState.TerminalSearchSnapshot)?
+        if let viewport {
+          saved = (state.viewportOffset, state.snapshotSearch())
+          if let failure = apply(viewport) {
+            restore(offset: saved!.offset, search: saved!.search)
+            completion(.failure(failure))
+            return
+          }
+        } else {
+          state.refreshSearchIfNeeded()
+        }
+        var screen = state.captureOwnedScreen()
+        let selected = state.searchSelected
+        let geometry = geometryGeneration
+        // A viewer capture does not share the controller's revision: each
+        // exported frame for this pane stays strictly newer than the last.
+        if viewport != nil { revision &+= 1 }
+        let shownRevision =
+          viewport?.revision ?? currentViewport.load(ordering: .relaxed)
+        if let saved { restore(offset: saved.offset, search: saved.search) }
+        rearmScrollbackMaintenanceIfNeeded()
+        if let viewport {
+          screen = screen.cropped(
+            columns: viewport.columns ?? screen.columns,
+            rows: viewport.rows ?? screen.rows
+          )
+        }
+        let identity = FrameIdentity(
+          server: server,
+          attachment: attachment,
+          pane: id,
+          revision: revision,
+          layoutRevision: layoutRevision,
+          geometryGeneration: geometry,
+          viewportRevision: shownRevision,
         )
-      }
-      let identity = FrameIdentity(
-        server: server,
-        attachment: attachment,
-        pane: id,
-        revision: revision,
-        layoutRevision: layoutRevision,
-        geometryGeneration: geometry,
-        viewportRevision: shownRevision,
-      )
-      do {
-        var frame = try FrameExporter.frame(
-          from: screen,
-          identity: identity,
-          limits: limits,
-        )
-        frame.search?.selected = selected
-        let data = try SMXCodec.encode(
-          ServerMessage.event(.frame(frame)),
-          limit: limits.maxFrameBytes,
-        )
-        completion(
-          .success(
-            CapturedFrame(
-              data: data,
-              revision: revision,
-              geometry: geometry,
-              viewportRevision: shownRevision,
+        do {
+          var frame = try FrameExporter.frame(
+            from: screen,
+            identity: identity,
+            limits: limits,
+          )
+          frame.search?.selected = selected
+          // Detach forgets a tracker; this bound only evicts the attachment
+          // least recently captured, never every live one.
+          rowTrackerOrder.removeAll { $0 == attachment }
+          rowTrackerOrder.append(attachment)
+          while rowTrackerOrder.count > Self.maxRowTrackers {
+            rowTrackers.removeValue(forKey: rowTrackerOrder.removeFirst())
+          }
+          frame.rowVersions = rowTrackers[
+            attachment,
+            default: RowVersionTracker()
+          ]
+          .stamp(screen)
+          let delta =
+            encoding.deltas
+            ? baseline.flatMap {
+              FrameDeltaBuilder.delta(from: frame, base: $0)
+            } : nil
+          let data: Data
+          switch (encoding.binary, delta) {
+          case (true, let delta?): data = SMXB.encode(delta)
+          case (true, nil): data = SMXB.encode(frame)
+          case (false, let delta?):
+            data = try SMXCodec.encode(
+              ServerMessage.event(.frameDelta(delta)),
+              limit: limits.maxFrameBytes,
+            )
+          case (false, nil):
+            data = try SMXCodec.encode(
+              ServerMessage.event(.frame(frame)),
+              limit: limits.maxFrameBytes,
+            )
+          }
+          guard data.count <= limits.maxFrameBytes else {
+            throw MuxError(.resourceLimit, "frame of \(data.count) bytes")
+          }
+          completion(
+            .success(
+              CapturedFrame(
+                data: data,
+                revision: revision,
+                geometry: geometry,
+                viewportRevision: shownRevision,
+                baseline: FrameBaseline(frame),
+              )
             )
           )
-        )
-      } catch let error as MuxError { completion(.failure(error)) } catch {
-        completion(.failure(MuxError(.resourceLimit, "\(error)")))
+        } catch let error as MuxError { completion(.failure(error)) } catch {
+          completion(.failure(MuxError(.resourceLimit, "\(error)")))
+        }
       }
     }
   }
@@ -1290,74 +1705,76 @@ final class PaneRuntime: @unchecked Sendable {
     completion: @escaping @Sendable (Result<ResolvedViewport, MuxError>) -> Void,
   ) {
     queue.async { [self] in
-      let savedOffset = state.viewportOffset
-      let savedSearch = state.snapshotSearch()
-      defer { restore(offset: savedOffset, search: savedSearch) }
-      let anchored = place(
-        followTail: request.followTail,
-        historyGeneration: request.historyGeneration,
-        anchorRow: request.anchorRow,
-      )
-      let searching = searchQuery != nil || searchStep != nil
-      // A stale anchor leaves the controller's viewport in place; a search
-      // or scroll must start from the tail instead.
-      if !anchored, searching || scroll != nil {
-        state.scrollViewportToBottom()
-      }
-      if let searchStep {
-        if let searchQuery, !searchQuery.isEmpty { viewerSearch(searchQuery) }
-        // `search` clears the selection. Continue from the viewer's match
-        // so a step does not jump back to the last occurrence.
-        reselect(searchSelected)
-        _ = state.selectSearchMatch(forward: searchStep)
-      } else if let searchQuery {
-        viewerSearch(searchQuery)
-        _ = state.selectSearchMatch(forward: false)
-      } else if let scroll {
-        switch scroll {
-        case let .lines(n): state.scrollViewport(by: n)
-        case let .pages(n):
-          // A page is the viewer's display height, not the PTY's.
-          let page = max(1, (request.rows ?? state.rows) - 1)
-          let (lines, overflow) = n.multipliedReportingOverflow(by: page)
-          state.scrollViewport(by: overflow ? (n < 0 ? .min : .max) : lines)
-        case .bottom: state.scrollViewportToBottom()
-        case .oldest: state.scrollViewport(by: .max)
-        case let .prompt(n): state.jumpToPrompt(n)
-        case .top: break
-        }
-      } else if !anchored {
-        completion(
-          .failure(MuxError(.historyUnavailable, "history anchor is stale"))
+      afterGeometryControl(failure: { completion(.failure($0)) }) { [self] in
+        let savedOffset = state.viewportOffset
+        let savedSearch = state.snapshotSearch()
+        defer { restore(offset: savedOffset, search: savedSearch) }
+        let anchored = place(
+          followTail: request.followTail,
+          historyGeneration: request.historyGeneration,
+          anchorRow: request.anchorRow,
         )
-        return
-      }
-      let searchResult: SearchResult? =
-        searching
-        ? SearchResult(
-          matchCount: state.searchMatches.count,
-          selected: state.searchSelected,
-        ) : nil
-      let follow =
-        request.followTail && !searching && scroll == nil
-        ? true : state.viewportOffset == 0
-      completion(
-        .success(
-          ResolvedViewport(
-            followTail: follow,
-            historyGeneration: state.addressingGeneration,
-            anchorRow: state.absoluteRow(viewportRow: 0),
-            search: searchResult,
-            selectedMatch: state.searchSelected.map {
-              SelectedMatch(
-                range: state.searchMatches[$0],
-                index: $0,
-                historyGeneration: state.addressingGeneration,
-              )
-            },
+        let searching = searchQuery != nil || searchStep != nil
+        // A stale anchor leaves the controller's viewport in place; a search
+        // or scroll must start from the tail instead.
+        if !anchored, searching || scroll != nil {
+          state.scrollViewportToBottom()
+        }
+        if let searchStep {
+          if let searchQuery, !searchQuery.isEmpty { viewerSearch(searchQuery) }
+          // `search` clears the selection. Continue from the viewer's match
+          // so a step does not jump back to the last occurrence.
+          reselect(searchSelected)
+          _ = state.selectSearchMatch(forward: searchStep)
+        } else if let searchQuery {
+          viewerSearch(searchQuery)
+          _ = state.selectSearchMatch(forward: false)
+        } else if let scroll {
+          switch scroll {
+          case let .lines(n): state.scrollViewport(by: n)
+          case let .pages(n):
+            // A page is the viewer's display height, not the PTY's.
+            let page = max(1, (request.rows ?? state.rows) - 1)
+            let (lines, overflow) = n.multipliedReportingOverflow(by: page)
+            state.scrollViewport(by: overflow ? (n < 0 ? .min : .max) : lines)
+          case .bottom: state.scrollViewportToBottom()
+          case .oldest: state.scrollViewport(by: .max)
+          case let .prompt(n): state.jumpToPrompt(n)
+          case .top: break
+          }
+        } else if !anchored {
+          completion(
+            .failure(MuxError(.historyUnavailable, "history anchor is stale"))
+          )
+          return
+        }
+        let searchResult: SearchResult? =
+          searching
+          ? SearchResult(
+            matchCount: state.searchMatches.count,
+            selected: state.searchSelected,
+          ) : nil
+        let follow =
+          request.followTail && !searching && scroll == nil
+          ? true : state.viewportOffset == 0
+        completion(
+          .success(
+            ResolvedViewport(
+              followTail: follow,
+              historyGeneration: state.addressingGeneration,
+              anchorRow: state.absoluteRow(viewportRow: 0),
+              search: searchResult,
+              selectedMatch: state.searchSelected.map {
+                SelectedMatch(
+                  range: state.searchMatches[$0],
+                  index: $0,
+                  historyGeneration: state.addressingGeneration,
+                )
+              },
+            )
           )
         )
-      )
+      }
     }
   }
 
@@ -1438,35 +1855,66 @@ final class PaneRuntime: @unchecked Sendable {
     if delta != 0 { state.scrollViewport(by: delta) }
   }
 
-  /// Crops or pads a captured grid. Does not change addressing of the
-  /// rows that remain; the PTY size is the caller's responsibility.
-  private func fit(_ screen: inout OwnedScreen, columns: Int, rows: Int) {
-    guard columns > 0, rows > 0,
-      columns != screen.columns || rows != screen.rows
-    else { return }
-    var cells: [Cell] = []
-    cells.reserveCapacity(columns * rows)
-    var wrapped: [Bool] = []
-    wrapped.reserveCapacity(rows)
-    for y in 0 ..< rows {
-      let source = y < screen.rows
-      wrapped.append(
-        source && y < screen.wrapped.count ? screen.wrapped[y] : false
-      )
-      for x in 0 ..< columns {
-        if source, x < screen.columns {
-          cells.append(screen.cells[y * screen.columns + x])
-        } else {
-          cells.append(.blank)
-        }
+  /// The newest main-screen rows for a saved layout (spec.durability.md
+  /// §12.2.5, C1), or nil when unchanged since `revision`. Refused while the
+  /// alternate screen is shown. The controller's viewport and search are
+  /// restored before returning; nothing reaches the PTY.
+  func exportSavedOutput(
+    ifChangedSince revision: UInt64?,
+    completion:
+      @escaping @Sendable (Result<(UInt64, SavedOutput?), MuxError>) -> Void
+  ) {
+    queue.async { [self] in
+      let current = changeCount
+      guard current != revision else {
+        return completion(.success((current, nil)))
       }
+      guard !state.isAlternateScreen else {
+        return completion(
+          .failure(MuxError(.quiescing, "the alternate screen is shown"))
+        )
+      }
+      let saved = (state.viewportOffset, state.snapshotSearch())
+      defer { restore(offset: saved.0, search: saved.1) }
+      let rows = state.rows
+      let history = state.scrollbackCount
+      let wanted = min(history + rows, SavedOutput.maxRows)
+      // Absolute line of the first row kept; line `history` is the top of
+      // the live grid.
+      let first = history + rows - wanted
+      var builder = SavedOutputBuilder()
+      var next = first
+      let identity = FrameIdentity(
+        server: ServerInstanceID(),
+        attachment: AttachmentID(),
+        pane: id,
+        revision: 0,
+        layoutRevision: 0,
+        geometryGeneration: 0,
+        viewportRevision: 0
+      )
+      while next < history + rows {
+        // The viewport whose top row is `next`, clamped to the history.
+        let offset = max(0, history - next)
+        let delta = offset - state.viewportOffset
+        if delta != 0 { state.scrollViewport(by: delta) }
+        let top = history - state.viewportOffset
+        do {
+          let frame = try FrameExporter.frame(
+            from: state.captureOwnedScreen(),
+            identity: identity,
+            limits: limits
+          )
+          builder.append(frame, rows: (next - top) ..< rows)
+        } catch let error as MuxError {
+          return completion(.failure(error))
+        } catch {
+          return completion(.failure(MuxError(.resourceLimit, "\(error)")))
+        }
+        next = top + rows
+      }
+      completion(.success((current, builder.build())))
     }
-    screen.cells = cells
-    screen.wrapped = wrapped
-    screen.columns = columns
-    screen.rows = rows
-    screen.cursor.x = min(max(0, screen.cursor.x), columns - 1)
-    screen.cursor.y = min(max(0, screen.cursor.y), rows - 1)
   }
 
   /// Plain text of the visible screen (tests, diagnostics).
@@ -1489,18 +1937,8 @@ final class PaneRuntime: @unchecked Sendable {
     }
   }
 
-  /// Captures teardown progress in pane order without signaling or reaping.
   func terminationStateForTesting() -> String {
-    queue.sync {
-      let now = DispatchTime.now().uptimeNanoseconds
-      let remaining = terminationDeadline.map {
-        $0.uptimeNanoseconds > now ? $0.uptimeNanoseconds - now : 0
-      }
-      return
-        "pid=\(pid) terminating=\(terminating) exit=\(String(describing: exitStatus)) "
-        + "finished=\(finished) forced=\(forcedTermination) groupKill=\(groupKillSent) "
-        + "graceRemainingNs=\(String(describing: remaining)) drainPending=\(drainTimer != nil)"
-    }
+    process.terminationStateForTesting()
   }
 
   /// Runs `body` in this pane's order with the authoritative state, for
@@ -1520,190 +1958,14 @@ final class PaneRuntime: @unchecked Sendable {
     queue.sync { (state.columns, state.rows) }
   }
 
-  // MARK: Lifetime
-
-  private func childExited(pollIfNeeded: Bool = true) {
-    guard exitStatus == nil, !finished else { return }
-    if pollIfNeeded {
-      // NOTE_EXIT can precede waitability while the controlling terminal
-      // drains. Release reply pressure before checking the exit status.
-      childIsExiting = true
-      readAvailable()
-    }
-    var info = siginfo_t()
-    var peek: Int32
-    repeat {
-      peek = waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
-    } while peek < 0 && errno == EINTR
-    guard peek == 0 else {
-      recordExit(-1)
-      return
-    }
-    guard info.si_pid == pid else {
-      if pollIfNeeded { pollExit() }
-      return
-    }
-    childIsExiting = true
-    readAvailable()
-    if !groupKillSent, groupHasOtherMembers {
-      if !terminating {
-        // Preserve the natural final-output drain before hanging up any
-        // descendants. Retain the leader until cleanup can safely signal
-        // the group; collecting it first would permit ID reuse.
-        let deadline = naturalDrainDeadline ?? (.now() + Self.drainBound)
-        naturalDrainDeadline = deadline
-        if DispatchTime.now() < deadline {
-          pollExit()
-          return
-        }
-        beginTermination()
-      }
-      if let deadline = terminationDeadline, DispatchTime.now() < deadline {
-        pollExit()
-        return
-      }
-      killOwnedGroup()
-    }
-    var status: Int32 = 0
-    var result: pid_t
-    repeat {
-      result = waitpid(pid, &status, WNOHANG)
-    } while result < 0 && errno == EINTR
-    if result == 0 {
-      pollExit()
-      return
-    }
-    recordExit(result == pid ? status : -1)
+  func retire(completion: @escaping @Sendable (MuxError?) -> Void) {
+    queue.async { [self] in process.retire(completion: completion) }
   }
 
-  /// Only a complete single-member result proves no descendants remain.
-  /// A full buffer or a failed query keeps cleanup conservative.
-  private var groupHasOtherMembers: Bool {
-    var members = [pid_t](repeating: 0, count: 2)
-    let count = members.withUnsafeMutableBytes {
-      proc_listpgrppids(pid, $0.baseAddress, Int32($0.count))
-    }
-    return count != 1 || members[0] != pid
-  }
-
-  private func pollExit() {
-    guard exitPoll == nil else { return }
-    let poll = DispatchSource.makeTimerSource(queue: queue)
-    poll.schedule(
-      deadline: .now() + .milliseconds(25),
-      repeating: .milliseconds(25),
-    )
-    poll.setEventHandler { [weak self] in self?.childExited() }
-    exitPoll = poll
-    poll.resume()
-  }
-
-  /// Called only after waitid confirms exclusive ownership of the leader.
-  private func killOwnedGroup() {
-    guard !groupKillSent else { return }
-    groupKillSent = true
-    forcedTermination = true
-    kill(-pid, SIGKILL)
-    kill(pid, SIGKILL)
-  }
-
-  private func recordExit(_ raw: Int32) {
-    guard exitStatus == nil else { return }
-    exitSource?.cancel()
-    exitSource = nil
-    exitPoll?.cancel()
-    exitPoll = nil
-    exitStatus =
-      raw == -1
-      ? -1 : ((raw & 0x7F) == 0 ? (raw >> 8) & 0xFF : 128 + (raw & 0x7F))
-    // Drain what the PTY holds, then release our slave so EOF can arrive
-    // once descendants also close it.
-    readAvailable()
-    if slave >= 0 {
-      close(slave)
-      slave = -1
-    }
-    if readSource == nil {
-      finish()
-      return
-    }
-    // Descendants may retain the slave; bound the wait.
-    let timer = DispatchWorkItem { [weak self] in self?.finish() }
-    drainTimer = timer
-    queue.asyncAfter(deadline: .now() + Self.drainBound, execute: timer)
-  }
-
-  private func finish() {
-    guard !finished else { return }
-    finished = true
-    readAvailable()
-    drainTimer?.cancel()
-    drainTimer = nil
-    setReadActive(true)
-    readSource?.cancel()
-    readSource = nil
-    readSourceActive = false
-    bufferedRead = 0 ..< 0
-    setWriteActive(true)  // a suspended source must not be released
-    writeSource?.cancel()
-    writeSource = nil
-    writeActive = false
-    release(writer.discardAll())
-    if master >= 0 {
-      // Hang up descendants still holding the slave.
-      close(master)
-      master = -1
-    }
-    if slave >= 0 {
-      close(slave)
-      slave = -1
-    }
-    parser = Parser()
-    state.programExited()
-    // The final status reaches the inbox before `finished`.
-    publishStatus()
-    noteChange()
-    onEvent?(.finished(status: exitStatus ?? -1, forced: forcedTermination))
-  }
-
-  /// Bounded explicit termination of this pane's processes only.
   func terminate() {
     queue.async { [self] in
-      guard !finished else {
-        onEvent?(.finished(status: exitStatus ?? -1, forced: forcedTermination))
-        return
-      }
-      guard pid > 0 else {
-        finish()
-        return
-      }
-      beginTermination()
-    }
-  }
-
-  private func beginTermination() {
-    guard !terminating else { return }
-    terminating = true
-    let deadline = DispatchTime.now() + Self.terminateGrace
-    terminationDeadline = deadline
-    if exitStatus == nil {
-      kill(-pid, SIGHUP)
-      kill(pid, SIGHUP)
-    }
-    queue.asyncAfter(deadline: deadline) { [self] in
-      guard !finished else { return }
-      forcedTermination = true
-      if exitStatus == nil {
-        var info = siginfo_t()
-        var owned: Int32
-        repeat {
-          owned = waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
-        } while owned < 0 && errno == EINTR
-        if owned == 0 { killOwnedGroup() }
-        childExited()
-      } else {
-        finish()
-      }
+      cancelGeometryWork { _ in true }
+      process.terminate()
     }
   }
 

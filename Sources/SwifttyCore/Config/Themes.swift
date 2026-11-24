@@ -1,131 +1,175 @@
 import Foundation
+import SwifttyConfig
 
-/// Theme files: Ghostty's format, a configuration file containing only
-/// color keys. Looked up by name in the theme directories, then among the
-/// built-ins; a name with a `/` is a path.
+/// JSONC color themes, looked up by filename in the theme directories, then
+/// among the built-ins. A name containing `/` is an explicit path.
 public enum Themes {
   /// Maximum UTF-8 bytes read from one theme file.
   public static let maxFileBytes = 64 * 1024
-  /// Built-in themes, as theme-file text: Blackboard, forked for each
-  /// appearance.
+  /// Portable fallbacks for the native Apple light and dark palettes.
+  /// On macOS the built-ins resolve semantic AppKit colors at runtime.
   public static let builtIn: [String: String] = [
     "Swiftty Dark": """
-    background = #0C1021
-    foreground = #F8F8F8
-    cursor-color = #FFFFFF
-    cursor-text = #0C1021
-    selection-background = #253B76
-    selection-foreground = #F8F8F8
-    palette = 0=#0C1021
-    palette = 1=#BF392A
-    palette = 2=#61CE3C
-    palette = 3=#FBDE2D
-    palette = 4=#8DA6CE
-    palette = 5=#FF6400
-    palette = 6=#BECDE6
-    palette = 7=#F8F8F8
-    palette = 8=#7F90AA
-    palette = 9=#D74E41
-    palette = 10=#D8FA3C
-    palette = 11=#FBDE2D
-    palette = 12=#D5E0F3
-    palette = 13=#FF6400
-    palette = 14=#FFFFFF
-    palette = 15=#FFFFFF
+    {
+      "background": "#1E1E1E",
+      "foreground": "#FFFFFF",
+      "cursor": "#FFFFFF",
+      "cursor_text": "#1E1E1E",
+      "selection_background": "#3F638B",
+      "selection_foreground": "#FFFFFF",
+      "palette": {
+        "0": "#1C1C1E",
+        "1": "#FF453A",
+        "2": "#32D74B",
+        "3": "#FFD60A",
+        "4": "#0A84FF",
+        "5": "#BF5AF2",
+        "6": "#64D2FF",
+        "7": "#D1D1D6",
+        "8": "#8E8E93",
+        "9": "#FF6961",
+        "10": "#6EE787",
+        "11": "#FFE570",
+        "12": "#70B7FF",
+        "13": "#DA8FFF",
+        "14": "#9DE4FF",
+        "15": "#FFFFFF"
+      }
+    }
     """,
     "GRID": """
-    background = #000000
-    foreground = #e4f2f8
-    cursor-color = #f4be4f
-    cursor-text = #000000
-    selection-background = #4d3f18
-    selection-foreground = #e4f2f8
-    palette = 0=#0c1013
-    palette = 1=#ff655a
-    palette = 2=#74e29f
-    palette = 3=#f4be4f
-    palette = 4=#2286a7
-    palette = 5=#d5b2ff
-    palette = 6=#44daff
-    palette = 7=#a8bcc6
-    palette = 8=#4a5a63
-    palette = 9=#ff655a
-    palette = 10=#74e29f
-    palette = 11=#f4be4f
-    palette = 12=#44daff
-    palette = 13=#d5b2ff
-    palette = 14=#44daff
-    palette = 15=#e4f2f8
+    {
+      "background": "#000000",
+      "foreground": "#e4f2f8",
+      "cursor": "#f4be4f",
+      "cursor_text": "#000000",
+      "selection_background": "#4d3f18",
+      "selection_foreground": "#e4f2f8",
+      "palette": {
+        "0": "#0c1013",
+        "1": "#ff655a",
+        "2": "#74e29f",
+        "3": "#f4be4f",
+        "4": "#2286a7",
+        "5": "#d5b2ff",
+        "6": "#44daff",
+        "7": "#a8bcc6",
+        "8": "#4a5a63",
+        "9": "#ff655a",
+        "10": "#74e29f",
+        "11": "#f4be4f",
+        "12": "#44daff",
+        "13": "#d5b2ff",
+        "14": "#44daff",
+        "15": "#e4f2f8"
+      }
+    }
     """,
     "Swiftty Light": """
-    background = #F8FAFD
-    foreground = #1E2840
-    cursor-color = #0C1021
-    cursor-text = #F8FAFD
-    selection-background = #C6D6EE
-    selection-foreground = #1E2840
-    palette = 0=#0C1021
-    palette = 1=#B03028
-    palette = 2=#2E7D1B
-    palette = 3=#8F6F00
-    palette = 4=#3D639C
-    palette = 5=#BF4D00
-    palette = 6=#35708E
-    palette = 7=#5B6B88
-    palette = 8=#5B6B88
-    palette = 9=#922921
-    palette = 10=#1F6410
-    palette = 11=#705700
-    palette = 12=#2A4E86
-    palette = 13=#9E3F00
-    palette = 14=#245B77
-    palette = 15=#1E2840
+    {
+      "background": "#FFFFFF",
+      "foreground": "#000000",
+      "cursor": "#000000",
+      "cursor_text": "#FFFFFF",
+      "selection_background": "#B3D7FF",
+      "selection_foreground": "#000000",
+      "palette": {
+        "0": "#1C1C1E",
+        "1": "#FF3B30",
+        "2": "#28CD41",
+        "3": "#FFCC00",
+        "4": "#007AFF",
+        "5": "#AF52DE",
+        "6": "#55BEF0",
+        "7": "#C7C7CC",
+        "8": "#8E8E93",
+        "9": "#FF6259",
+        "10": "#4CD964",
+        "11": "#FFD60A",
+        "12": "#409CFF",
+        "13": "#BF5AF2",
+        "14": "#70D7FF",
+        "15": "#FFFFFF"
+      }
+    }
     """,
   ]
+
+  /// Built-in theme names and the files in `directories`, sorted.
+  public static func available(in directories: [URL]) -> [String] {
+    var names = Set(builtIn.keys)
+    for directory in directories {
+      let files =
+        (try? FileManager.default.contentsOfDirectory(
+          atPath: directory.path(percentEncoded: false)
+        )) ?? []
+      names.formUnion(
+        files.filter {
+          !$0.hasPrefix(".")
+            && ["jsonc", "json"]
+              .contains(URL(fileURLWithPath: $0).pathExtension)
+        }
+      )
+    }
+    return names.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+  }
 
   public static func colors(
     named name: String,
     searching directories: [URL]
   ) -> ColorSet? {
-    guard let text = text(named: name, searching: directories) else {
-      return nil
-    }
-    return parse(text)
-  }
-
-  static func text(named name: String, searching directories: [URL]) -> String?
-  {
-    guard !name.unicodeScalars.contains("\0") else { return nil }
+    guard !name.contains("\0") else { return nil }
     if name.unicodeScalars.contains("/") {
-      return try? ConfigurationFile.read(
-        URL(fileURLWithPath: (name as NSString).expandingTildeInPath),
-        maxBytes: maxFileBytes
-      )
+      return read(URL(fileURLWithPath: (name as NSString).expandingTildeInPath))
     }
     for directory in directories {
-      if let text = try? ConfigurationFile.read(
-        directory.appendingPathComponent(name),
-        maxBytes: maxFileBytes
-      ) {
-        return text
+      if let colors = read(directory.appendingPathComponent(name)) {
+        return colors
       }
     }
-    return builtIn[name]
+    #if os(macOS)
+    if let colors = NativeTheme.colors(named: name) { return colors }
+    #endif
+    return builtIn[name].flatMap(decode)
   }
 
-  /// The color keys of a theme file; anything else is ignored.
+  private static func read(_ url: URL) -> ColorSet? {
+    guard let text = try? ConfigurationFile.read(url, maxBytes: maxFileBytes)
+    else { return nil }
+    return decode(text)
+  }
+
+  /// Invalid JSONC or invalid colors produce no overrides.
   public static func parse(_ text: String) -> ColorSet {
+    decode(text) ?? ColorSet()
+  }
+
+  private static func decode(_ text: String) -> ColorSet? {
+    guard let data = try? JSONCParser.parse(text),
+      let object = try? JSONSerialization.jsonObject(with: data)
+        as? [String: Any]
+    else { return nil }
+    let keys = [
+      "foreground": "foreground", "background": "background",
+      "cursor": "cursor-color", "cursor_text": "cursor-text",
+      "selection_foreground": "selection-foreground",
+      "selection_background": "selection-background",
+    ]
     var colors = ColorSet()
-    for raw in text.split(whereSeparator: \.isNewline) {
-      let line = raw.trimmingCharacters(in: .whitespaces)
-      let scalars = line.unicodeScalars
-      guard scalars.first != "#", let eq = scalars.firstIndex(of: "=") else {
-        continue
+    for (key, value) in object {
+      if key == "palette" {
+        guard let palette = value as? [String: String] else { return nil }
+        for (index, color) in palette {
+          guard let number = Int(index), (0 ..< 256).contains(number),
+            let rgb = Configuration.parseColor(color)
+          else { return nil }
+          colors.palette[number] = rgb
+        }
+      } else {
+        guard let name = keys[key], let value = value as? String,
+          let result = colors.set(name, value), result == nil
+        else { return nil }
       }
-      let key = String(scalars[..<eq]).trimmingCharacters(in: .whitespaces)
-      let value = String(scalars[scalars.index(after: eq)...])
-        .trimmingCharacters(in: .whitespaces)
-      _ = colors.set(key, Configuration.unquote(value))
     }
     return colors
   }
